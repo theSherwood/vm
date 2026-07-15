@@ -120,7 +120,7 @@ pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Modul
     if !opts.optimize {
         return Ok(residual);
     }
-    let opt = svm_peval::optimize_module(&residual);
+    let opt = svm_opt::optimize_module(&residual);
     svm_verify::verify_module(&opt)
         .map_err(|e| format!("optimized residual failed re-verification: {e:?}"))?;
     Ok(opt)

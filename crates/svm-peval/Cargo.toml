@@ -15,19 +15,20 @@ publish = false
 # `abs`/`copysign` are folded in pure `core` (exact bit ops), so they fold in every build. Host builds
 # (tests, benches, the host-driven specializer, every dependent) keep the default and fold everything.
 default = ["libm-floats"]
-libm-floats = ["dep:libm"]
+# Forwarded to `svm-opt`, which owns the float-fold machinery. The in-svm svm-IR build turns this off
+# (`default-features = false`) so libm's untranslatable `fma` (x86 inline-asm + i128) is dropped.
+libm-floats = ["svm-opt/libm-floats"]
 
 [dependencies]
 # The IR definition this pass transforms.
 svm-ir.workspace = true
+# The generic optimizer + shared constant-fold machinery (`Known`, `fold_*`, remap helpers), carved
+# out in OPT.md Phase 0. The workspace dep pins `default-features = false`; this crate's own
+# `libm-floats` (default on for host builds) forwards to `svm-opt/libm-floats`.
+svm-opt.workspace = true
 # Per-SSA-value types (`func_value_types`): needed to type the caller values threaded across an
 # inlined call boundary when a dynamic-control-flow callee is specialized into residual blocks.
 svm-verify.workspace = true
-# `sqrt`/`ceil`/`floor`/`trunc`/round-ties-even/`fma` are not in `core` (std-only); the float folds use
-# libm for them. Optional (see the `libm-floats` feature): the in-svm svm-IR build drops it because
-# libm's `fma` brings untranslatable x86 inline-asm + i128. Correctly-rounded, so bit-identical to the
-# std methods the interpreter uses (verified by the differential harness).
-libm = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # The differential harness: re-verify the optimized module, then run original vs

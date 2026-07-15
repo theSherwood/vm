@@ -29,6 +29,8 @@ svm-jit.workspace = true
 # The partial-evaluation on-ramp (§20c): the `--specialize` path turns an interpreter + a fixed
 # program into a compiled residual (a pure `Module → Module` transform; the residual is re-verified).
 svm-peval.workspace = true
+# The generic IR→IR optimizer (OPT.md): CFG cleanup of the residual before re-verify/encode.
+svm-opt.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Real `map`/`unmap`/`protect` for the Memory capability (§3e): `mprotect` on the JIT window
