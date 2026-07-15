@@ -1,0 +1,24 @@
+[package]
+name = "svm-webgpu"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A **headless WebGPU compute capability** for the SVM (LLVM.md §"GPU via a WebGPU capability").
+# The host holds a real GPU device via `wgpu`; the guest drives it over the generic §7
+# host-defined-capability surface (`__vm_cap_resolve` + `__vm_host_call`), so it needs **no
+# translator change** and is never on the escape-TCB — the cap is re-verified IR like any other.
+#
+# Kept **out of the workspace** (root `Cargo.toml` `exclude`, like `svm-llvm`/`fuzz`/`bench`) so the
+# heavy `wgpu` dependency never enters the default `cargo build`/`test`. Runs headless via lavapipe
+# (Mesa software Vulkan) in CI — no physical GPU required.
+
+[dependencies]
+svm-run = { path = "../svm-run" }
+svm-interp = { path = "../svm-interp" }
+wgpu = "24"
+pollster = "0.4"
+
+[dev-dependencies]
+svm-llvm = { path = "../svm-llvm" }
+svm-verify = { path = "../svm-verify" }

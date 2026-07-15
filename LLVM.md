@@ -2539,9 +2539,23 @@ WebGPU does the validation for you (guest-authored WGSL is safe by construction)
 
 **Demos that prove safe access (headless first — the safety story is complete with no display):**
 1. **GPU compute → readback → assert vs CPU** *(the ideal first demo)* — a WGSL compute shader
-   (prefix-sum / matmul / N-body) over a guest-uploaded buffer, read back and checked against a CPU
-   reference. Proves the whole data plane (upload → dispatch → readback) + the validated-buffer model,
-   **with zero windowing**.
+   over a guest-uploaded buffer, read back and checked against a CPU reference. Proves the whole data
+   plane (upload → dispatch → readback) + the validated-buffer model, **with zero windowing**. —
+   **DONE.** The new **workspace-excluded `crates/svm-webgpu`** crate holds a `webgpu` [`HostCap`]
+   backed by **`wgpu`**: an op protocol (create_buffer / write_buffer / set_shader / dispatch /
+   read_buffer) the guest drives over the generic §7 `__vm_cap_resolve("webgpu")` + `__vm_host_call`
+   surface — **no translator change** (exactly the doc's prediction; the same shape as the `fs`/LMDB
+   host-fn caps). `demos/webgpu/{wgpu_demo.c,wgpu_shim.c}`: a guest uploads a `u32` buffer, sets a WGSL
+   kernel, dispatches, reads back, and re-checks the result against a CPU reference **in-guest** — two
+   kernels (an in-place `b[i]=b[i]*3+7` single-buffer map, and a two-buffer `c[i]=a[i]*a[i]+i` at
+   `@binding(0)`/`@binding(1)`). Test `demo_webgpu_compute` runs it through the on-ramp on **all three
+   engines** (tree-walk/bytecode/JIT), asserting the guest's self-check (`ALL MATCH cpu`); no native
+   oracle (the cap is SVM-only, like the async/JIT demos). Runs headless with **no physical GPU** via
+   **lavapipe** (`force_fallback_adapter` → llvmpipe software Vulkan); the wgpu build is isolated to
+   this opt-in crate (like `svm-llvm`), so the default `cargo test` is untouched. **CI note:** the
+   webgpu lane installs `mesa-vulkan-drivers`; without an adapter the test **skips cleanly**
+   (`adapter_available()`). Follow-ups: promote the cap into `svm-run` behind a feature; the
+   offscreen-render (demo 2) + Mandelbrot→PNG (demo 3) slices; richer bind-group/uniform support.
 2. **Offscreen render-to-texture → read pixels → hash** — "hello triangle" / a rotating cube to an
    offscreen attachment, pixels compared to a reference image. Proves the render pipeline headlessly.
 3. **Compute image filter / Mandelbrot / a Shadertoy-style shader → PNG** (written via the File cap) —
