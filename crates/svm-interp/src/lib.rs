@@ -6125,12 +6125,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // remaining args by one, and fold into the shared op logic below; `join`/`resume`
                     // (ops 1/3) serve both kinds unchanged. A forged module handle is a `CapFault`.
                     #[allow(clippy::type_complexity)]
+                    // `grant`/`named` carry the re-grant **handles** (not pre-resolved bindings): a pipe
+                    // end must alias its shared backing into the child, not copy a parent-local index, so
+                    // resolution happens at child construction via `regrant_into_child`. Validated here.
                     let (op, child_mod, askip, grant, named): (
                         u32,
                         Option<ModArc>,
                         usize,
-                        Option<(u32, Binding)>,
-                        Vec<(String, u32, Binding)>,
+                        Option<i32>,
+                        Vec<(String, i32)>,
                     ) = match *op {
                         mop @ 5..=7 => {
                             // The module handle crosses as an i64 arg (the slot ABI); low 32 bits.
@@ -6171,11 +6174,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let gh =
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as i32;
-                            let g = {
+                            // Validate the grant is re-grantable now (coordinate-free cap or pipe end);
+                            // a forged / non-grantable handle fails the spawn closed.
+                            {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                hg.resolve_copyable(gh)?
-                            };
-                            (0, None, 1, Some(g), Vec::new())
+                                hg.can_regrant(gh).then_some(()).ok_or(Trap::CapFault)?;
+                            }
+                            (0, None, 1, Some(gh), Vec::new())
                         }
                         // §14 `instantiate_named(grants_ptr, grants_n, entry, off, size_log2, quota)`
                         // (PROCESS.md S2): `instantiate` (op 0) plus a **grant list** — `grants_n`
@@ -6194,7 +6199,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
                                     as u64;
                             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let mut list: Vec<(String, u32, Binding)> = Vec::new();
+                            let mut list: Vec<(String, i32)> = Vec::new();
                             for i in 0..grants_n {
                                 let rec = m.read_window(grants_ptr + i * 16, 16)?;
                                 let name_off =
@@ -6205,11 +6210,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let name_bytes = m.read_window(name_off, name_len)?;
                                 let name =
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                let g = {
+                                {
                                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.resolve_copyable(handle)?
-                                };
-                                list.push((name, g.0, g.1));
+                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                }
+                                list.push((name, handle));
                             }
                             (0, None, 2, None, list)
                         }
@@ -6316,62 +6321,37 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // reserve shadow state like the parent's (and its own nested
                                 // instantiates re-apply this same admission rule).
                                 ch.set_durable(durable);
+                                // §6: stamp the child's attestation — nested (its carve is a superset
+                                // the parent reads), freezable iff durable, tier inherited from us.
+                                let catt = {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.child_attestation(durable)
+                                };
+                                ch.set_attestation(catt);
                                 let cinst = ch.grant_instantiator(0, child_size);
                                 let cas = ch.grant_address_space(0, child_size);
-                                // S2: re-grant a parent capability (`Stream`/`Exit`/`Clock`) into the
-                                // child's fresh powerbox. Its handle is guest-visible data the child
-                                // receives as its third entry arg, so grant it before sealing `ch`. For
-                                // a stdout/stderr `Stream`, point the child's sink at the parent's
-                                // shared buffer so the child's output reaches the granting embedder
-                                // (stdio inheritance) rather than the child's discarded host buffer.
-                                let cgrant = grant.map(|(tid, b)| {
-                                    if let Binding::Stream(
-                                        r @ (StreamRole::Out | StreamRole::Err),
-                                    ) = b
-                                    {
-                                        let sink = {
-                                            let mut hg =
-                                                host.lock().unwrap_or_else(|e| e.into_inner());
-                                            if r == StreamRole::Out {
-                                                hg.shared_stdout()
-                                            } else {
-                                                hg.shared_stderr()
-                                            }
-                                        };
-                                        if r == StreamRole::Out {
-                                            ch.out_sink = Some(sink);
-                                        } else {
-                                            ch.err_sink = Some(sink);
-                                        }
-                                    }
-                                    ch.grant(tid, b)
+                                // S2: re-grant the parent capability into the child's fresh powerbox —
+                                // a coordinate-free cap (`Stream`/`Exit`/`Clock`, a stdout/stderr stream
+                                // sharing the parent's sink) or a **pipe end** (aliasing its shared FIFO,
+                                // the cross-domain `cmd1 | cmd2` grant). Its handle is guest-visible data
+                                // the child receives as its third entry arg. Pre-validated above, so the
+                                // regrant cannot fail. `regrant_into_child` is the same helper the JIT's
+                                // `spawn_granted_child` uses, so both backends stay in lockstep.
+                                let cgrant = grant.and_then(|gh| {
+                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.regrant_into_child(gh, &mut ch)
                                 });
-                                // S2 named grant list (op 11): install each re-granted cap into the
-                                // child **under its name** (so the child resolves it by
-                                // `cap.self.resolve`), sharing stdout/stderr sinks as the positional
-                                // path does. Empty for every other op.
-                                for (name, tid, b) in &named {
-                                    if let Binding::Stream(
-                                        r @ (StreamRole::Out | StreamRole::Err),
-                                    ) = *b
-                                    {
-                                        let sink = {
-                                            let mut hg =
-                                                host.lock().unwrap_or_else(|e| e.into_inner());
-                                            if r == StreamRole::Out {
-                                                hg.shared_stdout()
-                                            } else {
-                                                hg.shared_stderr()
-                                            }
-                                        };
-                                        if r == StreamRole::Out {
-                                            ch.out_sink = Some(sink);
-                                        } else {
-                                            ch.err_sink = Some(sink);
-                                        }
+                                // S2 named grant list (op 11): install each re-granted cap into the child
+                                // **under its name** (so the child resolves it by `cap.self.resolve`).
+                                // Empty for every other op.
+                                for (name, gh) in &named {
+                                    let cg = {
+                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        hg.regrant_into_child(*gh, &mut ch)
+                                    };
+                                    if let Some(cg) = cg {
+                                        ch.register_cap_name(name, cg);
                                     }
-                                    let cg = ch.grant(*tid, *b);
-                                    ch.register_cap_name(name, cg);
                                 }
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let mut child_args = vec![Value::I64(cinst as i64)];
@@ -6571,6 +6551,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // §4: a durable parent's co-fiber child is durable too (see
                                 // `instantiate`); its module admission was enforced above.
                                 ch.set_durable(durable);
+                                // §6: a co-fiber child is nested (window-exposed), freezable iff durable.
+                                let catt = {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.child_attestation(durable)
+                                };
+                                ch.set_attestation(catt);
                                 let cy = ch.grant_yielder(); // the child's handle to suspend back to us
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let cfuncs = child_mod.as_ref().map_or_else(
@@ -6896,6 +6882,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapSelfCount => {
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let r = hg.self_dispatch(0, &[])?;
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
+                // §6 attestation (`cap.self.attest`): the domain's platform-vouched provenance, packed
+                // into an `i32` (op 4). Same `self_dispatch` path the JIT thunk takes, so they agree.
+                Inst::CapSelfAttest => {
+                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r = hg.self_dispatch(4, &[])?;
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                 }
                 // §7 reflection (`cap.self.get`): the `idx`-th held capability as `(handle, type_id)`
@@ -7731,6 +7724,7 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
         Inst::CapSelfCount
+        | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
         | Inst::CapSelfLabel { .. } => return Err(Trap::Malformed),
@@ -9125,6 +9119,12 @@ pub trait SharedBacking: Send + Sync {
 /// A reference to a shared region backing (see [`SharedBacking`]); cloning shares the same object.
 pub type RegionBacking = Arc<dyn SharedBacking>;
 
+/// §4 / S4 — a host-served **pipe's** shared FIFO backing. `Arc<Mutex<…>>` so a pipe end can be
+/// **re-granted into a §14 child** (the child's `Host` clones the `Arc`, aliasing the same queue) and
+/// so concurrent parent/child access — the interpreter runs children on its M:N executor — is
+/// serialized. The `write` end appends, the `read` end drains.
+type PipeBacking = Arc<Mutex<VecDeque<u8>>>;
+
 /// The reference [`SharedBacking`]: a plain in-process buffer behind a `Mutex` (so it is `Send +
 /// Sync` and safe to alias across vCPU threads). The interpreter models aliasing by reading/writing
 /// this shared buffer through several `Backed` pages.
@@ -9288,6 +9288,15 @@ pub enum StreamRole {
 #[derive(Clone, Copy, Debug)]
 enum Binding {
     Stream(StreamRole),
+    /// A **host-served pipe** end (§4/S4, the personality's byte IPC): resolves under iface `STREAM`
+    /// (a pipe end *is* a stream — the personality treats it as an fd), carrying the index of its FIFO
+    /// in [`Host::pipes`] and which half it is. `write = true` appends to the FIFO (op 1), `false`
+    /// drains it (op 0) — non-blocking: a read of an empty pipe returns `0`. Index-carrying, so
+    /// non-durable and non-copyable, like [`Binding::SharedRegion`].
+    PipeEnd {
+        pipe: u32,
+        write: bool,
+    },
     Exit,
     Clock,
     Memory,
@@ -9365,6 +9374,48 @@ struct BudgetState {
     spawn: i64,
 }
 
+/// §6 (PROCESS.md) — a domain's platform-vouched **attestation**, reported by `cap.self.attest`. The
+/// non-interposable trust anchor: a nested host can virtualize every handle-gated capability, but not
+/// this (it is a D46 `cap.self` intrinsic, never a handle). Kept minimal (O5: a tier + two bits, not an
+/// authority set) so the non-interposable surface stays tiny.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attestation {
+    /// §2 isolation tier — `0`/`1` in-process (defense-in-depth, **not** a Spectre boundary), `3`
+    /// separate-process. The strongest isolation the domain may *require*; a domain needing protection
+    /// from a distrusted host must see `3` or refuse.
+    pub tier: u8,
+    /// `true` iff an **ancestor** (beyond the platform) holds map/read/pager rights over the domain's
+    /// backing — a §14 nested carve is exposed (the parent sees the superset); a platform-minted or
+    /// root window is not.
+    pub window_exposed: bool,
+    /// `true` iff an ancestor may **snapshot** the domain (a snapshot is a complete read). A domain is
+    /// *confidential* (freezable by nobody below the platform) or *ancestor-durable*, never both.
+    pub freeze_exposed: bool,
+}
+
+impl Default for Attestation {
+    /// A **root** domain: in-process (tier 1), platform-only window (no ancestor read), not
+    /// ancestor-freezable. The embedder overrides via [`Host::set_attestation`]; the §14 spawn path
+    /// stamps a nested child's (exposed) report.
+    fn default() -> Attestation {
+        Attestation {
+            tier: 1,
+            window_exposed: false,
+            freeze_exposed: false,
+        }
+    }
+}
+
+impl Attestation {
+    /// Pack into the `i32` `cap.self.attest` returns: `tier | (window_exposed << 8) |
+    /// (freeze_exposed << 9)`.
+    fn packed(self) -> i32 {
+        (self.tier as i32)
+            | ((self.window_exposed as i32) << 8)
+            | ((self.freeze_exposed as i32) << 9)
+    }
+}
+
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
 /// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
 /// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
@@ -9417,6 +9468,7 @@ pub enum NonDurableKind {
     JitCode,
     HostFn,
     Budget,
+    Pipe,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -9727,6 +9779,16 @@ pub struct Host {
     /// remaining resource-quota vector; `split` moves quota from a parent's entry into a fresh child
     /// entry (append-only, like `regions` — a split budget's index stays valid for the run).
     budgets: Vec<BudgetState>,
+    /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
+    /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
+    /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
+    /// `Host` clones the `Arc`, so both domains see the same queue — the cross-domain `cmd1 | cmd2`
+    /// wiring). Append-only vector (a pipe's index stays valid for the run), like `regions`/`budgets`.
+    pipes: Vec<PipeBacking>,
+    /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
+    /// `cap.self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
+    /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
+    attestation: Attestation,
     /// §14 instantiable **modules**, indexed by the id a [`Binding::Module`] carries — host-verified
     /// code a guest holding the handle may spawn as a child domain (`Arc`s so a spawned child shares,
     /// not copies). Append-only for the life of the `Host`, so raw views handed to the JIT's nesting
@@ -9940,6 +10002,8 @@ impl Host {
             clock_ns: 0,
             regions: Vec::new(),
             budgets: Vec::new(),
+            pipes: Vec::new(),
+            attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
             blockings: Vec::new(),
@@ -10279,6 +10343,9 @@ impl Host {
                     .ok_or(Trap::Malformed)?;
                 Ok(vec![handle as i64, type_id as i64])
             }
+            // §6 `cap.self.attest`: the domain's platform-vouched provenance, packed as
+            // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
+            4 => Ok(vec![self.attestation.packed() as i64]),
             _ => Err(Trap::Malformed),
         }
     }
@@ -10338,6 +10405,7 @@ impl Host {
                     return Err(self.non_durable(slot, NonDurableKind::HostFn))
                 }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
+                Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -10390,6 +10458,7 @@ impl Host {
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
                 Binding::Budget(_) => NonDurableKind::Budget,
+                Binding::PipeEnd { .. } => NonDurableKind::Pipe,
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -10450,6 +10519,43 @@ impl Host {
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
     pub fn grant_stream(&mut self, role: StreamRole) -> i32 {
         self.grant(iface::STREAM, Binding::Stream(role))
+    }
+
+    /// §4 / S4 — mint a **host-served pipe** and grant both ends, returning `(write_handle,
+    /// read_handle)`. Both are `Stream`-typed (a pipe end is a stream: read/write/close), backed by one
+    /// FIFO in [`Host::pipes`]: bytes written to the write end are drained by the read end (non-blocking,
+    /// FIFO order). The personality's byte-IPC primitive — a shell wiring `cmd1 | cmd2` grants each side
+    /// one end. (Cross-domain granting of an end into a child is a follow-up — the FIFO would move to a
+    /// shared backing, like `SharedRegion`; today both ends live in the minting domain, e.g. between its
+    /// own fibers.)
+    pub fn grant_pipe(&mut self) -> (i32, i32) {
+        let pipe = self.pipes.len() as u32;
+        self.pipes.push(Arc::new(Mutex::new(VecDeque::new())));
+        let w = self.grant(iface::STREAM, Binding::PipeEnd { pipe, write: true });
+        let r = self.grant(iface::STREAM, Binding::PipeEnd { pipe, write: false });
+        (w, r)
+    }
+
+    /// Resolve a handle to a **pipe end** — `(is_write, shared FIFO backing)` — or `None` if it is not
+    /// a live `PipeEnd`. The re-grant counterpart of [`Self::resolve_copyable`] for the one
+    /// index-carrying cap a §14 child can be handed: it returns the shared backing (not the parent-local
+    /// index) so [`Self::install_pipe_end`] can alias it into a child `Host`.
+    fn resolve_pipe_end(&self, handle: i32) -> Option<(bool, PipeBacking)> {
+        match self.resolve(handle, iface::STREAM) {
+            Ok(Binding::PipeEnd { pipe, write }) => {
+                Some((write, Arc::clone(self.pipes.get(pipe as usize)?)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Install a re-granted pipe end (its shared `backing` aliased from the granting domain) into this
+    /// `Host` and return its handle. The child sees the **same** FIFO as the parent's other end — how a
+    /// pipe crosses a §14 domain boundary.
+    fn install_pipe_end(&mut self, write: bool, backing: PipeBacking) -> i32 {
+        let pipe = self.pipes.len() as u32;
+        self.pipes.push(backing);
+        self.grant(iface::STREAM, Binding::PipeEnd { pipe, write })
     }
 
     /// PROCESS.md S2 — promote `stdout` to a **shared** sink and return a handle to it, so a child
@@ -10694,6 +10800,32 @@ impl Host {
         let id = self.budgets.len() as u32;
         self.budgets.push(BudgetState { fuel, mem, spawn });
         self.grant(iface::BUDGET, Binding::Budget(id))
+    }
+
+    /// Set this domain's §6 [`Attestation`] — what `cap.self.attest` reports. The embedder calls it on
+    /// the **top-level** `Host` to declare the platform-vouched provenance (isolation tier, whether an
+    /// ancestor can read/snapshot it); the §14 spawn path calls it internally to stamp a nested child's
+    /// (exposed) report. The default (a fresh `Host`) is a root domain (tier 1, unexposed).
+    pub fn set_attestation(&mut self, attestation: Attestation) {
+        self.attestation = attestation;
+    }
+
+    /// This domain's current §6 [`Attestation`] (what `cap.self.attest` reports) — the read half of
+    /// [`Self::set_attestation`], for an embedder that inspects a child host it built.
+    pub fn attestation(&self) -> Attestation {
+        self.attestation
+    }
+
+    /// The §6 [`Attestation`] to stamp on a §14 **nested child** this host spawns: the child inherits
+    /// the parent's isolation tier, is always `window_exposed` (the parent sees its carve — the §14
+    /// superset, so an ancestor holds read authority), and is `freeze_exposed` iff spawned into a
+    /// **durable** subtree (an ancestor may snapshot it — a snapshot is a read).
+    fn child_attestation(&self, durable: bool) -> Attestation {
+        Attestation {
+            tier: self.attestation.tier,
+            window_exposed: true,
+            freeze_exposed: durable,
+        }
     }
 
     /// Install the [`JitValidator`] — the decode+verify gate every `Jit.compile` runs. The
@@ -11029,15 +11161,46 @@ impl Host {
     /// factored out so the **JIT** backend can build the *same* child powerbox host-side (via
     /// `svm_run::grant_child_build`) and keep both backends in differential lockstep — the child sees an
     /// identical set of handles and the same shared sink.
+    ///
+    /// The grant may be a coordinate-free cap (`Stream`/`Exit`/`Clock`) **or a pipe end** — the latter
+    /// aliases its shared FIFO into the child (the cross-domain `cmd1 | cmd2` grant), see
+    /// [`Self::regrant_into_child`].
     pub fn spawn_granted_child(
         &mut self,
         grant_handle: i32,
         child_size: u64,
     ) -> Option<(Host, i32, i32, i32)> {
-        let (tid, binding) = self.resolve_copyable(grant_handle).ok()?;
+        // Reject a non-grantable handle before building anything (fail closed, no state mutated).
+        if !self.can_regrant(grant_handle) {
+            return None;
+        }
         let mut ch = Host::new();
+        // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
+        ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
+        let cg = self.regrant_into_child(grant_handle, &mut ch)?;
+        Some((ch, cinst, cas, cg))
+    }
+
+    /// Whether `handle` names a capability this host may **re-grant into a §14 child** — a coordinate-free
+    /// cap ([`Self::resolve_copyable`]) or a pipe end ([`Self::resolve_pipe_end`]). Used to fail a grant
+    /// closed *before* any child state is built.
+    fn can_regrant(&self, handle: i32) -> bool {
+        self.resolve_pipe_end(handle).is_some() || self.resolve_copyable(handle).is_ok()
+    }
+
+    /// Re-grant `handle` from this (parent) host into `child` — the §14 child-powerbox re-grant policy:
+    /// a **pipe end** aliases its shared FIFO backing into the child (so parent and child share the same
+    /// queue — the cross-domain pipe); a stdout/stderr `Stream` shares the parent's sink (stdio
+    /// inheritance); every other coordinate-free cap copies its binding as-is. Returns the child handle,
+    /// or `None` for a forged / non-grantable cap. (A pipe end is checked first: it is index-carrying,
+    /// so `resolve_copyable` would refuse it.)
+    fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
+        if let Some((write, backing)) = self.resolve_pipe_end(handle) {
+            return Some(child.install_pipe_end(write, backing));
+        }
+        let (tid, binding) = self.resolve_copyable(handle).ok()?;
         if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
             let sink = if r == StreamRole::Out {
                 self.shared_stdout()
@@ -11045,13 +11208,12 @@ impl Host {
                 self.shared_stderr()
             };
             if r == StreamRole::Out {
-                ch.out_sink = Some(sink);
+                child.out_sink = Some(sink);
             } else {
-                ch.err_sink = Some(sink);
+                child.err_sink = Some(sink);
             }
         }
-        let cg = ch.grant(tid, binding);
-        Some((ch, cinst, cas, cg))
+        Some(child.grant(tid, binding))
     }
 
     /// PROCESS.md S2 (JIT parity) — build a §14 **named-grant child** powerbox: a fresh `Host` holding
@@ -11069,30 +11231,20 @@ impl Host {
         grants: &[(String, i32)],
         child_size: u64,
     ) -> Option<(Host, i32, i32)> {
-        // Resolve every handle first — if any is non-copyable the spawn fails closed, before we mutate
-        // the parent's shared sinks (a partially-built child would leak a promoted sink).
-        let mut resolved: Vec<(&str, u32, Binding)> = Vec::with_capacity(grants.len());
-        for (name, handle) in grants {
-            let (tid, binding) = self.resolve_copyable(*handle).ok()?;
-            resolved.push((name.as_str(), tid, binding));
+        // Check every handle first — if any is non-grantable the spawn fails closed, before we mutate
+        // anything (a partially-built child would leak a promoted sink / installed pipe).
+        if !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
+            return None;
         }
         let mut ch = Host::new();
+        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
+        ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
-        for (name, tid, binding) in resolved {
-            if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
-                let sink = if r == StreamRole::Out {
-                    self.shared_stdout()
-                } else {
-                    self.shared_stderr()
-                };
-                if r == StreamRole::Out {
-                    ch.out_sink = Some(sink);
-                } else {
-                    ch.err_sink = Some(sink);
-                }
-            }
-            let cg = ch.grant(tid, binding);
+        for (name, handle) in grants {
+            // Pre-checked above, so this cannot fail; each cap (coordinate-free or pipe end) is
+            // re-granted into the child under its name.
+            let cg = self.regrant_into_child(*handle, &mut ch)?;
             ch.register_cap_name(name, cg);
         }
         Some((ch, cinst, cas))
@@ -11272,6 +11424,7 @@ impl Host {
         }
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
+            Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
             // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
             // then restore it — a panic would only poison this one slot, never the host.
@@ -12043,6 +12196,65 @@ impl Host {
                     None if role == StreamRole::Out => self.stdout.extend_from_slice(&bytes),
                     None => self.stderr.extend_from_slice(&bytes),
                 }
+                ret(len as i64)
+            }
+            2 => ret(0), // close: no-op in the MVP (exit reclaims all)
+            _ => ret(EINVAL),
+        }
+    }
+
+    /// §4 / S4 host-served **pipe** end, dispatched under iface `STREAM` (a pipe end *is* a stream).
+    /// Non-blocking: the `read` half drains bytes the `write` half has queued (op 0), a `read` of an
+    /// empty pipe returns `0`; the `write` half appends (op 1). Wrong-direction ops are `-EINVAL`. Same
+    /// `(buf, len) -> n | -errno` shapes as `stream_op`, so a personality's fd layer treats a pipe end
+    /// and a stdio stream identically.
+    fn pipe_op(
+        &mut self,
+        pipe: u32,
+        write: bool,
+        op: u32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let ret = |v: i64| Ok(vec![v]);
+        let Some(backing) = self.pipes.get(pipe as usize) else {
+            return ret(EINVAL);
+        };
+        let mut fifo = backing.lock().unwrap_or_else(|e| e.into_inner());
+        match op {
+            0 => {
+                // read(buf, len) -> n; only the read end is readable.
+                if write {
+                    return ret(EINVAL);
+                }
+                let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+                let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                let n = (len as usize).min(fifo.len());
+                let chunk: Vec<u8> = fifo.drain(..n).collect();
+                let Some(m) = mem else {
+                    return ret(EFAULT);
+                };
+                if m.write_bytes(ptr, &chunk).is_none() {
+                    // The bytes are already drained; a fail-closed buffer is the guest's bug, but keep
+                    // them out of the FIFO rather than re-queue (matches `stream_op`'s stdin semantics).
+                    return ret(EFAULT);
+                }
+                ret(n as i64)
+            }
+            1 => {
+                // write(buf, len) -> n; only the write end is writable.
+                if !write {
+                    return ret(EINVAL);
+                }
+                let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+                let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                let Some(m) = mem else {
+                    return ret(EFAULT);
+                };
+                let Some(bytes) = m.read_bytes(ptr, len) else {
+                    return ret(EFAULT);
+                };
+                fifo.extend(bytes);
                 ret(len as i64)
             }
             2 => ret(0), // close: no-op in the MVP (exit reclaims all)

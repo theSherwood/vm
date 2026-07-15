@@ -658,6 +658,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::CapCall { .. }
         | Inst::CallImport { .. }
         | Inst::CapSelfCount
+        | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
         | Inst::CapSelfLabel { .. }

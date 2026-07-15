@@ -108,6 +108,7 @@ mod op {
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
     pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
     pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
+    pub const CAP_SELF_ATTEST: u8 = 0xBE; // §6 attestation: () -> i32 packed provenance
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -517,6 +518,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         }
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
+        Inst::CapSelfAttest => out.push(op::CAP_SELF_ATTEST),
         Inst::CapSelfGet { idx } => {
             out.push(op::CAP_SELF_GET);
             write_uleb(out, *idx as u64);
@@ -1893,6 +1895,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             args: decode_idxs(c)?,
         },
         op::CAP_SELF_COUNT => Inst::CapSelfCount,
+        op::CAP_SELF_ATTEST => Inst::CapSelfAttest,
         op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
         op::CAP_SELF_RESOLVE => Inst::CapSelfResolve {
             name_ptr: c.idx()?,

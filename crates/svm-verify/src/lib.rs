@@ -300,6 +300,11 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.push(ValType::I32);
                 continue;
             }
+            // §6 attestation: `cap.self.attest` takes no args and appends the packed provenance `i32`.
+            if let Inst::CapSelfAttest = inst {
+                types.push(ValType::I32);
+                continue;
+            }
             if let Inst::CapSelfGet { idx } = inst {
                 let cx = Cx {
                     fi,
@@ -429,6 +434,7 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
                 types.push(ValType::I64); // value
             }
             Inst::CapSelfCount => types.push(ValType::I32),
+            Inst::CapSelfAttest => types.push(ValType::I32), // packed provenance
             Inst::CapSelfGet { .. } => {
                 types.push(ValType::I32); // handle
                 types.push(ValType::I32); // type_id
@@ -594,6 +600,7 @@ fn check_inst(
         }
         // §7 reflection appends its results in the multi-result section above; unreachable here.
         Inst::CapSelfCount
+        | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
         | Inst::CapSelfLabel { .. } => {

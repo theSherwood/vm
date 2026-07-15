@@ -398,6 +398,7 @@ fn print_inst(inst: &Inst) -> String {
         } => format!("call.import {import} v{handle}{}", arglist(args)),
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => "cap.self.count".to_string(),
+        Inst::CapSelfAttest => "cap.self.attest".to_string(),
         Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
         Inst::CapSelfResolve { name_ptr, name_len } => {
             format!("cap.self.resolve v{name_ptr} v{name_len}")
@@ -1740,6 +1741,9 @@ impl<'a> Parser<'a> {
         // §7 capability reflection intrinsics.
         if op == "cap.self.count" {
             return Ok(Inst::CapSelfCount);
+        }
+        if op == "cap.self.attest" {
+            return Ok(Inst::CapSelfAttest);
         }
         if op == "cap.self.get" {
             let idx = self.value(names)?;
