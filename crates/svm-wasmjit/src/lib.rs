@@ -1064,31 +1064,14 @@ pub fn compile_module_reactor(
     let cross: Vec<bool> = (0..n)
         .map(|i| a.reachable[i] && !a.in_subset[i] && int_sig(&m.funcs[i]))
         .collect();
-    let has_indirect = (0..n).any(|i| a.reachable[i] && func_uses_indirect(&m.funcs[i]));
-    // Address-taken functions (`RefFunc` targets) are the only legitimate indirect-call targets. When
-    // the guest makes an indirect call, each such target must be emitted or cross-tier-callable — an
-    // emitted table slot resolves to the wasm function, a `cross` one to a trampoline that bounces to
-    // the interpreter. A non-`cross` address-taken target (e.g. a non-integer signature) can't be
-    // marshalled, so the whole module falls back to the interpreter.
-    let indirect_ok = !has_indirect || {
-        let mut addr_taken = vec![false; n];
-        for f in &m.funcs {
-            for b in &f.blocks {
-                for inst in &b.insts {
-                    if let Inst::RefFunc { func } = inst {
-                        addr_taken[*func as usize] = true;
-                    }
-                }
-            }
-        }
-        (0..n).all(|i| !addr_taken[i] || a.in_subset[i] || cross[i])
-    };
     let ok = (entry as usize) < n
         && a.in_subset[entry as usize]
-        // Every reachable function must be emittable or cross-tier-callable...
-        && (0..n).all(|i| !a.reachable[i] || a.in_subset[i] || cross[i])
-        // ...and every indirect-call target must resolve to an emitted func or a cross-tier trampoline.
-        && indirect_ok;
+        // Every reachable function must be emittable or cross-tier-callable. When the guest makes an
+        // indirect call, `analyze` marks **all** functions reachable, so this also guarantees every
+        // possible indirect target (including a data-segment function pointer, which no `RefFunc` scan
+        // sees) is either emitted or `cross` — hence gets an identity-table slot: the emitted wasm
+        // function, or a trampoline that bounces to the interpreter (see `emit_module`).
+        && (0..n).all(|i| !a.reachable[i] || a.in_subset[i] || cross[i]);
     if !ok {
         return Err(Error::Unsupported("guest not cross-tier reactor runnable"));
     }
@@ -1266,19 +1249,18 @@ fn emit_module(
     let mut extra_bodies: Vec<Vec<u8>> = Vec::new();
     let mut trap_stub_widx: Option<u32> = None;
     if needs_table {
-        let mut addr_taken = vec![false; m.funcs.len()];
-        for f in &m.funcs {
-            for b in &f.blocks {
-                for inst in &b.insts {
-                    if let Inst::RefFunc { func } = inst {
-                        addr_taken[*func as usize] = true;
-                    }
-                }
-            }
-        }
+        // **Every** cross-tier function needs a trampoline slot — not just the `RefFunc`
+        // address-taken ones. A function pointer can be an indirect-call target without any `RefFunc`
+        // instruction: the frontend bakes static function-pointer tables (e.g. Doom's `states[]` /
+        // `mobjinfo[]` action functions) into **data segments** as plain function-index constants,
+        // invisible to a RefFunc scan. So the identity table must route *any* index to its function,
+        // exactly as the interpreter's `DomainTable` does — otherwise a `call_indirect` through a
+        // data-segment pointer hits a trap stub ("null function or function signature mismatch") the
+        // interpreter would have dispatched. (Fixed a hang/trap ~frame 174 of Doom, when the first
+        // monster thinker fires an `A_*` action loaded from `states[]`.)
         let mut next_widx = IMPORTED_FUNCS + emitted.len() as u32;
         for fi in 0..m.funcs.len() {
-            if wasm_of[fi].is_none() && addr_taken[fi] && interp_leaf[fi] {
+            if wasm_of[fi].is_none() && interp_leaf[fi] {
                 let f = &m.funcs[fi];
                 let key = indirect_type_bytes(&FuncType {
                     params: f.params.clone(),
