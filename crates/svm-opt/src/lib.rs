@@ -80,6 +80,8 @@ use svm_ir::{
     ValIdx, ValType,
 };
 
+pub mod cfg;
+
 /// A value known to be a constant at optimization time. Tracks scalar integers/floats and `v128`.
 /// Floats and `v128` are held as **raw bits/bytes** so equality/hashing are exact and NaN-safe
 /// (needed for the specializer's memo key) and folds preserve NaN payloads. Shared with the
@@ -1612,23 +1614,9 @@ fn resolve_term(t: &Terminator, known: &[Option<Known>]) -> Terminator {
 
 /// The block successors reachable through a terminator (for the reachability walk).
 fn term_successors(t: &Terminator) -> Vec<u32> {
-    match t {
-        Terminator::Br { target, .. } => vec![*target],
-        Terminator::BrIf {
-            then_blk, else_blk, ..
-        } => vec![*then_blk, *else_blk],
-        Terminator::BrTable {
-            targets, default, ..
-        } => {
-            let mut v: Vec<u32> = targets.iter().map(|(t, _)| *t).collect();
-            v.push(default.0);
-            v
-        }
-        Terminator::Return(_)
-        | Terminator::ReturnCall { .. }
-        | Terminator::ReturnCallIndirect { .. }
-        | Terminator::Unreachable => vec![],
-    }
+    // The canonical successor extraction lives in `cfg` (OPT.md Phase 1b); `prune_unreachable` only
+    // walks these to mark reachability, so `cfg::successors`'s deduplication is harmless here.
+    cfg::successors(t)
 }
 
 /// Rewrite the `BlockIdx` targets of a terminator through an old→new index map. Only the

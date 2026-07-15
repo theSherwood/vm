@@ -127,7 +127,12 @@ tracked enhancement, not a blocker.
     The DVE pass's `is_removable_if_dead` now delegates to it — one purity oracle. Behavior-preserving
     (the classification reproduces the old whitelist exactly; harness unchanged) and unit-tested by
     category in `svm-ir`.
-  - [ ] (b) CFG utilities: pred/succ, RPO, loop forest (irreducible-aware).
+  - [x] **(b) CFG utilities** (`svm_opt::cfg`): `Cfg` (pred/succ adjacency), `postorder`/`rpo`,
+    iterative Cooper–Harvey–Kennedy `dominators` (correct on irreducible CFGs), Tarjan `sccs`, and
+    irreducible-aware `loop_headers` (flags *every* entry of a multi-entry cycle). All traversals are
+    iterative (no host-stack recursion) and fuzz-safe (out-of-range targets ignored, not panicked).
+    `term_successors` now delegates to `cfg::successors`. Unit-tested incl. an irreducible two-entry
+    loop, self-loop, and unreachable block.
   - [ ] (c) The internal conventional-SSA form + lower-back pass, landed with the no-op round-trip
     differential fuzz target.
   - [ ] (d) `OptConfig` (budgets, pass toggles).
