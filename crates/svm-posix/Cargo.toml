@@ -1,0 +1,23 @@
+[package]
+name = "svm-posix"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# An **embedder host-capability provider** (POSIX.md), not escape-TCB: it registers a `HostFn` handler
+# (svm-interp) implementing the POSIX/libc surface a fork-less shell needs, plus a §7 import-name
+# resolver binding libc symbol names to it. libc semantics live here, outside the interp TCB match —
+# the guest reaches the personality only through a masked, type-checked capability handle. Generalizes
+# svm-wasi from a WASI subset to the POSIX subset BusyBox/Bash link against.
+
+[dependencies]
+svm-ir = { path = "../svm-ir" }
+svm-interp = { path = "../svm-interp" }
+
+[dev-dependencies]
+svm-text = { path = "../svm-text" }
+svm-verify = { path = "../svm-verify" }
+# The JIT + its host bridge (`cap_thunk`), so every op runs on **both** backends — the HostFn
+# capability dispatches through the same `cap_dispatch_slots` the JIT's `cap.call` thunk calls.
+svm-jit = { path = "../svm-jit" }
+svm-run = { path = "../svm-run" }

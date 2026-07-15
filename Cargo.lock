@@ -735,6 +735,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-posix"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-run",
+ "svm-text",
+ "svm-verify",
+]
+
+[[package]]
 name = "svm-run"
 version = "0.0.0"
 dependencies = [
