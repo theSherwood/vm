@@ -6398,19 +6398,25 @@ impl Vm {
                         .store_scalar(a, *offset, *op, lo)?;
                     pc += 1;
                 }
-                // Bulk-memory ops (D62): both `MemCopy` and `MemMove` use the overlap-safe `mem_copy`.
+                // Bulk-memory ops (D62): both `MemCopy` and `MemMove` use the overlap-safe fast path
+                // (bulk `memmove` on the backing behind the same whole-span confinement; the tree-walk
+                // oracle keeps the scalar `mem_copy`).
                 Op::MemCopy { dst, src, len } | Op::MemMove { dst, src, len } => {
                     let d = r!(*dst).i64() as u64;
                     let s = r!(*src).i64() as u64;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut().ok_or(Trap::Malformed)?.mem_copy(d, s, n)?;
+                    mem.as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .mem_copy_fast(d, s, n)?;
                     pc += 1;
                 }
                 Op::MemFill { dst, val, len } => {
                     let d = r!(*dst).i64() as u64;
                     let v = r!(*val).i32() as u8;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut().ok_or(Trap::Malformed)?.mem_fill(d, v, n)?;
+                    mem.as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .mem_fill_fast(d, v, n)?;
                     pc += 1;
                 }
                 Op::AtomicLoad {

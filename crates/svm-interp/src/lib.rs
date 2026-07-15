@@ -12769,6 +12769,50 @@ impl Mem {
         Ok(())
     }
 
+    /// Bytecode-engine fast path for `MemCopy`/`MemMove` (Phase 2). Same whole-span confinement +
+    /// per-page protection scan as the oracle [`Mem::mem_copy`], but the copy body is one bulk
+    /// [`Region::copy_within`] (a `memmove`) instead of the oracle's scalar snapshot loop — the same
+    /// single-threaded cooperative contract the bytecode engine already relies on for
+    /// [`Mem::load_scalar`]/`read_word`. The `§13`-regions path keeps the byte-at-a-time
+    /// [`Mem::copy_span`] (region redirection is not a `back`-contiguous span). The tree-walk oracle
+    /// stays on scalar `mem_copy`, so it remains the independent reference the JIT + this path are
+    /// differentially checked against.
+    fn mem_copy_fast(&mut self, dst: u64, src: u64, len: u64) -> Result<(), Trap> {
+        if len == 0 {
+            return Ok(());
+        }
+        let sbase = self.confine_span(src, len)?;
+        let dbase = self.confine_span(dst, len)?;
+        self.check_prot_span(sbase, len, false)?;
+        self.check_prot_span(dbase, len, true)?;
+        if !self.has_regions.load(Ordering::Relaxed) {
+            self.back.copy_within(dbase, sbase, len);
+        } else {
+            self.copy_span(dbase, sbase, len);
+        }
+        self.writes += 1;
+        Ok(())
+    }
+
+    /// Bytecode-engine fast path for `MemFill` — the [`Mem::mem_copy_fast`] counterpart: one bulk
+    /// [`Region::fill`] (a `memset`) instead of the oracle's scalar byte loop.
+    fn mem_fill_fast(&mut self, dst: u64, val: u8, len: u64) -> Result<(), Trap> {
+        if len == 0 {
+            return Ok(());
+        }
+        let base = self.confine_span(dst, len)?;
+        self.check_prot_span(base, len, true)?;
+        if !self.has_regions.load(Ordering::Relaxed) {
+            self.back.fill(base, len, val);
+        } else {
+            for k in 0..len {
+                self.set_byte(base + k, val);
+            }
+        }
+        self.writes += 1;
+        Ok(())
+    }
+
     /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When no protection has
     /// ever been mutated (`!prot_dirty` — the common case: no syscalls / coroutines / §13 regions, so
     /// every prefix page is plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies

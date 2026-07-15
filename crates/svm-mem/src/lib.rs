@@ -154,6 +154,41 @@ impl Region {
         }
     }
 
+    /// Set `[off, off+len)` to byte `b` — the bulk `memory.fill` primitive (a generalized
+    /// [`Region::zero`]). Range clamped to `[0, size)`. Bulk/non-atomic: sound for the single-threaded
+    /// cooperative caller (the bytecode interpreter's `memory.fill` fast path), the same contract as
+    /// [`Region::read_word`]; the concurrent tree-walker keeps the per-byte [`Region::set_byte`] path.
+    pub fn fill(&self, off: u64, len: u64, b: u8) {
+        let len = clamp_len(off, len, self.len());
+        if len == 0 {
+            return;
+        }
+        match self {
+            #[cfg(unix)]
+            Region::Mapped(m) => m.fill(off, len, b),
+            Region::Shared(s) => s.fill(off, len, b),
+            Region::Paged(p) => p.fill(off, len, b),
+        }
+    }
+
+    /// Copy `len` bytes `src`→`dst` within the region — the bulk `memory.copy`/`memory.move` primitive.
+    /// Overlap-safe (a `memmove`, so it serves both the non-overlapping and overlapping cases). Both
+    /// spans clamped to their in-range prefix (defense-in-depth; the caller confined both into
+    /// `[0, size)`). Bulk/non-atomic: same single-threaded contract as [`Region::fill`].
+    pub fn copy_within(&self, dst: u64, src: u64, len: u64) {
+        let size = self.len();
+        let len = clamp_len(dst, len, size).min(clamp_len(src, len, size));
+        if len == 0 {
+            return;
+        }
+        match self {
+            #[cfg(unix)]
+            Region::Mapped(m) => m.copy_within(dst, src, len),
+            Region::Shared(s) => s.copy_within(dst, src, len),
+            Region::Paged(p) => p.copy_within(dst, src, len),
+        }
+    }
+
     /// Copy `[off, off+out.len())` into `out` (zero past the touched extent / region end). Used for
     /// the escape-oracle window snapshot, which can span the whole mapped extent — so the mmap
     /// backing bulk-copies rather than dispatching per byte.
@@ -349,6 +384,17 @@ mod shared {
         pub(super) fn zero(&self, off: u64, len: u64) {
             // SAFETY: `[off, off+len) ⊆ [0, size)` (clamped by caller). Control-plane, not raced.
             unsafe { core::ptr::write_bytes(self.ptr(off), 0, len as usize) }
+        }
+
+        pub(super) fn fill(&self, off: u64, len: u64, b: u8) {
+            // SAFETY: as `zero`, with an arbitrary fill byte. Non-atomic bulk — single-threaded caller.
+            unsafe { core::ptr::write_bytes(self.ptr(off), b, len as usize) }
+        }
+
+        pub(super) fn copy_within(&self, dst: u64, src: u64, len: u64) {
+            // SAFETY: both spans `⊆ [0, size)` (clamped by caller); `ptr::copy` is overlap-safe
+            // (`memmove`). Non-atomic bulk — sound only for the single-threaded cooperative caller.
+            unsafe { core::ptr::copy(self.ptr(src), self.ptr(dst), len as usize) }
         }
 
         pub(super) fn read_into(&self, off: u64, out: &mut [u8]) {
@@ -581,6 +627,17 @@ mod mapped {
             unsafe { core::ptr::write_bytes(self.ptr(off), 0, len as usize) }
         }
 
+        pub(super) fn fill(&self, off: u64, len: u64, b: u8) {
+            // SAFETY: as `zero`, with an arbitrary fill byte. Non-atomic bulk — single-threaded caller.
+            unsafe { core::ptr::write_bytes(self.ptr(off), b, len as usize) }
+        }
+
+        pub(super) fn copy_within(&self, dst: u64, src: u64, len: u64) {
+            // SAFETY: both spans `⊆ [0, size)` (clamped by caller); `ptr::copy` is overlap-safe
+            // (`memmove`). Non-atomic bulk — sound only for the single-threaded cooperative caller.
+            unsafe { core::ptr::copy(self.ptr(src), self.ptr(dst), len as usize) }
+        }
+
         pub(super) fn read_into(&self, off: u64, out: &mut [u8]) {
             // Copy the in-range prefix in one shot; anything past `size` stays whatever `out` held
             // (the caller zeroes `out` first).
@@ -781,6 +838,33 @@ impl Paged {
         }
     }
 
+    fn fill(&self, off: u64, len: u64, b: u8) {
+        if b == 0 {
+            return self.zero(off, len); // a zero fill is exactly the page-dropping `zero`
+        }
+        let page_sz = self.page as usize;
+        let mut map = self.lock();
+        for o in off..off + len {
+            let key = o / self.page;
+            map.entry(key).or_insert_with(|| vec![0u8; page_sz])[(o % self.page) as usize] = b;
+        }
+    }
+
+    fn copy_within(&self, dst: u64, src: u64, len: u64) {
+        // Snapshot the source first (overlap-safe, mirroring the interpreter oracle), then write it
+        // back at `dst`. The portable path has no contiguous backing to `memmove`, so this is the
+        // rare-fallback cost.
+        let mut buf = vec![0u8; len as usize];
+        self.read_into(src, &mut buf);
+        let page_sz = self.page as usize;
+        let mut map = self.lock();
+        for (k, &byte) in buf.iter().enumerate() {
+            let o = dst + k as u64;
+            let key = o / self.page;
+            map.entry(key).or_insert_with(|| vec![0u8; page_sz])[(o % self.page) as usize] = byte;
+        }
+    }
+
     fn read_into(&self, off: u64, out: &mut [u8]) {
         let map = self.lock();
         for (k, slot) in out.iter_mut().enumerate() {
@@ -907,6 +991,61 @@ mod tests {
     }
 
     #[test]
+    fn fill_sets_span_and_clamps() {
+        each_region(1 << 16, 4096, |r| {
+            r.fill(10, 5, 0xAB);
+            assert_eq!(r.byte(9), 0);
+            for o in 10..15 {
+                assert_eq!(r.byte(o), 0xAB);
+            }
+            assert_eq!(r.byte(15), 0);
+            // A zero fill clears it again (the `zero` fast path).
+            r.fill(10, 5, 0);
+            assert_eq!(r.byte(12), 0);
+            // Length past the region end is clamped, not out-of-bounds.
+            r.fill((1 << 16) - 2, 100, 0xCD);
+            assert_eq!(r.byte((1 << 16) - 1), 0xCD);
+        });
+    }
+
+    #[test]
+    fn copy_within_is_overlap_safe() {
+        // Reference: an overlap-safe (memmove) copy against a plain Vec.
+        let scalar = |src_off: u64, dst_off: u64, len: u64, seed: &[u8]| -> Vec<u8> {
+            let mut v = seed.to_vec();
+            let window: Vec<u8> = (0..len).map(|k| v[(src_off + k) as usize]).collect();
+            for (k, b) in window.iter().enumerate() {
+                v[dst_off as usize + k] = *b;
+            }
+            v
+        };
+        let cases = [
+            (0u64, 8u64, 8u64), // disjoint forward
+            (8, 0, 8),          // disjoint backward
+            (0, 4, 8),          // overlap, dst > src (backward memmove)
+            (4, 0, 8),          // overlap, dst < src (forward memmove)
+            (0, 0, 8),          // self-copy no-op
+        ];
+        for (src, dst, len) in cases {
+            let seed: Vec<u8> = (0..64u8).collect();
+            each_region(1 << 16, 4096, |r| {
+                for (i, b) in seed.iter().enumerate() {
+                    r.set_byte(i as u64, *b);
+                }
+                r.copy_within(dst, src, len);
+                let want = scalar(src, dst, len, &seed);
+                for (i, b) in want.iter().enumerate() {
+                    assert_eq!(
+                        r.byte(i as u64),
+                        *b,
+                        "case src={src} dst={dst} len={len} at {i}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
     fn region_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Region>();
@@ -1020,7 +1159,7 @@ mod tests {
         // miri runs every op through its interpreter + provenance/race checkers, so far fewer there.
         let ops = if cfg!(miri) { 400 } else { 20_000 };
         for _ in 0..ops {
-            match xs(&mut s) % 7 {
+            match xs(&mut s) % 9 {
                 0 => {
                     // byte read, sometimes out of range (must read 0 / confine on both).
                     let off = xs(&mut s) % (size + 64);
@@ -1080,12 +1219,28 @@ mod tests {
                         "atomic_cmpxchg({off},{w}) diverged"
                     );
                 }
-                _ => {
+                6 => {
                     // zero a random (clamped) range.
                     let off = xs(&mut s) % size;
                     let len = xs(&mut s) % (2 * page);
                     a.zero(off, len);
                     b.zero(off, len);
+                }
+                7 => {
+                    // fill a random (clamped) range with an arbitrary byte.
+                    let off = xs(&mut s) % size;
+                    let len = xs(&mut s) % (2 * page);
+                    let byte = xs(&mut s) as u8;
+                    a.fill(off, len, byte);
+                    b.fill(off, len, byte);
+                }
+                _ => {
+                    // overlap-safe copy of a random (clamped) range — dst/src freely overlap.
+                    let src = xs(&mut s) % size;
+                    let dst = xs(&mut s) % size;
+                    let len = xs(&mut s) % (2 * page);
+                    a.copy_within(dst, src, len);
+                    b.copy_within(dst, src, len);
                 }
             }
         }
