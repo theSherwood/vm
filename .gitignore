@@ -4,5 +4,6 @@
 /fuzz/artifacts
 /bench/target
 /crates/svm-llvm/target
+/crates/svm-webgpu/target
 **/*.rs.bk
 rustc-ice-*.txt
