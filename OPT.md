@@ -141,7 +141,10 @@ tracked enhancement, not a blocker.
     `opt_ssa_roundtrip` cargo-fuzz target (reuses `irgen` → round-trip identity + interp-vs-JIT
     differential on the lowered module). Cross-block-use lowering (param threading) is deferred to the
     first Phase 2 pass that needs it — today every value is used only in its defining block.
-  - [ ] (d) `OptConfig` (budgets, pass toggles).
+  - [ ] (d) `OptConfig` (budgets, pass toggles) — **deferred to Phase 2**. Per the prime directive
+    (no configurability until something concrete demands it), this lands with the first budgeted pass
+    (the inliner / unroller), where a size/fuel budget actually bites; adding toggles now, with only
+    the always-on cleanup passes, would be speculative surface.
 - [ ] **Phase 2 — global scalar passes.** SCCP (subsumes and globalizes today's fold + branch
   resolution), GVN/CSE, instcombine-style rules + strength reduction, jump threading, LICM for
   pure non-trapping ops. Each pass lands with its own differential + fuzz coverage.
