@@ -6,9 +6,77 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 #include <langinfo.h>
 #include <locale.h>
+#include <stddef.h>
+#include <string.h>
 #include <wctype.h>
+
+/* strerror — a small C-locale errno→message table (`Unknown error N` for the rest). The GNU
+ * `char *strerror_r` the bitcode declares can't share this TU (its prototype clashes with the POSIX
+ * `int strerror_r` that `<string.h>` declares without `_GNU_SOURCE`, and defining `_GNU_SOURCE` here
+ * would perturb `__isoc23_*`/`getrlimit`/… across the whole shim TU) — so `strerror_r` lives in its own
+ * `_GNU_SOURCE`-isolated `strerror_shim.c`, which reuses this `strerror`. `shim_errmsg` is exported (not
+ * `static`) so that TU can reach it. */
+const char *shim_errmsg(int e) {
+  switch (e) {
+    case 0: return "Success";
+    case EPERM: return "Operation not permitted";
+    case ENOENT: return "No such file or directory";
+    case ESRCH: return "No such process";
+    case EINTR: return "Interrupted system call";
+    case EIO: return "Input/output error";
+    case ENXIO: return "No such device or address";
+    case EBADF: return "Bad file descriptor";
+    case EAGAIN: return "Resource temporarily unavailable";
+    case ENOMEM: return "Cannot allocate memory";
+    case EACCES: return "Permission denied";
+    case EFAULT: return "Bad address";
+    case EBUSY: return "Device or resource busy";
+    case EEXIST: return "File exists";
+    case ENODEV: return "No such device";
+    case ENOTDIR: return "Not a directory";
+    case EISDIR: return "Is a directory";
+    case EINVAL: return "Invalid argument";
+    case ENFILE: return "Too many open files in system";
+    case EMFILE: return "Too many open files";
+    case ENOSPC: return "No space left on device";
+    case ESPIPE: return "Illegal seek";
+    case EROFS: return "Read-only file system";
+    case EPIPE: return "Broken pipe";
+    case ERANGE: return "Numerical result out of range";
+    case ENAMETOOLONG: return "File name too long";
+    case ENOSYS: return "Function not implemented";
+    case ENOTEMPTY: return "Directory not empty";
+    case ELOOP: return "Too many levels of symbolic links";
+    default: return (const char *)0;
+  }
+}
+static char *shim_unknown_err(int e, char *buf, size_t n) {
+  const char *pre = "Unknown error ";
+  size_t i = 0;
+  while (pre[i] && i + 1 < n) {
+    buf[i] = pre[i];
+    i++;
+  }
+  unsigned v = e < 0 ? (unsigned)(-e) : (unsigned)e;
+  if (e < 0 && i + 1 < n) buf[i++] = '-';
+  char tmp[16];
+  int t = 0;
+  do {
+    tmp[t++] = (char)('0' + v % 10);
+    v /= 10;
+  } while (v && t < (int)sizeof tmp);
+  while (t > 0 && i + 1 < n) buf[i++] = tmp[--t];
+  if (n) buf[i < n ? i : n - 1] = 0;
+  return buf;
+}
+char *strerror(int e) {
+  static char buf[64];
+  const char *m = shim_errmsg(e);
+  return m ? (char *)m : shim_unknown_err(e, buf, sizeof buf);
+}
 
 /* setlocale always reports the C locale (the only one the sandbox has). */
 char *setlocale(int category, const char *locale) {

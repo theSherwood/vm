@@ -1061,8 +1061,19 @@ fn translate_impl(
             table.base,
             "stub_base must equal the non-stub function count"
         );
-        for (_name, sig) in &table.order {
+        for (i, (name, sig)) in table.order.iter().enumerate() {
+            let idx = table.base + i as u32;
             funcs.push(synth_trap_stub(sig.params.clone(), sig.results.clone()));
+            // Name the stub with its missing extern so a *called*-stub trap is legible: the trap-time
+            // backtrace's innermost frame resolves through `svm_interp::func_name` to the extern's name
+            // ("trapped in `shmat`" instead of an anonymous `Unreachable`). This is the §6 function-name
+            // waist — strippable, verifier-ignored (§2a), zero effect on the confinement path (the stub
+            // body stays a pure `Unreachable`); it just ends the blind guessing when a stubbed extern on
+            // the *live* path is what a large bring-up (Postgres `--single`) actually trapped on.
+            dbg.func_names.push(FuncName {
+                func: idx,
+                name: name.clone(),
+            });
         }
     }
     Ok(Translated {
@@ -14342,7 +14353,9 @@ fn lower_setjmp_call(
         ctx.operand(op)
     };
     match name {
-        "setjmp" | "_setjmp" | "sigsetjmp" => {
+        // `__sigsetjmp` is the actual libc symbol the `sigsetjmp` macro expands to (glibc); a
+        // whole-program build (Postgres' `PG_TRY`) carries it under that name, not `sigsetjmp`.
+        "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp" => {
             let buf = arg(ctx, 0)?;
             let r = ctx.push(Inst::SetJmp { buf });
             if let Some(dest) = &c.dest {

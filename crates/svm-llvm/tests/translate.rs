@@ -2924,6 +2924,23 @@ fn setjmp_nested_buffers() {
 }
 
 #[test]
+fn sigsetjmp_recognized() {
+    // `sigsetjmp`/`siglongjmp` — Postgres' `PG_TRY`/`ereport` non-local jump. The `sigsetjmp` macro
+    // expands to the actual libc symbol **`__sigsetjmp`** (glibc), which a whole-program build carries
+    // under that name; the on-ramp now recognizes it (alongside `setjmp`/`_setjmp`/`sigsetjmp`) and
+    // lowers it to the same `SetJmp` core op (the `savesigs` arg is ignored — the sandbox delivers no
+    // signals). `run(seed)` sets a checkpoint, jumps back through it with `seed+5`, and returns that —
+    // byte-identical to native across all three engines.
+    let src = "#include <setjmp.h>\n\
+               static sigjmp_buf env;\n\
+               static void jump(int x){ siglongjmp(env, x); }\n\
+               int run(int n){ int r = sigsetjmp(env, 1); \
+                 if (r == 0){ jump((n + 5) & 0xff); return -1; } return r; }\n\
+               int main(void){ return run(7); }";
+    check_setjmp_vs_native("sigsetjmp", src, 7);
+}
+
+#[test]
 fn demo_sha256_vs_native() {
     // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the
     // pangram, printing each digest as hex via `write` — byte-identical to the native `clang` build.
@@ -5240,6 +5257,64 @@ fn unresolved_extern_stub_opt_in() {
     assert!(
         svm_run::run_powerbox(&module2, b"").is_err(),
         "a called stub must trap (fail-closed at run time)"
+    );
+}
+
+#[test]
+fn stub_trap_names_the_extern() {
+    // Self-naming stub-traps. A *called* undefined-extern stub traps `Unreachable`, but the trap alone
+    // names nothing: for a large bring-up (Postgres `--single`) that traps on a stubbed extern on the
+    // *live* path, "which extern?" was blind guessing. The on-ramp now names each stub with its missing
+    // extern in the §6 function-name table, so the trap-time backtrace's innermost frame resolves — via
+    // `svm_interp::func_name` — to the extern's name. The stub body is unchanged (a pure `Unreachable`);
+    // only the strippable, verifier-ignored (§2a) name table grew, so the confinement path is untouched.
+    use svm_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+    let Some(bc) = compile_to_bc(
+        "stub_named",
+        "extern int frobnicate_widget(int);\n\
+         int run(int x){ return frobnicate_widget(x); }",
+    ) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let entry_sp = t.entry_sp as i64;
+    assert!(
+        t.module
+            .debug_info
+            .as_ref()
+            .is_some_and(|d| d.func_names.iter().any(|f| f.name == "frobnicate_widget")),
+        "the stub must be named with its missing extern in debug_info.func_names"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify stubbed module");
+    let run = module
+        .exports
+        .iter()
+        .find(|e| e.name == "run")
+        .map(|e| e.func)
+        .expect("run export");
+    let mut fuel = 1_000_000u64;
+    let (res, backtrace, _) = svm_interp::run_fast_traced(
+        &module,
+        run,
+        &[Value::I64(entry_sp), Value::I32(7)],
+        &mut fuel,
+    );
+    assert!(
+        matches!(res, Err(svm_interp::Trap::Unreachable)),
+        "the called stub must trap Unreachable, got {res:?}"
+    );
+    let named = backtrace
+        .first()
+        .and_then(|pc| svm_interp::func_name(&module, pc.func));
+    assert_eq!(
+        named,
+        Some("frobnicate_widget"),
+        "the innermost trapped frame must name the missing extern (backtrace: {backtrace:?})"
     );
 }
 
