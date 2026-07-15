@@ -292,6 +292,42 @@ pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
     run_at(ptr, len, &[])
 }
 
+/// `verify_module` rejected the decoded module ([`svm_prep_bench`]).
+pub const STATUS_VERIFY_ERR: i32 = 5;
+
+/// **Benchmark entry: the safe module-load path a browser must run before it can execute a guest.**
+/// Decode the module at `[ptr, ptr+len)`, `verify_module` it (the escape-freedom TCB gate — never
+/// skippable, however trusted the producer), and `bytecode::compile_module` it (the interpreter's
+/// per-module cold cost). Sets [`svm_status`]; returns the function count (`0` on any error). The host
+/// times this call to measure the **module-prep tax inside the wasm sandbox** — decode + verify +
+/// compile of a *pre-translated, pre-resolved* `.svmb` — the wasm counterpart to the native
+/// `prep_svmb` example. This is the one-time cost a fast-loading demo pays per page load (translation
+/// is done at build time); its ratio to the native example is the sandbox tax on loading (see
+/// `BOOTSPEED.md`). No powerbox run happens here. Driven by `browser/bench_prep.mjs`.
+#[no_mangle]
+pub extern "C" fn svm_prep_bench(ptr: *const u8, len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[ptr, ptr+len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return 0;
+    }
+    if bytecode::compile_module(&m.funcs).is_none() {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    }
+    set(STATUS_OK);
+    m.funcs.len() as i64
+}
+
 /// **Benchmark entry: run an arbitrary kernel function under the LLVM-frontend ABI.** Decode the
 /// module at `[mod_ptr, mod_len)`, run function `func` on the bytecode engine with the frontend's
 /// `(sp, n)` calling convention — `(sp, n)` for a ≥2-param entry, `(n)` for a 1-param one — under a
