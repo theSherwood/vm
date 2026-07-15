@@ -59,13 +59,13 @@ try {
 
   console.log(`\n  DOOM frame rate — interpreter: ${interp.toFixed(1)} fps · wasm-JIT: ${jitted.toFixed(1)} fps`);
   if (interp > 0) console.log(`  speedup: ${(jitted / interp).toFixed(1)}×`);
-  // The gate is a *material* win — the emitted tick clearly outruns the interpreter. Full-res (640×400)
-  // Doom's renderer is memory-bound (every guest access carries the confinement mask), so the ratio is
-  // smaller than register-heavy compute kernels' ~16–112×; smoother (30 fps) would come from a lower
-  // render resolution — a doomgeneric asset rebuild, not this wiring slice.
-  const ok = interp > 0 && jitted > interp * 2 && jitted > 5;
-  console.log(ok ? '  RESULT: wasm-JIT materially faster (emitted tick outruns the interpreter)'
-    : '  RESULT: no clear win (investigate)');
+  // The gate is smoothly playable: the emitted tick clears 30 fps and far outruns the interpreter.
+  // The whole tick emits once the emitter lowers tail calls (I25) — without which Doom's hottest
+  // functions (e.g. I_FinishUpdate) fall to the interpreter along with their subtrees; the display
+  // cap.call is isolated behind a noinline present_frame so the pixel swizzle stays emitted too.
+  const ok = interp > 0 && jitted > interp * 3 && jitted > 30;
+  console.log(ok ? '  RESULT: wasm-JIT smoothly playable (emitted tick far outruns the interpreter)'
+    : '  RESULT: not yet playable (investigate)');
   process.exitCode = ok ? 0 : 1;
 } finally {
   await browser.close();
