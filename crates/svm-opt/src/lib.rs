@@ -81,6 +81,8 @@ use svm_ir::{
 };
 
 pub mod cfg;
+pub mod gvn;
+pub mod sccp;
 pub mod ssa;
 
 /// A value known to be a constant at optimization time. Tracks scalar integers/floats and `v128`.
@@ -156,11 +158,19 @@ impl Known {
 /// stale once we fold instructions and drop blocks (it is strippable and untrusted for escape, §3a).
 pub fn optimize_module(m: &Module) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let has_memory = m.memory.is_some();
     Module {
         funcs: m
             .funcs
             .iter()
-            .map(|f| optimize_func(f, &fn_results))
+            .map(|f| {
+                // Global value numbering (OPT.md Phase 2) runs before the per-function cleanup: it
+                // eliminates cross-block redundant pure computations (threading the dominating value
+                // through block params), then `optimize_func` (SCCP + fixpoint) DCEs the dead
+                // duplicates and drops any parameter left unused.
+                let g = gvn::gvn(f, &m.funcs, has_memory);
+                optimize_func(&g, &fn_results)
+            })
             .collect(),
         memory: m.memory,
         data: m.data.clone(),
@@ -174,6 +184,11 @@ pub fn optimize_module(m: &Module) -> Module {
 /// straight-line chains, drop dead block parameters, and drop dead values — repeating until
 /// nothing changes. Every pass only simplifies, so this terminates; the cap guards pathologies.
 pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
+    // SCCP (OPT.md Phase 2) runs first: it propagates constants *globally* — through block
+    // parameters and around loops, with conditional reachability — folding what the per-block passes
+    // below cannot see. It materializes constants and resolves constant branches; the fixpoint then
+    // prunes the newly-unreachable blocks, DCEs the dead selector code, merges, and re-folds.
+    let f = sccp::sccp(f, fn_results);
     let mut blocks: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
     for _ in 0..1000 {
         let before = blocks.clone();
@@ -187,6 +202,9 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
             .iter()
             .map(|b| copy_propagate(b, fn_results))
             .collect();
+        // Common-subexpression elimination: dedup redundant *pure* computations within a block, so
+        // the duplicates become dead for the DCE below.
+        blocks = blocks.iter().map(|b| local_cse(b, fn_results)).collect();
         blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
         // Re-fold: merging brings a constant's definition into the same block as its use, and
         // dropping params can expose new constants — both newly foldable here.
@@ -235,7 +253,7 @@ fn fold_block(b: &Block, fn_results: &[usize]) -> Block {
 
 /// The constant an instruction *is*, if it is a literal `const` (after folding, every folded
 /// op has become one of these). Other instructions carry no statically-known value.
-fn const_value(inst: &Inst) -> Option<Known> {
+pub(crate) fn const_value(inst: &Inst) -> Option<Known> {
     match *inst {
         Inst::ConstI32(v) => Some(Known::I32(v)),
         Inst::ConstI64(v) => Some(Known::I64(v)),
@@ -247,7 +265,7 @@ fn const_value(inst: &Inst) -> Option<Known> {
 }
 
 /// Read a block-local value as a known constant, if it is one.
-fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
+pub(crate) fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
     known.get(idx as usize).copied().flatten()
 }
 
@@ -255,7 +273,7 @@ fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
 /// an operand is not known, the op is not foldable, or folding it would trap (div/rem by
 /// zero or signed overflow) — in which case the original instruction is kept so the residual
 /// traps identically to the source.
-fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
+pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
     match *inst {
         Inst::IntBin { ty, op, a, b } => {
             // Both operands known: the exact arithmetic fold.
@@ -1573,10 +1591,63 @@ fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
     }
 }
 
+/// Intra-block common-subexpression elimination. Within a block, a **pure** instruction (no trap, no
+/// memory access, no side effect — [`svm_ir::Inst::effects`]) whose operation *and* operands exactly
+/// match an earlier pure instruction computes the very same value, so its uses are rewritten to that
+/// earlier result and the redundant instruction is left dead for the following DCE pass. Operands are
+/// canonicalized to their CSE roots first (exactly as [`copy_propagate`] does), so equal expressions
+/// built from equal subexpressions are caught too. Index-stable (nothing is removed here).
+///
+/// Only pure ops are eligible: purity means the result is a deterministic function of the operands
+/// with no trap or effect, so two matching pure ops are interchangeable. A load/atomic/call (memory
+/// may change between them, they may trap or have effects) is never a CSE candidate — the effects
+/// table draws that line. Restricted to a single block, so the earlier definition trivially dominates
+/// the use and no block-parameter threading is needed (that is the job of the later global GVN).
+fn local_cse(b: &Block, fn_results: &[usize]) -> Block {
+    // `repl[v]` is the value `v` forwards to (its CSE root); params and non-redundant ops map to self.
+    let mut repl: Vec<ValIdx> = (0..b.params.len() as u32).collect();
+    let mut insts = b.insts.clone();
+    let mut next = b.params.len() as u32;
+    // Canonicalized pure instructions seen so far, paired with the value each one defines.
+    let mut seen: Vec<(Inst, ValIdx)> = Vec::new();
+    for inst in insts.iter_mut() {
+        // Compose with prior forwarding first, so operands name their roots before we compare.
+        map_operands(inst, &mut |o| repl[o as usize]);
+        let rc = inst.result_count(fn_results);
+        if rc == 1 {
+            let root = if inst.effects().is_pure() {
+                match seen.iter().find(|(prev, _)| *prev == *inst) {
+                    Some((_, e)) => *e, // a matching earlier pure op — reuse its result
+                    None => {
+                        seen.push((inst.clone(), next));
+                        next
+                    }
+                }
+            } else {
+                next
+            };
+            repl.push(root);
+            next += 1;
+        } else {
+            for _ in 0..rc {
+                repl.push(next);
+                next += 1;
+            }
+        }
+    }
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |o| repl[o as usize]);
+    Block {
+        params: b.params.clone(),
+        insts,
+        term,
+    }
+}
+
 /// Resolve a conditional terminator to an unconditional `br` when its selector is a known
 /// constant, using the interpreter's exact selection rule. Non-constant selectors (and the
 /// already-unconditional terminators) are returned unchanged.
-fn resolve_term(t: &Terminator, known: &[Option<Known>]) -> Terminator {
+pub(crate) fn resolve_term(t: &Terminator, known: &[Option<Known>]) -> Terminator {
     match t {
         Terminator::BrIf {
             cond,
@@ -1959,7 +2030,7 @@ pub fn map_term_operands(t: &mut Terminator, f: &mut impl FnMut(ValIdx) -> ValId
 
 /// Visit (read-only) every value operand of an instruction. Implemented on a throwaway clone
 /// through [`map_operands`], so there is a single source of truth for "what the operands are".
-fn each_operand(inst: &Inst, mut visit: impl FnMut(ValIdx)) {
+pub(crate) fn each_operand(inst: &Inst, mut visit: impl FnMut(ValIdx)) {
     let mut tmp = inst.clone();
     map_operands(&mut tmp, &mut |v| {
         visit(v);
