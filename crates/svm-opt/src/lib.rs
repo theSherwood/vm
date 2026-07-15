@@ -1525,6 +1525,9 @@ fn forward_to_operand(inst: &Inst, known: &[Option<Known>]) -> Option<ValIdx> {
     let is = |i, v| known_is(known, i, v);
     match *inst {
         Inst::Select { cond, a, b } => {
+            if a == b {
+                return Some(a); // equal arms: the result is that value whatever the condition
+            }
             let c = get(known, cond)?.as_i32()?;
             Some(if c != 0 { a } else { b })
         }
@@ -1655,31 +1658,50 @@ pub(crate) fn resolve_term(t: &Terminator, known: &[Option<Known>]) -> Terminato
             then_args,
             else_blk,
             else_args,
-        } => match get(known, *cond).and_then(Known::as_i32) {
-            Some(c) if c != 0 => Terminator::Br {
-                target: *then_blk,
-                args: then_args.clone(),
-            },
-            Some(_) => Terminator::Br {
-                target: *else_blk,
-                args: else_args.clone(),
-            },
-            None => t.clone(),
-        },
+        } => {
+            // Coincident targets — same block *and* same args — go the same place whatever the
+            // condition, so the branch is unconditional (the `cond` computation becomes dead for DCE).
+            if then_blk == else_blk && then_args == else_args {
+                return Terminator::Br {
+                    target: *then_blk,
+                    args: then_args.clone(),
+                };
+            }
+            match get(known, *cond).and_then(Known::as_i32) {
+                Some(c) if c != 0 => Terminator::Br {
+                    target: *then_blk,
+                    args: then_args.clone(),
+                },
+                Some(_) => Terminator::Br {
+                    target: *else_blk,
+                    args: else_args.clone(),
+                },
+                None => t.clone(),
+            }
+        }
         Terminator::BrTable {
             idx,
             targets,
             default,
-        } => match get(known, *idx).and_then(Known::as_i32) {
-            Some(c) => {
-                let (target, args) = targets.get(c as u32 as usize).unwrap_or(default);
-                Terminator::Br {
-                    target: *target,
-                    args: args.clone(),
-                }
+        } => {
+            // Every edge coincides with the default ⇒ unconditional (the `idx` computation dies).
+            if targets.iter().all(|e| e == default) {
+                return Terminator::Br {
+                    target: default.0,
+                    args: default.1.clone(),
+                };
             }
-            None => t.clone(),
-        },
+            match get(known, *idx).and_then(Known::as_i32) {
+                Some(c) => {
+                    let (target, args) = targets.get(c as u32 as usize).unwrap_or(default);
+                    Terminator::Br {
+                        target: *target,
+                        args: args.clone(),
+                    }
+                }
+                None => t.clone(),
+            }
+        }
         other => other.clone(),
     }
 }
