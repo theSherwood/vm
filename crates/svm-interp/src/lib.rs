@@ -11007,6 +11007,50 @@ impl Host {
         Some((ch, cinst, cas, cg))
     }
 
+    /// PROCESS.md S2 (JIT parity) — build a §14 **named-grant child** powerbox: a fresh `Host` holding
+    /// an `Instantiator` + `AddressSpace` over `[0, child_size)` and each of `grants` (a list of
+    /// `(name, handle)`) re-granted under its name, so the child discovers them by `cap.self.resolve`.
+    /// Returns the child `Host` and its `(instantiator, address_space)` handles, or `None` if **any**
+    /// grant's handle is forged / non-copyable (the whole spawn fails closed, `CapFault`, matching the
+    /// interpreter's op-11 path). stdout/stderr grants share the parent's sinks (stdio inheritance).
+    ///
+    /// The multi-cap, by-name analog of [`Self::spawn_granted_child`]; the JIT reads the guest's grant
+    /// records from the window (host-side, `svm_run::grant_named_child_build`) and calls this, so both
+    /// backends register the same names against the same shared sinks.
+    pub fn spawn_named_child(
+        &mut self,
+        grants: &[(String, i32)],
+        child_size: u64,
+    ) -> Option<(Host, i32, i32)> {
+        // Resolve every handle first — if any is non-copyable the spawn fails closed, before we mutate
+        // the parent's shared sinks (a partially-built child would leak a promoted sink).
+        let mut resolved: Vec<(&str, u32, Binding)> = Vec::with_capacity(grants.len());
+        for (name, handle) in grants {
+            let (tid, binding) = self.resolve_copyable(*handle).ok()?;
+            resolved.push((name.as_str(), tid, binding));
+        }
+        let mut ch = Host::new();
+        let cinst = ch.grant_instantiator(0, child_size);
+        let cas = ch.grant_address_space(0, child_size);
+        for (name, tid, binding) in resolved {
+            if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
+                let sink = if r == StreamRole::Out {
+                    self.shared_stdout()
+                } else {
+                    self.shared_stderr()
+                };
+                if r == StreamRole::Out {
+                    ch.out_sink = Some(sink);
+                } else {
+                    ch.err_sink = Some(sink);
+                }
+            }
+            let cg = ch.grant(tid, binding);
+            ch.register_cap_name(name, cg);
+        }
+        Some((ch, cinst, cas))
+    }
+
     /// **D45 allocation-free fast path for `Clock.now()`** (ISSUES.md I12). The generic
     /// [`Self::cap_dispatch_slots`] path is dominated, for a cheap cap, by the per-call `Vec` result
     /// allocation and the W1 record/replay gate — not by the work (a field read). This does the

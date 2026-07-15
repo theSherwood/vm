@@ -1357,6 +1357,100 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
     }
 }
 
+/// PROCESS.md S2 (JIT parity) — the §14 **named-grant-list builder** for `instantiate_named` (op 11):
+/// read `grants_n` 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
+/// window-relative `grants_ptr`, re-grant each record's copyable handle into a fresh child powerbox
+/// `Host` **under its name** (via the shared [`Host::spawn_named_child`]), and return the child host +
+/// its `Instantiator`/`AddressSpace` handles (`grant_handle` unused — named grants are found by
+/// `cap.self.resolve`, not passed as an arg). The multi-cap, by-name analog of [`grant_child_build`].
+///
+/// Fails the whole spawn closed, exactly like the interpreter's op-11 path: an out-of-window record or
+/// name is a `MemoryFault`; a non-UTF-8 name or a forged / non-copyable handle is a `CapFault`. Returns
+/// `1` on success (`out` filled), `0` with `*trap_out` set otherwise. Frees nothing — the paired
+/// [`grant_child_release`] does.
+///
+/// # Safety
+/// `ctx` is the live parent `*mut Host`; `[mem_base, mem_base+mem_size)` is the parent's mapped window
+/// (records/names are read within it); `out`/`trap_out` are writable. The returned `ctx` must be freed
+/// with [`grant_child_release`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn grant_named_child_build(
+    ctx: *mut c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    grants_ptr: u64,
+    grants_n: u64,
+    child_size: u64,
+    out: *mut svm_jit::GrantChild,
+    trap_out: *mut i64,
+) -> i32 {
+    // Bounded read of `[off, off+len)` within the parent's mapped window, or `None` (out of window).
+    let read = |off: u64, len: u64| -> Option<Vec<u8>> {
+        let end = off.checked_add(len)?;
+        if end > mem_size {
+            return None;
+        }
+        // SAFETY: `[0, mem_size)` is the parent's mapped, readable window; the bounds check above keeps
+        // the slice inside it.
+        Some(
+            unsafe { std::slice::from_raw_parts(mem_base.add(off as usize), len as usize) }
+                .to_vec(),
+        )
+    };
+    let mut grants: Vec<(String, i32)> = Vec::with_capacity(grants_n as usize);
+    for i in 0..grants_n {
+        let rec_off = match grants_ptr.checked_add(i.wrapping_mul(16)) {
+            Some(o) => o,
+            None => {
+                *trap_out = TrapKind::MemoryFault as i64;
+                return 0;
+            }
+        };
+        let rec = match read(rec_off, 16) {
+            Some(r) => r,
+            None => {
+                *trap_out = TrapKind::MemoryFault as i64;
+                return 0;
+            }
+        };
+        let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+        let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as u64;
+        let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+        let name_bytes = match read(name_off, name_len) {
+            Some(n) => n,
+            None => {
+                *trap_out = TrapKind::MemoryFault as i64;
+                return 0;
+            }
+        };
+        let name = match String::from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                *trap_out = TrapKind::CapFault as i64;
+                return 0;
+            }
+        };
+        grants.push((name, handle));
+    }
+    let parent = &mut *(ctx as *mut Host);
+    match parent.spawn_named_child(&grants, child_size) {
+        Some((child, inst_handle, as_handle)) => {
+            let boxed = Box::into_raw(Box::new(child));
+            *out = svm_jit::GrantChild {
+                ctx: boxed as *mut c_void,
+                inst_handle,
+                as_handle,
+                grant_handle: 0,
+            };
+            1
+        }
+        None => {
+            *trap_out = TrapKind::CapFault as i64;
+            0
+        }
+    }
+}
+
 /// The **host** page size: the protection granularity for `map`/`unmap`/`protect`, matching the
 /// interpreter (`svm_interp`) and the JIT (`svm-jit`) on the same host so all three agree
 /// page-for-page (§4 "pin page size", host-page default). `sysconf(_SC_PAGESIZE)` on unix,

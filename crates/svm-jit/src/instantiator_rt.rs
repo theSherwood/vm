@@ -131,6 +131,7 @@ pub(crate) struct Nursery {
     /// written before the guest runs, then only read by the `instantiate_granted` thunk), so no new
     /// param threads through the compile pipeline.
     grant_build: std::sync::atomic::AtomicUsize,
+    grant_build_named: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
 }
 
@@ -268,20 +269,22 @@ impl Nursery {
             frozen_nested_sink,
             child_code: Mutex::new(HashMap::new()),
             grant_build: std::sync::atomic::AtomicUsize::new(0),
+            grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// PROCESS.md S2 (JIT parity): install the `instantiate_granted` (op 8) host callbacks — build a
-    /// granted child's powerbox and release it after the run. Called once at run entry (like
-    /// [`Self::set_durable`]), before any `instantiate_granted` site can fire. `None` leaves them `0`
-    /// (op 8 stays an inert `CapFault`).
+    /// PROCESS.md S2 (JIT parity): install the granted-child host callbacks — build a granted child's
+    /// powerbox (positional op 8 / by-name op 11) and release it after the run. Called once at run entry
+    /// (like [`Self::set_durable`]), before any `instantiate_granted`/`instantiate_named` site can fire.
+    /// `None` leaves them `0` (both ops stay an inert `CapFault`).
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, r) = match hooks {
-            Some(h) => (h.build as usize, h.release as usize),
-            None => (0, 0),
+        let (b, bn, r) = match hooks {
+            Some(h) => (h.build as usize, h.build_named as usize, h.release as usize),
+            None => (0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
+        self.grant_build_named.store(bn, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
     }
 
@@ -763,6 +766,143 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
         None => {
             // An un-compilable child (fibers/threads/setjmp, or a backend error) is a CapFault, like
             // the plain `instantiate` path.
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
+    };
+    let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = children.len();
+    children.push(Child {
+        result,
+        trap,
+        joined: false,
+    });
+    slot as i32
+}
+
+/// PROCESS.md S2 (JIT parity) — `instantiate_named(grants_ptr, grants_n, entry, off, size_log2, quota)`
+/// (Instantiator op 11): the multi-cap, by-name form of [`instantiate_granted`]. The child powerbox is
+/// built host-side by [`Nursery::grant_build_named`], which reads `grants_n` 16-byte grant records from
+/// the **parent** window (`[mem_base, mem_base+mem_size)`) and re-grants each copyable handle under its
+/// name; the child finds them by `cap.self.resolve` (lowered to the run's `cap.call` thunk with the
+/// child host as ctx, so name resolution "just works"). The child entry is the 1- or 2-arg form
+/// (`Instantiator` [, `AddressSpace`]) — no positional grant arg. Same non-durable / uncached /
+/// non-nesting shape as [`instantiate_granted`]; a bad record/name is a `MemoryFault`, a non-copyable
+/// grant a `CapFault`, a bad carve/entry `-EINVAL` — all matching the interpreter's op-11 path.
+///
+/// # Safety
+/// As [`instantiate`]: `rt`/`mem_base`/`trap_out` are the baked nursery, live parent window base, and
+/// run trap cell, valid for the call; `mem_size` is the parent window's mapped byte count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn instantiate_named(
+    rt: *const Nursery,
+    mem_base: u64,
+    mem_size: u64,
+    handle: i32,
+    grants_ptr: i64,
+    grants_n: i64,
+    entry: i64,
+    off: i64,
+    size_log2: i64,
+    _fuel: i64,
+    trap_out: *mut i64,
+) -> i32 {
+    let rt = &*rt;
+    if rt.durable.load(Ordering::Acquire) {
+        return EINVAL as i32;
+    }
+    let build_addr = rt.grant_build_named.load(Ordering::Acquire);
+    let release_addr = rt.grant_release.load(Ordering::Acquire);
+    if build_addr == 0 || release_addr == 0 {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
+    let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
+    let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
+
+    let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
+        return 0; // `*trap_out` already holds the CapFault
+    };
+    let child_funcs = &rt.funcs;
+    let entry = entry as u64;
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let off = off as u64;
+    // A named child receives no positional grant, so its entry is the 1- or 2-arg form (`Instantiator`
+    // [, `AddressSpace`]) returning `i64` — it discovers its granted caps by name.
+    let want_as = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| f.params.len() >= 2);
+    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
+        f.results.as_slice() == [ValType::I64]
+            && (f.params.len() == 1 || f.params.len() == 2)
+            && f.params.iter().all(|p| *p == ValType::I64)
+    });
+    let fits = child_size != 0
+        && child_size <= size
+        && off & (child_size - 1) == 0
+        && off.checked_add(child_size).is_some_and(|e| e <= size);
+    if !ok_entry || !fits {
+        return EINVAL as i32;
+    }
+
+    // Build the child powerbox host-side from the grant records; a bad record/name sets `*trap_out`
+    // (MemoryFault / CapFault) and fails the whole spawn closed.
+    let mut gc = crate::GrantChild {
+        ctx: core::ptr::null_mut(),
+        inst_handle: 0,
+        as_handle: 0,
+        grant_handle: 0,
+    };
+    if build(
+        rt.cap_ctx,
+        mem_base as *mut u8,
+        mem_size,
+        grants_ptr as u64,
+        grants_n as u64,
+        child_size,
+        &mut gc,
+        trap_out,
+    ) == 0
+    {
+        return 0; // `*trap_out` already set by the builder
+    }
+
+    let compiled = crate::compile_child(
+        child_funcs,
+        entry as FuncIdx,
+        size_log2 as u8,
+        rt.cap_thunk,
+        gc.ctx,
+        rt.epoch_addr,
+        crate::InstEnv::null(),
+    );
+    let outcome = match compiled {
+        Ok(code) => {
+            let mut args = vec![gc.inst_handle as i64];
+            if want_as {
+                args.push(gc.as_handle as i64);
+            }
+            let n_results = child_funcs[entry as usize].results.len();
+            Some(crate::run_child_code(
+                &code,
+                base + off,
+                size_log2 as u8,
+                mem_base as *mut u8,
+                &args,
+                n_results,
+            ))
+        }
+        Err(_) => None,
+    };
+    release(gc.ctx);
+
+    let (result, trap) = match outcome {
+        Some(rt) => rt,
+        None => {
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }

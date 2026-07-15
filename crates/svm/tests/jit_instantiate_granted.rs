@@ -59,6 +59,7 @@ block0(vcinst: i64, vcas: i64, vcstream: i64):\n\
 fn grant_hooks() -> GrantChildHooks {
     GrantChildHooks {
         build: svm_run::grant_child_build,
+        build_named: svm_run::grant_named_child_build,
         release: svm_run::grant_child_release,
     }
 }
