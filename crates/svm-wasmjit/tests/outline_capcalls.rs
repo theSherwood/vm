@@ -74,8 +74,7 @@ fn outlining_flips_emittability_and_preserves_semantics() {
 
     // After: the entry is now pure compute + a `Call`, so it emits; the wrapper (which holds the
     // cap.call, an all-integer signature) is a cross-tier leaf.
-    let (_wasm, emitted) =
-        compile_module_reactor(&m, 0, false).expect("emittable after outlining");
+    let (_wasm, emitted) = compile_module_reactor(&m, 0, false).expect("emittable after outlining");
     assert_eq!(
         emitted,
         vec![true, false],

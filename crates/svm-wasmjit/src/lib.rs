@@ -1064,7 +1064,14 @@ pub fn outline_cap_calls(m: &mut Module) {
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
-                if let Inst::CapCall { type_id, op, sig, handle, args } = inst {
+                if let Inst::CapCall {
+                    type_id,
+                    op,
+                    sig,
+                    handle,
+                    args,
+                } = inst
+                {
                     let g = base + wrappers.len() as u32;
                     // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
                     let mut params = Vec::with_capacity(1 + sig.params.len());
@@ -1086,12 +1093,19 @@ pub fn outline_cap_calls(m: &mut Module) {
                         }],
                         term: Terminator::Return(ret),
                     };
-                    wrappers.push(Func { params, results: sig.results.clone(), blocks: vec![block] });
+                    wrappers.push(Func {
+                        params,
+                        results: sig.results.clone(),
+                        blocks: vec![block],
+                    });
                     // Rewrite the call site to invoke the wrapper: prepend the handle to the op args.
                     let mut call_args = Vec::with_capacity(1 + args.len());
                     call_args.push(*handle);
                     call_args.extend(args.iter().copied());
-                    *inst = Inst::Call { func: g, args: call_args };
+                    *inst = Inst::Call {
+                        func: g,
+                        args: call_args,
+                    };
                 }
             }
         }
