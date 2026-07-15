@@ -2287,6 +2287,10 @@ impl SharedOnrampReactor {
 pub struct JitOnrampReactor {
     /// The import-resolved, window-enlarged module — cross-tier callees are interpreted from it.
     module: svm_ir::Module,
+    /// The module compiled **once** for cross-tier runs. Recompiling per `env.call_interp` bounce
+    /// (a handful per frame) otherwise dominates the frame — for Doom, ~6 ms × 3 ≈ 19 ms of a 20 ms
+    /// frame; cached, a cross-tier call is just build-window + interpret.
+    program: bytecode::SharedProgram,
     /// The powerbox (granted caps + `_start`'s stashed handles), shared across `_start` and every
     /// per-frame cross-tier callee so caps + their state persist.
     host: Host,
@@ -2381,21 +2385,14 @@ impl JitOnrampReactor {
         let entry_sp = svm_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
         let (slots, frame, keys) = grant_onramp_caps(&mut host, &module, fs);
+        // Compile the module **once** — reused for `_start` and every per-frame cross-tier bounce.
+        let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Run `_start` once over the shared window (seed data + init), servicing `cap.call`s (Doom's
         // WAD read) inline against the powerbox. The window then persists in `back` for every frame.
         let mut fuel = u64::MAX;
-        match bytecode::compile_and_run_over_shared_with_host(
-            &module,
-            0,
-            &slots,
-            &mut fuel,
-            back.clone(),
-            &mut host,
-            true,
-        ) {
-            Some(Ok(_)) => {}
-            Some(Err(_)) => return Err(STATUS_TRAP),
-            None => return Err(STATUS_UNSUPPORTED),
+        match program.run_over(0, &slots, &mut fuel, back.clone(), &mut host, true) {
+            Ok(_) => {}
+            Err(_) => return Err(STATUS_TRAP),
         }
         // Emit the whole `tick` (cross-tier helpers routed to `env.call_interp`). Fall back if the
         // guest isn't reactor-emittable (e.g. its `tick` directly makes a cap.call → not in-subset).
@@ -2404,6 +2401,7 @@ impl JitOnrampReactor {
                 .map_err(|_| STATUS_UNSUPPORTED)?;
         Ok(JitOnrampReactor {
             module,
+            program,
             host,
             _backing: backing,
             back,
@@ -2452,18 +2450,15 @@ impl JitOnrampReactor {
     /// `Err(Trap::Exit)` is the guest's `Exit`; any other `Err` is a trap.
     pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
         let mut fuel = u64::MAX;
-        match bytecode::compile_and_run_over_shared_with_host(
-            &self.module,
+        // Use the once-compiled `program` (no per-call recompile — the frame's dominant cost otherwise).
+        self.program.run_over(
             func,
             args,
             &mut fuel,
             self.back.clone(),
             &mut self.host,
             false,
-        ) {
-            Some(r) => r,
-            None => Err(Trap::Malformed),
-        }
+        )
     }
 
     /// The signature of cross-tier `func` (the host marshals `env.call_interp`'s i64 arg/result slots
