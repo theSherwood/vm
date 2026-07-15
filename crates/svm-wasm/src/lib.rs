@@ -3171,14 +3171,6 @@ fn chunk_plan(len: u64) -> Vec<(u64, u64)> {
     }
     plan
 }
-fn load_w(w: u64) -> LoadOp {
-    match w {
-        8 => LoadOp::I64,
-        4 => LoadOp::I32,
-        2 => LoadOp::I32_16U,
-        _ => LoadOp::I32_8U,
-    }
-}
 fn store_w(w: u64) -> StoreOp {
     match w {
         8 => StoreOp::I64,
@@ -3208,146 +3200,20 @@ fn widen_to_i64(lo: &mut Lower, v: ValIdx) -> ValIdx {
     }
 }
 
-/// `memory.fill(dest, val, len)`: set `len` bytes at `dest` to byte `val`. A constant `len` is
-/// unrolled into chunked stores of the fill byte broadcast to each chunk width; a runtime `len` lowers
-/// to a byte loop.
+/// `memory.fill(dest, val, len)`: set `len` bytes at `dest` to byte `val`. Lowers to the D62
+/// [`Inst::MemFill`] — one whole-span confinement then a `memset` (the JIT emits the platform libcall),
+/// the same fast path the LLVM frontend's `llvm.memset` takes. No 64 KiB constant cap and no runtime
+/// byte loop; `MemFill` keeps only the low byte of the `i32` `val`, matching wasm's fill-byte semantics.
 fn mem_fill_op(lo: &mut Lower) -> Result<(), Error> {
     let (len_v, _) = lo.pop()?;
     let (val, _) = lo.pop()?; // the fill byte (low 8 bits of an i32)
     let dest = pop_addr(lo)?; // i64 window address
-    match const_bulk_len(lo, len_v) {
-        Some(n) => fill_unroll(lo, dest, val, n),
-        None => fill_dynamic(lo, dest, val, len_v),
-    }
-}
-
-/// Unrolled constant-length fill: store the fill byte (broadcast per chunk width) at each chunk.
-fn fill_unroll(lo: &mut Lower, dest: ValIdx, val: ValIdx, n: u64) -> Result<(), Error> {
-    if n == 0 {
-        return Ok(());
-    }
-    // The fill byte broadcast to each width: vb·0x01… (so every byte of the chunk is the fill byte).
-    let m255 = lo.emit(Inst::ConstI32(0xFF));
-    let byte = lo.emit(Inst::IntBin {
-        ty: IntTy::I32,
-        op: BinOp::And,
-        a: val,
-        b: m255,
+    let len = widen_to_i64(lo, len_v);
+    lo.emit_void(Inst::MemFill {
+        dst: dest,
+        val,
+        len,
     });
-    let mul_i32 = |lo: &mut Lower, k: i32| {
-        let m = lo.emit(Inst::ConstI32(k));
-        lo.emit(Inst::IntBin {
-            ty: IntTy::I32,
-            op: BinOp::Mul,
-            a: byte,
-            b: m,
-        })
-    };
-    let b2 = mul_i32(lo, 0x0001_0101);
-    let b4 = mul_i32(lo, 0x0101_0101);
-    let b8 = {
-        let b64 = lo.emit(Inst::Convert {
-            op: ConvOp::ExtendI32U,
-            a: byte,
-        });
-        let m = lo.emit(Inst::ConstI64(0x0101_0101_0101_0101));
-        lo.emit(Inst::IntBin {
-            ty: IntTy::I64,
-            op: BinOp::Mul,
-            a: b64,
-            b: m,
-        })
-    };
-    for (off, w) in chunk_plan(n) {
-        let value = match w {
-            8 => b8,
-            4 => b4,
-            2 => b2,
-            _ => byte,
-        };
-        lo.emit_void(Inst::Store {
-            op: store_w(w),
-            addr: dest,
-            value,
-            offset: off,
-            align: 0,
-        });
-    }
-    Ok(())
-}
-
-/// Runtime-length fill as a forward byte loop: `for (i = 0; i < n; i++) store8(dest + i, val)`.
-/// Synthesized as header/body/exit blocks threading the prefix + operand stack + the loop-private
-/// `(dest, val, n, i)`.
-fn fill_dynamic(lo: &mut Lower, dest: ValIdx, val: ValIdx, len: ValIdx) -> Result<(), Error> {
-    let below_t: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
-    let below_v = lo.stack_vals();
-    let n = widen_to_i64(lo, len);
-    let extra = [ValType::I64, ValType::I32, ValType::I64, ValType::I64]; // dest, val, n, i
-    let hsig = lo.synth_sig(&below_t, &extra);
-    let header = lo.new_block(hsig.clone());
-    let body = lo.new_block(hsig);
-    let exit_sig = lo.synth_sig(&below_t, &[]);
-    let exit = lo.new_block(exit_sig);
-
-    let zero = lo.emit(Inst::ConstI64(0));
-    let args = lo.synth_args(&below_v, &[dest, val, n, zero]);
-    lo.set_term(Terminator::Br {
-        target: header as u32,
-        args,
-    });
-
-    // header: while i < n → body, else → exit.
-    let hx = lo.enter_synth(header, &below_t, 4);
-    let (d, v, nn, i) = (hx[0], hx[1], hx[2], hx[3]);
-    let cond = lo.emit(Inst::IntCmp {
-        ty: IntTy::I64,
-        op: CmpOp::LtU,
-        a: i,
-        b: nn,
-    });
-    let bv = lo.stack_vals();
-    let then_args = lo.synth_args(&bv, &[d, v, nn, i]);
-    let else_args = lo.synth_args(&bv, &[]);
-    lo.set_term(Terminator::BrIf {
-        cond,
-        then_blk: body as u32,
-        then_args,
-        else_blk: exit as u32,
-        else_args,
-    });
-
-    // body: store8(d + i, v); i += 1; back to header.
-    let bx = lo.enter_synth(body, &below_t, 4);
-    let (d, v, nn, i) = (bx[0], bx[1], bx[2], bx[3]);
-    let addr = lo.emit(Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::Add,
-        a: d,
-        b: i,
-    });
-    lo.emit_void(Inst::Store {
-        op: StoreOp::I32_8,
-        addr,
-        value: v,
-        offset: 0,
-        align: 0,
-    });
-    let one = lo.emit(Inst::ConstI64(1));
-    let i1 = lo.emit(Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::Add,
-        a: i,
-        b: one,
-    });
-    let bv = lo.stack_vals();
-    let back = lo.synth_args(&bv, &[d, v, nn, i1]);
-    lo.set_term(Terminator::Br {
-        target: header as u32,
-        args: back,
-    });
-
-    lo.enter(exit, &below_t); // continue with the operand stack restored
     Ok(())
 }
 
@@ -3414,45 +3280,20 @@ fn init_unroll(lo: &mut Lower, dest: ValIdx, bytes: &[u8]) {
     }
 }
 
-/// `memory.copy(dest, src, len)`: copy `len` bytes (overlap-safe, like memmove). A constant `len`
-/// loads every chunk before storing any (overlap-safe); a runtime `len` lowers to a direction-correct
-/// byte loop.
+/// `memory.copy(dest, src, len)`: copy `len` bytes, overlap-safe (wasm `memory.copy` is memmove
+/// semantics). Lowers to the D62 [`Inst::MemMove`] — one whole-span confinement then a `memmove` (the
+/// JIT emits the platform libcall), matching the LLVM frontend's `llvm.memmove` fast path. No 64 KiB
+/// constant cap and no runtime byte loop. (`table.copy` still uses [`copy_dynamic`] below.)
 fn mem_copy_op(lo: &mut Lower) -> Result<(), Error> {
     let (len_v, _) = lo.pop()?;
     let src = pop_addr(lo)?;
     let dest = pop_addr(lo)?;
-    match const_bulk_len(lo, len_v) {
-        Some(n) => copy_unroll(lo, dest, src, n),
-        None => copy_dynamic(lo, dest, src, len_v),
-    }
-}
-
-/// Unrolled constant-length copy: load every chunk, then store every chunk (overlap-safe memmove).
-fn copy_unroll(lo: &mut Lower, dest: ValIdx, src: ValIdx, n: u64) -> Result<(), Error> {
-    if n == 0 {
-        return Ok(());
-    }
-    let plan = chunk_plan(n);
-    let loaded: Vec<ValIdx> = plan
-        .iter()
-        .map(|&(off, w)| {
-            lo.emit(Inst::Load {
-                op: load_w(w),
-                addr: src,
-                offset: off,
-                align: 0,
-            })
-        })
-        .collect();
-    for (&(off, w), &value) in plan.iter().zip(&loaded) {
-        lo.emit_void(Inst::Store {
-            op: store_w(w),
-            addr: dest,
-            value,
-            offset: off,
-            align: 0,
-        });
-    }
+    let len = widen_to_i64(lo, len_v);
+    lo.emit_void(Inst::MemMove {
+        dst: dest,
+        src,
+        len,
+    });
     Ok(())
 }
 

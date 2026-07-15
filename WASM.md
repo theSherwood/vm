@@ -28,7 +28,10 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
   multi-value** block types; `call`; `call_indirect` (§3c type-id check); `memory.size`/`memory.grow`.
 - **memory64** — the 64-bit address path.
 - **Finished proposals**: sign-extension ops; non-trapping float→int (`trunc_sat`); bulk-memory
-  `memory.copy`/`memory.fill`; **fixed-128 SIMD** (the complete v128 op set, D58 — all
+  `memory.copy`/`memory.fill` (lower to the D62 IR ops `MemMove`/`MemFill` — one whole-span
+  confinement + a platform `memmove`/`memset` libcall in the JIT and a bulk backing copy in the
+  bytecode interp, no length cap, no per-chunk/byte loop — the same fast path the LLVM frontend takes);
+  **fixed-128 SIMD** (the complete v128 op set, D58 — all
   arith/bitwise/shuffle/compare/convert/widen/narrow/dot/extmul/q15 lanes + the memory variants
   (splat-load/load-extend/load-zero/load+store-lane) + all of **relaxed SIMD** via deterministic
   lowerings incl. a fused FMA and the signed-i8 relaxed dot);
@@ -116,7 +119,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 - [x] **Passive *data* segments + `memory.init`/`data.drop` — DONE.** A passive segment's bytes are
   known at transpile time, so a **constant-offset** `memory.init` (the toolchain's `__wasm_init_memory`
   shape: `src = 0`, `len = seg_len`, a possibly-runtime `dest`) unrolls into chunked const-stores of
-  those bytes — reusing the `memory.copy`/`fill` machinery, no IR/runtime change. `data.drop` is a
+  those bytes (the `chunk_plan` 8/4/2/1 helper) — the source bytes are static, so no IR/runtime change.
+  (`memory.copy`/`fill` themselves now lower to the D62 ops; `memory.init` keeps the unroll because its
+  source is host data, not a guest span.) `data.drop` is a
   no-op (bytes are inlined at the init site). A non-constant `src`/`len` is fail-closed `Unsupported`
   (no runtime passive-data store); a static source-OOB is a clean transpile error. `tests/bulk.rs`
   (passive + active segments, partial range, runtime dest, multi-segment indexing, dynamic-len reject).
@@ -128,7 +133,8 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   (params/results/locals/globals); `ref.null`/`ref.is_null`/`ref.func` (null = the `0xFFFF_FFFF`
   sentinel the table already uses); typed `select (result t)`; the full mutable-table op set —
   `table.get`/`set`/`size`/`fill`/`copy`/`init`/`grow` (the i32-slot twins of the memory ops:
-  `copy`/`init` reuse `memory.copy`/`init`, `grow` mirrors `memory.grow` with a slot size cell +
+  `table.copy` reuses the `copy_dynamic` byte-loop memmove, `table.init` its own const-store unroll,
+  `grow` mirrors `memory.grow` with a slot size cell +
   growable table region); passive **element** segments + `elem.drop`; declarative `elem` segments (a
   no-op). OOB indices **mask** into the window (the §1a model, like memory — not a trap); the
   `call_indirect` §3c type-check still guards a forged funcref, and a forged externref faults at
