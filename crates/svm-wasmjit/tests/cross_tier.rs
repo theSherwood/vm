@@ -201,3 +201,54 @@ fn cross_tier_shares_the_window() {
         );
     }
 }
+
+// Same shared-window round trip, but f0 reaches f1 through a **`call_indirect`** rather than a direct
+// call: `ref.func 1` forms the funcref, then `call_indirect (i64)->(i64)` dispatches through the
+// identity table. f1 is cross-tier (a `v128` op keeps it out of subset), so its table slot holds a
+// **trampoline** that bounces to `env.call_interp` — proving indirect calls reach the interpreter over
+// the same window. Using `call_indirect` also forces `has_indirect`, so the reactor path only stays
+// emittable because the trampoline routes the cross-tier target (it would otherwise fall back whole).
+const SRC_INDIRECT: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v7 = i64.const 7
+  vpre = i64.add v0 v7
+  va8 = i64.const 8
+  i64.store va8 vpre
+  vf = ref.func 1
+  vr1 = call_indirect (i64) -> (i64) vf (v0)
+  vaddr = i64.const 100
+  vr = i64.load vaddr
+  return vr
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  va8 = i64.const 8
+  vread = i64.load va8
+  vaddr = i64.const 100
+  i64.store vaddr vread
+  vs = i64x2.splat v0
+  vd = i16x8.dot_i8x16_s vs vs
+  ve = i64x2.extract_lane 0 vd
+  return ve
+}
+"#;
+
+#[test]
+fn cross_tier_indirect_trampoline() {
+    let m = parse(SRC_INDIRECT);
+    for &arg in &[0i64, 1, 42, 1000, -5] {
+        let got = reactor_run(&m, arg);
+        assert_eq!(
+            got,
+            oracle(&m, arg),
+            "indirect mixed != oracle for arg {arg}"
+        );
+        assert_eq!(
+            got,
+            arg + 7,
+            "the trampoline must run f1 over f0's window (arg {arg})"
+        );
+    }
+}
