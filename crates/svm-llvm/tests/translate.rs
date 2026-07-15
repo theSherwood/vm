@@ -4215,6 +4215,20 @@ fn trap_error_surfaces_guest_output() {
 }
 
 #[test]
+fn demo_pg_mmap_vs_native() {
+    // **The guest anonymous-mmap shim** (slice CI, gap #11i). `postgres --single` sets up its shared
+    // memory via `mmap(MAP_ANONYMOUS)`; in one address space that is just zeroed writable memory.
+    // `mmap_probe.c` checks it comes back zeroed, holds writes, and `munmap`s — byte-matching native.
+    // Pure — runs on the bare powerbox.
+    check_demo_vs_native_flags(
+        "pg_mmap",
+        "postgres/mmap_probe.c",
+        b"",
+        &["-DSVM_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
 fn demo_pg_wctype_vs_native() {
     // **The guest wide-ctype shim** (slice CF, gap #11g). `locale_shim.c`'s C/POSIX-locale iswX/towX
     // family is ASCII classification; `wctype_probe.c` prints all twelve classes + case mapping for

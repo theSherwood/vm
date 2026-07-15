@@ -4,5 +4,6 @@
 #include "locale_shim.c"
 #include "time_shim.c"
 #include "proc_shim.c"
+#include "ipc_shim.c"
 #include "stdio_shim.c"
 #include "printf_shim.c"
