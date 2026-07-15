@@ -639,6 +639,72 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
     }
 }
 
+/// PROCESS.md S3 `poll(child) -> 0 running | 1 returned | 2 trapped` (JIT). A JIT child runs
+/// **synchronously** at `instantiate`, so it is always *done* by the time the parent polls — hence
+/// `1` (clean) or `2` (trapped), never `0` (the running state is interpreter-only until JIT async
+/// children, S1c). Non-destructive: the slot + its result stay for a later `join`. A forged / already-
+/// joined handle is a `CapFault` (matching this runtime's `join`).
+///
+/// # Safety
+/// As [`join`]: `rt`/`trap_out` are the baked nursery + run trap cell, valid for the call.
+pub(crate) unsafe extern "C" fn poll(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+    let rt = &*rt;
+    let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    match children.get(handle as usize) {
+        Some(c) if !c.joined => {
+            if c.trap != 0 {
+                2
+            } else {
+                1
+            }
+        }
+        _ => {
+            *trap_out = TrapKind::CapFault as i64;
+            0
+        }
+    }
+}
+
+/// PROCESS.md S3 `detach(child) -> 0` (JIT). Drop the parent's join claim; the child already ran to
+/// completion synchronously, so a later `join` is inert. A forged / already-joined handle is a
+/// `CapFault`.
+///
+/// # Safety
+/// As [`join`].
+pub(crate) unsafe extern "C" fn detach(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+    let rt = &*rt;
+    let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    match children.get_mut(handle as usize) {
+        Some(c) if !c.joined => {
+            c.joined = true;
+            0
+        }
+        _ => {
+            *trap_out = TrapKind::CapFault as i64;
+            0
+        }
+    }
+}
+
+/// PROCESS.md S3 `kill(child) -> 0` (JIT). On the JIT a child has already finished by the time the
+/// parent gets control (synchronous `instantiate`), so kill is a harmless success — there is no
+/// running subtree to interrupt (that arrives with JIT async children, S1c). A forged / already-joined
+/// handle is a `CapFault`.
+///
+/// # Safety
+/// As [`join`].
+pub(crate) unsafe extern "C" fn kill(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+    let rt = &*rt;
+    let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    match children.get(handle as usize) {
+        Some(_) => 0,
+        None => {
+            *trap_out = TrapKind::CapFault as i64;
+            0
+        }
+    }
+}
+
 /// The `Yielder` interface id (iface 7), in lockstep with `svm_interp::iface::YIELDER`.
 #[inline]
 fn svm_ir_iface_yielder() -> u32 {

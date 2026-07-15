@@ -2365,6 +2365,9 @@ impl CompiledModule {
                 join_thunk: instantiator_rt::join as *const () as i64,
                 coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
                 coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
+                poll_thunk: instantiator_rt::poll as *const () as i64,
+                detach_thunk: instantiator_rt::detach as *const () as i64,
+                kill_thunk: instantiator_rt::kill as *const () as i64,
             }
         } else {
             InstEnv::null()
@@ -3732,6 +3735,9 @@ pub(crate) unsafe fn compile_child_and_run(
             join_thunk: instantiator_rt::join as *const () as i64,
             coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
             coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
+            poll_thunk: instantiator_rt::poll as *const () as i64,
+            detach_thunk: instantiator_rt::detach as *const () as i64,
+            kill_thunk: instantiator_rt::kill as *const () as i64,
         },
         None => InstEnv::null(),
     };
@@ -4500,6 +4506,10 @@ struct InstEnv {
     join_thunk: i64,
     coro_spawn_thunk: i64,
     coro_resume_thunk: i64,
+    // PROCESS.md S3 lifecycle thunks (poll / detach / kill) — parity with the interpreter's ops 9/10/12.
+    poll_thunk: i64,
+    detach_thunk: i64,
+    kill_thunk: i64,
 }
 
 impl InstEnv {
@@ -4510,6 +4520,9 @@ impl InstEnv {
             join_thunk: 0,
             coro_spawn_thunk: 0,
             coro_resume_thunk: 0,
+            poll_thunk: 0,
+            detach_thunk: 0,
+            kill_thunk: 0,
         }
     }
     /// True when this compilation may lower `Instantiator` cap.calls to the nesting runtime (the
@@ -6848,6 +6861,8 @@ fn lower_instantiator(
         1 => Some((&[VI32], &[VI64])),
         // coro_resume(child, value) -> (status, value)
         3 => Some((&[VI32, VI64], &[VI32, VI64])),
+        // S3 lifecycle: poll / detach / kill (child) -> i32 status
+        9 | 10 | 12 => Some((&[VI32], &[VI32])),
         _ => None,
     };
     let shape_ok = contract.is_some_and(|(need, res)| {
@@ -6982,6 +6997,29 @@ fn lower_instantiator(
             let status = b.ins().ireduce(I32, status64);
             vals.push(status);
             vals.push(value_out);
+        }
+        9 | 10 | 12 => {
+            // S3 lifecycle: poll / detach / kill (nursery, child:i32, trap_out:i64) -> status:i32.
+            // The cap.call's handle operand (the Instantiator) is unused — the child handle is arg 0,
+            // and the nursery owns the child table (as for `join`).
+            let child = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I32, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk_addr = match op {
+                9 => lower.inst.poll_thunk,
+                10 => lower.inst.detach_thunk,
+                _ => lower.inst.kill_thunk,
+            };
+            let thunk = b.ins().iconst(I64, thunk_addr);
+            let call = b
+                .ins()
+                .call_indirect(tref, thunk, &[nursery, child, trap_out]);
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
         }
         // Unknown ops were rejected by the shape check above (→ runtime CapFault, matching the
         // interpreter's default arm) — this match only sees contract-validated ops.
