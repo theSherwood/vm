@@ -1703,76 +1703,18 @@ fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
 // ---------------------------------------------------------------------------------------
 
 /// Whether a dead instruction (no live results) is safe to **remove**. True only for the
-/// whitelist of ops that are *pure*, *cannot trap*, and have *no side effect*, so deleting
-/// one changes nothing observable. Everything else — anything that can fault (loads,
-/// atomics, trapping float→int, `cap.self.get`), writes memory or state (stores, `gc.roots`),
-/// transfers control / spawns / blocks (calls, `cap`/`cont`/`thread`/`memory.wait` ops,
-/// fences), or is otherwise unclassified — defaults to **not** removable (kept). The
-/// default direction is the safe one: a missed removal only forgoes an optimization, never
-/// changes behavior.
+/// ops that are *pure* or a pure *read* and *cannot trap* and have *no side effect*, so deleting one
+/// changes nothing observable. Everything else — anything that can fault (loads, atomics, trapping
+/// float→int, `cap.self.get`), writes memory or state (stores, `gc.roots`), transfers control /
+/// spawns / blocks (calls, `cap`/`cont`/`thread`/`memory.wait` ops, fences) — is **kept**. The safe
+/// default falls out of the classification: a spurious effect only forgoes a removal, never changes
+/// behavior.
+///
+/// This delegates to the single source of truth, [`svm_ir::Inst::effects`] (see `OPT.md` Phase 1a),
+/// so the optimizer and every future pass share one purity oracle rather than each carrying its own
+/// whitelist.
 pub fn is_removable_if_dead(inst: &Inst) -> bool {
-    match inst {
-        // `div`/`rem` trap on a zero (or signed-overflow) divisor; the rest of `IntBin` is pure.
-        Inst::IntBin { op, .. } => !matches!(
-            op,
-            BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU
-        ),
-        Inst::ConstI32(_)
-        | Inst::ConstI64(_)
-        | Inst::ConstF32(_)
-        | Inst::ConstF64(_)
-        | Inst::ConstV128(_)
-        | Inst::IntCmp { .. }
-        | Inst::IntUn { .. }
-        | Inst::Eqz { .. }
-        | Inst::Convert { .. }
-        | Inst::Select { .. }
-        | Inst::FBin { .. }
-        | Inst::FUn { .. }
-        | Inst::FCmp { .. }
-        // saturating float→int does not trap (the trapping variant, `FToITrap`, does not appear here)
-        | Inst::FToISat { .. }
-        | Inst::IToFConv { .. }
-        | Inst::Cast { .. }
-        | Inst::RefFunc { .. }
-        | Inst::PtrAdd { .. }
-        | Inst::PtrCast { .. }
-        | Inst::SimdWidthBytes
-        // all SIMD lane ops below are pure register-to-register (no memory, no trap)
-        | Inst::Splat { .. }
-        | Inst::ExtractLane { .. }
-        | Inst::ReplaceLane { .. }
-        | Inst::VIntBin { .. }
-        | Inst::VIntCmp { .. }
-        | Inst::VFloatCmp { .. }
-        | Inst::VShift { .. }
-        | Inst::VIntUn { .. }
-        | Inst::VSatBin { .. }
-        | Inst::VWiden { .. }
-        | Inst::VNarrow { .. }
-        | Inst::VConvert { .. }
-        | Inst::VPMinMax { .. }
-        | Inst::VPopcnt { .. }
-        | Inst::VAvgr { .. }
-        | Inst::VDot { .. }
-        | Inst::VDotI8 { .. }
-        | Inst::Fma { .. }
-        | Inst::VFma { .. }
-        | Inst::VExtMul { .. }
-        | Inst::VExtAddPairwise { .. }
-        | Inst::VQ15MulrSat { .. }
-        | Inst::VAnyTrue { .. }
-        | Inst::VAllTrue { .. }
-        | Inst::VBitmask { .. }
-        | Inst::VFloatBin { .. }
-        | Inst::VFloatUn { .. }
-        | Inst::VBitBin { .. }
-        | Inst::VNot { .. }
-        | Inst::Bitselect { .. }
-        | Inst::Shuffle { .. }
-        | Inst::Swizzle { .. } => true,
-        _ => false,
-    }
+    inst.effects().removable_if_dead()
 }
 
 /// Apply `f` to **every value operand** of an instruction, in place. Exhaustive on purpose

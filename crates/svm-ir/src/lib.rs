@@ -2193,7 +2193,181 @@ pub enum Inst {
     SimdWidthBytes,
 }
 
+/// What an instruction can do **besides** producing its SSA result(s) — the single source of truth
+/// the optimizer (`svm-opt`) consults for legality (see `OPT.md`, "the equivalence contract"). The
+/// four axes are orthogonal; a **pure** value op (register-to-register, always the same result, no
+/// fault) has all four `false`. Built by [`Inst::effects`], whose match is exhaustive on purpose (no
+/// wildcard): a new `Inst` variant must fail to compile until it is classified there, so the optimizer
+/// can never silently treat an unknown effect as pure.
+///
+/// Conservative by construction — when in doubt an axis is set (a spurious effect only forgoes an
+/// optimization; a missed one would miscompile). `reads_mem`/`writes_mem` mean **guest linear
+/// memory**; every other kind of runtime state (the handle table via `cap.self`, the per-vCPU TLS
+/// word, fiber/thread tables, fences) is folded into `side_effect`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Effects {
+    /// May raise a deterministic trap: an out-of-window / misaligned access, div/rem by zero or
+    /// signed `INT_MIN/-1`, a trapping float→int, an out-of-range table/handle index, or a
+    /// noreturn-class fault. A trapping op is observable — it may not be deleted, and two trapping
+    /// ops may not be reordered past one another.
+    pub can_trap: bool,
+    /// Reads guest linear memory.
+    pub reads_mem: bool,
+    /// Writes guest linear memory (or other in-window state the "same final memory window" invariant
+    /// pins).
+    pub writes_mem: bool,
+    /// Any **other** effect that bars removal and reordering: a call or host `cap.call` (arbitrary
+    /// host-visible effect), a stack switch / non-falling-through control transfer
+    /// (`cont.*`/`suspend`/`setjmp`/`longjmp`), a thread spawn/join or futex wait/notify, a fence, or
+    /// a read/write of mutable runtime state outside linear memory (`vcpu.tls`, `cap.self`,
+    /// `gc.roots`, the durable shadow base).
+    pub side_effect: bool,
+}
+
+impl Effects {
+    /// A **pure** value op: no trap, no memory access, no other effect. Freely removable when dead,
+    /// reorderable, and CSE-able.
+    pub fn is_pure(&self) -> bool {
+        !self.can_trap && !self.reads_mem && !self.writes_mem && !self.side_effect
+    }
+    /// Safe to delete when **all** of its results are unused: it cannot trap, cannot write memory, and
+    /// has no other side effect. A dead *read* is removable (reading has no observable effect), so
+    /// `reads_mem` alone does not block removal.
+    pub fn removable_if_dead(&self) -> bool {
+        !self.can_trap && !self.writes_mem && !self.side_effect
+    }
+}
+
 impl Inst {
+    /// This instruction's [`Effects`] — the optimizer's legality oracle. Exhaustive by design (no
+    /// wildcard arm) so adding an `Inst` variant forces a classification decision here.
+    pub fn effects(&self) -> Effects {
+        // Terse constructor for the non-pure arms: (can_trap, reads_mem, writes_mem, side_effect).
+        let fx = |can_trap, reads_mem, writes_mem, side_effect| Effects {
+            can_trap,
+            reads_mem,
+            writes_mem,
+            side_effect,
+        };
+        match self {
+            // ---- Pure value ops: consts, integer/float/SIMD arithmetic, compares, conversions,
+            // lane ops, pointer casts. Always the same result, no fault, no memory, no effect. ----
+            Inst::ConstI32(_)
+            | Inst::ConstI64(_)
+            | Inst::ConstF32(_)
+            | Inst::ConstF64(_)
+            | Inst::ConstV128(_)
+            | Inst::IntCmp { .. }
+            | Inst::IntUn { .. }
+            | Inst::Eqz { .. }
+            | Inst::Convert { .. }
+            | Inst::Select { .. }
+            | Inst::FBin { .. }
+            | Inst::FUn { .. }
+            | Inst::FCmp { .. }
+            // saturating float→int does not trap (the trapping variant is `FToITrap`, below)
+            | Inst::FToISat { .. }
+            | Inst::IToFConv { .. }
+            | Inst::Cast { .. }
+            | Inst::Fma { .. }
+            | Inst::RefFunc { .. }
+            | Inst::PtrAdd { .. }
+            | Inst::PtrCast { .. }
+            | Inst::SimdWidthBytes
+            | Inst::Splat { .. }
+            | Inst::ExtractLane { .. }
+            | Inst::ReplaceLane { .. }
+            | Inst::VIntBin { .. }
+            | Inst::VIntCmp { .. }
+            | Inst::VFloatCmp { .. }
+            | Inst::VShift { .. }
+            | Inst::VIntUn { .. }
+            | Inst::VSatBin { .. }
+            | Inst::VWiden { .. }
+            | Inst::VNarrow { .. }
+            | Inst::VConvert { .. }
+            | Inst::VPMinMax { .. }
+            | Inst::VPopcnt { .. }
+            | Inst::VAvgr { .. }
+            | Inst::VDot { .. }
+            | Inst::VDotI8 { .. }
+            | Inst::VFma { .. }
+            | Inst::VExtMul { .. }
+            | Inst::VExtAddPairwise { .. }
+            | Inst::VQ15MulrSat { .. }
+            | Inst::VAnyTrue { .. }
+            | Inst::VAllTrue { .. }
+            | Inst::VBitmask { .. }
+            | Inst::VFloatBin { .. }
+            | Inst::VFloatUn { .. }
+            | Inst::VBitBin { .. }
+            | Inst::VNot { .. }
+            | Inst::Bitselect { .. }
+            | Inst::Shuffle { .. }
+            | Inst::Swizzle { .. } => Effects::default(),
+
+            // `div`/`rem` trap on a zero (or signed-overflow) divisor; the rest of `IntBin` is pure.
+            Inst::IntBin { op, .. } => fx(
+                matches!(op, BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU),
+                false,
+                false,
+                false,
+            ),
+            // Trapping float→int: NaN / out-of-range input traps. Pure otherwise.
+            Inst::FToITrap { .. } => fx(true, false, false, false),
+
+            // ---- Guest linear-memory access. Every one can trap (out-of-window / misaligned). ----
+            Inst::Load { .. } | Inst::V128Load { .. } => fx(true, true, false, false),
+            Inst::Store { .. } | Inst::V128Store { .. } | Inst::MemFill { .. } => {
+                fx(true, false, true, false)
+            }
+            Inst::MemCopy { .. } | Inst::MemMove { .. } => fx(true, true, true, false),
+
+            // ---- Atomics: memory access **plus** a synchronization barrier (`side_effect`), so they
+            // are never removed, duplicated, or reordered across. ----
+            Inst::AtomicLoad { .. } => fx(true, true, false, true),
+            Inst::AtomicStore { .. } => fx(true, false, true, true),
+            Inst::AtomicRmw { .. } | Inst::AtomicCmpxchg { .. } => fx(true, true, true, true),
+            Inst::AtomicFence { .. } => fx(false, false, false, true),
+            // futex wait reads the compared word and blocks; notify touches no memory and cannot fault.
+            Inst::MemoryWait { .. } => fx(true, true, false, true),
+            Inst::MemoryNotify { .. } => fx(false, false, false, true),
+
+            // ---- Calls: a guest callee or host handler may read, write, trap, or do anything — the
+            // conservative full clobber. (`CallImport` is resolved to `CapCall` before a backend, but
+            // is classified for completeness.) ----
+            Inst::Call { .. }
+            | Inst::CallIndirect { .. }
+            | Inst::CallImport { .. }
+            | Inst::CapCall { .. } => fx(true, true, true, true),
+
+            // ---- Fibers, threads, and non-local control transfer. ----
+            Inst::ContNew { .. } => fx(false, false, false, true), // allocates a fiber; runs nothing yet
+            Inst::ContResume { .. } | Inst::Suspend { .. } => fx(true, true, true, true), // stack switch → clobber
+            Inst::SetJmp { .. } => fx(true, false, true, true), // writes an opaque token into the guest jmp_buf
+            Inst::LongJmp { .. } => fx(true, true, false, true), // reads the jmp_buf; noreturn unwind
+            Inst::ThreadSpawn { .. } => fx(false, true, true, true), // shares memory with the new vCPU
+            Inst::ThreadJoin { .. } => fx(true, true, true, true), // blocks; joined writes + trap propagate
+
+            // §GC root enumeration: scans window words, writes the candidate buffer, can fault on an
+            // out-of-window buffer.
+            Inst::GcRoots { .. } => fx(true, true, true, true),
+
+            // ---- Ambient runtime-state intrinsics (`cap.self.*`, `vcpu.tls`, durable shadow base).
+            // Authority-neutral and read-only over guest memory, but they touch mutable runtime state
+            // (the handle table, the per-vCPU TLS word), so they carry `side_effect` — never CSE'd
+            // across a clobber, never removed. ----
+            Inst::CapSelfCount
+            | Inst::CapSelfAttest
+            | Inst::VcpuTlsGet
+            | Inst::VcpuTlsSet { .. }
+            | Inst::DurableShadowBase => fx(false, false, false, true),
+            Inst::CapSelfGet { .. } => fx(true, false, false, true), // out-of-range idx traps
+            Inst::CapSelfResolve { .. } => fx(false, true, false, true), // reads a name from guest mem (OOB → -errno)
+            Inst::CapSelfLabel { .. } => fx(false, false, true, true), // writes the label into guest mem (OOB → -errno)
+        }
+    }
+
     /// How many values this instruction appends at the next block-local indices.
     ///
     /// Most instructions append exactly one; `Store` appends none; a `Call` appends
@@ -3588,5 +3762,201 @@ mod powerbox_start_tests {
         let mut m = entry_module();
         m.funcs[1].params = vec![ValType::I32];
         assert!(synth_powerbox_start(m, 1, 3, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod effects_tests {
+    use super::*;
+
+    fn sig() -> FuncType {
+        FuncType {
+            params: vec![],
+            results: vec![ValType::I64],
+        }
+    }
+
+    #[test]
+    fn pure_ops_have_no_effects_and_are_removable() {
+        for inst in [
+            Inst::ConstI32(0),
+            Inst::ConstI64(0),
+            Inst::ConstF64(0),
+            Inst::ConstV128([0; 16]),
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 0,
+                b: 1,
+            },
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 1,
+            },
+            Inst::Select { cond: 0, a: 1, b: 2 },
+            Inst::FToISat {
+                op: FToI::F64I32S,
+                a: 0,
+            },
+            Inst::RefFunc { func: 0 },
+            Inst::PtrAdd { a: 0, b: 1 },
+            Inst::Splat {
+                shape: VShape::I32x4,
+                a: 0,
+            },
+        ] {
+            let e = inst.effects();
+            assert!(e.is_pure(), "{inst:?} should be pure: {e:?}");
+            assert!(e.removable_if_dead(), "{inst:?} should be removable");
+        }
+    }
+
+    #[test]
+    fn div_rem_trap_but_add_does_not() {
+        for op in [BinOp::DivS, BinOp::DivU, BinOp::RemS, BinOp::RemU] {
+            let e = Inst::IntBin {
+                ty: IntTy::I32,
+                op,
+                a: 0,
+                b: 1,
+            }
+            .effects();
+            assert!(e.can_trap, "{op:?} traps");
+            assert!(!e.removable_if_dead(), "{op:?} not removable (can trap)");
+        }
+        let add = Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Add,
+            a: 0,
+            b: 1,
+        }
+        .effects();
+        assert!(!add.can_trap && add.is_pure());
+    }
+
+    #[test]
+    fn loads_read_and_trap_stores_write_and_trap() {
+        let load = Inst::Load {
+            op: LoadOp::I64,
+            addr: 0,
+            offset: 0,
+            align: 0,
+        }
+        .effects();
+        assert!(load.can_trap && load.reads_mem && !load.writes_mem && !load.side_effect);
+        assert!(!load.removable_if_dead(), "a load can trap → kept");
+
+        let store = Inst::Store {
+            op: StoreOp::I64,
+            addr: 0,
+            value: 1,
+            offset: 0,
+            align: 0,
+        }
+        .effects();
+        assert!(store.can_trap && store.writes_mem && !store.reads_mem);
+        assert!(!store.removable_if_dead(), "a store writes memory → kept");
+    }
+
+    #[test]
+    fn atomics_are_barriers() {
+        let al = Inst::AtomicLoad {
+            ty: IntTy::I32,
+            addr: 0,
+            offset: 0,
+            order: Ordering::SeqCst,
+        }
+        .effects();
+        assert!(al.reads_mem && al.side_effect && !al.removable_if_dead());
+        let rmw = Inst::AtomicRmw {
+            ty: IntTy::I32,
+            op: AtomicRmwOp::Add,
+            addr: 0,
+            value: 1,
+            offset: 0,
+            order: Ordering::SeqCst,
+        }
+        .effects();
+        assert!(rmw.reads_mem && rmw.writes_mem && rmw.side_effect && rmw.can_trap);
+        let fence = Inst::AtomicFence {
+            order: Ordering::SeqCst,
+        }
+        .effects();
+        assert!(fence.side_effect && !fence.reads_mem && !fence.writes_mem && !fence.can_trap);
+    }
+
+    #[test]
+    fn calls_and_control_ops_are_full_clobbers() {
+        for inst in [
+            Inst::Call {
+                func: 0,
+                args: vec![],
+            },
+            Inst::CallIndirect {
+                ty: sig(),
+                idx: 0,
+                args: vec![],
+            },
+            Inst::CapCall {
+                type_id: 0,
+                op: 0,
+                sig: sig(),
+                handle: 0,
+                args: vec![],
+            },
+            Inst::ContResume { k: 0, arg: 1 },
+            Inst::ThreadJoin { handle: 0 },
+            Inst::GcRoots {
+                heap_lo: 0,
+                heap_hi: 1,
+                mask: 2,
+                buf: 3,
+                cap: 4,
+            },
+        ] {
+            let e = inst.effects();
+            assert!(e.side_effect, "{inst:?} must be a barrier: {e:?}");
+            assert!(!e.removable_if_dead(), "{inst:?} must be kept");
+            assert!(!e.is_pure());
+        }
+    }
+
+    #[test]
+    fn ambient_intrinsics_carry_a_side_effect_but_no_guest_memory() {
+        // `cap.self`/`vcpu.tls`/durable-shadow read or write *runtime* state, not guest memory.
+        let count = Inst::CapSelfCount.effects();
+        assert!(count.side_effect && !count.reads_mem && !count.writes_mem && !count.can_trap);
+        assert!(!count.removable_if_dead());
+        let get = Inst::CapSelfGet { idx: 0 }.effects();
+        assert!(get.can_trap && get.side_effect, "out-of-range idx traps");
+        let tls = Inst::VcpuTlsGet.effects();
+        assert!(tls.side_effect && !tls.can_trap);
+    }
+
+    #[test]
+    fn pure_implies_removable_for_every_representative() {
+        // The load-bearing invariant every pass leans on: a pure op is always removable-if-dead.
+        for inst in [
+            Inst::ConstI32(1),
+            Inst::IntUn {
+                ty: IntTy::I64,
+                op: IntUnOp::Clz,
+                a: 0,
+            },
+            Inst::Cast {
+                op: CastOp::ReinterpF64I64,
+                a: 0,
+            },
+            Inst::VNot { a: 0 },
+        ] {
+            let e = inst.effects();
+            assert_eq!(
+                e.is_pure(),
+                e.is_pure() && e.removable_if_dead(),
+                "pure ⇒ removable for {inst:?}"
+            );
+        }
     }
 }
