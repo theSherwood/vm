@@ -64,6 +64,11 @@
         <strong>result</strong>
         <pre id="result"></pre>
         <canvas id="canvas" width="1" height="1"></canvas>
+        <!-- A separate canvas for the WebGPU (`webgpu` capability) demos: a canvas is bound to one
+             context type for its lifetime, so GPU demos can't share the 2D `#canvas` the display
+             (framebuffer) demos use. Hidden until a GPU demo runs. -->
+        <canvas id="gpucanvas" style="display:none; image-rendering:auto; width:100%; max-width:40rem;
+                height:auto; background:#000; border:1px solid #ccc;"></canvas>
         <strong>stdout</strong>
         <pre id="stdout"></pre>
         <strong>log</strong>

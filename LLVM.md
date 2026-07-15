@@ -2670,8 +2670,24 @@ WebGPU does the validation for you (guest-authored WGSL is safe by construction)
    Test `demo_webgpu_mandelbrot` runs it through the on-ramp on **all three engines**, asserts the
    self-check, and encodes the guest-written RGBA to a PNG. (A latent finding: computing `y0` from
    `(py+0.5)/H·range−offset` is *not* bit-symmetric under f32 rounding — the center-relative form is.)
-4. **On-screen presentation (a `Surface`/swapchain capability) — defer.** Presenting to a host window is
-   the OS-coupled part and a later capability; the **safe-access** narrative is fully told headless.
+4. **On-screen presentation (a swapchain/canvas capability)** — presenting to a real display surface.
+   — **DONE (in the browser playground).** The native path is still deferred (a host window is the
+   OS-coupled part), but the browser is a swapchain we already have: `browser/web/webgpu.js` installs a
+   **`webgpu` capability servicer** on the wasm engine, backed by the page's `<canvas>` + `navigator.gpu`.
+   `demos/display/gpu_shader.c` is a reactor guest that ships one WGSL fragment shader (op 0 `set_shader`)
+   and asks the host to present a frame each `tick` (op 1 `present(frame,w,h)`); the Mandelbrot escape
+   loop runs on the **real GPU** and renders straight to the canvas — only the `(frame,w,h)` scalars
+   cross the boundary per frame, and the guest never holds a GPU pointer (validation, not raw access,
+   is the boundary — §2a). All per-op work is **synchronous** (device creation, the one async step, is
+   awaited before the reactor loop starts — required, since the main-thread reactor can't block). Wired
+   into the playground as **"GPU: Mandelbrot zoom (WebGPU shader)"** (`browser/web/play.js`), and proven
+   end-to-end by `browser/browser-webgpu-test.mjs`: a headless-Chromium Playwright test that drives the
+   full stack (wasm → `webgpu` cap → servicer → `navigator.gpu`) and verifies real GPU pixels via an
+   **offscreen** readback (headless Chromium can't read the canvas swapchain, but an offscreen texture
+   reads back fine). **CI note:** that browser test needs lavapipe (`mesa-vulkan-drivers`) + the WebGPU
+   Chromium flags (`--enable-unsafe-webgpu --enable-features=Vulkan --use-angle=vulkan`); wiring it into
+   a workflow lane is a maintainer follow-up. The native `Surface`/swapchain capability remains the
+   later slice.
 
 Riders: any C/C++/Rust app on **wgpu-native** or **Dawn** (the WebGPU C API) — learn-wgpu / WebGPU
 samples — plus `wgpu`'s own CTS as a (meta) conformance check.

@@ -7,6 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
+import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -343,6 +344,18 @@ block0(v0: i64):
       'few FPS (like Doom) — the compute is all guest code, only the finished frame crosses the ' +
       'capability boundary. Click Stop to end.',
   },
+  'GPU: Mandelbrot zoom (WebGPU shader)': {
+    kind: 'reactor',
+    url: './assets/gpu_shader.svmb',
+    mode: 'io',
+    webgpu: true,
+    desc: 'crates/svm-run/demos/display/gpu_shader.c — a sandboxed C guest ships a WGSL fragment ' +
+      'shader once through a `webgpu` capability, then asks the host to present a frame each tick. ' +
+      'The Mandelbrot escape-time loop runs on the **GPU** (via the browser’s WebGPU / navigator.gpu), ' +
+      'so it stays smooth at 640×480 while zooming into a seahorse valley — only the tiny (frame, w, h) ' +
+      'scalars cross the capability boundary per frame, and the guest never holds a GPU pointer. ' +
+      'Needs a WebGPU-capable browser (Chrome/Edge, recent Firefox). Click Stop to end.',
+  },
   'DOOM (1993 — arrow keys, Ctrl fires)': {
     kind: 'reactor',
     url: './assets/doom.svmb',
@@ -563,6 +576,9 @@ let jitReactor = null; // the wasm-JIT reactor driver while a JIT loop runs (els
 
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
 function stopReactor() {
+  teardownWebGPU(); // drop any GPU device + the servicer (no-op for non-webgpu reactors)
+  const gc = $('gpucanvas');
+  if (gc) gc.style.display = 'none';
   if (reactorRAF === null) return;
   cancelAnimationFrame(reactorRAF);
   reactorRAF = null;
@@ -589,6 +605,24 @@ async function runReactor(ex) {
   } catch (e) {
     setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     return;
+  }
+  // A GPU demo: bring up a `navigator.gpu` device + the WebGPU canvas and install the servicer BEFORE
+  // the reactor's first `tick`, so the guest's `webgpu` capability calls (set_shader/present) render.
+  // Device creation is the only async step — awaited here, off the main-thread reactor loop.
+  if (ex.webgpu) {
+    if (!webgpuAvailable()) {
+      setState('error', 'no WebGPU in this browser — the GPU demo needs it (try Chrome/Edge)');
+      return;
+    }
+    try {
+      $('gpucanvas').style.display = 'block';
+      await initWebGPU($('gpucanvas'));
+      log('WebGPU device ready — the guest ships one WGSL shader; the GPU renders every frame');
+    } catch (e) {
+      setState('error', `WebGPU init failed: ${e.message}`);
+      $('gpucanvas').style.display = 'none';
+      return;
+    }
   }
   // Open the reactor: alloc, copy the module in, run _start (decode + grant powerbox). A guest that
   // needs a served file (Doom reads its WAD at _start) is opened with svm_onramp_open_fs, which grants

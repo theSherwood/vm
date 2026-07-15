@@ -28,6 +28,11 @@ use std::alloc::Layout;
 use svm_interp::HostFn;
 use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
 
+// The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
+// builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
+#[cfg(target_arch = "wasm32")]
+mod webgpu;
+
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
 
 /// In-wasm roundtrip probe: parse → **encode** → **decode** → run, entirely inside the sandbox, so
@@ -1873,6 +1878,42 @@ fn grant_onramp_caps(
                 .map_or(-1, |e| e as i64)])
         }));
         host.register_cap_name("keyboard", handle);
+    }
+    // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via the
+    // `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0) and asks the
+    // host to present a frame each tick (op 1); the parallel pixel work runs on the GPU and only tiny
+    // scalars + the shader source cross the boundary — the guest never holds a GPU pointer (§2a). Only
+    // granted in the wasm build (native has no GPU import); a guest resolves `-1` and skips elsewhere.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let handle = host.grant_host_fn(Box::new(move |op, args, mem| {
+            match op {
+                // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
+                0 => {
+                    let ptr = args.first().copied().unwrap_or(0);
+                    let len = args.get(1).copied().unwrap_or(0);
+                    if !(0..=1 << 20).contains(&len) {
+                        return Ok(vec![-1]);
+                    }
+                    let Some(wgsl) = mem.and_then(|m| m.read_bytes(ptr as u64, len as u64)) else {
+                        return Ok(vec![-1]);
+                    };
+                    // SAFETY: wasm-only import; `wgsl` outlives the synchronous call.
+                    let r = unsafe { webgpu::webgpu_op(0, 0, 0, 0, wgsl.as_ptr(), wgsl.len()) };
+                    Ok(vec![r])
+                }
+                // present(frame, w, h) → 0
+                1 => {
+                    let a = args.first().copied().unwrap_or(0);
+                    let b = args.get(1).copied().unwrap_or(0);
+                    let c = args.get(2).copied().unwrap_or(0);
+                    let r = unsafe { webgpu::webgpu_op(1, a, b, c, core::ptr::null(), 0) };
+                    Ok(vec![r])
+                }
+                _ => Ok(vec![-1]),
+            }
+        }));
+        host.register_cap_name("webgpu", handle);
     }
     // `fs` — a read-only in-memory file (Doom slice 4: the WAD read path). Granted only when the host
     // supplies one file; a guest that resolves no `fs` cap (bounce/life) is unaffected. The op

@@ -26,7 +26,20 @@ export async function loadEngine() {
     throw new Error('not a threads build (no imported memory)');
   }
   const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-  const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
+  // The wasm imports `svm_host.webgpu_op` (the `webgpu` capability's host seam). It is a no-op unless a
+  // page installs a real servicer on `globalThis.__svm_webgpu_op` (play.js does, backed by the page's
+  // <canvas> + `navigator.gpu`). i64 args arrive as BigInt; the handler gets the shared `memory` so it
+  // can read the WGSL bytes at `ptr`/`len`. Returns a BigInt (the wasm import result is i64).
+  const importObj = {
+    env: { memory },
+    svm_host: {
+      webgpu_op: (op, a, b, c, ptr, len) => {
+        const h = globalThis.__svm_webgpu_op;
+        return h ? BigInt(h(op, a, b, c, ptr, len, memory)) : -1n;
+      },
+    },
+  };
+  const { exports: ex } = await WebAssembly.instantiate(module, importObj);
   return { module, memory, ex };
 }
 
