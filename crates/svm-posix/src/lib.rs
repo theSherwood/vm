@@ -34,6 +34,7 @@ pub const OP_EXIT: u32 = 4;
 pub const OP_OPEN: u32 = 5;
 pub const OP_CLOSE: u32 = 6;
 pub const OP_LSEEK: u32 = 7;
+pub const OP_UNLINK: u32 = 8;
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT)
@@ -158,6 +159,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "open" => OP_OPEN,
         "close" => OP_CLOSE,
         "lseek" => OP_LSEEK,
+        "unlink" | "remove" => OP_UNLINK,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -209,6 +211,7 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_OPEN => st.open(args, mem),
             OP_CLOSE => Ok(vec![st.close(args)]),
             OP_LSEEK => Ok(vec![st.lseek(args)]),
+            OP_UNLINK => st.unlink(args, mem),
             _ => Err(Trap::CapFault),
         }
     })
@@ -327,6 +330,24 @@ impl Inner {
         }
         self.fds[fd as usize].as_mut().unwrap().pos = newpos as usize;
         newpos
+    }
+
+    /// `unlink(path_ptr, path_len) -> 0 | -errno`: remove a memfs file. Already-open fds keep their
+    /// (now-detached) contents via the file map only until closed — POSIX unlink-while-open nuance is a
+    /// follow-up; here a removed path simply reads as absent to a fresh `open`. Missing file is `-ENOENT`.
+    fn unlink(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        Ok(vec![if self.files.remove(&path).is_some() {
+            0
+        } else {
+            ENOENT
+        }])
     }
 
     /// Allocate the first free fd at [`FIRST_FD`] or above for `of`, extending the table if needed.
@@ -694,6 +715,71 @@ block0(vph: i32):\n\
             Some(&b"Hi!"[..]),
             "jit: memfs file written"
         );
+    }
+
+    /// func 0 `(handle) -> i64`: `unlink("g")` (a preloaded file → `0`), then `open("g", O_RDONLY)` (now
+    /// gone → `-ENOENT`). Returns `unlink_result * 1000 + (-open_result)` = `0*1000 + 2` = `2`.
+    const UNLINK_THEN_OPEN: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block0(vph: i32):\n\
+  vpath = i64.const 0\n\
+  vg = i32.const 103\n\
+  i32.store8 vpath vg\n\
+  vplen = i64.const 1\n\
+  vu = cap.call 13 8 (i64, i64) -> (i64) vph (vpath, vplen)\n\
+  vflags = i64.const 0\n\
+  vo = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  vzero = i64.const 0\n\
+  vneg = i64.sub vzero vo\n\
+  vk = i64.const 1000\n\
+  vt = i64.mul vu vk\n\
+  vr = i64.add vt vneg\n\
+  return vr\n\
+}\n";
+
+    #[test]
+    fn unlink_removes_then_open_is_enoent_on_both() {
+        let m = parse_module(UNLINK_THEN_OPEN).expect("parse");
+        verify_module(&m).expect("verify");
+        let mut ih = Host::new();
+        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, Vec::new());
+        iposix.write_file("g", b"x");
+        let mut fuel = 5_000_000u64;
+        let ir = run_capture_reserved_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[0u8; WIN],
+            0,
+            &mut ih,
+        )
+        .0;
+        let mut jh = Host::new();
+        let (jhh, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
+        jposix.write_file("g", b"x");
+        let jo = compile_and_run_capture_reserved_with_host(
+            &m,
+            0,
+            &[jhh as i64],
+            &[0u8; WIN],
+            0,
+            svm_run::cap_thunk,
+            &mut jh as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit")
+        .0;
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(2)]),
+            "interp: unlink 0, then open -ENOENT"
+        );
+        assert_eq!(iposix.read_file("g"), None, "interp: file is gone");
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[2]),
+            "jit: must match interp, got {jo:?}"
+        );
+        assert_eq!(jposix.read_file("g"), None, "jit: file is gone");
     }
 
     #[test]
