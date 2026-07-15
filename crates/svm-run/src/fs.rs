@@ -840,6 +840,18 @@ pub fn mem_fs_seeded(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> HostCa
 /// symlink to a file becomes that file's bytes). For building a demo data image from an on-disk
 /// cluster; the resulting cap has no further tie to the host filesystem.
 pub fn mem_fs_from_host_dir(root: &Path) -> std::io::Result<HostCap> {
+    let (files, dirs) = read_host_dir(root)?;
+    Ok(mem_fs_seeded(files, dirs))
+}
+
+/// A filesystem seed: `(files as (relative-path, bytes), directory relative-paths)`. The material both
+/// [`mem_fs_seeded`] mounts and [`encode_image`] serializes.
+pub type FsSeed = (Vec<(String, Vec<u8>)>, Vec<String>);
+
+/// Walk a host directory into a [`FsSeed`] — every regular file's `(relative-path, bytes)` plus every
+/// directory's relative path (so empty ones survive). Symlinks are followed. The raw material for both
+/// [`mem_fs_from_host_dir`] and [`encode_image`] (build a shippable data image once).
+pub fn read_host_dir(root: &Path) -> std::io::Result<FsSeed> {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     fn walk(
@@ -866,6 +878,76 @@ pub fn mem_fs_from_host_dir(root: &Path) -> std::io::Result<HostCap> {
         Ok(())
     }
     walk(root, root, &mut files, &mut dirs)?;
+    Ok((files, dirs))
+}
+
+const IMAGE_MAGIC: &[u8; 8] = b"SVMFSIM1";
+
+/// Serialize a `(files, dirs)` seed into a **self-contained data image** — a flat, portable byte blob a
+/// demo ships and mounts with [`mem_fs_from_archive`] (no host filesystem needed, e.g. in the browser).
+/// Format (all little-endian): magic `SVMFSIM1`; `u32` dir count, then each dir `u32 len + path`; `u32`
+/// file count, then each file `u32 path-len + path + u64 data-len + data`. Paths are stored verbatim
+/// (normalization happens at mount time, as for any seed).
+pub fn encode_image(files: &[(String, Vec<u8>)], dirs: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(IMAGE_MAGIC);
+    out.extend_from_slice(&(dirs.len() as u32).to_le_bytes());
+    for d in dirs {
+        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        out.extend_from_slice(d.as_bytes());
+    }
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (p, data) in files {
+        out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        out.extend_from_slice(p.as_bytes());
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        out.extend_from_slice(data);
+    }
+    out
+}
+
+/// Parse a [`encode_image`] blob back into a [`FsSeed`]. `Err` on a bad magic or a truncated/oversized
+/// field (fail-closed — a corrupt image never yields a partial mount).
+pub fn decode_image(bytes: &[u8]) -> Result<FsSeed, String> {
+    let mut p = 0usize;
+    let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
+        let end = p.checked_add(n).ok_or("image: length overflow")?;
+        let s = bytes.get(*p..end).ok_or("image: truncated")?;
+        *p = end;
+        Ok(s)
+    };
+    let u32at = |p: &mut usize| -> Result<usize, String> {
+        Ok(u32::from_le_bytes(take(p, 4)?.try_into().unwrap()) as usize)
+    };
+    let u64at = |p: &mut usize| -> Result<usize, String> {
+        let v = u64::from_le_bytes(take(p, 8)?.try_into().unwrap());
+        usize::try_from(v).map_err(|_| "image: entry too large".to_string())
+    };
+    if take(&mut p, 8)? != IMAGE_MAGIC {
+        return Err("image: bad magic".into());
+    }
+    let n_dirs = u32at(&mut p)?;
+    let mut dirs = Vec::with_capacity(n_dirs);
+    for _ in 0..n_dirs {
+        let len = u32at(&mut p)?;
+        let s = std::str::from_utf8(take(&mut p, len)?).map_err(|_| "image: non-UTF-8 dir")?;
+        dirs.push(s.to_string());
+    }
+    let n_files = u32at(&mut p)?;
+    let mut files = Vec::with_capacity(n_files);
+    for _ in 0..n_files {
+        let len = u32at(&mut p)?;
+        let s = std::str::from_utf8(take(&mut p, len)?).map_err(|_| "image: non-UTF-8 path")?;
+        let dlen = u64at(&mut p)?;
+        files.push((s.to_string(), take(&mut p, dlen)?.to_vec()));
+    }
+    Ok((files, dirs))
+}
+
+/// Mount a [`encode_image`] data-image blob as an in-memory `fs` cap — the browser/demo path (a shipped
+/// image, no host filesystem). Decode + [`mem_fs_seeded`].
+pub fn mem_fs_from_archive(bytes: &[u8]) -> Result<HostCap, String> {
+    let (files, dirs) = decode_image(bytes)?;
     Ok(mem_fs_seeded(files, dirs))
 }
 
@@ -1648,6 +1730,54 @@ mod tests {
         );
         assert_eq!(mem_name, "f");
         assert_eq!(host_name, "f");
+    }
+
+    /// A data image round-trips through [`encode_image`]/[`decode_image`] byte-exact, and mounts via
+    /// [`mem_fs_from_archive`] into a working fs — the shippable-artifact path (no host filesystem).
+    #[test]
+    fn data_image_roundtrip_and_mount() {
+        use super::*;
+        use svm_interp::{iface, Host, WindowMem};
+
+        let files = vec![
+            ("PG_VERSION".to_string(), b"17\n".to_vec()),
+            ("base/1/1259".to_string(), vec![0u8; 300]),
+            ("global/pg_control".to_string(), b"\x01\x02\x03".to_vec()),
+        ];
+        let dirs = vec!["base/1".to_string(), "pg_logical/mappings".to_string()];
+
+        let img = encode_image(&files, &dirs);
+        let (df, dd) = decode_image(&img).expect("decode");
+        assert_eq!(df, files, "files round-trip byte-exact");
+        assert_eq!(dd, dirs, "dirs round-trip");
+        assert!(decode_image(b"nope").is_err(), "bad magic fails closed");
+        assert!(
+            decode_image(&img[..img.len() - 5]).is_err(),
+            "truncation fails closed"
+        );
+
+        // Mount the image and read a file back through the cap.
+        let cap = mem_fs_from_archive(&img).expect("mount archive");
+        let mut host = Host::new();
+        let h = (cap.grant)(&mut host, 0);
+        let mut win = vec![0u8; 4096];
+        win[..10].copy_from_slice(b"PG_VERSION");
+        let mut wm = WindowMem::new(&mut win, 4096);
+        let fd = host
+            .cap_dispatch_slots(
+                iface::HOST_FN,
+                FS_OPEN,
+                h,
+                &[0, 10, O_READ, 0],
+                Some(&mut wm),
+            )
+            .unwrap()[0];
+        assert!(fd >= 0, "open a file from the mounted image");
+        let n = host
+            .cap_dispatch_slots(iface::HOST_FN, FS_READ, h, &[fd, 512, 8, 0], Some(&mut wm))
+            .unwrap()[0];
+        assert_eq!(n, 3);
+        assert_eq!(&win[512..515], b"17\n", "file contents from the image");
     }
 
     /// A **pre-seeded** in-memory fs ([`mem_fs_seeded`]) exposes its files and empty dirs, tolerates a
