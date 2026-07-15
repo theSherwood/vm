@@ -1,6 +1,5 @@
 #define SVM_GUEST 1
 #include "mem_shim.c"
-#include "math_shim.c"
 #include "os_shim.c"
 #include "libc_shim.c"
 #include "locale_shim.c"
