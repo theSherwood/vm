@@ -218,6 +218,27 @@ tracked enhancement, not a blocker.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).
+  - [x] **Dead-function elimination** (`svm_opt::interproc::dead_func_elim`): the first module-level
+    pass. Call-graph reachability closure from the roots (entry `func 0` + every named export) over
+    `call`/`return_call`/`thread.spawn`/`ref.func` edges (the static-funcidx sites
+    `svm_ir::offset_func_indices` enumerates); survivors renumbered densely, every funcidx reference +
+    export target remapped (names preserved). Because a funcref **equals its funcidx** (identity table)
+    and can be a plain `ConstI32`, an indirect dispatch could reach any function, so the pass bails to
+    the identity while `call_indirect`/`return_call_indirect`/`cont.new` is present — devirtualization
+    (below) removes those first, then DFE applies. `OptConfig.dfe` toggle (default on), runs once after
+    the per-function passes; output re-verified; debug info dropped on any removal. Tests in
+    `tests/interproc.rs`; covered by the `opt_sccp` fuzz target (whole pipeline).
+  - [ ] **Budgeted direct-call inliner.** Structural CFG splice: split the caller block at a direct
+    `call`, splice the callee's blocks (values renumbered, block targets offset), rewrite each callee
+    `Return(vals)` to a `br` into the continuation block that takes the call's results as parameters.
+    Size/fuel budget + a recursion guard (don't inline a call already on the inline stack — cf. peval's
+    `is_recursion`). Reuses `map_operands`/`map_term_operands`/`remap_targets`. After inlining, the
+    now-uncalled leaf is swept by DFE — the end-to-end interprocedural story. Differential + fuzz.
+  - [ ] **Constant-funcref devirtualization.** A `call_indirect`/`return_call_indirect` whose `idx` is
+    a known constant `k` (from `ref.func k` or a `ConstI32 k`) and `funcs[k]`'s signature matches `ty`
+    → rewrite to a direct `call`/`return_call` (identity-table resolution, cf. peval's
+    `resolve_indirect`). Feeds the inliner and unblocks DFE (removes the indirect-dispatch gate).
+    Differential + fuzz.
 - [ ] **Phase 4 — memory passes.** Redundant-load elimination + store-to-load forwarding over
   the effects table (clobber rules 2/4); opt-in scratch-region contract for DSE; simple range
   analysis so LICM/DCE can touch provably in-bounds loads.
