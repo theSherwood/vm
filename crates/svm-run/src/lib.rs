@@ -2476,6 +2476,20 @@ pub fn is_powerbox_entry(module: &Module) -> bool {
     )
 }
 
+/// A **named-export** powerbox entry (PROCESS.md S15 (c2)): a paramless `_start` (function 0) the
+/// frontend marks with `export "_start" 0`. This retires the positional powerbox — `_start` takes no
+/// handle arguments; its prologue obtains each cap **by name** (`cap.self.resolve("stdout")`, …) from
+/// the F7 name registry the runner populates when it grants the fixed set. The named export is the
+/// marker (the 3–8 `i32` params that used to tag [`is_powerbox_entry`] are gone), so the runtime still
+/// knows to grant the powerbox rather than treat func 0 as a bare kernel.
+pub fn is_named_powerbox_entry(module: &Module) -> bool {
+    module.funcs.first().is_some_and(|f| f.params.is_empty())
+        && module
+            .exports
+            .iter()
+            .any(|e| e.name == "_start" && e.func == 0)
+}
+
 /// The reference host's capability-import name policy (§7 "Host-defined capabilities &
 /// discoverability"): the standard `name → (type_id, op)` binding that a frontend's `extern`
 /// capability names resolve to at load. This is the default "powerbox ABI" the bundled toolchain
@@ -3520,8 +3534,10 @@ impl Instance {
             .module
             .resolve_export(export)
             .ok_or_else(|| format!("no export named `{export}`"))?;
-        let is_powerbox_func0 =
-            fidx == 0 && (self.binding.is_some() || is_powerbox_entry(&self.module));
+        let is_powerbox_func0 = fidx == 0
+            && (self.binding.is_some()
+                || is_powerbox_entry(&self.module)
+                || is_named_powerbox_entry(&self.module));
         if is_powerbox_func0 {
             if !args.is_empty() {
                 return Err(
@@ -3690,6 +3706,12 @@ impl Instance {
                         Value::I32(handle)
                     })
                     .collect()
+            }
+            None if is_named_powerbox_entry(&self.module) => {
+                // S15 (c2): grant + register the full fixed powerbox (the guest resolves each by name
+                // in its `_start` prologue), and hand the entry **no** positional arguments.
+                grant_powerbox_prefix(h, 8, win);
+                Vec::new()
             }
             None => grant_powerbox_prefix(h, self.module.funcs[0].params.len(), win),
         }

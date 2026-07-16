@@ -13,7 +13,7 @@ use core::ffi::c_void;
 
 use svm_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap};
 use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
-use svm_run::{cap_thunk, powerbox_resolver};
+use svm_run::{cap_thunk, instantiate, powerbox_resolver, Outcome, Value};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -112,6 +112,68 @@ fn paramless_start_binds_stream_and_exit_by_name_on_both_backends() {
         "jit: exit(5) must match interp, got {jo:?}"
     );
     assert_eq!(jh.stdout, ih.stdout, "jit: stdout must match interp");
+}
+
+/// The **named-export** powerbox path end to end through the high-level embedding API
+/// (`instantiate` → `call`): a paramless `_start` marked `export "_start" 0` obtains its `stdout`
+/// handle **by name** (`cap.self.resolve("stdout")`) — no positional entry argument, no slot index —
+/// and writes through it. The runner sees the named-export marker, grants the fixed powerbox, and
+/// registers each cap under its name (F7) so the resolve succeeds; `call` runs it on both backends
+/// and asserts they agree. This is the runtime shape the chibicc `_start` flip (S15 (c2)) produces.
+const NAMED_EXPORT_START: &str = "memory 17\n\
+export \"_start\" 0\n\
+func () -> (i32) {\n\
+block0():\n\
+  p0 = i64.const 64\n\
+  s = i32.const 115\n\
+  i32.store8 p0 s\n\
+  p1 = i64.const 65\n\
+  t0 = i32.const 116\n\
+  i32.store8 p1 t0\n\
+  p2 = i64.const 66\n\
+  d = i32.const 100\n\
+  i32.store8 p2 d\n\
+  p3 = i64.const 67\n\
+  o0 = i32.const 111\n\
+  i32.store8 p3 o0\n\
+  p4 = i64.const 68\n\
+  u = i32.const 117\n\
+  i32.store8 p4 u\n\
+  p5 = i64.const 69\n\
+  t1 = i32.const 116\n\
+  i32.store8 p5 t1\n\
+  nptr = i64.const 64\n\
+  nlen = i64.const 6\n\
+  vh = cap.self.resolve nptr nlen\n\
+  vo = i32.const 111\n\
+  a = i64.const 16\n\
+  i32.store8 a vo\n\
+  vk = i32.const 107\n\
+  b = i64.const 17\n\
+  i32.store8 b vk\n\
+  vbuf = i64.const 16\n\
+  vlen = i64.const 2\n\
+  vn = cap.call 0 1 (i64, i64) -> (i64) vh (vbuf, vlen)\n\
+  vr = i32.const 0\n\
+  return vr\n\
+}\n";
+
+#[test]
+fn named_export_start_resolves_stdout_by_name_and_runs_both_backends() {
+    let m = parse_module(NAMED_EXPORT_START).expect("parse");
+    assert!(
+        svm_run::is_named_powerbox_entry(&m),
+        "export \"_start\" 0 + paramless func 0 marks a named-export powerbox entry"
+    );
+    let inst = instantiate(m).expect("instantiate");
+    // `call` grants the fixed powerbox + registers cap names, runs `_start` on both backends, and
+    // asserts they agree — the resolve-by-name succeeds because the runner registered "stdout".
+    let run = inst.call("_start", &[]).expect("run both backends");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+    assert_eq!(
+        run.stdout, b"ok",
+        "wrote via the name-resolved stdout handle"
+    );
 }
 
 /// A `SharedRegion` op (`vm_region_map`) is **not** a powerbox slot — its region handle is minted at
