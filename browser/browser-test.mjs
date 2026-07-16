@@ -169,8 +169,11 @@ try {
   check('jit (§22)', await runPlay('jit'), '1136');
   check('inst (§14)', await runPlay('inst'), '40');
 
-  // Negative: garbage source must come back as a parse error message (state 'error').
-  await play.fill('#src', 'func ( this is not svm text');
+  // Negative: garbage source must come back as a parse error message (state 'error'). The source
+  // pane is a CodeMirror editor (it hides the underlying textarea), so set its value through the CM
+  // instance rather than filling the textarea directly.
+  await play.evaluate((t) => document.querySelector('.CodeMirror').CodeMirror.setValue(t),
+    'func ( this is not svm text');
   const bad = await runPlay(null);
   const badOk = bad.state === 'error' && bad.status.includes('parse error');
   checks.push(badOk);
@@ -179,8 +182,8 @@ try {
 
   // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
   // `svm_run_onramp` (not the text/`svm_parse` path). Uses the committed `web/assets/hello_c.svmb`.
-  // Runs last: selecting it makes the source textarea read-only (it's a binary module, not editable
-  // SVM text), which would trip the `page.fill` in the parse-reject check above.
+  // Runs last: selecting it makes the source editor read-only (it's a binary module, not editable
+  // SVM text), which would reject the editor `setValue` in the parse-reject check above.
   check('hello (C → SVM, on-ramp module)', await runPlay('hello (C → SVM)'), '0', 'hello, sandbox!\n');
 
   // The framebuffer output path (the `display` capability): the gradient guest presents a 128×128

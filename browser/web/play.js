@@ -8,6 +8,7 @@
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
+import { mountEditor, setDoc, getDoc, setVim, refresh as refreshEditor, markError, clearError } from './editor.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -381,6 +382,7 @@ block0(v0: i64):
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
     editable: true,
+    lang: 'lua',
     url: './assets/lua_eval.svmb',
     mode: 'io',
     desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math/' +
@@ -423,6 +425,7 @@ print("squares:", table.concat(sq, " "))
   'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
     editable: true,
+    lang: 'sql',
     url: './assets/sqlite_repl.svmb',
     mode: 'io',
     desc: 'The unmodified SQLite 3.50.2 amalgamation (~257k lines of C), compiled through the LLVM ' +
@@ -465,21 +468,21 @@ function loadExample(name) {
   if ($('jitLabel')) $('jitLabel').hidden = !ex.jit;
   if (ex.kind === 'reactor') {
     // A per-frame reactor module: the "source" is binary; click Run to start the loop, arrow keys steer.
-    $('src').value =
+    setDoc(
       `// ${name}\n// A pre-built on-ramp reactor module: ${ex.url}\n// Click Run — the page calls the ` +
       `guest's tick() once per animation frame\n// (svm_onramp_open/frame), and the arrow keys steer ` +
-      `it via the keyboard capability.`;
-    $('src').readOnly = true;
+      `it via the keyboard capability.`,
+      'note', true);
   } else if (ex.kind === 'module' && !ex.editable) {
     // A pre-built on-ramp module with a fixed program: the "source" is binary, not editable. Show a note.
-    $('src').value =
+    setDoc(
       `// ${name}\n// A pre-built on-ramp module: ${ex.url}\n// Click Run — it executes as a real ` +
-      `C/C++ guest via svm_run_onramp,\n// and its stdout appears in the pane on the right.`;
-    $('src').readOnly = true;
+      `C/C++ guest via svm_run_onramp,\n// and its stdout appears in the pane on the right.`,
+      'note', true);
   } else {
-    // Text examples, and **editable** modules (whose source is fed to the guest as stdin), stay editable.
-    $('src').value = ex.src;
-    $('src').readOnly = false;
+    // Text examples (SVM text), and **editable** modules (whose source is fed to the guest as stdin —
+    // Lua/SQL), stay editable, highlighted in their declared language (SVM text by default).
+    setDoc(ex.src, ex.lang || 'svm', false);
   }
 }
 
@@ -537,7 +540,7 @@ async function runModule(ex) {
   // view after all allocations and write into it.
   let stdinP = 0, stdinLen = 0, stdinBytes = null;
   if (ex.editable) {
-    stdinBytes = new TextEncoder().encode($('src').value);
+    stdinBytes = new TextEncoder().encode(getDoc());
     if (stdinBytes.length > 0) {
       stdinP = eng.ex.svm_alloc(stdinBytes.length);
       stdinLen = stdinBytes.length;
@@ -744,6 +747,7 @@ async function runReactor(ex) {
 
 async function doRun() {
   if (broken) return;
+  clearError(); // drop any prior parse-error marker before this run
   stopReactor(); // a fresh Run supersedes any running reactor loop
   // A pre-built on-ramp module runs single-shot via svm_run_onramp — no in-browser parse, no Workers.
   const selected = EXAMPLES[$('example').value];
@@ -752,7 +756,7 @@ async function doRun() {
   // Leave the terminal states synchronously on click, so an observer (the Playwright smoke) that
   // clicks Run and polls for done/error never reads the PREVIOUS run's state.
   setState('running', 'parsing…');
-  const src = $('src').value;
+  const src = getDoc();
   const mode = $('mode').value;
   $('result').textContent = '';
   $('stdout').textContent = '';
@@ -774,7 +778,9 @@ async function doRun() {
     // `slice` copies out of the SharedArrayBuffer (the stash may move on the next call).
     const out = u8().slice(eng.ex.svm_parse_ptr(), eng.ex.svm_parse_ptr() + eng.ex.svm_parse_len());
     if (ok !== 1) {
-      setState('error', new TextDecoder().decode(out));
+      const msg = new TextDecoder().decode(out);
+      setState('error', msg);
+      markError(msg); // pin the offending line in the editor when we can locate it
       return;
     }
     guest = out;
@@ -819,6 +825,7 @@ async function doRun() {
 }
 
 async function main() {
+  mountEditor($('src')); // replace the textarea with the CodeMirror editor before the first setDoc
   for (const name of Object.keys(EXAMPLES)) {
     const o = document.createElement('option');
     o.value = name;
@@ -826,7 +833,9 @@ async function main() {
     $('example').appendChild(o);
   }
   loadExample('hello');
+  refreshEditor(); // lay the editor out now that it holds content
   $('example').addEventListener('change', () => loadExample($('example').value));
+  $('vim').addEventListener('change', (e) => setVim(e.target.checked));
   $('run').addEventListener('click', doRun);
   $('stop').addEventListener('click', () => {
     if (reactorRAF !== null) {
