@@ -70,14 +70,15 @@
 //! /`fma`) route through the `libm` crate, which is bit-identical for these correctly-rounded ops.
 
 extern crate alloc;
+use alloc::collections::BTreeMap;
 use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
-    IntTy, IntUnOp, Module, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp,
-    VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp,
-    ValIdx, ValType,
+    IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp,
+    VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp,
+    VWidenOp, ValIdx, ValType,
 };
 
 pub mod cfg;
@@ -190,6 +191,9 @@ pub struct OptConfig {
     /// Dead-function elimination (`svm_opt::interproc::dead_func_elim`) — module-level, runs once
     /// after the per-function passes.
     pub dfe: bool,
+    /// Memory forwarding (`mem_forward`): intra-block redundant-load elimination + store-to-load
+    /// forwarding (OPT.md Phase 4).
+    pub mem: bool,
 }
 
 impl OptConfig {
@@ -205,6 +209,7 @@ impl OptConfig {
             devirt: true,
             inline: true,
             dfe: true,
+            mem: true,
         }
     }
     /// Every optional pass off — only the always-on intra-block canonicalization runs. The ablation
@@ -220,6 +225,7 @@ impl OptConfig {
             devirt: false,
             inline: false,
             dfe: false,
+            mem: false,
         }
     }
 }
@@ -345,6 +351,12 @@ pub fn optimize_func_with(f: &Func, fn_results: &[usize], cfg: &OptConfig) -> Fu
         // the duplicates become dead for the DCE below.
         if cfg.local_cse {
             blocks = blocks.iter().map(|b| local_cse(b, fn_results)).collect();
+        }
+        // Memory forwarding (OPT.md Phase 4): within a block, drop a load made redundant by an earlier
+        // identical load or a matching store (store-to-load forwarding), forwarding its result. Runs
+        // after CSE so recomputed addresses share one value (making the address keys match).
+        if cfg.mem {
+            blocks = blocks.iter().map(|b| mem_forward(b, fn_results)).collect();
         }
         blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
         // Re-fold: merging brings a constant's definition into the same block as its use, and
@@ -1800,6 +1812,121 @@ fn local_cse(b: &Block, fn_results: &[usize]) -> Block {
     }
     let mut term = b.term.clone();
     map_term_operands(&mut term, &mut |o| repl[o as usize]);
+    Block {
+        params: b.params.clone(),
+        insts,
+        term,
+    }
+}
+
+/// The load op that reads back exactly what a store wrote, for **store-to-load forwarding** — only the
+/// full-width, same-type ops, where the loaded value equals the stored value bit-for-bit *and* by
+/// type. The narrowing stores (`i32.store8`, …) write only the low bytes, and a matching load would
+/// zero/sign-extend them, so the loaded value is not the stored value — those are deliberately not
+/// forwardable. A cross-type match (store `f32`, load `i32`) is excluded too: same bytes, wrong type.
+fn store_forward_load_op(op: StoreOp) -> Option<LoadOp> {
+    match op {
+        StoreOp::I32 => Some(LoadOp::I32),
+        StoreOp::I64 => Some(LoadOp::I64),
+        StoreOp::F32 => Some(LoadOp::F32),
+        StoreOp::F64 => Some(LoadOp::F64),
+        _ => None,
+    }
+}
+
+/// Intra-block **redundant-load elimination + store-to-load forwarding** (OPT.md Phase 4). Scanning a
+/// block forward, a value is *available* at a memory location keyed by `(address value, offset, load
+/// op)` once a load reads it or a matching store writes it. A later `Load` of the same key with no
+/// intervening memory clobber is redundant: it is **removed** and its result forwarded to the
+/// available value (block-local value indices renumber, exactly as [`dce_block`]).
+///
+/// The alias model is deliberately minimal and conservative: two accesses touch the same location only
+/// when they name the **same address SSA value** (same block-local value ⇒ same runtime address), the
+/// same offset, and the same op. Any instruction that **writes memory or has a side effect** (a store,
+/// an atomic, a `mem.copy`/`fill`, a call — via [`svm_ir::Inst::effects`]) could alias anything, so it
+/// **clobbers the whole availability map**; a plain store then re-establishes just the cell it wrote.
+/// Recomputed addresses are unified by the CSE pass that runs just before this, so the same-value key
+/// matches in practice.
+///
+/// Sound on both value and traps: a redundant load reads the identical bytes because an earlier access
+/// to the same location established the value and nothing wrote memory since; and it cannot trap
+/// because the earlier same-address, same-width access already proved the address in-bounds (loads are
+/// confined/masked, so bounds is the only fault and `align` is a hint). The pass removes the load
+/// itself — general DCE keeps loads (possible traps), so this pass carries the safety argument.
+fn mem_forward(b: &Block, fn_results: &[usize]) -> Block {
+    let nparams = b.params.len() as u32;
+    let mut result_start = Vec::with_capacity(b.insts.len());
+    let mut total = nparams;
+    for inst in &b.insts {
+        result_start.push(total);
+        total += inst.result_count(fn_results) as u32;
+    }
+
+    // old block-local value → new value (a removed load's result maps to the forwarded value).
+    let mut map: Vec<u32> = vec![0; total as usize];
+    for p in 0..nparams {
+        map[p as usize] = p;
+    }
+    // (new address value, offset, load-op index) → available new value.
+    let mut avail: BTreeMap<(u32, u64, u8), u32> = BTreeMap::new();
+    let mut insts: Vec<Inst> = Vec::with_capacity(b.insts.len());
+    let mut next = nparams;
+
+    for (i, inst) in b.insts.iter().enumerate() {
+        match inst {
+            Inst::Load {
+                op, addr, offset, ..
+            } => {
+                let key = (map[*addr as usize], *offset, op.index());
+                if let Some(&v) = avail.get(&key) {
+                    map[result_start[i] as usize] = v; // redundant → drop, forward
+                } else {
+                    let mut ni = inst.clone();
+                    map_operands(&mut ni, &mut |o| map[o as usize]);
+                    insts.push(ni);
+                    map[result_start[i] as usize] = next;
+                    avail.insert(key, next);
+                    next += 1;
+                }
+            }
+            Inst::Store {
+                op,
+                addr,
+                value,
+                offset,
+                ..
+            } => {
+                let na = map[*addr as usize];
+                let nv = map[*value as usize];
+                let mut ni = inst.clone();
+                map_operands(&mut ni, &mut |o| map[o as usize]);
+                insts.push(ni);
+                // A store could alias any cached cell (only same-value addresses are known disjoint),
+                // so clobber all, then record the one cell it definitely wrote (if forwardable).
+                avail.clear();
+                if let Some(lop) = store_forward_load_op(*op) {
+                    avail.insert((na, *offset, lop.index()), nv);
+                }
+            }
+            other => {
+                let e = other.effects();
+                if e.writes_mem || e.side_effect {
+                    avail.clear(); // a write / call / atomic / fence could touch any cell
+                }
+                let mut ni = other.clone();
+                map_operands(&mut ni, &mut |o| map[o as usize]);
+                insts.push(ni);
+                let rc = other.result_count(fn_results) as u32;
+                for r in 0..rc {
+                    map[(result_start[i] + r) as usize] = next;
+                    next += 1;
+                }
+            }
+        }
+    }
+
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |o| map[o as usize]);
     Block {
         params: b.params.clone(),
         insts,

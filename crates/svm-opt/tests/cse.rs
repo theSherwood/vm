@@ -112,54 +112,61 @@ fn equal_expressions_from_equal_subexpressions_are_deduped() {
 }
 
 #[test]
-fn identical_loads_are_not_deduped() {
-    // Two identical loads of the same address must both survive: a load is impure (memory may change
-    // between them, and it may trap), so CSE must not treat them as the same value.
+fn loads_across_a_may_alias_store_are_not_merged() {
+    // Two loads of the same address with an intervening store to a **runtime** address must both
+    // survive: a load is impure (memory may change between them, and it may trap), so CSE never treats
+    // them as one value, and the Phase-4 memory pass clobbers on a store it can't prove disjoint (the
+    // store address is a parameter, so never provably distinct from the load address). With no
+    // intervening write the memory pass *does* forward such loads — see `tests/memopt.rs`; this pins
+    // the conservative boundary that keeps that sound.
     let f = Func {
-        params: vec![ValType::I32],
+        params: vec![ValType::I32, ValType::I64], // v0 = value, v1 = store address (runtime)
         results: vec![ValType::I32],
         blocks: vec![Block {
-            params: vec![ValType::I32], // v0 = a
+            params: vec![ValType::I32, ValType::I64],
             insts: vec![
-                Inst::ConstI64(0), // v1 = addr (i64 pointer)
+                Inst::ConstI64(0), // v2 = load address (const 0)
+                Inst::Load {
+                    op: LoadOp::I32,
+                    addr: 2,
+                    offset: 0,
+                    align: 2,
+                }, // v3 = mem[0]  (x)
                 Inst::Store {
                     op: StoreOp::I32,
                     addr: 1,
                     value: 0,
                     offset: 0,
                     align: 2,
-                },
+                }, // mem[b] = value — may alias mem[0]
                 Inst::Load {
                     op: LoadOp::I32,
-                    addr: 1,
+                    addr: 2,
                     offset: 0,
                     align: 2,
-                }, // v2
-                Inst::Load {
-                    op: LoadOp::I32,
-                    addr: 1,
-                    offset: 0,
-                    align: 2,
-                }, // v3 (identical, must stay)
-                add(2, 3), // v4 = v2 + v3
+                }, // v4 = mem[0]  (y) — must NOT merge with x
+                add(3, 4),         // v5 = x + y
             ],
-            term: Terminator::Return(vec![4]),
+            term: Terminator::Return(vec![5]),
         }],
     };
     let m = module(f);
     let opt = check_equiv(
         &m,
         &[
-            vec![Value::I32(0)],
-            vec![Value::I32(7)],
-            vec![Value::I32(-3)],
+            vec![Value::I32(5), Value::I64(0)], // b == 0: store overwrites mem[0]
+            vec![Value::I32(5), Value::I64(8)], // b != 0: disjoint
+            vec![Value::I32(7), Value::I64(0)],
         ],
     );
     assert_eq!(
         count(&opt, |i| matches!(i, Inst::Load { .. })),
         2,
-        "both impure loads must survive CSE"
+        "a may-alias store between identical loads must block merging them"
     );
-    // Behavior: *addr = a, then a + a = 2a.
-    assert_eq!(run(&opt, &[Value::I32(21)]), Ok(vec![Value::I32(42)]));
+    // Aliasing case: x = 0 (init), then mem[0] = 5, so y = 5 → 5.
+    assert_eq!(
+        run(&opt, &[Value::I32(5), Value::I64(0)]),
+        Ok(vec![Value::I32(5)])
+    );
 }

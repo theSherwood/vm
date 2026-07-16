@@ -256,6 +256,23 @@ tracked enhancement, not a blocker.
 - [ ] **Phase 4 — memory passes.** Redundant-load elimination + store-to-load forwarding over
   the effects table (clobber rules 2/4); opt-in scratch-region contract for DSE; simple range
   analysis so LICM/DCE can touch provably in-bounds loads.
+  - [x] **Intra-block redundant-load elimination + store-to-load forwarding** (`mem_forward` in the
+    `optimize_func` fixpoint): scanning a block forward, a value is *available* at a location keyed by
+    `(address SSA value, offset, load op)` once a load reads it or a full-width matching store writes
+    it; a later identical `Load` with no intervening clobber is **removed** and its result forwarded
+    (renumbering like `dce_block` — the pass carries its own safety argument since general DCE keeps
+    loads as possible traps). Minimal, sound alias model: same location ⇔ same address *value* + offset
+    + op; **any** memory write or side effect (store / atomic / `mem.copy`/`fill` / call, via the
+    effects table) clobbers the whole availability map, and a plain store re-establishes only the cell
+    it wrote. Runs right after `local_cse` so recomputed addresses are already unified. Sound on value
+    *and* traps (the earlier same-address, same-width access proved the address in-bounds; `align` is a
+    hint). Only full-width same-type store→load pairs forward (`i32/i64/f32/f64`); narrowing/cross-type
+    are excluded. `OptConfig.mem` toggle (default on). Tests in `tests/memopt.rs` (forwarded store,
+    redundant load across a pure op, and the aliasing `a==b` case where a may-alias store must block
+    forwarding); the peval differential suite + `opt_sccp` fuzz cover the pipeline. **Next:** cross-
+    block load elimination (GVN-style, threading the available value through block params), an opt-in
+    scratch-region contract for dead-store elimination, and simple constant-address range/disjointness
+    analysis to relax the clobber-all conservatism.
 - [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `svm-opt` on a module and JITs the
   result, peval-demo shape); PEVAL_BENCH + Wasmtime-relative numbers with the optimizer on;
   fold the settled design into `DESIGN.md` §20 and retire this doc to a tracker stub.
