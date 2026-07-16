@@ -19382,6 +19382,148 @@ fn vec_implode(
     unsup("vector convert: unsupported destination vector shape")
 }
 
+/// Try to lower an integer vector **widen** (`sext`/`zext`, `<N x iA> → <N x iB>` with `B == 2A`)
+/// to native `VWiden` (`swiden_low`/`swiden_high`/`uwiden_low`/`uwiden_high`) instead of scalarizing
+/// (D64: the on-ramp's per-lane explode/repack was edn's dominant cost — 534 `vpinsr`/`vpextr`). The
+/// source is a 128-bit (or wider) integer vector; each source `v128` chunk widens to **two** dest
+/// chunks (low half-lanes + high half-lanes), preserving lane order. Returns `Ok(false)` (fall back
+/// to scalarize) for a single-width-step that isn't ×2, a sub-128 / 2-lane source (no full `v128` to
+/// `swiden`), or a source with a partial tail chunk. **Widen and narrow are lowered together** so a
+/// widened value is never re-exploded by a scalarizing narrow (the D64 regression).
+fn try_native_vwiden(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    operand: &Operand,
+    from_bits: u32,
+    to_bits: u32,
+    signed: bool,
+    types: &Types,
+) -> Result<bool, Error> {
+    if to_bits != from_bits * 2 {
+        return Ok(false); // only a single ×2 step maps to one `swiden`/`uwiden`
+    }
+    let from_ty = operand.get_type(types);
+    let Some(src_lane) = vec_lane_shape(from_ty.as_ref()) else {
+        return Ok(false);
+    };
+    let Some(dst_lane) = src_lane.wider() else {
+        return Ok(false); // i64 lanes can't widen further
+    };
+    // Source chunks: one `v128` for a 128-bit source, several for a wider one. A `<2 x _>` (packed
+    // i64) or sub-128 source has no full `v128` to `swiden` — scalarize instead.
+    let src_parts: Vec<ValIdx> = if vec128_shape(from_ty.as_ref()).is_some() {
+        vec![ctx.operand(operand)?]
+    } else if let Some(layout) = wide_vec_layout(from_ty.as_ref()) {
+        if layout.tail_lanes != 0 {
+            return Ok(false);
+        }
+        ctx.wide_operand(operand, layout)?
+    } else {
+        return Ok(false);
+    };
+    let (lo, hi) = if signed {
+        (svm_ir::VWidenOp::LowS, svm_ir::VWidenOp::HighS)
+    } else {
+        (svm_ir::VWidenOp::LowU, svm_ir::VWidenOp::HighU)
+    };
+    let mut dst_parts = Vec::with_capacity(src_parts.len() * 2);
+    for c in src_parts {
+        dst_parts.push(ctx.push(Inst::VWiden {
+            shape: dst_lane,
+            op: lo,
+            a: c,
+        }));
+        dst_parts.push(ctx.push(Inst::VWiden {
+            shape: dst_lane,
+            op: hi,
+            a: c,
+        }));
+    }
+    // The dest is 2× the source's byte size ⇒ ≥ 256-bit ⇒ always a wide (multi-chunk) vector.
+    ctx.bind_wide(dest, dst_parts);
+    Ok(true)
+}
+
+/// Try to lower an integer vector **wrapping narrow** (`trunc`, `<N x iA> → <N x iB>` with `A == 2B`)
+/// from a 256-bit source (two `v128` chunks) to a 128-bit dest via one byte `Shuffle` that keeps each
+/// lane's low `B/8` bytes. `VNarrow` can't be used — it *saturates*, but LLVM `trunc` *wraps*. This is
+/// the companion to [`try_native_vwiden`]: lowering the narrow natively keeps the widened chunks from
+/// being re-exploded (the D64 regression). `Ok(false)` (fall back) for a non-×2 step, a source that is
+/// not exactly two full chunks, or a non-128-bit dest.
+fn try_native_vnarrow(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    operand: &Operand,
+    from_bits: u32,
+    to_bits: u32,
+    types: &Types,
+) -> Result<bool, Error> {
+    if from_bits != to_bits * 2 {
+        return Ok(false);
+    }
+    let from_ty = operand.get_type(types);
+    let to_bytes = (to_bits / 8) as u8;
+    let (Some(layout), Some(dst_shape)) = (
+        wide_vec_layout(from_ty.as_ref()),
+        vec128_shape(&narrow_dest_ty(from_ty.as_ref())),
+    ) else {
+        return Ok(false);
+    };
+    // Only a 256-bit source (two full chunks) narrowing to a single 128-bit dest — the edn case.
+    if layout.full_chunks != 2 || layout.tail_lanes != 0 {
+        return Ok(false);
+    }
+    let _ = dst_shape;
+    let parts = ctx.wide_operand(operand, layout)?;
+    let lpc_src = layout.shape.lanes() as usize; // lanes per source chunk
+    let src_lane_bytes = layout.shape.lane_bytes() as u8;
+    let total = lpc_src * 2; // dest lane count
+                             // Byte `j` of dest lane `k` = byte `j` of source lane `k` (its low `to_bytes` bytes); source lanes
+                             // `0..lpc_src` live in chunk `a` (mask 0..15), the rest in chunk `b` (mask 16..31).
+    let mut mask = [0u8; 16];
+    let mut di = 0usize;
+    for k in 0..total {
+        let (chunk_base, pos) = if k < lpc_src {
+            (0u8, k)
+        } else {
+            (16u8, k - lpc_src)
+        };
+        let lane_byte0 = chunk_base + (pos as u8) * src_lane_bytes;
+        for b in 0..to_bytes {
+            mask[di] = lane_byte0 + b;
+            di += 1;
+        }
+    }
+    let a = parts[0];
+    let b = parts[1];
+    let r = ctx.push(Inst::Shuffle { lanes: mask, a, b });
+    finish(ctx, dest, r)?;
+    Ok(true)
+}
+
+/// The 128-bit result type of narrowing `wide_ty` one width step (each lane halved). Used only to
+/// confirm the dest is a native `v128` shape in [`try_native_vnarrow`].
+fn narrow_dest_ty(wide_ty: &Type) -> Type {
+    match wide_ty {
+        Type::VectorType {
+            element_type,
+            num_elements,
+            scalable,
+        } => {
+            let half = match element_type.as_ref() {
+                Type::IntegerType { bits } => Type::IntegerType { bits: bits / 2 },
+                other => other.clone(),
+            };
+            Type::VectorType {
+                element_type: crate::ll::ast::TypeRef::new(half),
+                num_elements: *num_elements,
+                scalable: *scalable,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 /// Lower a lane-wise **integer** vector conversion (`zext`/`sext`/`trunc`, `<N x iA> → <N x iB>`) —
 /// the auto-vectorizer's widen/narrow. svm-ir has no vector-convert op, so we scalarize: explode the
 /// source to `N` lane scalars, convert each in its `i32`/`i64` container via the same `emit_ext`/
@@ -19419,6 +19561,21 @@ fn lower_vec_int_convert(
         .ok_or_else(|| Error::Unsupported("vector conversion of non-integer lanes".into()))?;
     let to_bits = vec_int_lane_bits(to_type)
         .ok_or_else(|| Error::Unsupported("vector conversion to non-integer lanes".into()))?;
+    // Native SIMD widen/narrow (D64) — a full-128 ×2 widen → `swiden`/`uwiden`, a 256→128 wrapping
+    // narrow → a byte `Shuffle`. Lowered as a pair so a widened value is never re-exploded by a
+    // scalarizing narrow. Anything else falls through to the per-lane scalarize below.
+    match kind {
+        VConv::SExt if try_native_vwiden(ctx, dest, operand, from_bits, to_bits, true, types)? => {
+            return Ok(());
+        }
+        VConv::ZExt if try_native_vwiden(ctx, dest, operand, from_bits, to_bits, false, types)? => {
+            return Ok(());
+        }
+        VConv::Trunc if try_native_vnarrow(ctx, dest, operand, from_bits, to_bits, types)? => {
+            return Ok(());
+        }
+        _ => {}
+    }
     let lanes_in = vec_explode(ctx, operand, types, false)?;
     let mut out = Vec::with_capacity(lanes_in.len());
     for v in lanes_in {
