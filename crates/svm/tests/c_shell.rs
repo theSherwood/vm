@@ -90,6 +90,9 @@ long __px_getcwd(int cap, long buf, long size);
 long __px_chdir(int cap, long path, long len);
 long __px_getenv(int cap, long name, long len);
 void __px_exit(int cap, int code);
+long __px_opendir(int cap, long path, long len);
+long __px_readdir(int cap, long dir, long namebuf, long namecap);
+long __px_closedir(int cap, long dir);
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
@@ -99,6 +102,10 @@ char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 
 long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
 char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
 void exit(int code) { __px_exit(0, code); }
+/* A DIR is just the personality's stream handle (a long); readdir writes the next name. */
+long opendir(char *path) { return __px_opendir(0, (long)path, slen(path)); }
+long readdir(long dir, char *namebuf, long cap) { return __px_readdir(0, dir, (long)namebuf, cap); }
+long closedir(long dir) { return __px_closedir(0, dir); }
 "#;
 
 /// The Stage-0 shell itself (guest code): a read-eval loop over stdin. Builtins only — `echo`
@@ -134,6 +141,15 @@ int main(void) {
       puts_("\n");
     } else if (streq(cmd, "cd")) {
       if (arg) chdir(arg);
+    } else if (streq(cmd, "ls")) {
+      char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
+      long d = opendir(dir);
+      if (d < 0) { puts_(dir); puts_(": not found\n"); }
+      else {
+        static char name[128];
+        while (readdir(d, name, 128) > 0) { puts_(name); puts_("\n"); }
+        closedir(d);
+      }
     } else if (streq(cmd, "exit")) {
       return 0;
     } else {
@@ -145,8 +161,9 @@ int main(void) {
 
 /// Compile the shell, grant the personality (with `stdin` preloaded as the script) on two identical
 /// hosts, resolve libc by name, and run on **both** backends. `env` seeds the personality environment
-/// before the run. Returns each backend's captured stdout (asserted equal for the differential).
-fn run_shell(stdin: &[u8], env: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>) {
+/// and `files` seeds the memfs before the run. Returns each backend's captured stdout (asserted equal
+/// for the differential).
+fn run_shell(stdin: &[u8], env: &[(&str, &str)], files: &[&str]) -> (Vec<u8>, Vec<u8>) {
     let src = format!("{SHIM}\n{SHELL_MAIN}");
     let ir = c_to_ir(&src);
     let raw = parse_module_raw(&ir)
@@ -161,6 +178,10 @@ fn run_shell(stdin: &[u8], env: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>) {
     for (k, v) in env {
         iposix.set_env(k, v);
         jposix.set_env(k, v);
+    }
+    for path in files {
+        iposix.write_file(path, b"");
+        jposix.write_file(path, b"");
     }
 
     let m = svm_ir::resolve_imports_with(&raw, resolver(ipx))
@@ -195,7 +216,7 @@ fn stage0_shell_runs_a_script() {
                    pwd\n\
                    frobnicate\n\
                    exit\n";
-    let (iout, jout) = run_shell(script, &[("HOME", "/root")]);
+    let (iout, jout) = run_shell(script, &[("HOME", "/root")], &[]);
     assert_eq!(
         iout, b"hello, shell\n/root\n/tmp\nfrobnicate: not found\n",
         "interp: the shell ran the script (echo, $VAR, cd+pwd, unknown cmd)"
@@ -207,10 +228,27 @@ fn stage0_shell_runs_a_script() {
 /// end of the preloaded script, and `main` returns. Also checks a bare `pwd` at the default cwd `/`.
 #[test]
 fn stage0_shell_handles_eof_and_default_cwd() {
-    let (iout, jout) = run_shell(b"pwd\necho done", &[]);
+    let (iout, jout) = run_shell(b"pwd\necho done", &[], &[]);
     assert_eq!(
         iout, b"/\ndone\n",
         "interp: default cwd is / then echo, then EOF ends it"
     );
     assert_eq!(jout, iout, "jit: must match interp");
+}
+
+/// The `ls` builtin drives the personality's `opendir`/`readdir`/`closedir` from compiled C: with a
+/// memfs staged, `ls /tmp` lists the immediate children (files and the subdir once), sorted; `ls` of
+/// a missing directory reports `not found`. Proves the fs-metadata surface (S7 item 2) end to end.
+#[test]
+fn stage0_shell_ls_lists_a_directory() {
+    let (iout, jout) = run_shell(
+        b"ls /tmp\nls /nope\n",
+        &[],
+        &["/tmp/a.txt", "/tmp/b.txt", "/tmp/sub/c"],
+    );
+    assert_eq!(
+        iout, b"a.txt\nb.txt\nsub\n/nope: not found\n",
+        "interp: ls lists sorted children (subdir once), then a miss"
+    );
+    assert_eq!(jout, iout, "jit: ls output must match interp");
 }

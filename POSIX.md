@@ -111,7 +111,11 @@ only to mark the boundary.
 | 10 | `chdir(path, len)` | `-> 0 \| -errno` | host cwd | **done** — flat memfs, no existence check yet |
 | 11 | `getenv(name, len)` | `-> ptr \| 0` | host env map | **done** — stable NUL-terminated `char*` in arena |
 | 12 | `setenv(name, nlen, val, vlen, overwrite)` | `-> 0 \| -errno` | host env map | **done** — invalidates `getenv` cache |
-| — | `stat/fstat/readdir/environ` | / `-errno` | memfs + host fd table | todo |
+| 13 | `stat(path, len, statbuf)` | `-> 0 \| -errno` | memfs | **done** — minimal `{ st_mode, st_size }`; `S_IFREG`/`S_IFDIR`, `-ENOENT` (aka `lstat`) |
+| 14 | `opendir(path, len)` | `-> dir \| -errno` | memfs | **done** — snapshots immediate children; `-ENOTDIR`/`-ENOENT` |
+| 15 | `readdir(dir, buf, cap)` | `-> namelen \| 0 \| -errno` | dir stream | **done** — NUL-terminated name; `0` at end, `-ERANGE`/`-EBADF` |
+| 16 | `closedir(dir)` | `-> 0 \| -errno` | dir stream | **done** — `-EBADF` on a stale handle |
+| — | `fstat/environ` | / `-errno` | memfs + host fd table | todo |
 | — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
 | — | `pipe/dup/dup2/fcntl` | `-> fd \| -errno` | `Pipe` cap + host fd table | todo |
 | — | `time/clock_gettime` | `-> t` | `Clock` cap | todo |
