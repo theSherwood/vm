@@ -127,8 +127,8 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 /// redirects (pointing globals `in_fd`/`out_fd` at the targets via `open`, restored after), then
 /// `exec_line` tokenizes the remainder into `argv[]`, sets a shell variable for a lone `NAME=VALUE`,
 /// then expands `$NAME`/`$?` tokens (shell vars shadow the environment) before running one builtin —
-/// `echo`, `export`, `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `rm`, `ls`,
-/// `true`/`false`, `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
+/// `echo`, `export`, `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `sort`, `uniq`, `rm`,
+/// `ls`, `true`/`false`, `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
 /// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
 /// and surfaced as `$?`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
 /// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
@@ -181,6 +181,17 @@ static int contains(char *hay, char *needle) {
     if (needle[j] == 0) return 1;
   }
   return needle[0] == 0;
+}
+
+/* Byte-wise string compare (for sort/uniq): <0, 0, >0. */
+static int scmp(char *a, char *b) {
+  int i = 0; while (a[i] && a[i] == b[i]) i++;
+  return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
+}
+
+/* Bounded string copy (dst holds up to 255 bytes + NUL). */
+static void scpy(char *d, char *s) {
+  int i = 0; while (s[i] && i < 255) { d[i] = s[i]; i++; } d[i] = 0;
 }
 
 /* Read one newline-delimited line from fd into buf (NUL-terminated, newline dropped); returns its
@@ -397,6 +408,30 @@ static int exec_line(char *line) {
       if (ci) close(fd);
       long start = count > n ? count - n : 0;
       for (long k = start; k < count; k++) { puts_(ring[k % 16]); puts_("\n"); }
+    }
+  } else if (streq(cmd, "sort")) {
+    int ci; long fd = src_fd(arg, &ci);
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
+    else {
+      static char buf[64][256]; int n = 0;
+      while (n < 64 && read_line(fd, buf[n], 256) >= 0) n++;
+      if (ci) close(fd);
+      for (int i = 1; i < n; i++) {          /* insertion sort (n <= 64) */
+        static char key[256]; scpy(key, buf[i]);
+        int j = i - 1;
+        while (j >= 0 && scmp(buf[j], key) > 0) { scpy(buf[j + 1], buf[j]); j--; }
+        scpy(buf[j + 1], key);
+      }
+      for (int i = 0; i < n; i++) { puts_(buf[i]); puts_("\n"); }
+    }
+  } else if (streq(cmd, "uniq")) {
+    int ci; long fd = src_fd(arg, &ci);
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
+    else {
+      static char cur[256], prev[256]; int have = 0;
+      while (read_line(fd, cur, 256) >= 0)
+        if (!have || scmp(cur, prev) != 0) { puts_(cur); puts_("\n"); scpy(prev, cur); have = 1; }
+      if (ci) close(fd);
     }
   } else if (streq(cmd, "rm")) {
     for (int i = 1; i < argc; i++)
@@ -1017,4 +1052,27 @@ fn stage0_shell_export_to_env() {
         "interp: export NAME=VALUE and export NAME both reach env"
     );
     assert_eq!(jout, iout, "jit: export output must match interp");
+}
+
+/// `sort` and `uniq` as a pipeline: `cat f | sort | uniq` orders the lines and collapses adjacent
+/// duplicates — the canonical Unix idiom, here proving three-stage piping of real filters.
+#[test]
+fn stage0_shell_sort_uniq_pipeline() {
+    let (iout, jout) = run_shell(
+        b"echo banana > /f\n\
+          echo apple >> /f\n\
+          echo cherry >> /f\n\
+          echo apple >> /f\n\
+          echo banana >> /f\n\
+          cat /f | sort | uniq\n",
+        &[],
+        &[],
+        &[],
+    );
+    // sorted: apple, apple, banana, banana, cherry → uniq → apple, banana, cherry.
+    assert_eq!(
+        iout, b"apple\nbanana\ncherry\n",
+        "interp: sort orders, uniq collapses adjacent dups, over a 3-stage pipe"
+    );
+    assert_eq!(jout, iout, "jit: sort/uniq output must match interp");
 }
