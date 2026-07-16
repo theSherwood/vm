@@ -23,127 +23,13 @@
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
-use svm_ir::{Func, Inst, Terminator, ValType};
+use svm_ir::{Func, ValType};
 use svm_verify::func_value_types;
 
 use crate::cfg::Cfg;
-use crate::ssa::{from_ssa, to_ssa, Def, SsaFunc, Value};
+use crate::ssa::{from_ssa, to_ssa, Def, Value};
+use crate::thread::{dominates, Threader};
 use crate::{map_operands, map_term_operands};
-
-/// Does block `a` dominate block `b`? Walks `b` up the immediate-dominator chain until it reaches `a`
-/// (dominated) or the entry (not). `idom` is [`Cfg::dominators`] (entry / unreachable → `None`).
-fn dominates(idom: &[Option<u32>], a: u32, b: u32) -> bool {
-    let mut x = b;
-    loop {
-        if x == a {
-            return true;
-        }
-        match idom[x as usize] {
-            Some(p) => x = p,
-            None => return false,
-        }
-    }
-}
-
-/// Enumerate a terminator's out-edges as `(target, args)` in canonical order.
-fn edges_of(term: &Terminator) -> Vec<(u32, &Vec<Value>)> {
-    match term {
-        Terminator::Br { target, args } => vec![(*target, args)],
-        Terminator::BrIf {
-            then_blk,
-            then_args,
-            else_blk,
-            else_args,
-            ..
-        } => vec![(*then_blk, then_args), (*else_blk, else_args)],
-        Terminator::BrTable {
-            targets, default, ..
-        } => {
-            let mut v: Vec<(u32, &Vec<Value>)> = targets.iter().map(|(t, a)| (*t, a)).collect();
-            v.push((default.0, &default.1));
-            v
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Append `arg` to every edge of `term` that targets block `to` (a predecessor may have several: a
-/// `br_if` with both arms to `to`, or a `br_table` repeating it). Keeps edge args aligned with the
-/// new parameter appended at `to`.
-fn append_edge_arg(term: &mut Terminator, to: u32, arg: Value) {
-    match term {
-        Terminator::Br { target, args } => {
-            if *target == to {
-                args.push(arg);
-            }
-        }
-        Terminator::BrIf {
-            then_blk,
-            then_args,
-            else_blk,
-            else_args,
-            ..
-        } => {
-            if *then_blk == to {
-                then_args.push(arg);
-            }
-            if *else_blk == to {
-                else_args.push(arg);
-            }
-        }
-        Terminator::BrTable {
-            targets, default, ..
-        } => {
-            for (t, a) in targets.iter_mut() {
-                if *t == to {
-                    a.push(arg);
-                }
-            }
-            if default.0 == to {
-                default.1.push(arg);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Threads a dominating value to the blocks that need it, adding block parameters + edge args. Holds
-/// the mutable SSA function plus the immutable analysis it reads (predecessors, value types).
-struct Threader<'a> {
-    s: &'a mut SsaFunc,
-    preds: &'a [Vec<u32>],
-    gtype: Vec<ValType>,
-    /// Memo: value `e` made available at block `b` is represented by `avail[(e, b)]`.
-    avail: BTreeMap<(Value, u32), Value>,
-}
-
-impl Threader<'_> {
-    /// Return a value valid **in block `at`** that equals `e` (defined in `def_b`, which dominates
-    /// `at`). Adds a parameter to `at` and threads `e` in along each predecessor edge when needed.
-    fn make_available(&mut self, e: Value, def_b: u32, at: u32) -> Value {
-        if at == def_b {
-            return e; // e is defined right here
-        }
-        if let Some(&v) = self.avail.get(&(e, at)) {
-            return v;
-        }
-        // Add a fresh parameter to `at`, typed like `e`, at the end of its parameter list.
-        let ty = self.gtype[e as usize];
-        let slot = self.s.blocks[at as usize].params.len();
-        self.s.blocks[at as usize].params.push(ty);
-        let g = self.s.num_values;
-        self.s.num_values += 1;
-        self.gtype.push(ty);
-        self.s.values[at as usize].insert(slot, g); // new param sits right after existing params
-        self.avail.insert((e, at), g); // record before recursing so cycles (loops) terminate
-                                       // Feed the new parameter from every predecessor.
-        for p in self.preds[at as usize].clone() {
-            let arg = self.make_available(e, def_b, p);
-            append_edge_arg(&mut self.s.blocks[p as usize].term, at, arg);
-        }
-        g
-    }
-}
 
 /// Run global value numbering / CSE on a function. `funcs` is the whole module's function list and
 /// `has_memory` its memory presence — both only for `func_value_types` (call result types / memory
@@ -191,74 +77,9 @@ pub fn gvn(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
         inst_results.push(per_inst);
     }
 
-    // in_args[b][j] = the values passed to block b's parameter j over *all* in-edges.
-    let mut in_args: Vec<Vec<Vec<Value>>> = (0..nblocks)
-        .map(|b| vec![Vec::new(); s.blocks[b].params.len()])
-        .collect();
-    for blk in &s.blocks {
-        for (to, args) in edges_of(&blk.term) {
-            for (j, &a) in args.iter().enumerate() {
-                if (j) < in_args[to as usize].len() {
-                    in_args[to as usize][j].push(a);
-                }
-            }
-        }
-    }
-
-    // ---- Value-number congruence to a fixpoint. `vn[v]` is v's value number (a representative value
-    // id); congruent values share it. Impure / multi-result values keep their own id (never shared).
-    let mut vn: Vec<u32> = (0..nvals as u32).collect();
-    // Cap iterations for termination (VN is monotone in practice; the cap is a pathology guard).
-    for _ in 0..nvals + 8 {
-        let mut changed = false;
-        // Expression table for this sweep: canonical (operands→VN) pure instruction → its VN.
-        let mut table: Vec<(Inst, u32)> = Vec::new();
-        for &b in &rpo {
-            let bi = b as usize;
-            // Parameters: congruent to the incoming value when every predecessor agrees.
-            let nparams = s.blocks[bi].params.len();
-            for (&pv, incoming) in s.values[bi][..nparams].iter().zip(in_args[bi].iter()) {
-                let new = if incoming.is_empty() {
-                    pv // entry parameters (function inputs): unique
-                } else {
-                    let first = vn[incoming[0] as usize];
-                    if incoming.iter().all(|&a| vn[a as usize] == first) {
-                        first
-                    } else {
-                        pv
-                    }
-                };
-                if new != vn[pv as usize] {
-                    vn[pv as usize] = new;
-                    changed = true;
-                }
-            }
-            // Instruction results: a pure single-result op is numbered by (op, operand VNs).
-            for (ii, inst) in s.blocks[bi].insts.iter().enumerate() {
-                let results = &inst_results[bi][ii];
-                if results.len() != 1 || !inst.effects().is_pure() {
-                    continue;
-                }
-                let v = results[0];
-                let mut canon = inst.clone();
-                map_operands(&mut canon, &mut |o| vn[o as usize]);
-                let new = match table.iter().find(|(c, _)| *c == canon) {
-                    Some(&(_, num)) => num,
-                    None => {
-                        table.push((canon, v));
-                        v
-                    }
-                };
-                if new != vn[v as usize] {
-                    vn[v as usize] = new;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    // Value-number congruence (shared with LICM): congruent values share a number, which is what makes
+    // a join recomputation match the original even though its operands are fresh block parameters.
+    let vn = crate::vn::value_numbers(&s, &cfg, &fn_results);
 
     // ---- Redundancy: replace a value with a congruent one whose definition dominates it. Processing
     // in RPO, the first value of each VN becomes its leader; a later congruent value it dominates is

@@ -1010,6 +1010,17 @@ maintainer needs to `git apply` the patch from the PR. Move to Resolved once app
 nightlies confirm. If the dated toolchain ever lacks a component the job needs, bump the date
 rather than reverting to the channel.
 
+3. **Runner disk-full during `apt-get install` of the mingw-w64 Windows cross-toolchain.** Run
+   29508205769 (Jul 16, `build · test · fmt · clippy` job, dependency-install step, before any
+   build/test ran): `dpkg … cannot copy extracted data … failed to write (No space left on device)`
+   while unpacking `gcc-mingw-w64-x86-64-*` → exit 100. Purely the runner's ephemeral disk filling
+   during toolchain install; not a code failure (the same SHA is fmt/clippy/test-clean locally).
+   Re-running on a fresh runner clears it.
+   *Mitigation:* free space before the apt step (e.g. the standard
+   `jlumbroso/free-disk-space` action or `rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android`),
+   or install only the mingw packages actually needed. Workflow-file change (`workflow` scope), so a
+   maintainer applies it.
+
 ---
 
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
