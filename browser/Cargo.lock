@@ -172,6 +172,7 @@ version = "0.0.0"
 dependencies = [
  "svm-durable",
  "svm-encode",
+ "svm-fs",
  "svm-interp",
  "svm-ir",
  "svm-text",
@@ -192,6 +193,13 @@ name = "svm-encode"
 version = "0.0.0"
 dependencies = [
  "svm-ir",
+]
+
+[[package]]
+name = "svm-fs"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
 ]
 
 [[package]]
