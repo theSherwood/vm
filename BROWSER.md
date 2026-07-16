@@ -761,6 +761,33 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `browser/browser-jit-reactor-test.mjs` (each reactor guest renders byte-identically on both tiers in
    real Chromium). *(This does **not** bring `cap.call` into the emitted subset — the note at slice 3's
    deopt still holds; it makes cap-call-bearing **functions** emittable by outlining the cap op.)*
+8. **[landed — capability] Single-shot module wasm-JIT (Lua/SQLite run-to-completion).** The
+   run-to-completion twin of the reactor: a `.svmb` module's whole program *is* func 0 (`_start`), so
+   [`JitOnrampRun`] emits **that** and runs `f0(win, env, ...slots)` **once** (`_start` takes the granted
+   capability handles as params, stashes them, seeds the heap, and calls `main(sp)`), with the ~7%
+   cross-tier helpers relaying to the interpreter through `env.call_interp` over the shared window. Unlike
+   the reactor, `_start` is **not** pre-run on the interpreter; the `.data`/`.rodata` are materialized up
+   front (emitted `_start` seeds only the heap), and the window is sized to the module's **declared**
+   `size_log2` (Lua declares 64 MiB — a smaller allocation faults any access into its upper range). FFI:
+   `svm_onramp_jit_run_open` + the `svm_onramp_jit_run_*` accessors; JS: `web/wasmjit-module.js`. Proven
+   **byte-identical** to the interpreter (`svm_run_onramp`) for hello_c / Lua / SQLite by the native
+   `tests/jit_module.rs` (hello_c; Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their
+   giant hot functions, which V8 runs fine) and the committed `browser/browser-jit-module-test.mjs` (V8
+   differential + timing). **Finding — the speedup here is modest** (Lua ~3×, SQLite ~1.3×, vs the
+   reactor demos' 24–34×), and it is **not** a compile cost (V8 compiles the emitted 3 MB Lua module in
+   ~6 ms). The reactor demos win big because their hot loops are *small* functions; Lua/SQLite's hot
+   functions (`luaV_execute`, `sqlite3VdbeExec`) are *giant*, and giant emitted functions run slowly.
+   **Measured negative result (do not re-attempt blindly): the block dispatcher is NOT the bottleneck.**
+   A full **relooper** — structured `loop`/`block` + direct branches for reducible CFGs — was built and
+   verified (differential-clean; Lua is 100% reducible, so `luaV_execute` *was* structured) and made
+   **no difference** in an A/B: Lua's 5M-loop ran 16.9 s (relooper) vs 16.8 s (dispatcher). Control-flow
+   shape is irrelevant to V8 here; the cost is the giant function itself (V8's optimizing tier declines
+   functions that large, and the all-SSA-values-in-locals model blocks register allocation) — both
+   orthogonal to the relooper. The real levers, if this is ever worth pursuing, are **function
+   splitting** (break the giant into V8-optimizable pieces) or **value stackification** (fewer locals) —
+   larger, uncertain work. So the relooper was reverted, and a playground toggle for the module demos
+   waits on a lever that actually moves the needle (light scripts also run net *slower* under the JIT —
+   the emit/setup overhead isn't repaid).
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
