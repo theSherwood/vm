@@ -126,6 +126,11 @@ pub struct Prog {
     /// **constexpr** GEPs — the path where I23's const-GEP-stride bug lived (a `getelementptr
     /// (i8, ptr @g, …)` whose source element type differs from `@g`'s pointee).
     glob: [u32; 16],
+    /// Fresh basic-block label counter (for the phi-merge diamonds and counted loops).
+    blk: usize,
+    /// The label of the block currently being generated into — a phi's predecessor edge from the
+    /// straight-line code before a construct.
+    cur_block: String,
 }
 
 /// A per-lane binary op on raw lane values `(x, y, lane_bits) -> result`.
@@ -164,6 +169,29 @@ impl Prog {
         self.body.push_str("  ");
         self.body.push_str(line);
         self.body.push('\n');
+    }
+    /// Emit a block label (`name:` at column 0 — starts a new basic block) and make it current.
+    fn emit_label(&mut self, name: &str) {
+        self.body.push_str(name);
+        self.body.push_str(":\n");
+        self.cur_block = name.to_string();
+    }
+    /// Emit one scalar arithmetic op into the *current* block, returning its `(name, conc)`. Used to
+    /// give a phi-merge branch a computed (not merely forwarded) value. Local to its block — the
+    /// caller truncates the pool afterward so the value never leaks past its dominance region.
+    fn branch_expr(&mut self, g: &mut Gen, bits: u32) -> (String, u64) {
+        let (a, av) = self.any_scalar(g, bits);
+        let (b, bv) = self.any_scalar(g, bits);
+        let (op, r) = match g.u(4) {
+            0 => ("add", av.wrapping_add(bv)),
+            1 => ("sub", av.wrapping_sub(bv)),
+            2 => ("mul", av.wrapping_mul(bv)),
+            _ => ("xor", av ^ bv),
+        };
+        let d = self.fresh();
+        self.emit(&format!("{d} = {op} i{bits} {a}, {b}"));
+        self.push_scalar(d.clone(), bits, r);
+        (d, mask(r, bits))
     }
     fn push_scalar(&mut self, name: String, bits: u32, raw: u64) {
         self.pool.push(Val {
@@ -235,6 +263,8 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
         mem: [0; 16],
         have_mem: false,
         glob: [0; 16],
+        blk: 0,
+        cur_block: String::from("entry"),
     };
     for slot in p.glob.iter_mut() {
         *slot = g.boundary_scalar(32) as u32;
@@ -246,7 +276,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
 
     let steps = 12 + g.u(40);
     for _ in 0..steps {
-        match g.u(16) {
+        match g.u(18) {
             // ---- scalar integer binops (wrapping / bitwise) ----
             0 => {
                 let bits = SCALAR_TYS[g.u(2)];
@@ -481,6 +511,81 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                     "{d} = load i32, ptr getelementptr (i8, ptr @g, i64 {byteoff}), align 4"
                 ));
                 p.push_scalar(d, 32, p.glob[idx] as u64);
+            }
+            // ---- control flow: a diamond with a phi merge (forward-only ⇒ still terminating) ----
+            15 => {
+                let bits = SCALAR_TYS[g.u(2)];
+                let (a, av) = p.any_scalar(g, bits);
+                let (b, bv) = p.any_scalar(g, bits);
+                let (pred, cond) = match g.u(6) {
+                    0 => ("eq", av == bv),
+                    1 => ("ne", av != bv),
+                    2 => ("slt", sext(av, bits) < sext(bv, bits)),
+                    3 => ("sgt", sext(av, bits) > sext(bv, bits)),
+                    4 => ("ult", mask(av, bits) < mask(bv, bits)),
+                    _ => ("ugt", mask(av, bits) > mask(bv, bits)),
+                };
+                let c = p.fresh();
+                p.emit(&format!("{c} = icmp {pred} i{bits} {a}, {b}"));
+                let k = p.blk;
+                p.blk += 1;
+                let (tl, el, ml) = (format!("t{k}"), format!("e{k}"), format!("m{k}"));
+                p.emit(&format!("br i1 {c}, label %{tl}, label %{el}"));
+                // Values in each arm are block-local: snapshot the pool, generate, then truncate so
+                // nothing escapes its dominance region (the merge only sees the phi).
+                let base = p.pool.len();
+                p.emit_label(&tl);
+                let (tv, tvc) = p.branch_expr(g, bits);
+                p.emit(&format!("br label %{ml}"));
+                p.pool.truncate(base);
+                p.emit_label(&el);
+                let (ev, evc) = p.branch_expr(g, bits);
+                p.emit(&format!("br label %{ml}"));
+                p.pool.truncate(base);
+                p.emit_label(&ml);
+                let phi = p.fresh();
+                p.emit(&format!(
+                    "{phi} = phi i{bits} [ {tv}, %{tl} ], [ {ev}, %{el} ]"
+                ));
+                p.push_scalar(phi, bits, if cond { tvc } else { evc });
+            }
+            // ---- a fixed-bound counted loop: induction + accumulator phis, a loop-variant load
+            //      from @g[i] (exercises back-edges, phi lowering, and a variable GEP index) ----
+            16 => {
+                let n = 2 + g.u(5) as u64; // 2..=6 iterations — in-bounds for @g[i] and terminating
+                let (init, initc) = p.any_scalar(g, 64);
+                let pre = p.cur_block.clone();
+                let k = p.blk;
+                p.blk += 1;
+                let (hl, xl) = (format!("h{k}"), format!("x{k}"));
+                let (iv, accv, inext, accnext) = (p.fresh(), p.fresh(), p.fresh(), p.fresh());
+                p.emit(&format!("br label %{hl}"));
+                p.emit_label(&hl);
+                p.emit(&format!("{iv} = phi i64 [ 0, %{pre} ], [ {inext}, %{hl} ]"));
+                p.emit(&format!(
+                    "{accv} = phi i64 [ {init}, %{pre} ], [ {accnext}, %{hl} ]"
+                ));
+                let gp = p.fresh();
+                p.emit(&format!(
+                    "{gp} = getelementptr inbounds [16 x i32], ptr @g, i64 0, i64 {iv}"
+                ));
+                let gi = p.fresh();
+                p.emit(&format!("{gi} = load i32, ptr {gp}, align 4"));
+                let gis = p.fresh();
+                p.emit(&format!("{gis} = sext i32 {gi} to i64"));
+                p.emit(&format!("{accnext} = add i64 {accv}, {gis}"));
+                p.emit(&format!("{inext} = add i64 {iv}, 1"));
+                let lc = p.fresh();
+                p.emit(&format!("{lc} = icmp ult i64 {inext}, {n}"));
+                p.emit(&format!("br i1 {lc}, label %{hl}, label %{xl}"));
+                p.emit_label(&xl);
+                // The final accumulator (`{accnext}` in the header) dominates the exit (header is the
+                // exit's only predecessor). Compute the oracle by running the loop.
+                let mut acc = initc;
+                for i in 0..n {
+                    acc = acc.wrapping_add(sext(p.glob[i as usize] as u64, 32) as u64);
+                }
+                p.push_scalar(accnext, 64, acc);
             }
             // ---- build a vector by insertelement from scalars ----
             _ => {
