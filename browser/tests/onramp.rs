@@ -4,10 +4,13 @@
 //! (Lua, SQLite) the same way `svm-run` does natively.
 //!
 //! The fixture `fixtures/hello_onramp.svmb` is `crates/svm-run/demos/hello.c` compiled with stock
-//! `clang -O2 -emit-llvm` and translated (`svm-llvm-translate hello.bc -o hello_onramp.svmb`). It
-//! imports `write`/`exit` (a 3-handle `_start`), so it exercises import-lowering + the grant order
-//! without any clang/LLVM dependency at test time. Larger guests (malloc → the memory cap, Lua,
-//! SQLite Phase A) are verified out-of-tree via `cargo run --example run_onramp`.
+//! `clang -O2 -emit-llvm` and translated (`svm-llvm-translate hello.bc -o hello_onramp.svmb`). The
+//! current on-ramp emits the **by-name** paramless `_start` (S15), which resolves `write`/`exit` by
+//! name via `cap.self.resolve` — so this exercises the by-name grant path in [`onramp_exec`]
+//! (`grant_onramp_caps` must register the whole prefix by name, not just grant it positionally). The
+//! **positional** entry form is covered by `display.rs`'s gradient guest (a 1-handle `_start`). Larger
+//! guests (malloc → the memory cap, Lua, SQLite Phase A) are verified out-of-tree via
+//! `cargo run --example run_onramp`.
 
 use svm_browser::{onramp_exec, STATUS_OK};
 
