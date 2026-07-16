@@ -2485,11 +2485,70 @@ static void emit_data_segments(Obj *prog) {
   }
 }
 
+// Which fixed powerbox caps (by `VM_CAP_*`/slot index) does `n`'s subtree actually reach? Sets bit
+// `i` in `*mask` for each cap a builtin call would load, so `_start` resolves *only* those by name
+// (S15 (c2) follow-up): a personality-only program — whose libc calls all lower to generic imports,
+// firing no powerbox builtin — reaches none, resolves nothing, and depends on no powerbox grant. The
+// traversal mirrors the promotion `scan` (children + `body`/`args` lists). `__vm_cap(i)` reads an
+// arbitrary slot, so it conservatively marks all. The stdio builtins are counted only for a name that
+// is *declared but not defined* — a guest definition shadows them (S15 (b)), so a defined `write` is
+// an ordinary guest call, not the stdout cap.
+static void scan_caps(Node *n, unsigned *mask) {
+  if (!n)
+    return;
+  if (n->kind == ND_FUNCALL && n->lhs && n->lhs->kind == ND_VAR && n->lhs->var &&
+      n->lhs->var->is_function && n->lhs->var->name) {
+    char *nm = n->lhs->var->name;
+    if (!n->lhs->var->is_definition) {
+      if (!strcmp(nm, "write"))
+        *mask |= 1u << 0; // stdout
+      else if (!strcmp(nm, "read"))
+        *mask |= 1u << 1; // stdin
+      else if (!strcmp(nm, "exit") || !strcmp(nm, "_exit"))
+        *mask |= 1u << 2; // exit
+    }
+    if (!strcmp(nm, "__vm_map") || !strcmp(nm, "__vm_unmap") || !strcmp(nm, "__vm_protect") ||
+        !strcmp(nm, "__vm_page_size"))
+      *mask |= 1u << 3; // memory
+    else if (!strcmp(nm, "__vm_region_create"))
+      *mask |= 1u << 4; // addrspace
+    else if (!strcmp(nm, "__vm_io_submit_async") || !strcmp(nm, "__vm_io_reap"))
+      *mask |= 1u << 5; // ioring
+    else if (!strcmp(nm, "__vm_blocking_handle"))
+      *mask |= 1u << 6; // blocking
+    else if (!strncmp(nm, "__vm_jit_", 9))
+      *mask |= 1u << 7; // jit
+    else if (!strcmp(nm, "__vm_cap"))
+      *mask |= 0xFFu; // arbitrary slot index — conservatively resolve all
+  }
+  scan_caps(n->lhs, mask);
+  scan_caps(n->rhs, mask);
+  scan_caps(n->cond, mask);
+  scan_caps(n->then, mask);
+  scan_caps(n->els, mask);
+  scan_caps(n->init, mask);
+  scan_caps(n->inc, mask);
+  for (Node *b = n->body; b; b = b->next)
+    scan_caps(b, mask);
+  for (Node *a = n->args; a; a = a->next)
+    scan_caps(a, mask);
+}
+
+// The powerbox caps the whole program reaches (union over every defined function's body).
+static unsigned scan_prog_caps(Obj *prog) {
+  unsigned mask = 0;
+  for (Obj *fn = prog; fn; fn = fn->next)
+    if (fn->is_function && fn->is_definition)
+      scan_caps(fn->body, &mask);
+  return mask;
+}
+
 // Synthetic entry (function 0): resolve the powerbox capability handles **by name** into their
 // reserved stash slots, then call `main` with the initial data-SP (= data_end). Global data is
 // placed by module-level `data` segments (§3a, see `emit_data_segments`), not written here. The
 // runtime grants the fixed powerbox and invokes this with **no** arguments (§7 name binding).
-static void emit_start(Obj *main_fn) {
+// `cap_mask` (from `scan_prog_caps`) selects which caps to resolve — only the ones the program uses.
+static void emit_start(Obj *main_fn, unsigned cap_mask) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
@@ -2500,9 +2559,8 @@ static void emit_start(Obj *main_fn) {
   // unchanged, and there is no implicit guest/host slot-index agreement: the guest asks for
   // "stdout", the host answers or fails closed. A `export "_start" 0` marks func 0 as the powerbox
   // entry (the old 3-8 `i32` params that used to tag it are gone; see `is_named_powerbox_entry`).
-  // Names + slot order match `svm_run::POWERBOX_CAP_NAMES` / the `VM_CAP_*` order. (All 8 are
-  // resolved unconditionally — a per-program used-caps mask is a follow-up; an unused/ungranted name
-  // resolves to a negative errno that is stashed and never loaded.)
+  // Names + slot order match `svm_run::POWERBOX_CAP_NAMES` / the `VM_CAP_*` order. Only the caps the
+  // program actually uses (`cap_mask`) are resolved — a personality-only program resolves none.
 #define NHANDLES 8
   static const char *const cap_names[NHANDLES] = {"stdout", "stdin",  "exit",     "memory",
                                                   "addrspace", "ioring", "blocking", "jit"};
@@ -2512,10 +2570,12 @@ static void emit_start(Obj *main_fn) {
   cg("func () -> (%s) {\n", is_void ? "" : irty(mret));
   cg("block0():\n");
   nv = 0;
-  // Resolve each powerbox cap by name into its stash slot. Each name's bytes are written to a
+  // Resolve each *used* powerbox cap by name into its stash slot. Each name's bytes are written to a
   // scratch cell at the data-stack base (`data_end`), reused per name — transient, since `main`
   // (called below with the data-SP = `data_end`) overwrites it as it grows its frame.
   for (int i = 0; i < NHANDLES; i++) {
+    if (!(cap_mask & (1u << i)))
+      continue;
     const char *nm = cap_names[i];
     int len = (int)strlen(nm);
     for (int k = 0; k < len; k++) {
@@ -2845,7 +2905,7 @@ void codegen_ir(Obj *prog, FILE *out) {
   emit_data_segments(prog);
 
   if (has_main)
-    emit_start(funcs[0]);
+    emit_start(funcs[0], scan_prog_caps(prog));
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
 
