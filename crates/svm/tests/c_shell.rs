@@ -119,23 +119,40 @@ int argc_(void) { return (int)__px_argc(0); }
 long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap); }
 "#;
 
-/// The Stage-0 shell itself (guest code). `run_line` first strips a trailing `> file` / `>> file`
-/// redirect (pointing a global `out_fd` at the target via `open`, restored after), then `exec_line`
-/// runs one command line (builtins only — `echo` with `$VAR`, `pwd`, `cd`, `cat`, `ls`, `exit`;
-/// unknown → `<cmd>: not found`), tokenizing it into a command and a single argument on the first
-/// space. `cat` and redirection exercise the real file surface (`open`/`read`/`write`/`close`).
-/// `main` supports two invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs a
-/// single line; otherwise it's a read-eval loop over stdin. `exit` calls the personality `exit`.
+/// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
+/// redirects (pointing globals `in_fd`/`out_fd` at the targets via `open`, restored after), then
+/// `exec_line` runs one command line (builtins only — `echo` with `$VAR`, `pwd`, `cd`, `cat`, `wc`,
+/// `ls`, `exit`; unknown → `<cmd>: not found`), tokenizing it into a command and a single argument
+/// on the first space. `cat`/`wc` read a path arg or the redirected `in_fd`; together with `>`/`>>`
+/// this exercises the real file surface (`open`/`read`/`write`/`close`). `main` supports two
+/// invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs a single line; otherwise
+/// it's a read-eval loop over stdin. `exit` calls the personality `exit`.
 const SHELL_MAIN: &str = r#"
 #define O_WRONLY 1
 #define O_CREAT  0100
 #define O_TRUNC  01000
 #define O_APPEND 02000
 static char cwd[256];
-/* Current output fd: 1 (stdout) unless a `>`/`>>` redirect is in effect. */
+/* Current stdio for the command in flight: `out_fd` is 1 unless a `>`/`>>` redirect is active,
+   `in_fd` is 0 unless a `<` redirect is active. run_line points them at files and restores them. */
 static long out_fd = 1;
+static long in_fd = 0;
 static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }
 static void puts_(char *s) { write(out_fd, s, slen(s)); }
+
+/* Emit a non-negative count in decimal (wc's output). */
+static void put_num(long n) {
+  static char b[24]; int i = 24;
+  if (n == 0) { puts_("0"); return; }
+  while (n > 0) { b[--i] = '0' + (int)(n % 10); n /= 10; }
+  write(out_fd, b + i, 24 - i);
+}
+
+/* Read source for cat/wc: an explicit path arg (caller must close), else the current in_fd. */
+static long src_fd(char *arg, int *close_it) {
+  if (arg) { *close_it = 1; return open(arg, 0); }   /* O_RDONLY */
+  *close_it = 0; return in_fd;
+}
 
 /* Execute one command after redirection has been stripped: `cmd` plus an optional single `arg`. */
 static void exec_line(char *line) {
@@ -153,15 +170,30 @@ static void exec_line(char *line) {
   } else if (streq(cmd, "cd")) {
     if (arg) chdir(arg);
   } else if (streq(cmd, "cat")) {
-    if (arg) {
-      long fd = open(arg, 0);   /* O_RDONLY */
-      if (fd < 0) { puts_(arg); puts_(": not found\n"); }
-      else {
-        static char buf[256];
-        long r;
-        while ((r = read(fd, buf, 256)) > 0) write(out_fd, buf, r);
-        close(fd);
+    int ci; long fd = src_fd(arg, &ci);
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); }
+    else {
+      static char buf[256];
+      long r;
+      while ((r = read(fd, buf, 256)) > 0) write(out_fd, buf, r);
+      if (ci) close(fd);
+    }
+  } else if (streq(cmd, "wc")) {
+    int ci; long fd = src_fd(arg, &ci);
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); }
+    else {
+      static char buf[256];
+      long r, lines = 0, words = 0, bytes = 0; int inword = 0;
+      while ((r = read(fd, buf, 256)) > 0) {
+        for (long i = 0; i < r; i++) {
+          char c = buf[i]; bytes++;
+          if (c == '\n') lines++;
+          if (c == ' ' || c == '\n' || c == '\t') inword = 0;
+          else { if (!inword) words++; inword = 1; }
+        }
       }
+      if (ci) close(fd);
+      put_num(lines); puts_(" "); put_num(words); puts_(" "); put_num(bytes); puts_("\n");
     }
   } else if (streq(cmd, "ls")) {
     char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
@@ -179,28 +211,43 @@ static void exec_line(char *line) {
   }
 }
 
-/* Strip a trailing `> file` / `>> file` redirect, point `out_fd` at the target for the duration of
-   the command, then restore stdout. Absent a redirect, run the line straight to stdout. */
+/* Strip `< file`, `> file`, and `>> file` redirects out of the line, pointing in_fd/out_fd at the
+   targets for the duration of the command, then restore stdio. Absent any redirect, run straight to
+   stdin/stdout. Multiple redirects are honored (e.g. `wc < in > out`). */
 static void run_line(char *line) {
-  int gt = 0; while (line[gt] && line[gt] != '>') gt++;
-  if (line[gt] != '>') { exec_line(line); return; }
-  char *p = line + gt;
-  int append = 0;
-  *p = 0; p++;                       /* cut the command portion at `>` */
-  if (*p == '>') { append = 1; p++; }
-  while (*p == ' ') p++;             /* skip spaces before the filename */
-  char *target = p;
-  while (*p && *p != ' ') p++;       /* the filename ends at a space or EOL */
-  *p = 0;
-  int end = gt; while (end > 0 && line[end - 1] == ' ') line[--end] = 0;  /* rtrim command */
-  if (target[0] == 0) { exec_line(line); return; }
-  long flags = append ? (O_WRONLY | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_TRUNC);
-  long fd = open(target, flags);
-  if (fd < 0) { puts_(target); puts_(": cannot open\n"); return; }
-  out_fd = fd;
+  long ifd = 0, ofd = 1, ci = -1, co = -1;
+  int cmd_end = -1, i = 0;
+  while (line[i]) {
+    char op = line[i];
+    if (op != '<' && op != '>') { i++; continue; }
+    if (cmd_end < 0) cmd_end = i;
+    line[i++] = 0;                       /* terminate the token to the left of the operator */
+    int append = 0;
+    if (op == '>' && line[i] == '>') { append = 1; i++; }
+    while (line[i] == ' ') i++;          /* skip spaces before the filename */
+    char *target = line + i;
+    while (line[i] && line[i] != ' ' && line[i] != '<' && line[i] != '>') i++;
+    char save = line[i]; line[i] = 0;    /* terminate the filename for open() */
+    if (op == '<') {
+      long fd = open(target, 0);         /* O_RDONLY */
+      if (fd < 0) { puts_(target); puts_(": not found\n"); goto done; }
+      ifd = fd; ci = fd;
+    } else {
+      long flags = append ? (O_WRONLY | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_TRUNC);
+      long fd = open(target, flags);
+      if (fd < 0) { puts_(target); puts_(": cannot open\n"); goto done; }
+      ofd = fd; co = fd;
+    }
+    line[i] = save;                      /* restore so scanning continues past the filename */
+    if (save == 0) break;
+  }
+  if (cmd_end >= 0) { int e = cmd_end; while (e > 0 && line[e - 1] == ' ') line[--e] = 0; }
+  in_fd = ifd; out_fd = ofd;
   exec_line(line);
-  close(fd);
-  out_fd = 1;
+done:
+  if (ci >= 0) close(ci);
+  if (co >= 0) close(co);
+  in_fd = 0; out_fd = 1;
 }
 
 int main(void) {
@@ -389,4 +436,55 @@ fn stage0_shell_redirect_truncates() {
         "interp: the second `>` truncated the first write"
     );
     assert_eq!(jout, iout, "jit: truncation output must match interp");
+}
+
+/// Input redirection (`<`) + `wc` (S7 item 3, cont.): write a two-line file, then `wc < /f` reads it
+/// through the redirected `in_fd` and reports `lines words bytes`; `cat < /f` streams the same file
+/// back to stdout. Proves `<` binds a file to the command's input and that arg-less `cat`/`wc`
+/// consume it. `wc` with an explicit path arg matches the redirected form.
+#[test]
+fn stage0_shell_input_redirection_and_wc() {
+    let (iout, jout) = run_shell(
+        b"echo hello world > /f\n\
+          echo again >> /f\n\
+          wc < /f\n\
+          wc /f\n\
+          cat < /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    // "hello world\nagain\n" = 2 lines, 3 words, 18 bytes.
+    assert_eq!(
+        iout, b"2 3 18\n2 3 18\nhello world\nagain\n",
+        "interp: `< /f` feeds wc/cat; path arg and redirect agree"
+    );
+    assert_eq!(
+        jout, iout,
+        "jit: input-redirection/wc output must match interp"
+    );
+}
+
+/// Both redirections at once: `wc < in > out` reads one file and writes the counts to another, so
+/// nothing reaches stdout; `cat out` then reveals the diverted result. Exercises the multi-redirect
+/// path in `run_line`.
+#[test]
+fn stage0_shell_input_and_output_redirection() {
+    let (iout, jout) = run_shell(
+        b"echo a b c > /in\n\
+          wc < /in > /out\n\
+          cat /out\n",
+        &[],
+        &[],
+        &[],
+    );
+    // "a b c\n" = 1 line, 3 words, 6 bytes; the wc line itself is diverted to /out.
+    assert_eq!(
+        iout, b"1 3 6\n",
+        "interp: wc's output went to /out, surfaced by cat"
+    );
+    assert_eq!(
+        jout, iout,
+        "jit: combined-redirection output must match interp"
+    );
 }
