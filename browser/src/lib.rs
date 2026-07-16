@@ -293,7 +293,7 @@ pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
 }
 
 /// `verify_module` rejected the decoded module ([`svm_prep_bench`]).
-pub const STATUS_VERIFY_ERR: i32 = 5;
+pub const STATUS_VERIFY_ERR: i32 = 6;
 
 /// **Benchmark entry: the safe module-load path a browser must run before it can execute a guest.**
 /// Decode the module at `[ptr, ptr+len)`, `verify_module` it (the escape-freedom TCB gate — never
@@ -2065,6 +2065,151 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         stderr: host.stderr,
         framebuffer,
     }
+}
+
+/// Build the §3e powerbox args blob — `{ argc:u32-LE, envc:u32-LE }` then packed NUL-terminated
+/// strings — for seeding at `POWERBOX_ARGS_BASE` (the browser twin of `svm-run`'s `build_args_blob`,
+/// no env). The on-ramp `_start` parses it into `argc`/`argv`.
+fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes()); // envc = 0
+    for s in argv {
+        blob.extend_from_slice(s);
+        blob.push(0);
+    }
+    blob
+}
+
+/// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
+/// (`svm_fs::mem_fs_seeded_handler` — a real in-memory filesystem, no host fs), seed the `--single`
+/// argv, and run the module's `_start` on the **reserved-window** bytecode engine (Postgres grows its
+/// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
+/// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
+/// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). Function-0 arity is
+/// 4 (`stdout, stdin, exit, memory`), granted by [`grant_onramp_caps`]; `fs` is resolved by name.
+pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
+    let unsupported = |status: i32| PbOutcome {
+        status,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    // Idempotent on the already-resolved `.svmb` (imports = 0); resolves a raw on-ramp module too.
+    let resolved = match svm_ir::resolve_imports(m, onramp_cap_resolver) {
+        Ok(r) => r,
+        Err(_) => return unsupported(STATUS_UNSUPPORTED),
+    };
+    let m = &resolved;
+    if m.funcs.first().map_or(0, |f| f.params.len()) != 4 {
+        return unsupported(STATUS_UNSUPPORTED); // Postgres' `_start` takes the 4-cap prefix.
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    // The on-ramp powerbox prefix Postgres' `_start` expects, positionally: stdout, stdin, exit,
+    // memory (the heap-growth cap `malloc` uses). Registered by name too (`cap.self.resolve`). Granted
+    // directly — not via `grant_onramp_caps`, whose graphical `display`/`keyboard`/`webgpu` caps would
+    // add a host import a headless Postgres neither needs nor can satisfy.
+    let out = host.grant_stream(StreamRole::Out);
+    host.register_cap_name("stdout", out);
+    let inp = host.grant_stream(StreamRole::In);
+    host.register_cap_name("stdin", inp);
+    let exit = host.grant_exit();
+    host.register_cap_name("exit", exit);
+    let memory = host.grant_memory();
+    host.register_cap_name("memory", memory);
+    let slots = vec![
+        Value::I32(out),
+        Value::I32(inp),
+        Value::I32(exit),
+        Value::I32(memory),
+    ];
+    // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed).
+    let (files, dirs) = match svm_fs::decode_image(image) {
+        Ok(seed) => seed,
+        Err(_) => return unsupported(STATUS_DECODE_ERR),
+    };
+    let fsh = host.grant_host_fn(svm_fs::mem_fs_seeded_handler(files, dirs)());
+    host.register_cap_name("fs", fsh);
+    // Seed `argv` at the powerbox args base: a slashed argv[0] so `find_my_exec` resolves.
+    let argv: [&[u8]; 5] = [b"./postgres", b"--single", b"-D", b".", b"postgres"];
+    let blob = pg_args_blob(&argv);
+    let base = svm_ir::POWERBOX_ARGS_BASE as usize;
+    let mut init_mem = vec![0u8; base + blob.len()];
+    init_mem[base..].copy_from_slice(&blob);
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+        m,
+        0,
+        &slots,
+        &mut fuel,
+        &init_mem,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, 0),
+        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_BAD_RESULT, 0, 0),
+        },
+    };
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: host.stdout,
+        stderr: host.stderr,
+        framebuffer: None,
+    }
+}
+
+/// **Boot Postgres in wasm.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the data image
+/// at `[img_ptr, img_len)` on the `fs` cap, feed the SQL at `[stdin_ptr, stdin_len)`, and run. Sets
+/// [`svm_status`]/[`svm_exit_code`]; the backend's output is read back via `svm_stdout_ptr`/`_len`.
+/// Returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`). Driven by `browser/bench_pg.mjs`.
+#[no_mangle]
+pub extern "C" fn svm_run_pg(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return 0;
+    }
+    let out = pg_exec(&m, image, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
 }
 
 /// A live per-frame **reactor** over an on-ramp guest — the interactive/graphical run model (the path
