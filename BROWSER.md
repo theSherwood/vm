@@ -789,6 +789,22 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    waits on a lever that actually moves the needle (light scripts also run net *slower* under the JIT —
    the emit/setup overhead isn't repaid).
 
+   **The relooper is not a dead end — it is a *prerequisite* for value stackification.** The reason it
+   did nothing *alone* is the same reason it is the half that must land *first*: with the `br_table`
+   dispatcher, the operand stack must be empty (or a fixed type) at every dispatch edge, so **every SSA
+   value that crosses a basic-block boundary is forced into a wasm local**. That all-values-in-locals
+   model is precisely what starves V8's register allocator. You can only keep those cross-block values on
+   the operand stack — the fewer-locals win — if the control flow is *structured*, i.e. the relooper has
+   run. (Intra-block stackification is possible under the dispatcher; the cross-block form is not.) So the
+   real lever is **relooper + stackification together**: the relooper reshapes control flow, stackification
+   then drains locals onto the operand stack. Measured alone the relooper is inert (the A/B above) because
+   the emitter still spilled every value to a local; it only pays off once stackification consumes the
+   structure it creates. Caveat against reviving it casually: the relooper adds genuinely complex code
+   (RPO, dominators, reducibility test) to the **most security-sensitive file in the tree** — simpler
+   *output*, more complex *emitter*, which for this project normally cuts the wrong way. Revive it only as
+   **step 1 of a committed stackification effort**, where the added TCB buys a payoff, never as a
+   standalone change.
+
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
 whether `gc.roots`-bearing functions bail at function or module granularity (function, if the
