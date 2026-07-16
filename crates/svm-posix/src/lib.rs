@@ -40,12 +40,27 @@ pub const OP_GETCWD: u32 = 9;
 pub const OP_CHDIR: u32 = 10;
 pub const OP_GETENV: u32 = 11;
 pub const OP_SETENV: u32 = 12;
+pub const OP_STAT: u32 = 13;
+pub const OP_OPENDIR: u32 = 14;
+pub const OP_READDIR: u32 = 15;
+pub const OP_CLOSEDIR: u32 = 16;
+pub const OP_ARGC: u32 = 17;
+pub const OP_ARGV: u32 = 18;
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
-const ENOENT: i64 = -2; // no such file (open without O_CREAT)
+const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
 const EBADF: i64 = -9; // an op on an fd this personality does not serve
 const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
+const ENOTDIR: i64 = -20; // opendir on a path that is a regular file, not a directory
 const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
+
+/// `struct stat` **mode** bits this personality reports (Linux `<sys/stat.h>` `S_IFMT` values). The
+/// personality's `struct stat` is a deliberately minimal **`{ i64 st_mode; i64 st_size; }`** (16
+/// bytes) — the two fields a shell actually reads (`S_ISDIR`/`S_ISREG` on `st_mode`, `st_size`); a
+/// guest `<sys/stat.h>` agrees on that layout (POSIX.md §5). A memfs file is a regular file; a path
+/// that is a prefix of some file key (or `"/"`) is a directory.
+const S_IFREG: i64 = 0o100000; // regular file (| 0o644 perms)
+const S_IFDIR: i64 = 0o040000; // directory (| 0o755 perms)
 
 // The ABI is **explicit-length**, syscall-style: a string argument is `(ptr, len)`, not a
 // NUL-terminated `char*`. This avoids an unbounded window scan (safer) and matches `read`/`write`;
@@ -75,6 +90,14 @@ struct OpenFile {
     path: String,
     pos: usize,
     writable: bool,
+}
+
+/// One open directory stream: the immediate child names under the opened path, snapshotted at
+/// `opendir` (so a concurrent `open`/`unlink` during iteration doesn't perturb it — POSIX permits
+/// either), plus the `readdir` cursor.
+struct DirStream {
+    entries: Vec<String>,
+    pos: usize,
 }
 
 /// The allocator's alignment (bytes). 16 covers `max_align_t` (doubles / SIMD) so a `malloc`'d buffer
@@ -108,6 +131,15 @@ struct Inner {
     /// The host-side fd table (indexed by fd; `0`/`1`/`2` are always `None` — stdio is handled
     /// specially). `open` allocates the first free slot at [`FIRST_FD`] or above.
     fds: Vec<Option<OpenFile>>,
+    /// Open directory streams (`opendir`/`readdir`/`closedir`), indexed by the `DIR*`-analog handle
+    /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
+    /// read cursor. Separate from [`Inner::fds`] (a directory stream is not a file fd here).
+    dirs: Vec<Option<DirStream>>,
+    /// The program's argument vector (`args[0]` is the program name), delivered **host-side** — the
+    /// symmetric analogue of the environment: `argc`/`argv` read it, the embedder sets it. This is how
+    /// a personality program gets `sh -c "…"` without the window args buffer (POSIX.md §5); a guest
+    /// crt that wants a standard `main(int, char**)` builds `argv[]` from these ops.
+    args: Vec<String>,
     /// The current working directory `getcwd` reports and `chdir` updates. A plain string — the memfs
     /// is flat (paths are used as-given), so `cwd` is not validated against it; path normalization/
     /// resolution is a follow-up (POSIX.md §6).
@@ -182,6 +214,14 @@ impl Posix {
             .cwd
             .clone()
     }
+
+    /// Set the program's argument vector (`args[0]` is conventionally the program name) — how an
+    /// embedder hands a personality program its `argv` (e.g. `["sh", "-c", "echo hi"]`), read back by
+    /// the guest through the `argc`/`argv` ops.
+    pub fn set_args(&self, args: &[&str]) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).args =
+            args.iter().map(|s| s.to_string()).collect();
+    }
 }
 
 /// The §7 import-name resolver for the POSIX subset: binds libc symbol names to the
@@ -205,6 +245,14 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "chdir" => OP_CHDIR,
         "getenv" => OP_GETENV,
         "setenv" => OP_SETENV,
+        "stat" | "lstat" => OP_STAT,
+        "opendir" => OP_OPENDIR,
+        "readdir" => OP_READDIR,
+        "closedir" => OP_CLOSEDIR,
+        // Personality extensions (not standard libc functions): the host-side argument vector, the
+        // symmetric analogue of `getenv`/`environ`. A guest crt reads these to build `main`'s argv.
+        "argc" => OP_ARGC,
+        "argv" => OP_ARGV,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -248,6 +296,8 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         free_list: Vec::new(),
         files: HashMap::new(),
         fds: Vec::new(),
+        dirs: Vec::new(),
+        args: Vec::new(),
         cwd: "/".to_string(),
         env: HashMap::new(),
         env_ptrs: HashMap::new(),
@@ -277,6 +327,12 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_CLOSE => Ok(vec![st.close(args)]),
             OP_LSEEK => Ok(vec![st.lseek(args)]),
             OP_UNLINK => st.unlink(args, mem),
+            OP_STAT => st.stat(args, mem),
+            OP_OPENDIR => st.opendir(args, mem),
+            OP_READDIR => st.readdir(args, mem),
+            OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
+            OP_ARGC => Ok(vec![st.args.len() as i64]),
+            OP_ARGV => st.argv(args, mem),
             OP_GETCWD => st.getcwd(args, mem),
             OP_CHDIR => st.chdir(args, mem),
             OP_GETENV => st.getenv(args, mem),
@@ -417,6 +473,155 @@ impl Inner {
         } else {
             ENOENT
         }])
+    }
+
+    /// The immediate child **names** of directory `path` in the flat memfs — the distinct first
+    /// component of every file key under `path` (deduped, sorted for determinism). A file key exactly
+    /// one level below yields its basename; a key deeper below yields the intervening subdir name
+    /// (so a directory appears once even with many files under it). `"/"` lists top-level components.
+    fn dir_children(&self, path: &str) -> Vec<String> {
+        // Normalize to the prefix every child key starts with: `path` + "/" (just "/" for the root).
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", path.trim_end_matches('/'))
+        };
+        let mut names: Vec<String> = self
+            .files
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .filter(|rest| !rest.is_empty())
+            .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// True if `path` names a directory in the flat memfs: the root `"/"`, or any path that is a
+    /// proper prefix of some file key (i.e. has at least one child). Not a file key itself.
+    fn is_dir(&self, path: &str) -> bool {
+        path == "/" || !self.dir_children(path).is_empty()
+    }
+
+    /// `stat(path_ptr, path_len, statbuf_ptr) -> 0 | -errno`: fill the caller's `struct stat`
+    /// (`{ i64 st_mode; i64 st_size; }`, 16 bytes) for a memfs path. A file key is `S_IFREG` with its
+    /// byte length; a directory (a prefix of some key, or `"/"`) is `S_IFDIR` size 0; anything else is
+    /// `-ENOENT`. A non-UTF-8 path is `-EINVAL`.
+    fn stat(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let buf = *args.get(2).ok_or(Trap::Malformed)? as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        let (mode, size) = if let Some(f) = self.files.get(&path) {
+            (S_IFREG | 0o644, f.len() as i64)
+        } else if self.is_dir(&path) {
+            (S_IFDIR | 0o755, 0)
+        } else {
+            return Ok(vec![ENOENT]);
+        };
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&mode.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
+    }
+
+    /// `opendir(path_ptr, path_len) -> dir | -errno`: snapshot a directory's immediate children and
+    /// return a `DIR*`-analog handle for `readdir`/`closedir`. A regular file is `-ENOTDIR`; a path
+    /// with no children that isn't the root is `-ENOENT`; a non-UTF-8 path is `-EINVAL`.
+    fn opendir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        if self.files.contains_key(&path) {
+            return Ok(vec![ENOTDIR]);
+        }
+        if !self.is_dir(&path) {
+            return Ok(vec![ENOENT]);
+        }
+        let entries = self.dir_children(&path);
+        let stream = DirStream { entries, pos: 0 };
+        let idx = match self.dirs.iter().position(Option::is_none) {
+            Some(i) => {
+                self.dirs[i] = Some(stream);
+                i
+            }
+            None => {
+                self.dirs.push(Some(stream));
+                self.dirs.len() - 1
+            }
+        };
+        Ok(vec![idx as i64])
+    }
+
+    /// `readdir(dir, name_ptr, name_cap) -> namelen | 0 | -errno`: write the next entry's name
+    /// (NUL-terminated, C's `dirent.d_name` convention) into the caller's buffer and advance. Returns
+    /// the name length (excluding the NUL) on success, `0` at end of stream, `-EBADF` for a stale
+    /// handle, `-ERANGE` if the name + NUL won't fit `name_cap`.
+    fn readdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let dir = *args.first().ok_or(Trap::Malformed)?;
+        let name_ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
+        let Some(stream) = usize::try_from(dir)
+            .ok()
+            .and_then(|i| self.dirs.get_mut(i)?.as_mut())
+        else {
+            return Ok(vec![EBADF]);
+        };
+        let Some(name) = stream.entries.get(stream.pos) else {
+            return Ok(vec![0]); // end of stream
+        };
+        let mut bytes = name.clone().into_bytes();
+        let namelen = bytes.len() as i64;
+        bytes.push(0); // NUL
+        if bytes.len() as u64 > cap {
+            return Ok(vec![ERANGE]);
+        }
+        stream.pos += 1;
+        mem.write_bytes(name_ptr, &bytes).ok_or(Trap::Malformed)?;
+        Ok(vec![namelen])
+    }
+
+    /// `closedir(dir) -> 0 | -errno`: release a directory stream. A stale handle is `-EBADF`.
+    fn closedir(&mut self, args: &[i64]) -> i64 {
+        let dir = *args.first().unwrap_or(&-1);
+        if let Some(slot @ Some(_)) = usize::try_from(dir).ok().and_then(|i| self.dirs.get_mut(i)) {
+            *slot = None;
+            0
+        } else {
+            EBADF
+        }
+    }
+
+    /// `argv(i, buf, cap) -> len | -errno`: write argument `i` (NUL-terminated) into the caller's
+    /// buffer and return its length (excluding the NUL). An out-of-range index is `-EINVAL`; a name
+    /// that won't fit `cap` is `-ERANGE`. (`argc` is a fieldless op: `self.args.len()`.)
+    fn argv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let i = *args.first().ok_or(Trap::Malformed)?;
+        let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
+        let Some(arg) = usize::try_from(i).ok().and_then(|i| self.args.get(i)) else {
+            return Ok(vec![EINVAL]);
+        };
+        let mut bytes = arg.clone().into_bytes();
+        let len = bytes.len() as i64;
+        bytes.push(0);
+        if bytes.len() as u64 > cap {
+            return Ok(vec![ERANGE]);
+        }
+        mem.write_bytes(buf, &bytes).ok_or(Trap::Malformed)?;
+        Ok(vec![len])
     }
 
     /// Allocate the first free fd at [`FIRST_FD`] or above for `of`, extending the table if needed.
@@ -1114,6 +1319,82 @@ block0(vph: i32):\n\
             Some("v2"),
             "overwrite=0 kept the existing value"
         );
+    }
+
+    #[test]
+    fn stat_and_readdir_over_the_memfs() {
+        // A host-level unit for the fs-metadata surface (stat + the opendir/readdir/closedir stream):
+        // a file stats as a regular file with its size; a path with children stats as a directory and
+        // enumerates its immediate children (files *and* the subdir once), sorted, ending at `0`.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/tmp/a", b"hello");
+        posix.write_file("/tmp/b", b"hi");
+        posix.write_file("/tmp/sub/c", b"x");
+
+        let mut win = vec![0u8; WIN];
+        win[..6].copy_from_slice(b"/tmp/a"); // path at offset 0
+        win[100..104].copy_from_slice(b"/tmp"); // dir path at offset 100
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        let mut st = posix.inner.lock().unwrap();
+        let rd = |mem: &svm_interp::WindowMem, off: u64| {
+            i64::from_le_bytes(mem.read_bytes(off, 8).unwrap().try_into().unwrap())
+        };
+
+        // stat("/tmp/a", statbuf@200) → regular file, size 5.
+        assert_eq!(st.stat(&[0, 6, 200], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(rd(&mem, 200), S_IFREG | 0o644, "st_mode: regular file");
+        assert_eq!(rd(&mem, 208), 5, "st_size: the file's byte length");
+
+        // stat("/tmp") → directory.
+        assert_eq!(st.stat(&[100, 4, 200], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(rd(&mem, 200), S_IFDIR | 0o755, "st_mode: directory");
+
+        // stat of an absent path → -ENOENT.
+        win_write(&mut mem, 400, b"/nope");
+        assert_eq!(st.stat(&[400, 5, 200], Some(&mut mem)).unwrap()[0], ENOENT);
+
+        // opendir("/tmp") → children {a, b, sub} (the subdir listed once), sorted, then `0` at end.
+        let dir = st.opendir(&[100, 4], Some(&mut mem)).unwrap()[0];
+        assert!(dir >= 0, "opendir returns a stream handle");
+        let mut got = Vec::new();
+        loop {
+            let n = st.readdir(&[dir, 300, 64], Some(&mut mem)).unwrap()[0];
+            if n == 0 {
+                break;
+            }
+            got.push(String::from_utf8(mem.read_bytes(300, n as u64).unwrap()).unwrap());
+        }
+        assert_eq!(got, vec!["a", "b", "sub"], "immediate children, sorted");
+        assert_eq!(st.closedir(&[dir]), 0);
+        assert_eq!(st.closedir(&[dir]), EBADF, "double closedir is -EBADF");
+
+        // opendir of a regular file → -ENOTDIR.
+        assert_eq!(st.opendir(&[0, 6], Some(&mut mem)).unwrap()[0], ENOTDIR);
+    }
+
+    /// Write `bytes` into `mem` at `off` (test helper — `WindowMem` has no direct slice setter).
+    fn win_write(mem: &mut svm_interp::WindowMem, off: u64, bytes: &[u8]) {
+        mem.write_bytes(off, bytes).unwrap();
+    }
+
+    #[test]
+    fn argc_argv_deliver_the_argument_vector() {
+        // The host-side argument vector (the `sh -c "…"` path): `argc` reports the count, `argv(i, …)`
+        // writes arg `i` NUL-terminated; an out-of-range index is -EINVAL.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_args(&["sh", "-c", "echo hi"]);
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        let mut st = posix.inner.lock().unwrap();
+
+        assert_eq!(st.args.len() as i64, 3, "argc");
+        assert_eq!(st.argv(&[1, 0, 64], Some(&mut mem)).unwrap()[0], 2); // "-c" len 2
+        assert_eq!(mem.read_bytes(0, 3).unwrap(), b"-c\0");
+        assert_eq!(st.argv(&[2, 100, 64], Some(&mut mem)).unwrap()[0], 7); // "echo hi"
+        assert_eq!(mem.read_bytes(100, 8).unwrap(), b"echo hi\0");
+        assert_eq!(st.argv(&[9, 0, 64], Some(&mut mem)).unwrap()[0], EINVAL);
     }
 
     #[test]
