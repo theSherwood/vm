@@ -1,18 +1,23 @@
-//! Structured generator of **well-defined, terminating** LLVM-IR functions for the on-ramp
+//! Structured generator of **well-defined, terminating** LLVM-IR modules for the on-ramp
 //! differential harness (`onramp_diff.rs` stable test + `fuzz/onramp_diff` target).
 //!
-//! It emits a single `define i64 @run()` whose body is a straight-line sequence of ops over a
-//! typed SSA value pool, **computing each value's concrete result as it emits** — so the final
-//! `ret i64` value is known by construction (the *oracle*), with no separate interpreter to carry
-//! its own bugs. The generated program is UB-free by construction (shift amounts `< width`, array
-//! indices masked in-bounds, no div, no poison flags), so it must **never trap**, and all three
-//! svm backends (tree-walker, bytecode, JIT) must return the oracle value. A divergence is an
-//! **on-ramp translation bug** — the I23 class, where every backend agrees with the *wrong* IR
-//! (so an interp-vs-JIT differential can't see it; the source-semantics oracle can).
+//! It emits `define i64 @run()` (plus a few pure helper functions and a read-only global) while
+//! **computing each value's concrete result as it emits** — so the final `ret i64` value is known
+//! by construction (the *oracle*), with no separate interpreter to carry its own bugs. Every
+//! program is UB-free by construction (shift amounts `< width`, in-bounds array indices, fixed loop
+//! bounds, no div, no poison flags), so it must **never trap**, and all three svm backends
+//! (tree-walker, bytecode, JIT) must return the oracle value. A divergence is an **on-ramp
+//! translation bug** — the I23 class, where every backend agrees with the *wrong* IR (so an
+//! interp-vs-JIT differential can't see it; the source-semantics oracle can).
 //!
-//! Coverage is biased to the translation surface that has bitten us: `getelementptr` with distinct
-//! source element types (`i8` vs `[N x i32]`), 2-lane (`<2 x i32>`, packed-i64) *and* 128-bit
-//! vector min/max, vector widen/narrow, and integer width conversions.
+//! Coverage spans the translation surface that has bitten us and its neighbours:
+//! - `getelementptr` with distinct source element types — instruction-form over an `alloca` **and**
+//!   **constexpr** GEPs over a global (`i8` vs `[N x i32]` — the I23 const-GEP-stride path);
+//! - 2-lane (`<2 x i32>`, packed-i64) *and* 128-bit vector min/max, widen/narrow, and width
+//!   conversions (the I23 vec2-minmax path);
+//! - control flow — phi-merge diamonds and fixed-bound counted loops (back-edges, phi lowering,
+//!   loop-variant GEP indices); and
+//! - function calls to pure helpers (the call ABI: threaded data-SP, arg passing, scalar return).
 #![allow(dead_code)]
 
 /// Entropy: consume libFuzzer bytes first (coverage-guided), then a deterministic xorshift so a
@@ -122,10 +127,70 @@ pub struct Prog {
     /// Shadow of the `[16 x i32]` stack array (concrete bytes as u32 lanes).
     mem: [u32; 16],
     have_mem: bool,
+    /// Contents of the module-level `@g = constant [16 x i32]` (known to the oracle), read via
+    /// **constexpr** GEPs — the path where I23's const-GEP-stride bug lived (a `getelementptr
+    /// (i8, ptr @g, …)` whose source element type differs from `@g`'s pointee).
+    glob: [u32; 16],
+    /// Fresh basic-block label counter (for the phi-merge diamonds and counted loops).
+    blk: usize,
+    /// The label of the block currently being generated into — a phi's predecessor edge from the
+    /// straight-line code before a construct.
+    cur_block: String,
+    /// Pure `i64,i64 -> i64` helpers `@run` can call (exercises the call ABI).
+    helpers: Vec<Helper>,
 }
 
 /// A per-lane binary op on raw lane values `(x, y, lane_bits) -> result`.
 type LaneOp = fn(u64, u64, u32) -> u64;
+
+/// A wrapping i64 binop selector (`0=add 1=sub 2=mul _=xor`) — shared by generated helper bodies
+/// and their Rust oracle so both agree exactly.
+fn apply_i64(op: u8, a: u64, b: u64) -> u64 {
+    match op {
+        0 => a.wrapping_add(b),
+        1 => a.wrapping_sub(b),
+        2 => a.wrapping_mul(b),
+        _ => a ^ b,
+    }
+}
+fn op_name(op: u8) -> &'static str {
+    ["add", "sub", "mul", "xor"][(op & 3) as usize]
+}
+
+/// A pure `i64 f(i64 a, i64 b)` helper: `(a op1 c1) op2 (b op3 c2)` (all wrapping). Emitted as its
+/// own `define` and callable from `@run` — exercises the on-ramp's call ABI (the threaded data-SP,
+/// arg passing, scalar return). Small and closed-form so the oracle evaluates it directly.
+#[derive(Clone)]
+struct Helper {
+    name: String,
+    op1: u8,
+    c1: i64,
+    op2: u8,
+    op3: u8,
+    c2: i64,
+}
+impl Helper {
+    fn eval(&self, a: u64, b: u64) -> u64 {
+        let x = apply_i64(self.op1, a, self.c1 as u64);
+        let y = apply_i64(self.op3, b, self.c2 as u64);
+        apply_i64(self.op2, x, y)
+    }
+    fn define(&self) -> String {
+        format!(
+            "define i64 @{}(i64 %a, i64 %b) {{\n  \
+             %x = {} i64 %a, {}\n  \
+             %y = {} i64 %b, {}\n  \
+             %r = {} i64 %x, %y\n  \
+             ret i64 %r\n}}\n",
+            self.name,
+            op_name(self.op1),
+            self.c1,
+            op_name(self.op3),
+            self.c2,
+            op_name(self.op2),
+        )
+    }
+}
 
 const SCALAR_TYS: [u32; 2] = [32, 64];
 const SHAPES: [Shape; 3] = [
@@ -160,6 +225,29 @@ impl Prog {
         self.body.push_str("  ");
         self.body.push_str(line);
         self.body.push('\n');
+    }
+    /// Emit a block label (`name:` at column 0 — starts a new basic block) and make it current.
+    fn emit_label(&mut self, name: &str) {
+        self.body.push_str(name);
+        self.body.push_str(":\n");
+        self.cur_block = name.to_string();
+    }
+    /// Emit one scalar arithmetic op into the *current* block, returning its `(name, conc)`. Used to
+    /// give a phi-merge branch a computed (not merely forwarded) value. Local to its block — the
+    /// caller truncates the pool afterward so the value never leaks past its dominance region.
+    fn branch_expr(&mut self, g: &mut Gen, bits: u32) -> (String, u64) {
+        let (a, av) = self.any_scalar(g, bits);
+        let (b, bv) = self.any_scalar(g, bits);
+        let (op, r) = match g.u(4) {
+            0 => ("add", av.wrapping_add(bv)),
+            1 => ("sub", av.wrapping_sub(bv)),
+            2 => ("mul", av.wrapping_mul(bv)),
+            _ => ("xor", av ^ bv),
+        };
+        let d = self.fresh();
+        self.emit(&format!("{d} = {op} i{bits} {a}, {b}"));
+        self.push_scalar(d.clone(), bits, r);
+        (d, mask(r, bits))
     }
     fn push_scalar(&mut self, name: String, bits: u32, raw: u64) {
         self.pool.push(Val {
@@ -230,7 +318,24 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
         n: 0,
         mem: [0; 16],
         have_mem: false,
+        glob: [0; 16],
+        blk: 0,
+        cur_block: String::from("entry"),
+        helpers: Vec::new(),
     };
+    for slot in p.glob.iter_mut() {
+        *slot = g.boundary_scalar(32) as u32;
+    }
+    for h in 0..(1 + g.u(3)) {
+        p.helpers.push(Helper {
+            name: format!("f{h}"),
+            op1: g.byte() & 3,
+            c1: sext(g.boundary_scalar(64), 64),
+            op2: g.byte() & 3,
+            op3: g.byte() & 3,
+            c2: sext(g.boundary_scalar(64), 64),
+        });
+    }
 
     // A stack array for GEP/load/store coverage.
     p.emit("%arr = alloca [16 x i32], align 16");
@@ -238,7 +343,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
 
     let steps = 12 + g.u(40);
     for _ in 0..steps {
-        match g.u(14) {
+        match g.u(19) {
             // ---- scalar integer binops (wrapping / bitwise) ----
             0 => {
                 let bits = SCALAR_TYS[g.u(2)];
@@ -454,6 +559,111 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 p.emit(&format!("{d} = load i32, ptr {ptr}, align 4"));
                 p.push_scalar(d, 32, p.mem[idx] as u64);
             }
+            // ---- load @g[idx] via a **constexpr** array-typed GEP (source element `[16 x i32]`) ----
+            13 => {
+                let idx = g.u(16);
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = load i32, ptr getelementptr inbounds ([16 x i32], ptr @g, i64 0, i64 {idx}), align 4"
+                ));
+                p.push_scalar(d, 32, p.glob[idx] as u64);
+            }
+            // ---- load @g[idx] via a **constexpr** i8-typed GEP (source element `i8`, byte offset —
+            //      the exact I23 const-GEP-stride path: strides by `i8`, not by `@g`'s pointee) ----
+            14 => {
+                let idx = g.u(16);
+                let byteoff = idx * 4;
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = load i32, ptr getelementptr (i8, ptr @g, i64 {byteoff}), align 4"
+                ));
+                p.push_scalar(d, 32, p.glob[idx] as u64);
+            }
+            // ---- control flow: a diamond with a phi merge (forward-only ⇒ still terminating) ----
+            15 => {
+                let bits = SCALAR_TYS[g.u(2)];
+                let (a, av) = p.any_scalar(g, bits);
+                let (b, bv) = p.any_scalar(g, bits);
+                let (pred, cond) = match g.u(6) {
+                    0 => ("eq", av == bv),
+                    1 => ("ne", av != bv),
+                    2 => ("slt", sext(av, bits) < sext(bv, bits)),
+                    3 => ("sgt", sext(av, bits) > sext(bv, bits)),
+                    4 => ("ult", mask(av, bits) < mask(bv, bits)),
+                    _ => ("ugt", mask(av, bits) > mask(bv, bits)),
+                };
+                let c = p.fresh();
+                p.emit(&format!("{c} = icmp {pred} i{bits} {a}, {b}"));
+                let k = p.blk;
+                p.blk += 1;
+                let (tl, el, ml) = (format!("t{k}"), format!("e{k}"), format!("m{k}"));
+                p.emit(&format!("br i1 {c}, label %{tl}, label %{el}"));
+                // Values in each arm are block-local: snapshot the pool, generate, then truncate so
+                // nothing escapes its dominance region (the merge only sees the phi).
+                let base = p.pool.len();
+                p.emit_label(&tl);
+                let (tv, tvc) = p.branch_expr(g, bits);
+                p.emit(&format!("br label %{ml}"));
+                p.pool.truncate(base);
+                p.emit_label(&el);
+                let (ev, evc) = p.branch_expr(g, bits);
+                p.emit(&format!("br label %{ml}"));
+                p.pool.truncate(base);
+                p.emit_label(&ml);
+                let phi = p.fresh();
+                p.emit(&format!(
+                    "{phi} = phi i{bits} [ {tv}, %{tl} ], [ {ev}, %{el} ]"
+                ));
+                p.push_scalar(phi, bits, if cond { tvc } else { evc });
+            }
+            // ---- a fixed-bound counted loop: induction + accumulator phis, a loop-variant load
+            //      from @g[i] (exercises back-edges, phi lowering, and a variable GEP index) ----
+            16 => {
+                let n = 2 + g.u(5) as u64; // 2..=6 iterations — in-bounds for @g[i] and terminating
+                let (init, initc) = p.any_scalar(g, 64);
+                let pre = p.cur_block.clone();
+                let k = p.blk;
+                p.blk += 1;
+                let (hl, xl) = (format!("h{k}"), format!("x{k}"));
+                let (iv, accv, inext, accnext) = (p.fresh(), p.fresh(), p.fresh(), p.fresh());
+                p.emit(&format!("br label %{hl}"));
+                p.emit_label(&hl);
+                p.emit(&format!("{iv} = phi i64 [ 0, %{pre} ], [ {inext}, %{hl} ]"));
+                p.emit(&format!(
+                    "{accv} = phi i64 [ {init}, %{pre} ], [ {accnext}, %{hl} ]"
+                ));
+                let gp = p.fresh();
+                p.emit(&format!(
+                    "{gp} = getelementptr inbounds [16 x i32], ptr @g, i64 0, i64 {iv}"
+                ));
+                let gi = p.fresh();
+                p.emit(&format!("{gi} = load i32, ptr {gp}, align 4"));
+                let gis = p.fresh();
+                p.emit(&format!("{gis} = sext i32 {gi} to i64"));
+                p.emit(&format!("{accnext} = add i64 {accv}, {gis}"));
+                p.emit(&format!("{inext} = add i64 {iv}, 1"));
+                let lc = p.fresh();
+                p.emit(&format!("{lc} = icmp ult i64 {inext}, {n}"));
+                p.emit(&format!("br i1 {lc}, label %{hl}, label %{xl}"));
+                p.emit_label(&xl);
+                // The final accumulator (`{accnext}` in the header) dominates the exit (header is the
+                // exit's only predecessor). Compute the oracle by running the loop.
+                let mut acc = initc;
+                for i in 0..n {
+                    acc = acc.wrapping_add(sext(p.glob[i as usize] as u64, 32) as u64);
+                }
+                p.push_scalar(accnext, 64, acc);
+            }
+            // ---- call a pure helper (the call ABI: threaded data-SP, arg passing, scalar return) ----
+            17 => {
+                let hi = g.u(p.helpers.len());
+                let h = p.helpers[hi].clone();
+                let (a, av) = p.any_scalar(g, 64);
+                let (b, bv) = p.any_scalar(g, 64);
+                let d = p.fresh();
+                p.emit(&format!("{d} = call i64 @{}(i64 {a}, i64 {b})", h.name));
+                p.push_scalar(d, 64, h.eval(av, bv));
+            }
             // ---- build a vector by insertelement from scalars ----
             _ => {
                 let s = SHAPES[g.u(3)];
@@ -524,8 +734,18 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
     }
     p.emit(&format!("ret i64 {acc_name}"));
 
-    // Assemble the module: declare the min/max intrinsics used, define @run.
+    // Assemble the module: the read-only global (read via constexpr GEPs), the min/max intrinsic
+    // declarations, then define @run.
     let mut m = String::new();
+    let gelems: Vec<String> = p
+        .glob
+        .iter()
+        .map(|&v| format!("i32 {}", sext(v as u64, 32)))
+        .collect();
+    m.push_str(&format!(
+        "@g = internal constant [16 x i32] [{}]\n",
+        gelems.join(", ")
+    ));
     for s in SHAPES {
         for nm in ["smax", "smin", "umax", "umin"] {
             let tv = ty_str_vec(s);
@@ -534,6 +754,9 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 s.lanes, s.lane_bits
             ));
         }
+    }
+    for h in &p.helpers {
+        m.push_str(&h.define());
     }
     m.push_str("define i64 @run() {\nentry:\n");
     m.push_str(&p.body);
