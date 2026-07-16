@@ -228,12 +228,19 @@ tracked enhancement, not a blocker.
     (below) removes those first, then DFE applies. `OptConfig.dfe` toggle (default on), runs once after
     the per-function passes; output re-verified; debug info dropped on any removal. Tests in
     `tests/interproc.rs`; covered by the `opt_sccp` fuzz target (whole pipeline).
-  - [ ] **Budgeted direct-call inliner.** Structural CFG splice: split the caller block at a direct
-    `call`, splice the callee's blocks (values renumbered, block targets offset), rewrite each callee
-    `Return(vals)` to a `br` into the continuation block that takes the call's results as parameters.
-    Size/fuel budget + a recursion guard (don't inline a call already on the inline stack — cf. peval's
-    `is_recursion`). Reuses `map_operands`/`map_term_operands`/`remap_targets`. After inlining, the
-    now-uncalled leaf is swept by DFE — the end-to-end interprocedural story. Differential + fuzz.
+  - [x] **Budgeted direct-call inliner** (`svm_opt::interproc::inline_calls`): splices a **single-
+    block, straight-line** callee into a direct `call` site in place — its params bind to the call's
+    args, its instruction results take fresh caller-local indices where the call was, and the call's
+    result forwards to the callee's returned values (renumbered through the shared `map_operands`
+    map). No block split / cross-block threading, so the common leaf-helper case (the `a*3+b*5+7`
+    demo shape) is handled with the boring straight-line substitution; **multi-block callees stay
+    calls** (block-local SSA would need value threading through the inlined region — a later slice).
+    Module-wide instruction budget + `MAX_CALLEE_INSTS` size guard + direct-self-recursion skip bound
+    growth and guarantee termination. `OptConfig.inline` toggle (default on), runs first at module
+    scope so the per-function passes fold through the inlined bodies and DFE sweeps the now-uncalled
+    leaf — the end-to-end interprocedural story. Tests in `tests/interproc.rs` (leaf inlined +
+    DFE-removed, live code across the call site renumbered, multi-block callee left alone); the peval
+    differential suite + `opt_sccp` fuzz target now exercise it on real residuals.
   - [ ] **Constant-funcref devirtualization.** A `call_indirect`/`return_call_indirect` whose `idx` is
     a known constant `k` (from `ref.func k` or a `ConstI32 k`) and `funcs[k]`'s signature matches `ty`
     → rewrite to a direct `call`/`return_call` (identity-table resolution, cf. peval's

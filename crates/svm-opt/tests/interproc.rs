@@ -6,9 +6,27 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{BinOp, Block, Export, Func, FuncType, Inst, IntTy, Module, Terminator, ValType};
-use svm_opt::interproc::dead_func_elim;
+use svm_opt::interproc::{dead_func_elim, inline_calls};
 use svm_opt::optimize_module;
 use svm_verify::verify_module;
+
+fn mul(a: u32, b: u32) -> Inst {
+    Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Mul,
+        a,
+        b,
+    }
+}
+
+fn n_calls(m: &Module) -> usize {
+    m.funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i, Inst::Call { .. }))
+        .count()
+}
 
 fn run(m: &Module, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
     let mut fuel = 1_000_000u64;
@@ -113,8 +131,23 @@ fn drops_uncalled_function_and_renumbers() {
         assert_eq!(run(&opt, ph, &[Value::I32(a)]), Ok(vec![Value::I32(a * 2)]));
     }
 
-    // The full pipeline drops it too (DFE runs at the end of optimize_module).
-    assert_eq!(optimize_module(&m).funcs.len(), 3);
+    // The full pipeline is even stronger: it also *inlines* the single-block `a+1` helper into the
+    // entry, so that leaf becomes dead too — leaving just the entry and the exported helper (2 funcs).
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    assert_eq!(
+        opt.funcs.len(),
+        2,
+        "inline + DFE remove both the dead func and the inlined leaf"
+    );
+    let ph2 = opt.resolve_export("pub_helper").expect("export survives");
+    for a in [-5i32, 0, 7, 100] {
+        assert_eq!(run(&m, 0, &[Value::I32(a)]), run(&opt, 0, &[Value::I32(a)]));
+        assert_eq!(
+            run(&opt, ph2, &[Value::I32(a)]),
+            Ok(vec![Value::I32(a * 2)])
+        );
+    }
 }
 
 #[test]
@@ -165,5 +198,187 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
             "divergence at a={a}"
         );
         assert_eq!(run(&opt, 0, &[Value::I32(a)]), Ok(vec![Value::I32(a + 1)]));
+    }
+}
+
+/// `helper(a, b) = a*3 + b*5 + 7`, a single-block leaf.
+fn affine_helper() -> Func {
+    Func {
+        params: vec![ValType::I32, ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32, ValType::I32],
+            insts: vec![
+                Inst::ConstI32(3),
+                mul(0, 2), // a*3
+                Inst::ConstI32(5),
+                mul(1, 4), // b*5
+                add(3, 5), // a*3 + b*5
+                Inst::ConstI32(7),
+                add(6, 7), // + 7
+            ],
+            term: Terminator::Return(vec![8]),
+        }],
+    }
+}
+
+#[test]
+fn inlines_leaf_helper_then_dfe_removes_it() {
+    // func 0: entry(a,b) = helper(a,b) via a direct call. func 1: the leaf helper.
+    let entry = Func {
+        params: vec![ValType::I32, ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32, ValType::I32],
+            insts: vec![Inst::Call {
+                func: 1,
+                args: vec![0, 1],
+            }],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, affine_helper()],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    // Inlining alone: the call is spliced away (helper still present, now uncalled).
+    let inl = inline_calls(&m);
+    verify_module(&inl).expect("inlined re-verifies");
+    assert_eq!(n_calls(&inl), 0, "the direct call should be inlined away");
+    assert_eq!(
+        inl.funcs.len(),
+        2,
+        "inlining does not itself remove the callee"
+    );
+    for (a, b) in [(-3i32, 4i32), (0, 0), (7, 11), (100, -2)] {
+        assert_eq!(
+            run(&m, 0, &[Value::I32(a), Value::I32(b)]),
+            run(&inl, 0, &[Value::I32(a), Value::I32(b)]),
+            "divergence at ({a},{b})"
+        );
+    }
+
+    // Full pipeline: inline → fold → DFE collapses to a single self-contained function.
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    assert_eq!(
+        opt.funcs.len(),
+        1,
+        "the inlined leaf is DCE'd as a function"
+    );
+    assert_eq!(n_calls(&opt), 0);
+    for (a, b) in [(-3i32, 4i32), (0, 0), (7, 11), (100, -2)] {
+        let args = [Value::I32(a), Value::I32(b)];
+        assert_eq!(run(&m, 0, &args), run(&opt, 0, &args));
+        assert_eq!(run(&opt, 0, &args), Ok(vec![Value::I32(a * 3 + b * 5 + 7)]));
+    }
+}
+
+#[test]
+fn inlines_with_live_code_after_the_call() {
+    // entry(a) = inc(a) * 2, so a value flows *through* the call site and code runs after it — the
+    // renumbering across the splice must keep it correct.
+    let inc = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![Inst::ConstI32(1), add(0, 1)],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::Call {
+                    func: 1,
+                    args: vec![0],
+                }, // v1 = inc(a)
+                Inst::ConstI32(2),
+                mul(1, 2), // v3 = v1 * 2
+            ],
+            term: Terminator::Return(vec![3]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, inc],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    let inl = inline_calls(&m);
+    verify_module(&inl).expect("inlined re-verifies");
+    assert_eq!(n_calls(&inl), 0);
+    for a in [-5i32, 0, 3, 21] {
+        assert_eq!(
+            run(&m, 0, &[Value::I32(a)]),
+            run(&inl, 0, &[Value::I32(a)]),
+            "divergence at a={a}"
+        );
+        assert_eq!(
+            run(&inl, 0, &[Value::I32(a)]),
+            Ok(vec![Value::I32((a + 1) * 2)])
+        );
+    }
+}
+
+#[test]
+fn does_not_inline_a_multiblock_callee() {
+    // A two-block callee (internal control flow) must stay a call — inlining it in block-local SSA
+    // needs cross-block threading, deferred to a later slice.
+    let two_block = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32],
+                insts: vec![],
+                term: Terminator::Br {
+                    target: 1,
+                    args: vec![0],
+                },
+            },
+            Block {
+                params: vec![ValType::I32],
+                insts: vec![Inst::ConstI32(5), add(0, 1)],
+                term: Terminator::Return(vec![2]),
+            },
+        ],
+    };
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![Inst::Call {
+                func: 1,
+                args: vec![0],
+            }],
+            term: Terminator::Return(vec![1]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, two_block],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    let inl = inline_calls(&m);
+    assert_eq!(
+        n_calls(&inl),
+        1,
+        "a multi-block callee must not be inlined by this slice"
+    );
+    for a in [0i32, 4, 40] {
+        assert_eq!(
+            run(&m, 0, &[Value::I32(a)]),
+            run(&inl, 0, &[Value::I32(a)]),
+            "divergence at a={a}"
+        );
     }
 }
