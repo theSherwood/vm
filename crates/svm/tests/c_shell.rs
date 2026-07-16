@@ -94,6 +94,7 @@ long __px_unlink(int cap, long path, long len);
 long __px_getcwd(int cap, long buf, long size);
 long __px_chdir(int cap, long path, long len);
 long __px_getenv(int cap, long name, long len);
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long overwrite);
 void __px_exit(int cap, int code);
 long __px_opendir(int cap, long path, long len);
 long __px_readdir(int cap, long dir, long namebuf, long namecap);
@@ -111,6 +112,7 @@ long unlink(char *path) { return __px_unlink(0, (long)path, slen(path)); }
 char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 ? buf : 0; }
 long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
 char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
+long setenv_(char *name, char *val) { return __px_setenv(0, (long)name, slen(name), (long)val, slen(val), 1); }
 void exit(int code) { __px_exit(0, code); }
 /* A DIR is just the personality's stream handle (a long); readdir writes the next name. */
 long opendir(char *path) { return __px_opendir(0, (long)path, slen(path)); }
@@ -123,9 +125,10 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 
 /// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
 /// redirects (pointing globals `in_fd`/`out_fd` at the targets via `open`, restored after), then
-/// `exec_line` tokenizes the remainder into `argv[]` and runs one builtin — `echo` (with `$VAR` and
-/// `$?`), `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `rm`, `ls`, `true`/`false`,
-/// `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
+/// `exec_line` tokenizes the remainder into `argv[]`, sets a shell variable for a lone `NAME=VALUE`,
+/// then expands `$NAME`/`$?` tokens (shell vars shadow the environment) before running one builtin —
+/// `echo`, `export`, `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `rm`, `ls`,
+/// `true`/`false`, `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
 /// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
 /// and surfaced as `$?`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
 /// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
@@ -209,6 +212,49 @@ static int tokenize(char *line, char **argv) {
   return argc;
 }
 
+/* Shell variables (distinct from the personality environment until `export`ed). A tiny flat table:
+   name/value pairs in fixed storage, linear-scanned. */
+#define NVARS 32
+static char var_name[NVARS][32];
+static char var_val[NVARS][128];
+static int nvars = 0;
+static char *get_var(char *name) {
+  for (int i = 0; i < nvars; i++)
+    if (streq(var_name[i], name)) return var_val[i];
+  return 0;
+}
+static void set_var(char *name, char *val) {
+  int slot = -1;
+  for (int i = 0; i < nvars; i++)
+    if (streq(var_name[i], name)) { slot = i; break; }
+  if (slot < 0) { if (nvars >= NVARS) return; slot = nvars++; }
+  int i = 0; while (name[i] && i < 31) { var_name[slot][i] = name[i]; i++; } var_name[slot][i] = 0;
+  int j = 0; while (val[j] && j < 127) { var_val[slot][j] = val[j]; j++; } var_val[slot][j] = 0;
+}
+
+/* Format a non-negative integer into one of a few rotating static buffers (for `$?` expansion). */
+static char *itoa_(long n) {
+  static char ring[4][24]; static int k = 0;
+  char *b = ring[k]; k = (k + 1) & 3;
+  char t[24]; int ti = 0;
+  if (n == 0) t[ti++] = '0';
+  while (n > 0) { t[ti++] = '0' + (int)(n % 10); n /= 10; }
+  int bi = 0; while (ti > 0) b[bi++] = t[--ti]; b[bi] = 0;
+  return b;
+}
+
+/* Expand one token: `$?` → last status, `$NAME` → shell var then environment (empty if unset), else
+   the token unchanged. Returned pointers stay valid for the command's duration. */
+static char *expand(char *tok) {
+  if (tok[0] != '$') return tok;
+  char *name = tok + 1;
+  if (streq(name, "?")) return itoa_(last_status);
+  char *v = get_var(name);
+  if (v) return v;
+  v = getenv(name);
+  return v ? v : "";
+}
+
 /* Evaluate `test`/`[ … ]` and return a shell status (0 = true). Supports: a lone non-empty string;
    unary `-f`/`-d`/`-e` (file / dir / either exists), `-z`/`-n` (empty / non-empty); and binary
    `=`/`!=` (string) and `-eq`/`-ne`/`-lt`/`-gt` (numeric). Anything else is false. */
@@ -249,18 +295,34 @@ static int exec_line(char *line) {
   char *argv[MAXARGS];
   int argc = tokenize(line, argv);
   if (argc == 0) return 0;
+  /* A lone `NAME=VALUE` (identifier before `=`) sets a shell variable, expanding the RHS. */
+  if (argc == 1) {
+    char *t = argv[0]; int eq = -1;
+    for (int j = 0; t[j]; j++) {
+      char c = t[j];
+      if (c == '=') { eq = j; break; }
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) break;
+    }
+    if (eq > 0) { t[eq] = 0; set_var(t, expand(t + eq + 1)); return 0; }
+  }
+  /* Expand `$`-tokens in place before dispatch. */
+  for (int i = 0; i < argc; i++) argv[i] = expand(argv[i]);
   char *cmd = argv[0];
   char *arg = argc > 1 ? argv[1] : 0;
   int st = 0;
   if (streq(cmd, "echo")) {
     for (int i = 1; i < argc; i++) {
-      char *a = argv[i];
-      if (streq(a, "$?")) put_num(last_status);
-      else if (a[0] == '$') { char *v = getenv(a + 1); if (v) puts_(v); }
-      else puts_(a);
+      puts_(argv[i]);
       if (i + 1 < argc) puts_(" ");
     }
     puts_("\n");
+  } else if (streq(cmd, "export")) {
+    for (int i = 1; i < argc; i++) {
+      char *e = argv[i]; int eq = -1;
+      for (int j = 0; e[j]; j++) if (e[j] == '=') { eq = j; break; }
+      if (eq >= 0) { e[eq] = 0; char *v = expand(e + eq + 1); set_var(e, v); setenv_(e, v); }
+      else { char *v = get_var(e); setenv_(e, v ? v : ""); }
+    }
   } else if (streq(cmd, "true")) {
     st = 0;
   } else if (streq(cmd, "false")) {
@@ -907,4 +969,52 @@ fn stage0_shell_pipeline_from_stdin_redirect() {
         jout, iout,
         "jit: pipeline-from-stdin output must match interp"
     );
+}
+
+/// Shell variables: `NAME=VALUE` sets a shell var, `$NAME` (a whole token) expands it in any argument
+/// position (not just echo), a shell var shadows an environment var of the same name, and a `$NAME`
+/// RHS composes. An unset variable token expands to nothing (an empty line here).
+#[test]
+fn stage0_shell_variables() {
+    let (iout, jout) = run_shell(
+        b"X=hello\n\
+          echo $X world\n\
+          Y=$X\n\
+          echo $Y\n\
+          echo $UNSET\n\
+          echo $X > /vf\n\
+          cat /vf\n\
+          WHO=shellvar\n\
+          echo $WHO\n",
+        &[("WHO", "envvar")],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"hello world\nhello\n\nhello\nshellvar\n",
+        "interp: assignment, expansion everywhere, shadowing, unset->empty"
+    );
+    assert_eq!(jout, iout, "jit: variable output must match interp");
+}
+
+/// `export` promotes a shell variable into the personality environment (`setenv`). Both
+/// `export NAME=VALUE` and `export NAME` (of an existing shell var) make the value observable —
+/// expansion confirms it round-trips.
+#[test]
+fn stage0_shell_export_to_env() {
+    let (iout, jout) = run_shell(
+        b"export FOO=fooval\n\
+          echo $FOO\n\
+          BAR=barval\n\
+          export BAR\n\
+          echo $BAR\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"fooval\nbarval\n",
+        "interp: export NAME=VALUE and export NAME both reach env"
+    );
+    assert_eq!(jout, iout, "jit: export output must match interp");
 }
