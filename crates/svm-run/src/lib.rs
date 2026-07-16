@@ -2823,6 +2823,7 @@ fn run_powerbox_inner(
     let inst = Instance {
         module: module.clone(),
         binding: None,
+        hooks: None,
     };
     let config = RunConfig {
         limits: Limits {
@@ -3453,6 +3454,82 @@ pub struct Instance {
     // `Some` when built via `instantiate_with_imports` (name-bound capabilities); `None` for the fixed
     // powerbox preset (`instantiate`).
     binding: Option<NamedBinding>,
+    // `Some` when this instance opted into memory-access hooks ([`Instance::with_mem_hooks`]): the
+    // module has been instrumented and every run must grant the hook capability first.
+    hooks: Option<MemHooks>,
+}
+
+/// One guest memory access, reported to a [`Instance::with_mem_hooks`] handler **before** the
+/// access executes (pre-confinement-check, so a faulting run's final event is the *attempted*
+/// faulting access). `addr` is the effective guest address (base + immediate offset). Bulk ops are
+/// one event carrying their span operands — `Copy` covers both `mem.copy` and `mem.move`;
+/// consumers expand spans themselves. v128 accesses are `Load`/`Store` with `width` 16.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemEvent {
+    Load { addr: u64, width: u32 },
+    Store { addr: u64, width: u32 },
+    AtomicLoad { addr: u64, width: u32 },
+    AtomicStore { addr: u64, width: u32 },
+    AtomicRmw { addr: u64, width: u32 },
+    AtomicCmpxchg { addr: u64, width: u32 },
+    Copy { dst: u64, src: u64, len: u64 },
+    Fill { dst: u64, len: u64 },
+}
+
+/// A per-host memory-hook handler: observe each [`MemEvent`]; return `Err(Trap)` to veto — the run
+/// aborts with that trap, with ordinary backend-identical cap-trap semantics.
+pub type MemHookFn = Box<dyn FnMut(MemEvent) -> Result<(), Trap> + Send>;
+
+/// The hook binding a hooked [`Instance`] carries: a re-buildable handler factory (called once per
+/// host — [`Instance::run_diff`] grants two hosts that must agree) plus the capability handle the
+/// instrumented code baked in as a constant.
+#[derive(Clone)]
+struct MemHooks {
+    make: Arc<dyn Fn() -> MemHookFn + Send + Sync>,
+    handle: i32,
+}
+
+/// Decode a hook `cap.call` (`op` = event kind, `args` per `svm_opt::instrument::mem_hook_op`)
+/// into its [`MemEvent`]. `None` is malformed — unreachable from a module the pass produced.
+fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
+    use svm_opt::instrument::mem_hook_op as k;
+    let addr = |i: usize| args.get(i).copied().map(|v| v as u64);
+    Some(match (op, args.len()) {
+        (k::LOAD, 2) => MemEvent::Load {
+            addr: addr(0)?,
+            width: args[1] as u32,
+        },
+        (k::STORE, 2) => MemEvent::Store {
+            addr: addr(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_LOAD, 2) => MemEvent::AtomicLoad {
+            addr: addr(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_STORE, 2) => MemEvent::AtomicStore {
+            addr: addr(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_RMW, 2) => MemEvent::AtomicRmw {
+            addr: addr(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_CMPXCHG, 2) => MemEvent::AtomicCmpxchg {
+            addr: addr(0)?,
+            width: args[1] as u32,
+        },
+        (k::COPY, 3) => MemEvent::Copy {
+            dst: addr(0)?,
+            src: addr(1)?,
+            len: addr(2)?,
+        },
+        (k::FILL, 2) => MemEvent::Fill {
+            dst: addr(0)?,
+            len: addr(1)?,
+        },
+        _ => return None,
+    })
 }
 
 /// Resolve `module`'s §7 named capability imports under the reference host policy
@@ -3470,6 +3547,7 @@ pub fn instantiate(module: Module) -> Result<Instance, String> {
     Ok(Instance {
         module: resolved,
         binding: None,
+        hooks: None,
     })
 }
 
@@ -3504,6 +3582,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
     Ok(Instance {
         module: resolved,
         binding: Some(NamedBinding { imports, order }),
+        hooks: None,
     })
 }
 
@@ -3511,6 +3590,67 @@ impl Instance {
     /// The resolved, verified module (function 0 is the powerbox `_start`).
     pub fn module(&self) -> &Module {
         &self.module
+    }
+
+    /// Opt this instance into **memory-access hooks**: rewrite its module so every guest memory op
+    /// (loads, stores, v128, atomics, `mem.copy`/`move`/`fill`) announces itself to `make`'s
+    /// handler *before* it executes, re-verify the result (fail-closed, like every rewrite pass),
+    /// and auto-grant the handler as a host capability on every run. The instrumented module is an
+    /// ordinary module, so this works on **every backend** — and programs that don't opt in are
+    /// byte-for-byte untouched (no engine changes anywhere; the zero-cost path is structural).
+    ///
+    /// `make` builds a fresh handler per host: [`Instance::run_diff`] runs two backends under two
+    /// hosts, so shared consumer state belongs behind an `Arc` inside the closure. The handler
+    /// observes and may veto (`Err(Trap)` aborts the run with that trap).
+    ///
+    /// Costs, for the opted-in run only: one `cap.call` (plus a couple of consts) per memory op —
+    /// so more fuel than the pristine module (scale [`Limits::fuel`]) — and the module's
+    /// `debug_info` is dropped (its per-inst positions would be stale after insertion). Not
+    /// reported: host-side `GuestMem` accesses from other capability handlers, futex word touches,
+    /// and accesses a frontend's SSA promotion removed before the IR existed.
+    pub fn with_mem_hooks(
+        self,
+        make: impl Fn() -> MemHookFn + Send + Sync + 'static,
+    ) -> Result<Instance, String> {
+        // Discover the handle the hook grant will mint: grants are deterministic and `grant_caps`
+        // grants the hook first on each run's fresh Host, so a scratch first-grant yields exactly
+        // the value the instrumented code must bake in as its `cap.call` handle constant.
+        let handle = {
+            let mut scratch = Host::new();
+            scratch.grant_host_fn(Box::new(|_, _, _| Ok(vec![])))
+        };
+        let spec = svm_opt::instrument::MemHookSpec {
+            type_id: iface::HOST_FN,
+            handle,
+        };
+        let (m, _stats) = svm_opt::instrument::instrument_mem_hooks(&self.module, spec);
+        svm_verify::verify_module(&m)
+            .map_err(|e| format!("mem-hook instrumented module failed re-verification: {e:?}"))?;
+        Ok(Instance {
+            module: m,
+            binding: self.binding,
+            hooks: Some(MemHooks {
+                make: Arc::new(make),
+                handle,
+            }),
+        })
+    }
+
+    /// Grant the mem-hook capability, when this instance carries one. **Must be the first grant on
+    /// `h`** — the instrumented module baked the handle a fresh host's first grant mints; asserted
+    /// fail-closed (a mismatch would make every hook `cap.call` an inert `CapFault`).
+    fn grant_mem_hooks(&self, h: &mut Host) {
+        let Some(hooks) = &self.hooks else { return };
+        let mut hook = (hooks.make)();
+        let handle = h.grant_host_fn(Box::new(move |op, args, _mem| {
+            let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
+            hook(ev)?;
+            Ok(vec![])
+        }));
+        assert_eq!(
+            handle, hooks.handle,
+            "mem-hook grant must be the first grant on a fresh Host (deterministic handles)"
+        );
     }
 
     /// Run the named export and return its outcome plus captured stdout/stderr.
@@ -3690,6 +3830,8 @@ impl Instance {
     /// order: the name-bound registry (import order, slot i ↔ import i) when present, else the fixed
     /// §3e powerbox prefix.
     fn grant_caps(&self, h: &mut Host, win: u64) -> Vec<Value> {
+        // Hooks first: the instrumented module bakes the handle of a fresh host's first grant.
+        self.grant_mem_hooks(h);
         match &self.binding {
             Some(b) => {
                 // Inert unless a granted cap needs them (region-backed / Jit caps).
@@ -3727,6 +3869,14 @@ impl Instance {
     /// Run a bare (non-powerbox) export with `args` on both backends, assert they agree, and return
     /// the outcome (no host capabilities granted — the escape hatch for pure kernel functions).
     fn run_kernel_diff(&self, fidx: FuncIdx, args: &[Value]) -> Result<Run, String> {
+        if self.hooks.is_some() {
+            // The bare-kernel JIT path runs hostless, so the hook capability has nowhere to live.
+            return Err(
+                "a mem-hooked instance runs through the powerbox entry (`run`/`run_with_caps`/\
+                 `run_diff`/`call(\"_start\")`), not a bare kernel export"
+                    .into(),
+            );
+        }
         let m = &self.module;
         let mut h = Host::new();
         let mut fuel = 50_000_000u64;

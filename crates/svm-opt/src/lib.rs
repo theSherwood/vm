@@ -82,6 +82,7 @@ use svm_ir::{
 
 pub mod cfg;
 pub mod gvn;
+pub mod instrument;
 pub mod licm;
 pub mod reassociate;
 pub mod sccp;
