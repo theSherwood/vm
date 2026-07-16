@@ -135,21 +135,24 @@ try {
   play.on('console', (m) => console.log(`  [play] ${m.text()}`));
   play.on('pageerror', (e) => console.log(`  [play pageerror] ${e.message}`));
   await play.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
-  await play.waitForFunction(() => document.getElementById('state').dataset.state === 'ready',
+  await play.waitForFunction(() => document.getElementById('engine-state').dataset.state === 'ready',
     { timeout: 30_000 });
 
-  const runPlay = async (example) => {
-    if (example) await play.selectOption('#example', example);
-    await play.click('#run');
+  // Each demo is a self-contained card addressed by its data-demo attribute (the EXAMPLES key); its
+  // Run/Stop/state/result/stdout/canvas live inside it.
+  const card = (name) => `[data-demo="${name}"]`;
+  const runPlay = async (name) => {
+    const sel = card(name);
+    await play.click(`${sel} .run`);
     await play.waitForFunction(
-      () => ['done', 'error', 'stopped'].includes(document.getElementById('state').dataset.state),
-      { timeout: 30_000 },
+      (s) => ['done', 'error', 'stopped'].includes(document.querySelector(s).dataset.state),
+      `${sel} .state`, { timeout: 30_000 },
     );
     return {
-      state: await play.$eval('#state', (e) => e.dataset.state),
-      status: await play.$eval('#state', (e) => e.textContent),
-      result: await play.$eval('#result', (e) => e.textContent),
-      stdout: await play.$eval('#stdout', (e) => e.textContent),
+      state: await play.$eval(`${sel} .state`, (e) => e.dataset.state),
+      status: await play.$eval(`${sel} .state`, (e) => e.textContent),
+      result: await play.$eval(`${sel} .result`, (e) => e.textContent),
+      stdout: await play.$eval(`${sel} .stdout`, (e) => e.textContent),
     };
   };
 
@@ -170,12 +173,11 @@ try {
   check('jit (§22)', await runPlay('jit'), '1136');
   check('inst (§14)', await runPlay('inst'), '40');
 
-  // Negative: garbage source must come back as a parse error message (state 'error'). The source
-  // pane is a CodeMirror editor (it hides the underlying textarea), so set its value through the CM
-  // instance rather than filling the textarea directly.
-  await play.evaluate((t) => document.querySelector('.CodeMirror').CodeMirror.setValue(t),
-    'func ( this is not svm text');
-  const bad = await runPlay(null);
+  // Negative: garbage source must come back as a parse error message (state 'error'). Set the hello
+  // card's CodeMirror value (it hides the underlying textarea) and run that card.
+  await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue('func ( this is not svm text'),
+    card('hello'));
+  const bad = await runPlay('hello');
   const badOk = bad.state === 'error' && bad.status.includes('parse error');
   checks.push(badOk);
   console.log(`  play/parse-reject: state=${bad.state} msg=${JSON.stringify(bad.status)} ` +
@@ -183,8 +185,6 @@ try {
 
   // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
   // `svm_run_onramp` (not the text/`svm_parse` path). Uses the committed `web/assets/hello_c.svmb`.
-  // Runs last: selecting it makes the source editor read-only (it's a binary module, not editable
-  // SVM text), which would reject the editor `setValue` in the parse-reject check above.
   check('hello (C → SVM, on-ramp module)', await runPlay('hello (C → SVM)'), '0', 'hello, sandbox!\n');
 
   // The framebuffer output path (the `display` capability): the gradient guest presents a 128×128
@@ -192,13 +192,13 @@ try {
   // pixel matching the guest's analytic gradient — R ramps across X, G down Y (top-left ≈ black).
   {
     const grad = await runPlay('gradient (C → framebuffer)');
-    const canvas = await play.evaluate(() => {
-      const c = document.getElementById('canvas');
-      if (c.style.display === 'none' || !c.width || !c.height) return null;
+    const canvas = await play.evaluate((s) => {
+      const c = document.querySelector(`${s} .canvas`);
+      if (c.hidden || !c.width || !c.height) return null;
       const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
       const px = (x, y) => Array.from(d.slice((y * c.width + x) * 4, (y * c.width + x) * 4 + 4));
       return { w: c.width, h: c.height, topLeft: px(0, 0), bottomRight: px(c.width - 1, c.height - 1) };
-    });
+    }, card('gradient (C → framebuffer)'));
     const gradOk = grad.state === 'done' && canvas && canvas.w === 128 && canvas.h === 128 &&
       canvas.topLeft[0] === 0 && canvas.topLeft[1] === 0 && canvas.topLeft[3] === 255 &&
       canvas.bottomRight[0] === 255 && canvas.bottomRight[1] === 255 && canvas.bottomRight[3] === 255;
@@ -212,9 +212,10 @@ try {
   // keys through the keyboard capability without trapping. (The exact input→motion mapping is pinned
   // deterministically by the native `reactor.rs` test; here we prove the loop runs in a real browser.)
   {
-    // Leftmost x of the amber box (255,220,40) on the canvas, or -1 if not found / no frame yet.
-    const boxX = () => play.evaluate(() => {
-      const c = document.getElementById('canvas');
+    const B = card('bounce (interactive — arrow keys)');
+    // Leftmost x of the amber box (255,220,40) on the card's canvas, or -1 if not found / no frame yet.
+    const boxX = () => play.evaluate((s) => {
+      const c = document.querySelector(`${s} .canvas`);
       if (!c.width || !c.height) return -1;
       const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
       for (let x = 0; x < c.width; x++)
@@ -223,15 +224,14 @@ try {
           if (d[i] === 255 && d[i + 1] === 220 && d[i + 2] === 40) return x;
         }
       return -1;
-    });
-    await play.selectOption('#example', 'bounce (interactive — arrow keys)');
-    await play.click('#run');
-    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'running',
-      { timeout: 30_000 });
+    }, B);
+    await play.click(`${B} .run`);
+    await play.waitForFunction((s) => document.querySelector(`${s} .state`).dataset.state === 'running',
+      B, { timeout: 30_000 });
     // Wait for the first frame (canvas sized to the guest's 160×120), then sample across ~200ms.
-    await play.waitForFunction(() => document.getElementById('canvas').width === 160, { timeout: 5000 });
-    const w = await play.$eval('#canvas', (c) => c.width);
-    const h = await play.$eval('#canvas', (c) => c.height);
+    await play.waitForFunction((s) => document.querySelector(`${s} .canvas`).width === 160, B, { timeout: 5000 });
+    const w = await play.$eval(`${B} .canvas`, (c) => c.width);
+    const h = await play.$eval(`${B} .canvas`, (c) => c.height);
     const a = await boxX();
     await play.waitForTimeout(200);
     const b = await boxX();
@@ -239,10 +239,10 @@ try {
     for (let i = 0; i < 6; i++) await play.keyboard.press('ArrowLeft');
     await play.waitForTimeout(150);
     const c = await boxX();
-    const stateRunning = await play.$eval('#state', (e) => e.dataset.state);
-    await play.click('#stop');
-    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'stopped',
-      { timeout: 5000 });
+    const stateRunning = await play.$eval(`${B} .state`, (e) => e.dataset.state);
+    await play.click(`${B} .stop`);
+    await play.waitForFunction((s) => document.querySelector(`${s} .state`).dataset.state === 'stopped',
+      B, { timeout: 5000 });
     const bounceOk = w === 160 && h === 120 && a >= 0 && b >= 0 && c >= 0 && a !== b &&
       stateRunning === 'running';
     checks.push(bounceOk);
@@ -255,9 +255,10 @@ try {
   // frame — so a moving glider in the browser is the end-to-end heap-persistence proof. Sample the
   // glider's bounding-box top-left: 5 live cells always, position advancing over generations.
   {
-    // {count, minX, minY} of the amber live cells (255,200,40) on the canvas.
-    const cells = () => play.evaluate(() => {
-      const c = document.getElementById('canvas');
+    const L = card('life (Conway — heap persistence)');
+    // {count, minX, minY} of the amber live cells (255,200,40) on the card's canvas.
+    const cells = () => play.evaluate((s) => {
+      const c = document.querySelector(`${s} .canvas`);
       if (!c.width || !c.height) return null;
       const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
       let n = 0, minx = 1e9, miny = 1e9;
@@ -267,18 +268,17 @@ try {
           if (d[i] === 255 && d[i + 1] === 200 && d[i + 2] === 40) { n++; minx = Math.min(minx, x); miny = Math.min(miny, y); }
         }
       return { w: c.width, h: c.height, n, minx, miny };
-    });
-    await play.selectOption('#example', 'life (Conway — heap persistence)');
-    await play.click('#run');
-    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'running',
-      { timeout: 30_000 });
-    await play.waitForFunction(() => document.getElementById('canvas').width === 96, { timeout: 5000 });
+    }, L);
+    await play.click(`${L} .run`);
+    await play.waitForFunction((s) => document.querySelector(`${s} .state`).dataset.state === 'running',
+      L, { timeout: 30_000 });
+    await play.waitForFunction((s) => document.querySelector(`${s} .canvas`).width === 96, L, { timeout: 5000 });
     const a = await cells();
     await play.waitForTimeout(300);
     const b = await cells();
-    await play.click('#stop');
-    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'stopped',
-      { timeout: 5000 });
+    await play.click(`${L} .stop`);
+    await play.waitForFunction((s) => document.querySelector(`${s} .state`).dataset.state === 'stopped',
+      L, { timeout: 5000 });
     // 5 live cells (a glider) throughout, and the bounding-box top-left advanced (heap persisted).
     const lifeOk = a && b && a.w === 96 && a.h === 64 && a.n === 5 && b.n === 5 &&
       (b.minx > a.minx || b.miny > a.miny);
@@ -294,16 +294,16 @@ try {
   // proof that a real database runs in the browser. Boot is multi-second — a generous timeout.
   if (existsSync(join(ROOT, 'web/assets/postgres_resolved.svmb')) &&
       existsSync(join(ROOT, 'web/assets/pgdata.img'))) {
-    await play.selectOption('#example', 'PostgreSQL (17.5 — write & run SQL)');
-    await play.click('#run');
+    const P = card('PostgreSQL (17.5 — write & run SQL)');
+    await play.click(`${P} .run`);
     await play.waitForFunction(
-      () => ['done', 'error'].includes(document.getElementById('state').dataset.state),
-      { timeout: 180_000 },
+      (s) => ['done', 'error'].includes(document.querySelector(`${s} .state`).dataset.state),
+      P, { timeout: 180_000 },
     );
     const pg = {
-      state: await play.$eval('#state', (e) => e.dataset.state),
-      status: await play.$eval('#state', (e) => e.textContent),
-      stdout: await play.$eval('#stdout', (e) => e.textContent),
+      state: await play.$eval(`${P} .state`, (e) => e.dataset.state),
+      status: await play.$eval(`${P} .state`, (e) => e.textContent),
+      stdout: await play.$eval(`${P} .stdout`, (e) => e.textContent),
     };
     const want = ['PostgreSQL stand-alone backend', 's = "three"', 'count'];
     const missing = want.filter((w) => !pg.stdout.includes(w));
