@@ -126,7 +126,8 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 /// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
 /// redirects (pointing globals `in_fd`/`out_fd` at the targets via `open`, restored after), then
 /// `exec_line` tokenizes the remainder into `argv[]`, sets a shell variable for a lone `NAME=VALUE`,
-/// then expands `$NAME`/`$?` tokens (shell vars shadow the environment) before running one builtin —
+/// then expands `$NAME`/`$?` tokens (shell vars shadow the environment) and glob tokens (`*`/`?`
+/// matched against the memfs, `dir/name` results, literal if no match) before running one builtin —
 /// `echo`, `export`, `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `sort`, `uniq`, `rm`,
 /// `ls`, `true`/`false`, `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
 /// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
@@ -209,8 +210,9 @@ static long read_line(long fd, char *buf, long lim) {
 }
 
 /* Split `line` into space-separated tokens (runs of spaces collapse), writing pointers into argv and
-   returning the count (capped at MAXARGS). Mutates `line` in place with NUL terminators. */
-#define MAXARGS 16
+   returning the count (capped at MAXARGS). Mutates `line` in place with NUL terminators. The cap is
+   generous so glob expansion (which grows argv) has room. */
+#define MAXARGS 64
 static int tokenize(char *line, char **argv) {
   int argc = 0, i = 0;
   for (;;) {
@@ -299,6 +301,47 @@ static int do_test(int argc, char **argv) {
   return 1;
 }
 
+/* Glob match with `*` (any run, incl. empty) and `?` (one char). Iterative with backtracking. */
+static int fnmatch_(char *p, char *s) {
+  char *star = 0, *ss = 0;
+  while (*s) {
+    if (*p == '?' || *p == *s) { p++; s++; }
+    else if (*p == '*') { star = p++; ss = s; }
+    else if (star) { p = star + 1; s = ++ss; }
+    else return 0;
+  }
+  while (*p == '*') p++;
+  return *p == 0;
+}
+
+/* Expand a glob token into matching absolute paths, appending pointers (into `store`) to `out`. The
+   token is split at its last `/` into a directory (default: cwd) and a pattern; each directory entry
+   matching the pattern yields `dir/name`. Returns the number of matches appended. */
+static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *sn, int cap) {
+  int last = -1;
+  for (int i = 0; tok[i]; i++) if (tok[i] == '/') last = i;
+  static char dir[256]; char *pat;
+  if (last < 0) { getcwd(dir, 256); pat = tok; }
+  else if (last == 0) { dir[0] = '/'; dir[1] = 0; pat = tok + 1; }
+  else { int k = 0; while (k < last && k < 255) { dir[k] = tok[k]; k++; } dir[k] = 0; pat = tok + last + 1; }
+  long d = opendir(dir);
+  if (d < 0) return 0;
+  static char name[256]; int matched = 0;
+  while (readdir(d, name, 256) > 0) {
+    if (!fnmatch_(pat, name)) continue;
+    if (*oc >= cap || *sn >= 64) break;
+    char *g = store[*sn];
+    int p = 0, k = 0;
+    while (dir[k] && p < 254) g[p++] = dir[k++];
+    if (p == 0 || g[p - 1] != '/') g[p++] = '/';
+    k = 0; while (name[k] && p < 255) g[p++] = name[k++];
+    g[p] = 0;
+    out[(*oc)++] = g; (*sn)++; matched++;
+  }
+  closedir(d);
+  return matched;
+}
+
 /* Execute one command after redirection has been stripped. `line` is tokenized into argv; builtins
    read their input from a path argument or, absent one, the (possibly redirected) in_fd. Returns the
    command's exit status (0 = success). */
@@ -318,6 +361,24 @@ static int exec_line(char *line) {
   }
   /* Expand `$`-tokens in place before dispatch. */
   for (int i = 0; i < argc; i++) argv[i] = expand(argv[i]);
+  /* Glob-expand any token containing `*`/`?` against the memfs; a token with no match stays literal
+     (bash's default nullglob-off). Rebuild argv from the expansion. */
+  {
+    static char gstore[64][256];
+    char *gbuf[MAXARGS];
+    int gn = 0, ac2 = 0;
+    for (int i = 0; i < argc && ac2 < MAXARGS; i++) {
+      char *tok = argv[i];
+      int has = 0;
+      for (int j = 0; tok[j]; j++) if (tok[j] == '*' || tok[j] == '?') { has = 1; break; }
+      if (!has) { gbuf[ac2++] = tok; continue; }
+      int m = glob_expand(tok, gbuf, &ac2, gstore, &gn, MAXARGS);
+      if (m == 0 && ac2 < MAXARGS) gbuf[ac2++] = tok;
+    }
+    for (int i = 0; i < ac2; i++) argv[i] = gbuf[i];
+    argc = ac2;
+  }
+  if (argc == 0) return 0;
   char *cmd = argv[0];
   char *arg = argc > 1 ? argv[1] : 0;
   int st = 0;
@@ -346,13 +407,16 @@ static int exec_line(char *line) {
   } else if (streq(cmd, "cd")) {
     if (arg) chdir(arg);
   } else if (streq(cmd, "cat")) {
-    int ci; long fd = src_fd(arg, &ci);
-    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
-    else {
-      static char buf[256];
-      long r;
-      while ((r = read(fd, buf, 256)) > 0) write(out_fd, buf, r);
-      if (ci) close(fd);
+    static char buf[256];
+    long r;
+    if (argc > 1) {
+      for (int ai = 1; ai < argc; ai++) {          /* concatenate each file argument */
+        long fd = open(argv[ai], 0);
+        if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 1; }
+        else { while ((r = read(fd, buf, 256)) > 0) write(out_fd, buf, r); close(fd); }
+      }
+    } else {
+      while ((r = read(in_fd, buf, 256)) > 0) write(out_fd, buf, r);   /* no args: stream in_fd */
     }
   } else if (streq(cmd, "wc")) {
     int ci; long fd = src_fd(arg, &ci);
@@ -1075,4 +1139,31 @@ fn stage0_shell_sort_uniq_pipeline() {
         "interp: sort orders, uniq collapses adjacent dups, over a 3-stage pipe"
     );
     assert_eq!(jout, iout, "jit: sort/uniq output must match interp");
+}
+
+/// Globbing: `*` expands against the memfs into sorted `dir/name` matches, feeding multi-file
+/// builtins (`echo`, `cat`, `rm`); a pattern with no match stays literal (nullglob-off). Exercises
+/// `fnmatch_` + `glob_expand` driving `opendir`/`readdir`.
+#[test]
+fn stage0_shell_globbing() {
+    let (iout, jout) = run_shell(
+        b"echo one > /a1\n\
+          echo two > /a2\n\
+          echo three > /b1\n\
+          echo /a*\n\
+          cat /a*\n\
+          echo /z*\n\
+          rm /a*\n\
+          cat /a1\n",
+        &[],
+        &[],
+        &[],
+    );
+    // `/a*` → /a1 /a2 (sorted); cat concatenates both; `/z*` has no match so stays literal; rm /a*
+    // removes both, so the final cat misses.
+    assert_eq!(
+        iout, b"/a1 /a2\none\ntwo\n/z*\n/a1: not found\n",
+        "interp: glob expands, feeds cat/rm, and is literal on no match"
+    );
+    assert_eq!(jout, iout, "jit: globbing output must match interp");
 }
