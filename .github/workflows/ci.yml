@@ -333,6 +333,10 @@ jobs:
             -Clink-arg=--export=__wasm_init_tls" \
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
           node browser-test.mjs
+          # wasm-JIT reactor differential: each committed reactor guest (bounce/life/mandelzoom) must
+          # render byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining).
+          # Reuses the threads module built above + the committed `.svmb` assets — no extra toolchain.
+          node browser-jit-reactor-test.mjs
 
   embench-differential:
     # Whole-stack differential on the real Embench-IoT suite — every engine's `verify` must equal
