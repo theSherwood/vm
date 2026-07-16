@@ -27,6 +27,9 @@ use svm_ir::{FuncIdx, Module, Resolved, ValType};
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
 pub use svm_interp::{Quota, Value};
+// Re-export the mem-hook instrumentation stats so [`Instance::mem_hook_stats`] consumers need not
+// also depend on `svm-opt`.
+pub use svm_opt::instrument::MemHookStats;
 pub mod fs;
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 pub use svm_peval::{SpecArg, SpecConfig};
@@ -3487,6 +3490,7 @@ pub type MemHookFn = Box<dyn FnMut(MemEvent) -> Result<(), Trap> + Send>;
 struct MemHooks {
     make: Arc<dyn Fn() -> MemHookFn + Send + Sync>,
     handle: i32,
+    stats: MemHookStats,
 }
 
 /// Decode a hook `cap.call` (`op` = event kind, `args` per `svm_opt::instrument::mem_hook_op`)
@@ -3623,7 +3627,7 @@ impl Instance {
             type_id: iface::HOST_FN,
             handle,
         };
-        let (m, _stats) = svm_opt::instrument::instrument_mem_hooks(&self.module, spec);
+        let (m, stats) = svm_opt::instrument::instrument_mem_hooks(&self.module, spec);
         svm_verify::verify_module(&m)
             .map_err(|e| format!("mem-hook instrumented module failed re-verification: {e:?}"))?;
         Ok(Instance {
@@ -3632,8 +3636,16 @@ impl Instance {
             hooks: Some(MemHooks {
                 make: Arc::new(make),
                 handle,
+                stats,
             }),
         })
+    }
+
+    /// What instrumentation did to this instance's module, or `None` if it never opted into hooks
+    /// ([`Instance::with_mem_hooks`]). `inserted_insts` is the extra per-execution op count — the
+    /// knob for scaling [`Limits::fuel`] on hooked runs relative to the pristine module.
+    pub fn mem_hook_stats(&self) -> Option<MemHookStats> {
+        self.hooks.as_ref().map(|h| h.stats)
     }
 
     /// Grant the mem-hook capability, when this instance carries one. **Must be the first grant on

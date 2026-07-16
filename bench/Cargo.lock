@@ -1347,6 +1347,7 @@ dependencies = [
  "svm-ir",
  "svm-jit",
  "svm-llvm",
+ "svm-run",
  "svm-text",
  "svm-wasm",
  "wasmtime",
@@ -1367,6 +1368,13 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "svm-fs"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
 ]
 
 [[package]]
@@ -1420,6 +1428,41 @@ name = "svm-mem"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "svm-opt"
+version = "0.0.0"
+dependencies = [
+ "libm",
+ "svm-ir",
+ "svm-verify",
+]
+
+[[package]]
+name = "svm-peval"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+ "svm-opt",
+ "svm-verify",
+]
+
+[[package]]
+name = "svm-run"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "svm-encode",
+ "svm-fs",
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-opt",
+ "svm-peval",
+ "svm-text",
+ "svm-verify",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

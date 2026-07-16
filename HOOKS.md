@@ -121,10 +121,21 @@ construction. The only touched crates are `svm-opt` (a new, never-called-by-defa
 Benchmark A/B against `bench/baseline.txt` is still worth running on any commit that later
 touches an engine file; for this change the diff itself is the proof.
 
-Hooked-run cost (measured expectations, not gates): one `cap.call` + 1–3 consts per memory op —
-roughly 50–100 ns/event on the interpreters, ~10–20 ns/event on the JIT, on top of whatever the
-consumer's handler does. Adequate for scoring a student program (≤10⁹ accesses in
-seconds-to-minutes); not aimed at >10⁷ events/s tracing.
+Hooked-run cost is **measured** by the overhead probe (`bench/`, `cargo run --release --bin
+hooks`): a counting hook (one relaxed `fetch_add` per event) on the store+load mem kernel,
+subtraction-isolated, min-of-5. First recorded numbers (2026-07-16, dev container — absolute ns
+are machine-dependent; watch the trend, not the value):
+
+| backend | pristine/iter | hooked/iter | overhead/event | hooked events/s |
+|---|---|---|---|---|
+| TreeWalk | 121.6 ns | 267.0 ns | 72.7 ns | 7.5 M/s |
+| Bytecode | 109.1 ns | 199.3 ns | 45.1 ns | 10.0 M/s |
+| Jit | 0.3 ns | 102.5 ns | 51.1 ns | 19.5 M/s |
+
+Right in the design's estimated band, and the JIT is the fastest hooked configuration as
+predicted (its per-event cost is the host-call boundary; the consumer's own handler is on top).
+Adequate for scoring a student program (≤10⁹ accesses in seconds-to-minutes); not aimed at
+>10⁷–10⁸ events/s tracing — that remains the P4 trigger.
 
 ## 6. Status & follow-ups
 
@@ -134,8 +145,10 @@ seconds-to-minutes); not aimed at >10⁷ events/s tracing.
 - [x] P3 — three-backend trace parity gate (`crates/svm/tests/mem_hooks_diff.rs`).
 - [ ] C ABI surface (`svm-capi`): `svm_instance_with_mem_hooks(instance, fn_ptr, user_ctx)` —
       when an FFI embedder asks.
-- [ ] Published hooked-run overhead number in the benchmark harness (a hooked mem kernel next to
-      the pristine one), so regressions in hooked throughput are visible over time.
+- [x] Published hooked-run overhead number in the benchmark harness — `bench/`'s `hooks` bin
+      (`cargo run --release --bin hooks`), hooked vs pristine on all three backends through the
+      real `Instance::with_mem_hooks` path; first numbers in §5. `Instance::mem_hook_stats()`
+      now exposes the pass's inserted-op count for fuel scaling.
 - [ ] Multi-vCPU hooked runs: events interleave schedule-dependently; v1 consumers should run
       single-vCPU/deterministic (the `Inspector`'s scope). Revisit if a consumer needs threaded
       traces (per-vCPU event streams would be the likely shape).
