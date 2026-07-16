@@ -83,6 +83,7 @@ use svm_ir::{
 pub mod cfg;
 pub mod gvn;
 pub mod instrument;
+pub mod interproc;
 pub mod licm;
 pub mod reassociate;
 pub mod sccp;
@@ -180,6 +181,15 @@ pub struct OptConfig {
     pub local_cse: bool,
     /// Jump threading through empty conditional forwarders (`jump_thread`).
     pub jump_thread: bool,
+    /// Constant-funcref devirtualization (`svm_opt::interproc::devirtualize`) — module-level, runs
+    /// before inlining (a devirtualized call becomes an inlining candidate).
+    pub devirt: bool,
+    /// Budgeted direct-call inlining (`svm_opt::interproc::inline_calls`) — module-level, runs once
+    /// before the per-function passes.
+    pub inline: bool,
+    /// Dead-function elimination (`svm_opt::interproc::dead_func_elim`) — module-level, runs once
+    /// after the per-function passes.
+    pub dfe: bool,
 }
 
 impl OptConfig {
@@ -192,6 +202,9 @@ impl OptConfig {
             licm: true,
             local_cse: true,
             jump_thread: true,
+            devirt: true,
+            inline: true,
+            dfe: true,
         }
     }
     /// Every optional pass off — only the always-on intra-block canonicalization runs. The ablation
@@ -204,6 +217,9 @@ impl OptConfig {
             licm: false,
             local_cse: false,
             jump_thread: false,
+            devirt: false,
+            inline: false,
+            dfe: false,
         }
     }
 }
@@ -214,10 +230,12 @@ impl Default for OptConfig {
     }
 }
 
-/// Optimize every function in a module with the full pipeline. Memory/data/imports/exports are
-/// carried through unchanged (optimization is per-function and order-preserving, so funcidxs — and
-/// the names that point at them — stay valid); `debug_info` is **dropped** because its
-/// `(func, block, inst)` positions go stale once we fold instructions and drop blocks (it is
+/// Optimize every function in a module with the full pipeline. Memory/data/imports are carried
+/// through unchanged. The per-function passes are order-preserving, but the module-level
+/// dead-function elimination ([`interproc::dead_func_elim`], OPT.md Phase 3) may drop and **renumber**
+/// functions — so every static funcidx reference and each **export**'s target are remapped with the
+/// survivors (export *names* stay valid). `debug_info` is **dropped** because its `(func, block,
+/// inst)` positions go stale once we fold instructions, drop blocks, and renumber functions (it is
 /// strippable and untrusted for escape, §3a).
 pub fn optimize_module(m: &Module) -> Module {
     optimize_module_with(m, &OptConfig::all())
@@ -226,9 +244,25 @@ pub fn optimize_module(m: &Module) -> Module {
 /// Optimize every function in a module, running only the passes enabled in `cfg`. [`optimize_module`]
 /// is this with [`OptConfig::all`]; the benchmark harness varies `cfg` to measure each pass.
 pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
+    // Interprocedural pre-passes (OPT.md Phase 3), at module scope. Devirtualization turns a constant
+    // `call_indirect` into a direct `call`; inlining then splices small callees into their callers so
+    // the per-function passes below fold through the inlined bodies; and dead-function elimination at
+    // the end sweeps the now-uncalled leaves (its indirect-dispatch gate having lifted once devirt ran).
+    // All three preserve every function's signature, so funcidxs and `fn_results` stay valid.
+    let devirt = if cfg.devirt {
+        interproc::devirtualize(m)
+    } else {
+        m.clone()
+    };
+    let inlined = if cfg.inline {
+        interproc::inline_calls(&devirt)
+    } else {
+        devirt
+    };
+    let m = &inlined;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let has_memory = m.memory.is_some();
-    Module {
+    let optimized = Module {
         funcs: m
             .funcs
             .iter()
@@ -257,6 +291,14 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
         imports: m.imports.clone(),
         exports: m.exports.clone(),
         debug_info: None,
+    };
+    // Dead-function elimination (OPT.md Phase 3) is the one module-level pass — it drops functions no
+    // reachable code can call and renumbers the survivors, so it runs once over the assembled module
+    // after the per-function passes (which are order-preserving and never change the call graph).
+    if cfg.dfe {
+        interproc::dead_func_elim(&optimized)
+    } else {
+        optimized
     }
 }
 

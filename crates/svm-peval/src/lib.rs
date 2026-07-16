@@ -33,6 +33,7 @@ pub use specialize::{
 // existing consumers (`svm-run`, the `svm-llvm` demos, this crate's own tests) keep working through
 // the `svm_peval::` path.
 pub use svm_opt::{
+    interproc::{dead_func_elim, devirtualize, inline_calls},
     is_removable_if_dead, map_operands, map_term_operands, optimize_func, optimize_func_with,
     optimize_module, optimize_module_with, OptConfig,
 };

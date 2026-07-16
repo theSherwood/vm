@@ -218,6 +218,41 @@ tracked enhancement, not a blocker.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).
+  - [x] **Dead-function elimination** (`svm_opt::interproc::dead_func_elim`): the first module-level
+    pass. Call-graph reachability closure from the roots (entry `func 0` + every named export) over
+    `call`/`return_call`/`thread.spawn`/`ref.func` edges (the static-funcidx sites
+    `svm_ir::offset_func_indices` enumerates); survivors renumbered densely, every funcidx reference +
+    export target remapped (names preserved). Because a funcref **equals its funcidx** (identity table)
+    and can be a plain `ConstI32`, an indirect dispatch could reach any function, so the pass bails to
+    the identity while `call_indirect`/`return_call_indirect`/`cont.new` is present — devirtualization
+    (below) removes those first, then DFE applies. `OptConfig.dfe` toggle (default on), runs once after
+    the per-function passes; output re-verified; debug info dropped on any removal. Tests in
+    `tests/interproc.rs`; covered by the `opt_sccp` fuzz target (whole pipeline).
+  - [x] **Budgeted direct-call inliner** (`svm_opt::interproc::inline_calls`): splices a **single-
+    block, straight-line** callee into a direct `call` site in place — its params bind to the call's
+    args, its instruction results take fresh caller-local indices where the call was, and the call's
+    result forwards to the callee's returned values (renumbered through the shared `map_operands`
+    map). No block split / cross-block threading, so the common leaf-helper case (the `a*3+b*5+7`
+    demo shape) is handled with the boring straight-line substitution; **multi-block callees stay
+    calls** (block-local SSA would need value threading through the inlined region — a later slice).
+    Module-wide instruction budget + `MAX_CALLEE_INSTS` size guard + direct-self-recursion skip bound
+    growth and guarantee termination. `OptConfig.inline` toggle (default on), runs first at module
+    scope so the per-function passes fold through the inlined bodies and DFE sweeps the now-uncalled
+    leaf — the end-to-end interprocedural story. Tests in `tests/interproc.rs` (leaf inlined +
+    DFE-removed, live code across the call site renumbered, multi-block callee left alone); the peval
+    differential suite + `opt_sccp` fuzz target now exercise it on real residuals.
+  - [x] **Constant-funcref devirtualization** (`svm_opt::interproc::devirtualize`): a
+    `call_indirect`/`return_call_indirect` whose `idx` is a compile-time-constant funcref (a
+    `ref.func k`, or an in-range `ConstI32 k` — a funcref is a plain `i32`, the identity table) and
+    `funcs[k]`'s signature matches `ty` → rewritten **in place** to a direct `call`/`return_call`
+    (matching signatures ⇒ matching result arity ⇒ no renumbering). The sig check is load-bearing: a
+    mismatched/out-of-range index is left as an indirect call so it still *traps* identically rather
+    than silently calling the wrong function. `OptConfig.devirt` toggle (default on), runs before
+    inlining so a devirtualized call becomes an inlining candidate — and, with the indirect dispatch
+    gone, DFE's gate lifts. Tests in `tests/interproc.rs` (devirt → inline → DFE end-to-end; a
+    signature mismatch is left to trap); peval differential + `opt_sccp` fuzz cover the pipeline. This
+    completes the Phase 3 trio (**devirt + inliner + DFE**); multi-block-callee inlining (below) is the
+    remaining interprocedural enhancement.
 - [ ] **Phase 4 — memory passes.** Redundant-load elimination + store-to-load forwarding over
   the effects table (clobber rules 2/4); opt-in scratch-region contract for DSE; simple range
   analysis so LICM/DCE can touch provably in-bounds loads.
@@ -234,8 +269,34 @@ tracked enhancement, not a blocker.
     while LICM/GVN *cost* static size — motivating a hoist cost model. Broaden the corpus (more
     realistic residuals, branch-heavy shapes) and add Wasmtime-relative numbers next.
 
+### Benchmark follow-ups (from `OPT_BENCH.md`, PR #337)
+
+The first ablation surfaced concrete next steps, tracked here so they aren't lost:
+
+- [ ] **LICM/GVN hoist cost model.** The clearest actionable finding: on a loop with *nothing worth
+  hoisting* (the tight sum loop), LICM/GVN still add block-parameter threading, so they grow static
+  size **and** make the interpreter slightly slower (removing them was 0.94–0.97×). Gate hoisting on a
+  cheap benefit estimate (invariant op count / loop-body share) so a pass only fires when it pays.
+  Until then the passes are a net loss on hoist-free loops.
+- [ ] **Broaden the ablation corpus.** SCCP and jump-threading barely move on the current corpus
+  (their speed effect is ~0 there). Add branch-heavy / constant-propagation-heavy shapes and more
+  realistic residuals so each pass has a case that actually exercises its run-time win.
+- [ ] **Multi-run statistics in the harness.** Single-run numbers show visible variance (one JIT row
+  read 2× its neighbors). Report medians + spread over several runs before treating any delta as load-
+  bearing.
+- [ ] **Wasmtime-relative numbers** (also under Phase 5): measure optimized-residual run time against
+  Wasmtime on the same workloads, per DESIGN.md §1a — the "measured relative to wasm/Wasmtime" bar.
+- [ ] **Note for Phase 3/4 targeting.** Because the JIT backend (`opt_level="speed"`) already does its
+  own GVN/CSE/LICM, scalar passes are ~JIT-run-time-neutral; the higher-leverage host-JIT wins are the
+  cross-boundary transforms Cranelift *cannot* see — inlining (Phase 3) and memory passes (Phase 4).
+
 ### Enhancements (tracked, not gating)
 
+- [ ] **Multi-block-callee inlining.** The Phase 3 inliner handles single-block straight-line callees
+  in place; a callee with internal control flow needs a structural CFG splice — clone its blocks into
+  the caller and thread every value live across the call site through the cloned region (block-local
+  SSA has no cross-block value visibility except via block params). Reuses `crate::thread` +
+  `map_operands`/`remap_targets`; recursion guard via the inline stack (cf. peval's `is_recursion`).
 - [ ] Debug-info (line map) preservation through transforms.
 - [ ] Loop unrolling / peeling under `OptConfig` budgets.
 - [ ] Interprocedural constant propagation (beyond what inlining exposes).
