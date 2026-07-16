@@ -1043,6 +1043,80 @@ pub fn compile_module_mixed_entry(
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
 }
 
+/// **Cap-call outlining** — hoist every inline `cap.call` into a synthetic single-block wrapper
+/// function, rewriting the call site to a plain [`Inst::Call`]. Semantics-preserving (the wrapper
+/// does the *identical* `cap.call`), but it moves the host-boundary op out of otherwise-emittable
+/// functions: the wrapper has an all-integer signature (a capability handle is `i32`, its op args/
+/// results are `i64`), so it is a **cross-tier callable** leaf, while the function that used to hold
+/// the `cap.call` becomes pure compute + a `Call` and can now emit. This is the compiler doing, on the
+/// IR, what a guest author would do by hand (moving `__vm_host_call` into a `noinline` shim) — so an
+/// **unmodified** reactor whose hot `tick` interleaves compute with a once-per-frame `present`/`poll`
+/// cap call runs its hot path on emitted wasm, bouncing to the interpreter only at the (rare) cap site.
+///
+/// Existing [`FuncIdx`](svm_ir::FuncIdx)es are unchanged — wrappers are **appended** — so exports,
+/// call sites, the function table, and debug locs (all keyed by the original indices) stay valid. The
+/// rewrite is **1:1** at each call site: a `Call` to a wrapper appends exactly the wrapper's results,
+/// which equal the `cap.call`'s `sig.results`, so block-local value numbering is preserved (no
+/// renumbering — the same property [`svm_ir::resolve_imports`] relies on lowering `CallImport`).
+///
+/// Runs **after** [`svm_ir::resolve_imports`] (it rewrites concrete `cap.call`s, not named imports),
+/// and the transformed module must be the one **both** tiers use: the emitter reads it, and the host's
+/// `call_interp` runs the wrapper on the interpreter — the wrapper only exists in the outlined module.
+pub fn outline_cap_calls(m: &mut Module) {
+    let base = m.funcs.len() as u32;
+    let mut wrappers: Vec<Func> = Vec::new();
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::CapCall {
+                    type_id,
+                    op,
+                    sig,
+                    handle,
+                    args,
+                } = inst
+                {
+                    let g = base + wrappers.len() as u32;
+                    // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
+                    let mut params = Vec::with_capacity(1 + sig.params.len());
+                    params.push(ValType::I32);
+                    params.extend(sig.params.iter().copied());
+                    let nparams = params.len() as u32;
+                    // Body: `cap.call` on the wrapper's own params (handle = val 0, args = vals 1..),
+                    // then return its results (appended right after the params).
+                    let wrapper_args: Vec<u32> = (1..nparams).collect();
+                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let block = Block {
+                        params: params.clone(),
+                        insts: vec![Inst::CapCall {
+                            type_id: *type_id,
+                            op: *op,
+                            sig: sig.clone(),
+                            handle: 0,
+                            args: wrapper_args,
+                        }],
+                        term: Terminator::Return(ret),
+                    };
+                    wrappers.push(Func {
+                        params,
+                        results: sig.results.clone(),
+                        blocks: vec![block],
+                    });
+                    // Rewrite the call site to invoke the wrapper: prepend the handle to the op args.
+                    let mut call_args = Vec::with_capacity(1 + args.len());
+                    call_args.push(*handle);
+                    call_args.extend(args.iter().copied());
+                    *inst = Inst::Call {
+                        func: g,
+                        args: call_args,
+                    };
+                }
+            }
+        }
+    }
+    m.funcs.extend(wrappers);
+}
+
 /// Compile a **whole-module reactor** guest with **widened cross-tier calls** (Doom-perf): emit every
 /// reachable in-subset function to wasm and route a **direct** `Call` to any reachable, non-emitted,
 /// **integer-signature** function through `env.call_interp` — not just the strict memory-free/call-free

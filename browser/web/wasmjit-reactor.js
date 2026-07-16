@@ -12,28 +12,38 @@
 
 const DEFAULT_FUEL = 1n << 52n; // huge per-frame dispatcher-fuel budget (only a runaway trips it)
 
-// Open a JIT reactor over `moduleBytes` (+ an `fs`-served `wad` under `wadName`). `ex`/`memory` are the
+// Open a JIT reactor over `moduleBytes`, optionally granting an `fs`-served `wad` under `wadName` (pass
+// `wad = null` for guests that need no served file — bounce/life/mandelzoom). `ex`/`memory` are the
 // cdylib exports and its shared linear memory. Returns `{ frame(), close() }` or throws on open/emit
 // failure (the caller falls back to the interpreter reactor). `frame()` runs one `tick` and returns the
 // status (0 = keep going, 5 = the guest exited, else a trap) after stashing the presented frame into
 // the `svm_framebuffer_*` slots.
 export async function openJitReactor(ex, memory, moduleBytes, wadName, wad) {
   const u8 = () => new Uint8Array(memory.buffer);
-  // Hand the module + WAD to the cdylib: it decodes, runs `_start`, and emits the whole `tick`.
-  const modP = Number(ex.svm_alloc(moduleBytes.length));
-  const nameBytes = new TextEncoder().encode(wadName);
-  const nameP = Number(ex.svm_alloc(nameBytes.length));
-  const wadP = Number(ex.svm_alloc(wad.length));
-  {
-    const v = u8();
-    v.set(moduleBytes, modP);
-    v.set(nameBytes, nameP);
-    v.set(wad, wadP);
+  // Hand the module (+ optional WAD) to the cdylib: it decodes, runs `_start`, and emits the whole
+  // `tick`. Without a WAD, the plain `svm_onramp_jit_open` (no `fs` cap) is the open path.
+  let opened;
+  if (wad) {
+    const modP = Number(ex.svm_alloc(moduleBytes.length));
+    const nameBytes = new TextEncoder().encode(wadName);
+    const nameP = Number(ex.svm_alloc(nameBytes.length));
+    const wadP = Number(ex.svm_alloc(wad.length));
+    {
+      const v = u8();
+      v.set(moduleBytes, modP);
+      v.set(nameBytes, nameP);
+      v.set(wad, wadP);
+    }
+    opened = ex.svm_onramp_jit_open_fs(modP, moduleBytes.length, nameP, nameBytes.length, wadP, wad.length);
+    ex.svm_dealloc(modP, moduleBytes.length);
+    ex.svm_dealloc(nameP, nameBytes.length);
+    ex.svm_dealloc(wadP, wad.length);
+  } else {
+    const modP = Number(ex.svm_alloc(moduleBytes.length));
+    u8().set(moduleBytes, modP);
+    opened = ex.svm_onramp_jit_open(modP, moduleBytes.length);
+    ex.svm_dealloc(modP, moduleBytes.length);
   }
-  const opened = ex.svm_onramp_jit_open_fs(modP, moduleBytes.length, nameP, nameBytes.length, wadP, wad.length);
-  ex.svm_dealloc(modP, moduleBytes.length);
-  ex.svm_dealloc(nameP, nameBytes.length);
-  ex.svm_dealloc(wadP, wad.length);
   if (opened !== 0) {
     throw new Error(`JIT reactor open failed: status ${ex.svm_status()} (2=tick not emittable, 3=trap)`);
   }
