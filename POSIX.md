@@ -76,6 +76,19 @@ shell's IR is identical; only the resolver's target differs. So the durable deci
 **pin the ABI** — the function list and each function's shape — and bind it host-side now,
 guest-serve the same ABI later.
 
+**The handle binds by name too — no powerbox slot (PROCESS.md S15).** The personality is a
+per-domain **singleton**, so its handle is supplied by the resolver, not threaded by the
+guest: each libc import's handle operand is a `ConstI32` **placeholder** patched at resolve
+(`svm_ir::Resolved::CapBound`, via `svm_posix::resolve_bound(handle)` — grant first, then
+resolve; DESIGN.md §7's "late binding is the general form of the powerbox"). Consequences:
+the guest's libc has **real C signatures** (`open(path, flags)`, `getenv(name)`, `malloc(n)`
+— the NUL→`(ptr,len)` adaptation is a thin guest wrapper); the module's **import section is
+the discoverable capability manifest** (explicit names + signatures, fail-closed — never a
+silent slot numbering agreed out-of-band); and nothing about the personality touches the
+fixed 8-slot `_start`, which S15 retires. Capabilities with **many** live objects (streams,
+regions, pipe ends) keep the handle a call-site operand — resolver-bound handles are the
+singleton case, not a replacement for first-class handles.
+
 ## 5. The ABI (POSIX subset for a fork-less shell)
 
 Op numbers on the shared `HOST_FN` handle. `ptr`/`buf` are **window offsets**; `-errno` on
@@ -110,9 +123,11 @@ only to mark the boundary.
 1. **Spike (done):** `svm-posix` crate — `write`/`read`/`malloc`/`free`/`exit` as a `HostFn`,
    differential interp↔JIT (`svm-posix` tests). Proves the arena-in-window + host-bookkeeping
    model and the cross-backend parity.
-2. **Named-import binding:** wire `svm_posix::resolve` into `resolve_capability_imports` and
-   run a C `main` (via chibicc) that calls `write`/`malloc` through named imports — the real
-   linking path, not hand-written cap.calls.
+2. **Named-import binding (done):** a real C `main` (via chibicc) links its libc calls to the
+   personality through named imports — the real linking path, not hand-written cap.calls
+   (`crates/svm/tests/c_posix.rs`). Bound in the §7 **general form**: `resolve_bound` supplies
+   the handle at resolve (`Resolved::CapBound`), so the guest libc has real C signatures and
+   no powerbox slot (§4 above; the fixed-`_start` retirement is PROCESS.md S15).
 3. **fs + fd table:** `open`/`read`/`write`/`close`/`stat`/`readdir` over the existing fs ops,
    with a host-side fd table; a real free-list allocator.
 4. **A first shell:** BusyBox `ash` (fork-less) at Stage 0/2 — `sh -c`, builtins, `ls | grep`

@@ -681,6 +681,11 @@ pub fn encode_symbol_table(entries: &[(&str, Resolved)]) -> Vec<u8> {
                 svm_encode::write_uleb(&mut out, cap.op as u64);
             }
             Resolved::Func(_) => panic!("Func is not deliverable via the guest symbol table"),
+            // A resolver-supplied handle is the *host's* instantiation-time grant (§7); a guest
+            // symbol table never carries one (it binds names, not authority).
+            Resolved::CapBound { .. } => {
+                panic!("CapBound is not deliverable via the guest symbol table")
+            }
         }
     }
     out
