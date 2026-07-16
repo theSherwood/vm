@@ -135,10 +135,10 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 /// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
 /// surface (`open`/`read`/`write`/`close`/`unlink`). `run_list` (splitting on `;`/`&&`/`||`, short-
 /// circuiting on `$?`) sits above `run_pipeline` (splitting on `|`, staging each stage's stdout
-/// through a memfs temp the next stage reads as stdin) above `run_line`. `main` supports two
-/// invocations:
-/// `sh -c "…"` (read via the personality's `argc`/`argv`) runs a command list; otherwise it's a
-/// read-eval loop over stdin. `exit` calls the personality `exit`.
+/// through a memfs temp the next stage reads as stdin) above `run_line`. `run_top` routes a line to
+/// the single-line `if COND; then …; [else …;] fi` construct (`run_if`) or to a command list. `main`
+/// supports two invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs one line;
+/// otherwise it's a read-eval loop over stdin. `exit` calls the personality `exit`.
 const SHELL_MAIN: &str = r#"
 #define O_WRONLY 1
 #define O_CREAT  0100
@@ -624,13 +624,62 @@ static int run_list(char *line) {
   return last_status;
 }
 
+static char *ltrim(char *s) { while (*s == ' ') s++; return s; }
+/* Does `w` start with the whole word `kw` (followed by a space or end)? */
+static int kw_is(char *w, char *kw) {
+  int i = 0; while (kw[i]) { if (w[i] != kw[i]) return 0; i++; }
+  return w[i] == 0 || w[i] == ' ';
+}
+
+/* Single-line `if COND; then BODY…; [else BODY…;] fi`. Split on `;` into segments: the first holds
+   `if COND`, later ones begin with `then`/`else` (whose remainder is the first body command) or are
+   further body commands, ending at `fi`. Evaluate COND with run_list, then run the taken branch's
+   commands. Returns the branch's status (0 when no branch runs). */
+static int run_if(char *line) {
+  char *seg[32]; int ns = 0, i = 0, start = 0;
+  for (;;) {
+    char c = line[i];
+    if (c == ';' || c == 0) {
+      line[i] = 0;
+      if (ns < 32) seg[ns++] = line + start;
+      if (c == 0) break;
+      start = i + 1;
+    }
+    i++;
+  }
+  char *cond = ltrim(ltrim(seg[0]) + 2);   /* drop leading "if" */
+  char *thenb[16]; int nt = 0;
+  char *elseb[16]; int ne = 0;
+  int mode = 0;                            /* 1 = collecting then-body, 2 = else-body */
+  for (int s = 1; s < ns; s++) {
+    char *w = ltrim(seg[s]);
+    if (kw_is(w, "fi")) break;
+    if (kw_is(w, "then")) { mode = 1; char *b = ltrim(w + 4); if (b[0] && nt < 16) thenb[nt++] = b; }
+    else if (kw_is(w, "else")) { mode = 2; char *b = ltrim(w + 4); if (b[0] && ne < 16) elseb[ne++] = b; }
+    else if (mode == 1 && nt < 16) thenb[nt++] = w;
+    else if (mode == 2 && ne < 16) elseb[ne++] = w;
+  }
+  int rc = 0;
+  if (run_list(cond) == 0) { for (int k = 0; k < nt; k++) rc = run_list(thenb[k]); }
+  else { for (int k = 0; k < ne; k++) rc = run_list(elseb[k]); }
+  return rc;
+}
+
+/* Top-level line dispatch: an `if …` line runs the conditional construct, everything else is a
+   command list. */
+static int run_top(char *line) {
+  char *t = ltrim(line);
+  if (kw_is(t, "if")) return run_if(t);
+  return run_list(line);
+}
+
 int main(void) {
   static char cmd[256];
   /* `sh -c "<command>"` — a single command line delivered via argv. */
   if (argc_() >= 3) {
     static char flag[8];
     if (getarg(1, flag, 8) > 0 && streq(flag, "-c") && getarg(2, cmd, 256) > 0) {
-      return run_list(cmd);
+      return run_top(cmd);
     }
   }
   /* Otherwise: a read-eval loop over stdin. */
@@ -645,7 +694,7 @@ int main(void) {
       if (n < 255) line[n++] = c;
     }
     line[n] = 0;
-    run_list(line);
+    last_status = run_top(line);
   }
 }
 "#;
@@ -1166,4 +1215,47 @@ fn stage0_shell_globbing() {
         "interp: glob expands, feeds cat/rm, and is literal on no match"
     );
     assert_eq!(jout, iout, "jit: globbing output must match interp");
+}
+
+/// Single-line `if/then/else/fi`: the condition's exit status picks the branch, both the taken and
+/// not-taken branches behave, and multiple body commands run. Uses `test -f` over the memfs and a
+/// multi-command then-body.
+#[test]
+fn stage0_shell_if_then_else() {
+    let (iout, jout) = run_shell(
+        b"echo hi > /f\n\
+          if test -f /f; then echo present; echo again; else echo absent; fi\n\
+          if test -f /nope; then echo present; else echo absent; fi\n\
+          if false; then echo t; fi\n\
+          if true; then echo taken; fi\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"present\nagain\nabsent\ntaken\n",
+        "interp: if picks the branch by $?, runs multi-command bodies, no-else is a no-op"
+    );
+    assert_eq!(jout, iout, "jit: if/then/else output must match interp");
+}
+
+/// `if` composes with the rest of the shell: the condition can be a pipeline (`grep` sets the status)
+/// and a body command can redirect. Proves `run_if` delegates each part back through `run_list`.
+#[test]
+fn stage0_shell_if_with_pipeline_condition() {
+    let (iout, jout) = run_shell(
+        b"echo apple > /f\n\
+          echo banana >> /f\n\
+          if cat /f | grep ban; then echo found > /r; else echo missing > /r; fi\n\
+          cat /r\n",
+        &[],
+        &[],
+        &[],
+    );
+    // grep prints its match (to stdout) and succeeds, so the then-branch writes "found" to /r.
+    assert_eq!(
+        iout, b"banana\nfound\n",
+        "interp: pipeline condition drives if; redirected body writes the result"
+    );
+    assert_eq!(jout, iout, "jit: if-with-pipeline output must match interp");
 }
