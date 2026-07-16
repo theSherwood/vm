@@ -133,8 +133,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   (params/results/locals/globals); `ref.null`/`ref.is_null`/`ref.func` (null = the `0xFFFF_FFFF`
   sentinel the table already uses); typed `select (result t)`; the full mutable-table op set —
   `table.get`/`set`/`size`/`fill`/`copy`/`init`/`grow` (the i32-slot twins of the memory ops:
-  `table.copy` reuses the `copy_dynamic` byte-loop memmove, `table.init` its own const-store unroll,
-  `grow` mirrors `memory.grow` with a slot size cell +
+  `table.copy` lowers to the D62 `MemMove` op (`count*4` bytes — the same whole-span fast path as
+  `memory.copy`, the table being window memory), `table.init` its own const-store unroll (host-data
+  source), `grow` mirrors `memory.grow` with a slot size cell +
   growable table region); passive **element** segments + `elem.drop`; declarative `elem` segments (a
   no-op). OOB indices **mask** into the window (the §1a model, like memory — not a trap); the
   `call_indirect` §3c type-check still guards a forged funcref, and a forged externref faults at

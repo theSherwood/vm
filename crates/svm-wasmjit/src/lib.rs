@@ -129,6 +129,10 @@ const OP_BR: u8 = 0x0c;
 const OP_BR_TABLE: u8 = 0x0e;
 const OP_RETURN: u8 = 0x0f;
 const OP_CALL: u8 = 0x10;
+// Tail-call proposal (shipped in V8 ≥ Chrome 112, wasmi ≥ 0.47, Wasmtime): a true tail call that
+// **reuses the caller's frame** (O(1) stack), matching the interpreter's frame-reusing `Op::TailCall`.
+const OP_RETURN_CALL: u8 = 0x12;
+const OP_RETURN_CALL_INDIRECT: u8 = 0x13;
 const OP_BLOCK: u8 = 0x02;
 const OP_LOCAL_GET: u8 = 0x20;
 const OP_LOCAL_SET: u8 = 0x21;
@@ -1037,6 +1041,80 @@ pub fn compile_module_mixed_entry(
         }
     }
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
+}
+
+/// **Cap-call outlining** — hoist every inline `cap.call` into a synthetic single-block wrapper
+/// function, rewriting the call site to a plain [`Inst::Call`]. Semantics-preserving (the wrapper
+/// does the *identical* `cap.call`), but it moves the host-boundary op out of otherwise-emittable
+/// functions: the wrapper has an all-integer signature (a capability handle is `i32`, its op args/
+/// results are `i64`), so it is a **cross-tier callable** leaf, while the function that used to hold
+/// the `cap.call` becomes pure compute + a `Call` and can now emit. This is the compiler doing, on the
+/// IR, what a guest author would do by hand (moving `__vm_host_call` into a `noinline` shim) — so an
+/// **unmodified** reactor whose hot `tick` interleaves compute with a once-per-frame `present`/`poll`
+/// cap call runs its hot path on emitted wasm, bouncing to the interpreter only at the (rare) cap site.
+///
+/// Existing [`FuncIdx`](svm_ir::FuncIdx)es are unchanged — wrappers are **appended** — so exports,
+/// call sites, the function table, and debug locs (all keyed by the original indices) stay valid. The
+/// rewrite is **1:1** at each call site: a `Call` to a wrapper appends exactly the wrapper's results,
+/// which equal the `cap.call`'s `sig.results`, so block-local value numbering is preserved (no
+/// renumbering — the same property [`svm_ir::resolve_imports`] relies on lowering `CallImport`).
+///
+/// Runs **after** [`svm_ir::resolve_imports`] (it rewrites concrete `cap.call`s, not named imports),
+/// and the transformed module must be the one **both** tiers use: the emitter reads it, and the host's
+/// `call_interp` runs the wrapper on the interpreter — the wrapper only exists in the outlined module.
+pub fn outline_cap_calls(m: &mut Module) {
+    let base = m.funcs.len() as u32;
+    let mut wrappers: Vec<Func> = Vec::new();
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::CapCall {
+                    type_id,
+                    op,
+                    sig,
+                    handle,
+                    args,
+                } = inst
+                {
+                    let g = base + wrappers.len() as u32;
+                    // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
+                    let mut params = Vec::with_capacity(1 + sig.params.len());
+                    params.push(ValType::I32);
+                    params.extend(sig.params.iter().copied());
+                    let nparams = params.len() as u32;
+                    // Body: `cap.call` on the wrapper's own params (handle = val 0, args = vals 1..),
+                    // then return its results (appended right after the params).
+                    let wrapper_args: Vec<u32> = (1..nparams).collect();
+                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let block = Block {
+                        params: params.clone(),
+                        insts: vec![Inst::CapCall {
+                            type_id: *type_id,
+                            op: *op,
+                            sig: sig.clone(),
+                            handle: 0,
+                            args: wrapper_args,
+                        }],
+                        term: Terminator::Return(ret),
+                    };
+                    wrappers.push(Func {
+                        params,
+                        results: sig.results.clone(),
+                        blocks: vec![block],
+                    });
+                    // Rewrite the call site to invoke the wrapper: prepend the handle to the op args.
+                    let mut call_args = Vec::with_capacity(1 + args.len());
+                    call_args.push(*handle);
+                    call_args.extend(args.iter().copied());
+                    *inst = Inst::Call {
+                        func: g,
+                        args: call_args,
+                    };
+                }
+            }
+        }
+    }
+    m.funcs.extend(wrappers);
 }
 
 /// Compile a **whole-module reactor** guest with **widened cross-tier calls** (Doom-perf): emit every
@@ -2464,15 +2542,19 @@ fn emit_block_body(
         Terminator::Unreachable => {
             code.push(OP_UNREACHABLE);
         }
-        // Tail calls: emit the ordinary call sequence, leaving the callee's results on the operand
-        // stack, then `return`. A tail call's callee results equal the caller's results (the verifier
-        // guarantees it), so the stack matches this emitted function's declared return type. This is a
-        // plain call + return — no wasm frame reuse — which is all the semantics require.
+        // Tail calls. A tail call's callee results equal the caller's results (the verifier guarantees
+        // it), so the callee's return type matches this emitted function's — the exact condition
+        // `return_call`/`return_call_indirect` validate against. Same-tier (emitted callee) and indirect
+        // tail calls lower to those **native tail-call opcodes**, which reuse the caller's frame (O(1)
+        // stack) — matching the interpreter's frame-reusing `Op::TailCall`, so an unbounded tail loop
+        // runs in constant space on both tiers instead of overflowing the wasm stack. The **cross-tier**
+        // case can't: its result comes back from the host via `env.call_interp`, so it stays an ordinary
+        // call + `return` (a bounded, one-deep bounce — no frame to reuse anyway).
         Terminator::ReturnCall { func, args } => {
             let callee = &m.funcs[*func as usize];
             let n_results = callee.results.len();
             match wasm_of[*func as usize] {
-                // Same-tier: a direct wasm call to the emitted function (win/env threaded), then return.
+                // Same-tier: a native `return_call` to the emitted function (win/env threaded).
                 Some(widx) => {
                     code.push(OP_LOCAL_GET);
                     uleb(code, 0); // win
@@ -2481,9 +2563,8 @@ fn emit_block_body(
                     for a in args {
                         get(code, cx, *a);
                     }
-                    code.push(OP_CALL);
+                    code.push(OP_RETURN_CALL);
                     uleb(code, widx as u64);
-                    code.push(OP_RETURN);
                 }
                 // Cross-tier: marshal args into the env scratch, `env.call_interp`, load results back
                 // onto the stack, then return (the tail-call form of the mid-block cross-tier sequence).
@@ -2532,9 +2613,10 @@ fn emit_block_body(
                 }
             }
         }
-        // Indirect tail call: push win/env/args, mask the index into the identity table, `call_indirect`
-        // the declared signature (wasm's signature check = the §3c type-id check), then return. A
-        // cross-tier target resolves to its trampoline slot (which itself bounces to `env.call_interp`).
+        // Indirect tail call: push win/env/args, mask the index into the identity table, then a native
+        // `return_call_indirect` on the declared signature (wasm's signature check = the §3c type-id
+        // check) — frame-reusing like the direct form. A cross-tier target resolves to its trampoline
+        // slot (which itself bounces to `env.call_interp`); tail-calling the trampoline is still correct.
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             code.push(OP_LOCAL_GET);
             uleb(code, 0); // win
@@ -2547,10 +2629,9 @@ fn emit_block_body(
             code.push(OP_I32_CONST);
             sleb32(code, (table_size - 1) as i32);
             code.push(0x71); // i32.and → mask into the table
-            code.push(0x11); // call_indirect
+            code.push(OP_RETURN_CALL_INDIRECT);
             uleb(code, indirect_type_index(types, ty)? as u64);
             uleb(code, 0); // table index 0
-            code.push(OP_RETURN);
         }
     }
     let _ = f;

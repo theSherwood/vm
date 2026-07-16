@@ -144,7 +144,7 @@ tracked enhancement, not a blocker.
     (no configurability until something concrete demands it), this lands with the first budgeted pass
     (the inliner / unroller), where a size/fuel budget actually bites; adding toggles now, with only
     the always-on cleanup passes, would be speculative surface.
-- [ ] **Phase 2 — global scalar passes.**
+- [x] **Phase 2 — global scalar passes.**
   - [x] **SCCP** (`svm_opt::sccp`): sparse conditional constant propagation on the internal SSA
     form — a `Top ⊒ Const ⊒ Bottom` lattice propagated across the CFG (through block-parameter phis
     and loops) together with per-edge executability, so a value is only marked varying on account of
@@ -183,8 +183,35 @@ tracked enhancement, not a blocker.
     routinely emit such degenerate branches/selects. Tests (`tests/simplify.rs`): coincident
     `br_if`→`br` (+ dead condition removed + block merged), coincident `br_table`→`br`, equal-arm
     `select`→copy.
-  - [ ] instcombine-style rules + strength reduction, jump threading, LICM for pure non-trapping ops.
-    Each with differential + fuzz.
+  - [x] **Instcombine peepholes** (`try_fold` + `reassociate`): integer **self-comparison** folds
+    (`x==x`/`x<=x`/`x>=x` → 1, `x!=x`/`x<x`/`x>x` → 0; integer only — floats are `FCmp`); and
+    **constant reassociation** `(x OP c1) OP c2 → x OP (c1 OP c2)` for associative+commutative ops
+    (Add/Mul/And/Or/Xor), which shrinks constant chains an op at a time and exposes CSE (two paths that
+    reassociate to `x+8` then share one op). Tests in `tests/peephole.rs`.
+  - [x] **LICM** (`svm_opt::licm`): hoists pure, non-trapping loop-invariant computations to the
+    loop preheader. Invariance is computed iteratively through block-param phis (a value defined
+    outside the loop is invariant; a loop parameter is invariant when every incoming arg is invariant
+    or is the parameter itself — the archetypal `x` passed unchanged around the back edge; a pure op is
+    invariant when its operands are). An invariant op is cloned into the preheader (operands rewritten
+    to preheader-valid values — a dominating value as is, or an invariant header param's entry arg) and
+    its result threaded back in (`crate::thread`), leaving the original for DCE. Sound by construction
+    (pure+non-trapping speculated above the loop) and conservative on shape (reducible single-header
+    loops with a unique preheader only). Reuses the shared `vn` / `thread` modules (extracted from GVN).
+    Tests: invariant op hoisted out of every loop (SCC check) + variant op stays, behavior preserved;
+    covered by the `opt_sccp` fuzz target (whole pipeline).
+  - [x] **Jump threading** (`jump_thread` in the `optimize_func` fixpoint): redirects an edge that
+    reaches an **empty conditional forwarder** — a block with no instructions whose `br_if`/`br_table`
+    tests one of its own parameters — straight to the resolved target when the predecessor passes a
+    constant for that selector parameter. This is the correlated-branch pattern (`if c { … } ; if c
+    { … }`) that SCCP structurally cannot catch, because the forwarder's selector parameter meets a
+    *different* constant on each incoming edge (so its lattice value is not constant). Sound because
+    the forwarder has no instructions (no defs, no effects): entering it only selects a branch, so
+    threading past it with the same argument values is observationally identical; the resolved edge's
+    args are forwarder-parameter indices, mapped back through the predecessor's edge args to values
+    valid there. The fixpoint's prune then drops any forwarder left with no predecessors, and re-runs
+    threading so multi-hop chains collapse a hop per iteration. Tests (`tests/jump_thread.rs`):
+    correlated branch threaded + forwarder eliminated, behavior preserved; covered by the `opt_sccp`
+    fuzz target (whole pipeline, gen → verify → optimize → re-verify + interp differential).
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).

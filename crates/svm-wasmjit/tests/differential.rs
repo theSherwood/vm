@@ -234,10 +234,10 @@ fn call() {
 }
 
 /// **Tail calls** (`return_call`): the entry tail-calls a helper, which tail-**recurses** — exercising
-/// both a same-tier tail call to another function and a tail call to self. Each lowers to the ordinary
-/// call sequence + `return` (no wasm frame reuse), so the emitted result must equal the interpreter's
-/// `sum(0..=n)`. Positive sweep: a negative/huge `n` would spin the decrement forever (fuel-trap on
-/// both tiers — parity, but vacuous); the positive values exercise the actual computation.
+/// both a same-tier tail call to another function and a tail call to self. Each lowers to a native
+/// `return_call` (frame-reusing), so the emitted result must equal the interpreter's `sum(0..=n)`.
+/// Positive sweep: a negative/huge `n` would spin the decrement forever (fuel-trap on both tiers —
+/// parity, but vacuous); the positive values exercise the actual computation.
 const TAILCALL: &str = r#"
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -262,6 +262,17 @@ block2(vn2: i64, vacc2: i64):
 #[test]
 fn tailcall() {
     diff("tailcall", TAILCALL, &[0, 1, 2, 3, 10, 50, 1000], FUEL);
+}
+
+/// **True TCO — the O(1)-stack proof.** Same recurrence, driven to a depth (1,000,000) far past any
+/// non-tail-call wasm call stack: a `call` + `return` lowering would grow the frame per level and
+/// **stack-overflow** here, but a native `return_call` reuses the frame, so it completes in constant
+/// space — exactly like the interpreter's frame-reusing tail call. Parity at this depth is only
+/// achievable with real TCO, so this fails closed if the lowering ever regresses to call + return.
+#[test]
+fn tailcall_deep_is_constant_stack() {
+    // sum(0..=1_000_000) = 500000500000 — well within i64, so the result is exact (not a wrap).
+    diff("tailcall_deep", TAILCALL, &[1_000_000], FUEL);
 }
 
 /// Store→load through the confined window every iteration (mask + guard on the hot path).

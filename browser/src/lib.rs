@@ -293,7 +293,7 @@ pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
 }
 
 /// `verify_module` rejected the decoded module ([`svm_prep_bench`]).
-pub const STATUS_VERIFY_ERR: i32 = 5;
+pub const STATUS_VERIFY_ERR: i32 = 6;
 
 /// **Benchmark entry: the safe module-load path a browser must run before it can execute a guest.**
 /// Decode the module at `[ptr, ptr+len)`, `verify_module` it (the escape-freedom TCB gate — never
@@ -2067,6 +2067,151 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
+/// Build the §3e powerbox args blob — `{ argc:u32-LE, envc:u32-LE }` then packed NUL-terminated
+/// strings — for seeding at `POWERBOX_ARGS_BASE` (the browser twin of `svm-run`'s `build_args_blob`,
+/// no env). The on-ramp `_start` parses it into `argc`/`argv`.
+fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes()); // envc = 0
+    for s in argv {
+        blob.extend_from_slice(s);
+        blob.push(0);
+    }
+    blob
+}
+
+/// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
+/// (`svm_fs::mem_fs_seeded_handler` — a real in-memory filesystem, no host fs), seed the `--single`
+/// argv, and run the module's `_start` on the **reserved-window** bytecode engine (Postgres grows its
+/// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
+/// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
+/// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). Function-0 arity is
+/// 4 (`stdout, stdin, exit, memory`), granted by [`grant_onramp_caps`]; `fs` is resolved by name.
+pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
+    let unsupported = |status: i32| PbOutcome {
+        status,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    // Idempotent on the already-resolved `.svmb` (imports = 0); resolves a raw on-ramp module too.
+    let resolved = match svm_ir::resolve_imports(m, onramp_cap_resolver) {
+        Ok(r) => r,
+        Err(_) => return unsupported(STATUS_UNSUPPORTED),
+    };
+    let m = &resolved;
+    if m.funcs.first().map_or(0, |f| f.params.len()) != 4 {
+        return unsupported(STATUS_UNSUPPORTED); // Postgres' `_start` takes the 4-cap prefix.
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    // The on-ramp powerbox prefix Postgres' `_start` expects, positionally: stdout, stdin, exit,
+    // memory (the heap-growth cap `malloc` uses). Registered by name too (`cap.self.resolve`). Granted
+    // directly — not via `grant_onramp_caps`, whose graphical `display`/`keyboard`/`webgpu` caps would
+    // add a host import a headless Postgres neither needs nor can satisfy.
+    let out = host.grant_stream(StreamRole::Out);
+    host.register_cap_name("stdout", out);
+    let inp = host.grant_stream(StreamRole::In);
+    host.register_cap_name("stdin", inp);
+    let exit = host.grant_exit();
+    host.register_cap_name("exit", exit);
+    let memory = host.grant_memory();
+    host.register_cap_name("memory", memory);
+    let slots = vec![
+        Value::I32(out),
+        Value::I32(inp),
+        Value::I32(exit),
+        Value::I32(memory),
+    ];
+    // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed).
+    let (files, dirs) = match svm_fs::decode_image(image) {
+        Ok(seed) => seed,
+        Err(_) => return unsupported(STATUS_DECODE_ERR),
+    };
+    let fsh = host.grant_host_fn(svm_fs::mem_fs_seeded_handler(files, dirs)());
+    host.register_cap_name("fs", fsh);
+    // Seed `argv` at the powerbox args base: a slashed argv[0] so `find_my_exec` resolves.
+    let argv: [&[u8]; 5] = [b"./postgres", b"--single", b"-D", b".", b"postgres"];
+    let blob = pg_args_blob(&argv);
+    let base = svm_ir::POWERBOX_ARGS_BASE as usize;
+    let mut init_mem = vec![0u8; base + blob.len()];
+    init_mem[base..].copy_from_slice(&blob);
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+        m,
+        0,
+        &slots,
+        &mut fuel,
+        &init_mem,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, 0),
+        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_BAD_RESULT, 0, 0),
+        },
+    };
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: host.stdout,
+        stderr: host.stderr,
+        framebuffer: None,
+    }
+}
+
+/// **Boot Postgres in wasm.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the data image
+/// at `[img_ptr, img_len)` on the `fs` cap, feed the SQL at `[stdin_ptr, stdin_len)`, and run. Sets
+/// [`svm_status`]/[`svm_exit_code`]; the backend's output is read back via `svm_stdout_ptr`/`_len`.
+/// Returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`). Driven by `browser/bench_pg.mjs`.
+#[no_mangle]
+pub extern "C" fn svm_run_pg(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return 0;
+    }
+    let out = pg_exec(&m, image, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
 /// A live per-frame **reactor** over an on-ramp guest — the interactive/graphical run model (the path
 /// Doom rides), the browser twin of `svm-run`'s reactor `Session`. Instantiate once: run `_start`
 /// (func 0) to stash the granted handles and run the C initializer, then call the guest's exported
@@ -2448,6 +2593,11 @@ impl JitOnrampReactor {
     ) -> Result<JitOnrampReactor, i32> {
         let mut module =
             svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+        // Hoist inline `cap.call`s into cross-tier wrapper functions so a hot `tick` that interleaves
+        // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
+        // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
+        // emitter reads it below, and `run_cross_tier` runs the wrappers on the interpreter.
+        svm_wasmjit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's grown heap (see the struct docs).
         if let Some(mc) = module.memory.as_mut() {
             if (mc.size_log2 as u32) < win_log2 as u32 {
@@ -2566,6 +2716,232 @@ impl JitOnrampReactor {
             .lock()
             .unwrap()
             .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+    }
+}
+
+/// A **single-shot** wasm-JIT run of an on-ramp module — the run-to-completion twin of
+/// [`JitOnrampReactor`] (which drives an exported `tick` per frame). Here the whole program *is* func 0
+/// (`_start`), so we emit **that** and run it once: `_start` takes the granted capability handles as
+/// params (`slots`), stashes them, seeds the heap, and calls `main(sp)` — all on emitted wasm, with the
+/// 47/103 cross-tier helpers (Lua/SQLite) bouncing to the interpreter through `env.call_interp` over the
+/// same window (so `write`/`read`/`exit` resolve against the powerbox). Unlike the reactor, `_start` is
+/// **not** pre-run on the interpreter; instead the `.data`/`.rodata` segments are materialized into the
+/// window up front (the emitted `_start` seeds only the heap), then `f0(win, env, ...slots)` runs the
+/// program. `stdout`/`stderr`/`exit_code` are read back from the host afterward, exactly as
+/// [`onramp_exec`] captures them — so the two tiers are a stdout/exit differential.
+pub struct JitOnrampRun {
+    module: svm_ir::Module,
+    program: bytecode::SharedProgram,
+    host: Host,
+    _backing: Option<Box<[u8]>>,
+    back: std::sync::Arc<svm_interp::Region>,
+    win_base: usize,
+    /// The capability handles `_start` (func 0) takes as params — the emitted `f0`'s `...slots` args.
+    slots: Vec<Value>,
+    emitted_wasm: Vec<u8>,
+    emitted: Vec<bool>,
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    last_trap: Option<String>,
+    /// Set when a cross-tier bounce returns `Trap::Exit(code)` (the guest called `exit`), unwinding the
+    /// emitted `f0`; `exited` distinguishes "exited with code 0" from "returned 0".
+    exit_code: i32,
+    exited: bool,
+}
+
+impl JitOnrampRun {
+    /// Open a single-shot JIT run over a **caller-owned** window (the FFI path: `win_ptr` addresses this
+    /// module's own linear memory). `win_size == 1 << win_log2`.
+    ///
+    /// # Safety
+    /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
+    /// run's window and kept valid until the run is dropped.
+    pub unsafe fn open_shared_run(
+        m: &svm_ir::Module,
+        win_ptr: *mut u8,
+        win_size: u64,
+        win_log2: u8,
+        shared_memory: bool,
+        stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        let win_base = win_ptr as usize;
+        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        Self::open_over_run(
+            m,
+            back,
+            None,
+            win_ptr,
+            win_size,
+            win_base,
+            win_log2,
+            shared_memory,
+            stdin,
+        )
+    }
+
+    /// Open a single-shot JIT run over an **owned** window (heap-backed, pointer-stable for the run).
+    /// `win_log2` is a **minimum** — the window is grown to the module's declared `size_log2` when
+    /// larger (Lua declares 64 MiB), so the allocated window always equals the size the emitter masks
+    /// to; a smaller allocation would fault any access into the module's upper address range.
+    pub fn open_owned_run(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        let declared = m.memory.map_or(0, |mc| mc.size_log2);
+        let win_log2 = win_log2.max(declared);
+        let win_size = 1u64 << win_log2;
+        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
+        let ptr = backing.as_mut_ptr();
+        let win_base = ptr as usize;
+        // SAFETY: `backing` is owned by the returned struct and pointer-stable across its moves, so
+        // `[ptr, win_size)` stays valid + exclusive for the run.
+        let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(ptr, win_size) });
+        Self::open_over_run(
+            m,
+            back,
+            Some(backing),
+            ptr,
+            win_size,
+            win_base,
+            win_log2,
+            shared_memory,
+            stdin,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_over_run(
+        m: &svm_ir::Module,
+        back: std::sync::Arc<svm_interp::Region>,
+        backing: Option<Box<[u8]>>,
+        win_ptr: *mut u8,
+        win_size: u64,
+        win_base: usize,
+        win_log2: u8,
+        shared_memory: bool,
+        stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        let mut module =
+            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+        svm_wasmjit::outline_cap_calls(&mut module);
+        // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
+        if let Some(mc) = module.memory.as_mut() {
+            if (mc.size_log2 as u32) < win_log2 as u32 {
+                mc.size_log2 = win_log2;
+            }
+        }
+        let arity = module.funcs.first().map_or(0, |f| f.params.len());
+        if arity > 5 {
+            return Err(STATUS_UNSUPPORTED);
+        }
+        let mut host = Host::new();
+        host.stdin = stdin;
+        // The powerbox prefix (stdout/stdin/exit/…) `_start` takes as params; `display` too (unused by a
+        // pure compute guest, present for parity with `onramp_exec`). No `fs` (input comes from stdin).
+        let (slots, frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+        // Compile once — reused for every cross-tier bounce.
+        let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
+        // Materialize `.data`/`.rodata` into the window before the emitted `_start` runs (the interpreter
+        // does this at instantiation; the emitted `_start` seeds only the heap + stashes handles).
+        // SAFETY: `[win_ptr, win_size)` is a live window (owned backing or the caller's linear memory).
+        unsafe {
+            let win = core::slice::from_raw_parts_mut(win_ptr, win_size as usize);
+            for seg in &module.data {
+                let off = seg.offset as usize;
+                let end = off.saturating_add(seg.bytes.len());
+                if end <= win.len() {
+                    win[off..end].copy_from_slice(&seg.bytes);
+                }
+            }
+        }
+        // Emit rooted at func 0 (`_start`); cross-tier helpers route to `env.call_interp`. Fall back if
+        // `_start` itself is out of subset.
+        let (emitted_wasm, emitted) =
+            svm_wasmjit::compile_module_reactor(&module, 0, shared_memory)
+                .map_err(|_| STATUS_UNSUPPORTED)?;
+        Ok(JitOnrampRun {
+            module,
+            program,
+            host,
+            _backing: backing,
+            back,
+            win_base,
+            slots,
+            emitted_wasm,
+            emitted,
+            frame,
+            last_trap: None,
+            exit_code: 0,
+            exited: false,
+        })
+    }
+
+    /// The emitted wasm (the host compiles + instantiates it, then calls `f0(win, env, ...slots)` once).
+    pub fn emitted_wasm(&self) -> &[u8] {
+        &self.emitted_wasm
+    }
+    /// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win`.
+    pub fn win_base(&self) -> usize {
+        self.win_base
+    }
+    /// The capability-handle values `_start` takes as params — the emitted `f0`'s trailing `...slots`.
+    pub fn slots(&self) -> &[Value] {
+        &self.slots
+    }
+    /// The per-function emitted bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the rest are cross-tier).
+    pub fn emitted(&self) -> &[bool] {
+        &self.emitted
+    }
+    /// The signature of cross-tier `func` (the host marshals `env.call_interp`'s i64 slots per these).
+    pub fn func_sig(&self, func: u32) -> (&[svm_ir::ValType], &[svm_ir::ValType]) {
+        let f = &self.module.funcs[func as usize];
+        (&f.params, &f.results)
+    }
+
+    /// **Cross-tier bounce.** Run non-emitted `func(args)` on the interpreter over the shared window with
+    /// the powerbox (so `write`/`read`/`exit` resolve). A `Trap::Exit(code)` is stashed (the guest called
+    /// `exit`) so `f0` unwinds and the run reports `STATUS_EXIT` with that code.
+    pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
+        let mut fuel = u64::MAX;
+        let r = self.program.run_over(
+            func,
+            args,
+            &mut fuel,
+            self.back.clone(),
+            &mut self.host,
+            false,
+        );
+        if let Err(Trap::Exit(code)) = &r {
+            self.exit_code = *code;
+            self.exited = true;
+        }
+        r
+    }
+
+    /// The captured streams / exit — read after the emitted `f0` returns or unwinds (same contract as
+    /// [`onramp_exec`]). `value` is `f0`'s return (meaningful when it returned rather than `exit`ed).
+    pub fn stdout(&self) -> &[u8] {
+        &self.host.stdout
+    }
+    pub fn stderr(&self) -> &[u8] {
+        &self.host.stderr
+    }
+    pub fn exited(&self) -> bool {
+        self.exited
+    }
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+    /// Take the frame the run presented through `display`, if any.
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.frame.lock().unwrap().take()
+    }
+    pub fn last_trap(&self) -> &str {
+        self.last_trap.as_deref().unwrap_or("")
+    }
+    pub fn set_last_trap(&mut self, s: String) {
+        self.last_trap = Some(s);
     }
 }
 
@@ -2925,6 +3301,40 @@ static mut JIT_REACTOR: Option<JitOnrampReactor> = None;
 /// static-`mapped` confinement mask holds (see [`JitOnrampReactor`]).
 const JIT_WIN_LOG2: u8 = 24;
 
+/// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)` with **no `fs` file** —
+/// the reactor analogue of [`svm_onramp_open`], with the whole `tick` emitted to wasm (for interactive
+/// guests that need no served file: bounce/life/mandelzoom). Decodes, enlarges the window, runs
+/// `_start` on the interpreter, and emits the whole `tick`. Returns `0` on success, else a negative
+/// `STATUS_*` (also set in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if the `tick` isn't
+/// wasm-JIT-emittable (the page falls back to the interp reactor). Otherwise identical to
+/// [`svm_onramp_jit_open_fs`]; drive/close with the same `svm_onramp_jit_*` exports.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    // The play threads build imports a **shared** memory, so the emitted module must too. No `fs` file.
+    match JitOnrampReactor::open_owned_jit(&m, JIT_WIN_LOG2, true, None) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
 /// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)`, granting an `fs`
 /// capability that serves the file `[data_ptr, data_len)` under the name `[name_ptr, name_len)` (Doom's
 /// WAD). Decodes, enlarges the window, runs `_start` on the interpreter, and emits the whole `tick`.
@@ -3106,6 +3516,204 @@ pub extern "C" fn svm_onramp_jit_trap_len() -> usize {
 pub extern "C" fn svm_onramp_jit_close() {
     // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
     unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = None };
+}
+
+// ---- single-shot module wasm-JIT run (Lua/SQLite on emitted wasm) — the run-to-completion twin ------
+//
+// The module-demo analogue of the reactor FFI above: the whole program is func 0 (`_start`), emitted and
+// run once as `f0(win, env, ...slots)`. The page compiles [`svm_onramp_jit_run_wasm_ptr`]/`_len`,
+// instantiates against the cdylib's linear memory with `env.call_interp` → [`svm_onramp_jit_run_call_interp`],
+// calls `f0` with [`svm_onramp_jit_run_win_ptr`] + the [`svm_onramp_jit_run_slot`] handles, then
+// [`svm_onramp_jit_run_finish`] captures stdout/stderr/exit into the shared `OUT`/`ERR`/`EXIT_CODE`.
+
+/// The live single-shot JIT run. `None` until [`svm_onramp_jit_run_open`]; single-threaded wasm.
+static mut JIT_RUN: Option<JitOnrampRun> = None;
+
+/// The single-shot run's fixed window log2 — 32 MiB, holding Lua/SQLite's heap (the emitted run can't
+/// grow it, so it must be sized up front).
+const JIT_RUN_WIN_LOG2: u8 = 25;
+
+/// Open a **single-shot wasm-JIT run** over the on-ramp module at `[mod_ptr, mod_len)` (Lua/SQLite/hello):
+/// resolve imports, outline cap-calls, grant the powerbox (seeding stdin from `[stdin_ptr, stdin_len)`),
+/// materialize `.data`, and emit rooted at `_start`. Returns `0`, else a negative `STATUS_*` (also set in
+/// [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start` isn't emittable (the page falls back to
+/// [`svm_run_onramp`]). Replaces any prior run. Drive it with the `svm_onramp_jit_run_*` exports below.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: same host guarantee for the stdin range.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
+    };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    // The play threads build imports a **shared** memory, so the emitted module must too.
+    match JitOnrampRun::open_owned_run(&m, JIT_RUN_WIN_LOG2, true, stdin) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// Pointer / length of the emitted `_start` wasm bytes (valid until the run is replaced/closed).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_wasm_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
+}
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_wasm_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.emitted_wasm().len())
+}
+/// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win`.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_win_ptr() -> usize {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.win_base())
+}
+/// The `env` cell size the page must `svm_alloc` for the emitted module's `env` argument.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_env_bytes() -> usize {
+    svm_wasmjit::ENV_CELL_BYTES
+}
+/// The number of capability-handle params `_start` takes — the emitted `f0`'s trailing `...slots` args.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_slot_count() -> usize {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.slots().len())
+}
+/// The `i`-th capability handle `_start` takes as a param (`0` if out of range / no run).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_slot(i: usize) -> i32 {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| match r.slots().get(i) {
+        Some(Value::I32(x)) => *x,
+        Some(Value::I64(x)) => *x as i32,
+        _ => 0,
+    })
+}
+
+/// **Cross-tier bounce** — the emitted `f0`'s `env.call_interp(func, args_ptr)` relays here (identical
+/// contract to [`svm_onramp_jit_call_interp`], but over the single-shot run's window/powerbox).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the run for this call.
+    let Some(run) = (unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).as_mut() }) else {
+        return STATUS_UNSUPPORTED;
+    };
+    let (params, results) = {
+        let (p, r) = run.func_sig(func);
+        (p.to_vec(), r.to_vec())
+    };
+    let read_slot = |i: usize| -> u64 {
+        let mut b = [0u8; 8];
+        // SAFETY: the host guarantees `args_ptr` addresses ≥ max(params, results) i64 slots.
+        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(i * 8), b.as_mut_ptr(), 8) };
+        u64::from_le_bytes(b)
+    };
+    let args: Vec<Value> = params
+        .iter()
+        .enumerate()
+        .map(|(i, t)| match t {
+            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
+            _ => Value::I64(read_slot(i) as i64),
+        })
+        .collect();
+    match run.run_cross_tier(func, &args) {
+        Ok(vals) => {
+            for (i, v) in vals.iter().enumerate() {
+                if i >= results.len() {
+                    break;
+                }
+                let raw = match v {
+                    Value::I32(x) => *x as u32 as u64,
+                    Value::I64(x) => *x as u64,
+                    _ => return STATUS_TRAP,
+                };
+                let b = raw.to_le_bytes();
+                // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
+                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
+            }
+            0
+        }
+        // The guest `exit`ed — unwind the emitted `f0`; `svm_onramp_jit_run_finish` reports the code.
+        Err(Trap::Exit(_)) => STATUS_EXIT,
+        Err(t) => {
+            run.set_last_trap(format!("{t:?}"));
+            STATUS_TRAP
+        }
+    }
+}
+
+/// Capture the finished run's streams into the shared `OUT`/`ERR`/`EXIT_CODE` + any presented frame into
+/// the `svm_framebuffer_*` slots, so the page reads them via the usual [`svm_stdout_ptr`] /
+/// [`svm_exit_code`] / `svm_framebuffer_*` accessors — identical to [`svm_run_onramp`]'s contract. Call
+/// once after `f0` returns or unwinds. Returns the status: [`STATUS_EXIT`] if the guest `exit`ed, else
+/// [`STATUS_OK`].
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the run.
+    let Some(run) = (unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }) else {
+        return STATUS_UNSUPPORTED;
+    };
+    let stdout = run.stdout().to_vec();
+    let stderr = run.stderr().to_vec();
+    let (status, code) = if run.exited() {
+        (STATUS_EXIT, run.exit_code())
+    } else {
+        (STATUS_OK, 0)
+    };
+    let (fb_rgba, fb_w, fb_h) = match run.take_frame() {
+        Some(f) => (f.rgba, f.width, f.height),
+        None => (Vec::new(), 0, 0),
+    };
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), stderr);
+        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
+        FB_W = fb_w;
+        FB_H = fb_h;
+        EXIT_CODE = code;
+        LAST_STATUS = status;
+    }
+    status
+}
+
+/// Diagnostic: stash the single-shot run's last-trap string into [`OUT`] and return its length.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_trap_len() -> usize {
+    let s = unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or("", |r| r.last_trap());
+    let bytes = s.as_bytes().to_vec();
+    let len = bytes.len();
+    // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// Close the open single-shot run, freeing it (and its window `Box`). Idempotent.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_close() {
+    // SAFETY: single-threaded wasm; exclusive access to drop the run.
+    unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = None };
 }
 
 /// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next

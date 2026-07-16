@@ -733,7 +733,61 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (~1 µs). So the only remaining per-frame cost is the genuine host I/O — pure headroom while
    display-capped; trimming it (cached cap resolution) is a *future* lever, not a smoothness fix.
    Remaining for the slice: a playground toggle **(already present — the "wasm-JIT" checkbox in
-   `play.js`)**.
+   `play.js`; cap-call outlining below extends it to bounce/life/mandelzoom)**.
+   **Cap-call outlining — emit hot reactor ticks that make inline `cap.call`s.** DOOM emitted because
+   its cap calls already live in helper functions; a simpler reactor whose `tick` makes an inline
+   `cap.call` did not. A `cap.call` is the
+   guest→host boundary (it dispatches into the powerbox, host-side), outside the emitter's compute
+   subset, and emittability is decided per **whole function** — so a reactor whose `tick` interleaves
+   compute with a once-per-frame `display.present` / `keyboard.poll` kept the *entire* function (its
+   hot loop included) on the interpreter. **`svm_wasmjit::outline_cap_calls`** (a JIT pre-pass run after `resolve_imports`,
+   before analyze/emit) hoists each inline `cap.call` into a synthetic single-block wrapper function
+   and rewrites the call site to a plain `Call`. The wrapper has an all-integer signature (a capability
+   handle is `i32`, its op args/results `i64`), so it is a **cross-tier leaf** reached through the
+   *existing* `env.call_interp` bridge — the function that held the cap call becomes pure compute + a
+   `Call` and now emits, while the wrapper bounces to the interpreter (with the powerbox) only at the
+   rare cap site. This is the compiler doing, on the IR, what a guest author would do by hand (moving
+   `__vm_host_call` into a `noinline` shim) — so **unmodified** guests speed up, and the emitted-code
+   security contract is unchanged (emitted functions still do nothing but masked memory + calls). The
+   rewrite is 1:1 (a `Call` to a wrapper appends exactly the cap call's `sig.results`, so block-local
+   value numbering is preserved) and **appends** the wrappers (existing funcidxs / exports / debug locs
+   stay valid). Wired into the browser reactor JIT open path (`open_over_jit`), plus a non-fs
+   `svm_onramp_jit_open` (the reactor analogue of `svm_onramp_open`) so a guest that needs no served
+   file can open a JIT reactor. Measured in Chromium on the **unmodified** playground assets, per frame
+   interpreter → JIT, with **byte-identical** framebuffers over 40 frames on every demo: mandelzoom
+   (f64 escape loop) **488 ms → 20 ms (~24×, ~2 → ~49 FPS, bit-exact)**, life 34×, bounce 7.8×. Proven
+   by `crates/svm-wasmjit/tests/outline_capcalls.rs` (the transform flips emittability and preserves
+   interpreter semantics, and the rewritten module verifies) and the committed
+   `browser/browser-jit-reactor-test.mjs` (each reactor guest renders byte-identically on both tiers in
+   real Chromium). *(This does **not** bring `cap.call` into the emitted subset — the note at slice 3's
+   deopt still holds; it makes cap-call-bearing **functions** emittable by outlining the cap op.)*
+8. **[landed — capability] Single-shot module wasm-JIT (Lua/SQLite run-to-completion).** The
+   run-to-completion twin of the reactor: a `.svmb` module's whole program *is* func 0 (`_start`), so
+   [`JitOnrampRun`] emits **that** and runs `f0(win, env, ...slots)` **once** (`_start` takes the granted
+   capability handles as params, stashes them, seeds the heap, and calls `main(sp)`), with the ~7%
+   cross-tier helpers relaying to the interpreter through `env.call_interp` over the shared window. Unlike
+   the reactor, `_start` is **not** pre-run on the interpreter; the `.data`/`.rodata` are materialized up
+   front (emitted `_start` seeds only the heap), and the window is sized to the module's **declared**
+   `size_log2` (Lua declares 64 MiB — a smaller allocation faults any access into its upper range). FFI:
+   `svm_onramp_jit_run_open` + the `svm_onramp_jit_run_*` accessors; JS: `web/wasmjit-module.js`. Proven
+   **byte-identical** to the interpreter (`svm_run_onramp`) for hello_c / Lua / SQLite by the native
+   `tests/jit_module.rs` (hello_c; Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their
+   giant hot functions, which V8 runs fine) and the committed `browser/browser-jit-module-test.mjs` (V8
+   differential + timing). **Finding — the speedup here is modest** (Lua ~3×, SQLite ~1.3×, vs the
+   reactor demos' 24–34×), and it is **not** a compile cost (V8 compiles the emitted 3 MB Lua module in
+   ~6 ms). The reactor demos win big because their hot loops are *small* functions; Lua/SQLite's hot
+   functions (`luaV_execute`, `sqlite3VdbeExec`) are *giant*, and giant emitted functions run slowly.
+   **Measured negative result (do not re-attempt blindly): the block dispatcher is NOT the bottleneck.**
+   A full **relooper** — structured `loop`/`block` + direct branches for reducible CFGs — was built and
+   verified (differential-clean; Lua is 100% reducible, so `luaV_execute` *was* structured) and made
+   **no difference** in an A/B: Lua's 5M-loop ran 16.9 s (relooper) vs 16.8 s (dispatcher). Control-flow
+   shape is irrelevant to V8 here; the cost is the giant function itself (V8's optimizing tier declines
+   functions that large, and the all-SSA-values-in-locals model blocks register allocation) — both
+   orthogonal to the relooper. The real levers, if this is ever worth pursuing, are **function
+   splitting** (break the giant into V8-optimizable pieces) or **value stackification** (fewer locals) —
+   larger, uncertain work. So the relooper was reverted, and a playground toggle for the module demos
+   waits on a lever that actually moves the needle (light scripts also run net *slower* under the JIT —
+   the emit/setup overhead isn't repaid).
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
@@ -755,5 +809,8 @@ partitioning is per-function anyway). Revisit fibers when JSPI / core stack-swit
   isolated, the powerbox prints `"hello, powerbox!"`, one guest's vCPUs run across real Web Workers
   → 4000, and the **playground** (`/web/play.html`) parses typed SVM text in-browser and runs it in
   every powerbox mode, incl. the parse-reject negative. (Build the threads module + `gencorpus`
-  first; see the header of `browser-test.mjs`.)
+  first; see the header of `browser-test.mjs`.) `node browser/browser-jit-reactor-test.mjs` adds the
+  **wasm-JIT reactor differential**: each committed reactor guest (bounce/life/mandelzoom) renders
+  byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining) — the emitter's
+  "verified ⇒ same on both tiers" contract, on real f64 guest code.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

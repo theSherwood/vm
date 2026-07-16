@@ -681,6 +681,11 @@ pub fn encode_symbol_table(entries: &[(&str, Resolved)]) -> Vec<u8> {
                 svm_encode::write_uleb(&mut out, cap.op as u64);
             }
             Resolved::Func(_) => panic!("Func is not deliverable via the guest symbol table"),
+            // A resolver-supplied handle is the *host's* instantiation-time grant (§7); a guest
+            // symbol table never carries one (it binds names, not authority).
+            Resolved::CapBound { .. } => {
+                panic!("CapBound is not deliverable via the guest symbol table")
+            }
         }
     }
     out
@@ -2471,6 +2476,20 @@ pub fn is_powerbox_entry(module: &Module) -> bool {
     )
 }
 
+/// A **named-export** powerbox entry (PROCESS.md S15 (c2)): a paramless `_start` (function 0) the
+/// frontend marks with `export "_start" 0`. This retires the positional powerbox — `_start` takes no
+/// handle arguments; its prologue obtains each cap **by name** (`cap.self.resolve("stdout")`, …) from
+/// the F7 name registry the runner populates when it grants the fixed set. The named export is the
+/// marker (the 3–8 `i32` params that used to tag [`is_powerbox_entry`] are gone), so the runtime still
+/// knows to grant the powerbox rather than treat func 0 as a bare kernel.
+pub fn is_named_powerbox_entry(module: &Module) -> bool {
+    module.funcs.first().is_some_and(|f| f.params.is_empty())
+        && module
+            .exports
+            .iter()
+            .any(|e| e.name == "_start" && e.func == 0)
+}
+
 /// The reference host's capability-import name policy (§7 "Host-defined capabilities &
 /// discoverability"): the standard `name → (type_id, op)` binding that a frontend's `extern`
 /// capability names resolve to at load. This is the default "powerbox ABI" the bundled toolchain
@@ -2512,6 +2531,44 @@ pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })
+}
+
+/// The §7 **general-form** powerbox resolver (PROCESS.md S15 (c)): binds each fixed powerbox cap
+/// **name** to its `(type_id, op)` — via [`default_cap_resolver`] — **plus the granted handle**
+/// ([`Resolved::CapBound`]), so a module whose `_start` takes **no positional handle parameters**
+/// resolves the entire powerbox by name. This is what retires the fixed 8-slot entry: the handle
+/// stops being a positional entry argument the guest threads from a stashed slot and becomes part of
+/// the instantiation-time binding, exactly as the POSIX personality already binds (`CapBound`).
+///
+/// `handles` are the granted powerbox handles in the fixed §3e slot order — stdout, stdin, exit,
+/// memory, addrspace, ioring, blocking, jit (the order [`grant_powerbox_prefix`] grants and
+/// [`POWERBOX_CAP_NAMES`] names). The handle for a name is selected by its interface, with `Stream`
+/// disambiguated by op (`write`→stdout, `read`→stdin). Names whose handle is **not** a powerbox slot
+/// — the `SharedRegion` ops, whose region handle is minted at runtime by `vm_region_create` and
+/// stays a call-site operand — return `None`, so a program using them composes this with a
+/// runtime-handle resolver (fall through to [`default_cap_resolver`] as a plain `Resolved::Cap`).
+pub fn powerbox_resolver(handles: [i32; 8]) -> impl Fn(&str) -> Option<Resolved> {
+    use svm_interp::iface;
+    let [stdout, stdin, exit, memory, addrspace, ioring, _blocking, jit] = handles;
+    move |name| {
+        let cap = default_cap_resolver(name)?;
+        let handle = match (cap.type_id, cap.op) {
+            (iface::STREAM, 1) => stdout, // write
+            (iface::STREAM, _) => stdin,  // read / close
+            (iface::EXIT, _) => exit,
+            (iface::MEMORY, _) => memory,
+            (iface::ADDRESS_SPACE, _) => addrspace,
+            (iface::IO_RING, _) => ioring,
+            (iface::JIT, _) => jit,
+            // e.g. SharedRegion: the handle is a runtime-minted region, not a powerbox slot.
+            _ => return None,
+        };
+        Some(Resolved::CapBound {
+            type_id: cap.type_id,
+            op: cap.op,
+            handle,
+        })
+    }
 }
 
 /// Lower a module's §7 named capability imports to concrete `cap.call`s using the reference host
@@ -3617,8 +3674,10 @@ impl Instance {
             .module
             .resolve_export(export)
             .ok_or_else(|| format!("no export named `{export}`"))?;
-        let is_powerbox_func0 =
-            fidx == 0 && (self.binding.is_some() || is_powerbox_entry(&self.module));
+        let is_powerbox_func0 = fidx == 0
+            && (self.binding.is_some()
+                || is_powerbox_entry(&self.module)
+                || is_named_powerbox_entry(&self.module));
         if is_powerbox_func0 {
             if !args.is_empty() {
                 return Err(
@@ -3789,6 +3848,12 @@ impl Instance {
                         Value::I32(handle)
                     })
                     .collect()
+            }
+            None if is_named_powerbox_entry(&self.module) => {
+                // S15 (c2): grant + register the full fixed powerbox (the guest resolves each by name
+                // in its `_start` prologue), and hand the entry **no** positional arguments.
+                grant_powerbox_prefix(h, 8, win);
+                Vec::new()
             }
             None => grant_powerbox_prefix(h, self.module.funcs[0].params.len(), win),
         }

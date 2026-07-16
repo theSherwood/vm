@@ -621,6 +621,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-posix",
  "svm-run",
  "svm-snapshot",
  "svm-spec",
@@ -672,6 +673,13 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "svm-fs"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
 ]
 
 [[package]]
@@ -762,6 +770,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "svm-encode",
+ "svm-fs",
  "svm-interp",
  "svm-ir",
  "svm-jit",

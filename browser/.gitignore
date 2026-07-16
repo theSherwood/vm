@@ -21,3 +21,4 @@ patched*.wasm
 !/web/assets/gradient.svmb
 !/web/assets/bounce.svmb
 !/web/assets/life.svmb
+!/web/assets/mandelzoom.svmb

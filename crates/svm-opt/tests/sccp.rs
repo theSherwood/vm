@@ -206,10 +206,12 @@ fn loop_invariant_constant_folds_inside_the_loop() {
             vec![Value::I32(0)],
         ],
     );
-    // The k + k inside the loop folded to a constant.
-    assert!(
-        count(&opt, |i| matches!(i, Inst::IntBin { op: BinOp::Add, .. })) == 0,
-        "loop-invariant k + k should fold"
+    // The loop-invariant `k + k` folded to the constant 14, so only the loop-decrement op survives
+    // (`i - 1`, which reassociation normalizes to `i + (-1)`). Two integer ops → one.
+    assert_eq!(
+        count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+        1,
+        "loop-invariant k + k should fold, leaving only the loop decrement"
     );
     assert_eq!(run(&opt, &[Value::I32(3)]), Ok(vec![Value::I32(14)]));
 }

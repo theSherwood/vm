@@ -63,10 +63,14 @@ identical IR):
 Compute is barely taxed; only serial pointer-chasing pays real cost. Postgres boot is pointer-heavy, so
 blend ~2–2.5×.
 
-**In-browser projection:** module prep ~1.1 s (measured) + guest boot ~1.4 s × ~2–2.5× (extrapolated) ≈
-**~4–5 s** from page load to a queried backend. The prep half is measured; the guest-boot half is
-extrapolated from the committed kernel taxes — directly measuring it means running the full
-fs-cap-in-wasm boot, i.e. building the demo itself (see "What's left").
+**In-browser — now measured end-to-end.** `browser/bench_pg.mjs` boots the real Postgres module inside
+the `svm-browser` cdylib on V8 (mount the data image on the `fs` cap, run to a queried backend): decode
++ verify + compile + full boot + the `CREATE/INSERT/SELECT` round-trip lands at **~6–8 s** (V8-warmup
+variance; the guest run dominates). That is higher than the ~4–5 s the kernel-tax extrapolation
+projected — Postgres boot is *even more* pointer-chasing-heavy than the `chase_rand` kernel (double
+memory indirection: SVM confinement **and** wasm bounds, every catalog/buffer load), so the guest-boot
+tax runs ~4–5× rather than the ~2–2.5× blend. Shippable with a spinner; the lever to shrink it is
+snapshot/restore of the post-boot state (deferred — see the levers above).
 
 ## The levers, ranked
 
@@ -94,12 +98,23 @@ fs-cap-in-wasm boot, i.e. building the demo itself (see "What's left").
   (Getting there needed three `mem_fs` fixes: consistent path normalization across all file ops, a
   read-only *directory* open so Postgres can `fsync` dirs at checkpoint, and a `0700` data-dir mode.)
   The seed step (~40 MB image) takes ~35 ms; the guest run ~1.2 s natively.
-- **Measure the guest boot in wasm directly** (the one number still extrapolated). With Milestone A the
-  `fs` cap is now backend-agnostic (pure in-memory), so this is: build a `svm-browser` cdylib entry that
-  mounts a seeded `mem_fs` and streams stdin/stdout, then time the boot on V8.
-- **The demo build + loader.** Emit `{postgres_resolved.svmb, data-image}` from the pipeline; the
-  browser loads → `decode → verify → run on the interpreter` (the `svm_run`/`svm_prep_bench` shape
-  already in the cdylib) with stdin/stdout streamed and the data image mounted on the `fs` cap.
+- **✅ Data image — a self-contained, shippable filesystem blob.** `encode_image`/`decode_image` +
+  `mem_fs_from_archive` (`crates/svm-run/src/fs.rs`) serialize a cluster into one `SVMFSIM1` byte blob
+  that mounts on the `fs` cap with **no host filesystem** — the browser's data half. `build_image`
+  (example) produces it from an on-disk cluster (Postgres' 39 MB `initdb` tree → a 41 MB image in ~3 s);
+  Postgres `--single` boots from the mounted archive and runs the round-trip (`Exited(0)`). So the
+  demo's two artifacts are now both buildable: `{postgres_resolved.svmb, pgdata.img}`.
+- **✅ The in-memory `fs` cap is now wasm-reachable.** Extracted the pure protocol + `mem_fs` +
+  data-image format into the **`svm-fs`** crate (depends only on `svm-interp`, builds for `wasm32`);
+  `svm-run` keeps the real-filesystem `host_fs` + the `HostCap` wrappers and re-exports `svm-fs`, so
+  `svm_run::fs::*` is unchanged.
+- **✅ Postgres boots in wasm — measured.** The `svm-browser` cdylib's `svm_run_pg` entry (decode +
+  verify → grant `stdout/stdin/exit/memory` + an `svm_fs::mem_fs_seeded_handler` over `pgdata.img` →
+  seed the `--single` argv → reserved-window bytecode run) boots the real database on V8 to a queried
+  backend, ~6–8 s (`browser/bench_pg.mjs`). The reserved-memory path works in wasm; the module stays
+  import-free (no graphical caps granted).
+- **The loader/page.** A web page that `svm_alloc`s `{postgres_resolved.svmb, pgdata.img, SQL}`, calls
+  `svm_run_pg`, and shows the backend output — the `bench_pg.mjs` flow behind a UI (Milestone C).
 
 ## Reproducing the measurements
 
@@ -114,4 +129,10 @@ node bench_prep.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm /path
 
 # 3. guest-execution tax (committed cross-engine bench, svm-bytecode vs svm-bytecode-wasm):
 #    see bench/cross-engine/README.md
+
+# 4. boot Postgres in wasm end-to-end (mount the data image, run the round-trip, time it):
+cargo run --release -p svm-run --example build_image -- /path/to/pgdata pgdata.img
+cd browser && cargo build --release --lib --target wasm32-unknown-unknown
+node bench_pg.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm \
+    /path/to/postgres_resolved.svmb pgdata.img
 ```

@@ -45,8 +45,14 @@ not from micro-optimizing hot code. Default to:
 
 - Target is **"as secure as wasm for the host"** — i.e. as secure as Wasmtime, not
   a proof of escape-impossibility (`DESIGN.md` §1a).
+
 - The verifier secures typing, control flow, and index ranges. **Memory
   confinement is the masking lowering, not the verifier** — treat that pass as the
   most sensitive code in the tree.
 - In-process isolation is defense-in-depth, **not** a Spectre boundary; distrust
   means separate processes.
+
+## Process
+
+Open a PR as soon as you have changes. If you have multiple slices queued to implement, you can put them on the same PR until the PR exceeds 1000 loc.
+
