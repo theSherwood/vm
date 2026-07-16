@@ -6,6 +6,15 @@
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node browser-play-editor-test.mjs
 import { startServer } from './serve.mjs';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+// The Lua/SQLite `.svmb` guests are built by `build-onramp-assets.mjs`, which the CI real-browser job
+// doesn't run (only the committed assets are present there). So the editable-module stdin check below
+// only runs when the Lua asset is actually built — otherwise it's SKIPped, not failed.
+const HERE = dirname(fileURLToPath(import.meta.url));
+const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_eval.svmb'));
 
 const chromium = (await import('playwright')).chromium;
 const { server, port } = await startServer(process.cwd());
@@ -61,14 +70,19 @@ try {
   });
   lua.mode === 'lua' && lua.hasPrint ? ok('Lua example → lua mode') : fail(`Lua switch: ${JSON.stringify(lua)}`);
 
-  // …and running an editable module feeds the editor contents to the guest as stdin.
-  await page.click('#run');
-  await page.waitForFunction(
-    () => ['done', 'error', 'stopped'].includes(document.getElementById('state').dataset.state),
-    { timeout: 30_000 },
-  );
-  const luaOut = await page.evaluate(() => document.getElementById('stdout').textContent);
-  luaOut.includes('Hello from Lua') ? ok('editable-module stdin reads the editor') : fail(`Lua stdout: ${luaOut.slice(0, 80)}`);
+  // …and running an editable module feeds the editor contents to the guest as stdin (only when the
+  // on-ramp Lua asset has been built — the CI real-browser job ships the committed assets only).
+  if (luaBuilt) {
+    await page.click('#run');
+    await page.waitForFunction(
+      () => ['done', 'error', 'stopped'].includes(document.getElementById('state').dataset.state),
+      { timeout: 30_000 },
+    );
+    const luaOut = await page.evaluate(() => document.getElementById('stdout').textContent);
+    luaOut.includes('Hello from Lua') ? ok('editable-module stdin reads the editor') : fail(`Lua stdout: ${luaOut.slice(0, 80)}`);
+  } else {
+    console.log('  SKIP: editable-module stdin (lua_eval.svmb not built — run build-onramp-assets.mjs)');
+  }
 
   // The SQL example switches the mode again.
   await page.selectOption('#example', 'SQLite (:memory: — write & run SQL)');
