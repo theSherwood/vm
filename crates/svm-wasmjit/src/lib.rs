@@ -129,6 +129,10 @@ const OP_BR: u8 = 0x0c;
 const OP_BR_TABLE: u8 = 0x0e;
 const OP_RETURN: u8 = 0x0f;
 const OP_CALL: u8 = 0x10;
+// Tail-call proposal (shipped in V8 ≥ Chrome 112, wasmi ≥ 0.47, Wasmtime): a true tail call that
+// **reuses the caller's frame** (O(1) stack), matching the interpreter's frame-reusing `Op::TailCall`.
+const OP_RETURN_CALL: u8 = 0x12;
+const OP_RETURN_CALL_INDIRECT: u8 = 0x13;
 const OP_BLOCK: u8 = 0x02;
 const OP_LOCAL_GET: u8 = 0x20;
 const OP_LOCAL_SET: u8 = 0x21;
@@ -2464,15 +2468,19 @@ fn emit_block_body(
         Terminator::Unreachable => {
             code.push(OP_UNREACHABLE);
         }
-        // Tail calls: emit the ordinary call sequence, leaving the callee's results on the operand
-        // stack, then `return`. A tail call's callee results equal the caller's results (the verifier
-        // guarantees it), so the stack matches this emitted function's declared return type. This is a
-        // plain call + return — no wasm frame reuse — which is all the semantics require.
+        // Tail calls. A tail call's callee results equal the caller's results (the verifier guarantees
+        // it), so the callee's return type matches this emitted function's — the exact condition
+        // `return_call`/`return_call_indirect` validate against. Same-tier (emitted callee) and indirect
+        // tail calls lower to those **native tail-call opcodes**, which reuse the caller's frame (O(1)
+        // stack) — matching the interpreter's frame-reusing `Op::TailCall`, so an unbounded tail loop
+        // runs in constant space on both tiers instead of overflowing the wasm stack. The **cross-tier**
+        // case can't: its result comes back from the host via `env.call_interp`, so it stays an ordinary
+        // call + `return` (a bounded, one-deep bounce — no frame to reuse anyway).
         Terminator::ReturnCall { func, args } => {
             let callee = &m.funcs[*func as usize];
             let n_results = callee.results.len();
             match wasm_of[*func as usize] {
-                // Same-tier: a direct wasm call to the emitted function (win/env threaded), then return.
+                // Same-tier: a native `return_call` to the emitted function (win/env threaded).
                 Some(widx) => {
                     code.push(OP_LOCAL_GET);
                     uleb(code, 0); // win
@@ -2481,9 +2489,8 @@ fn emit_block_body(
                     for a in args {
                         get(code, cx, *a);
                     }
-                    code.push(OP_CALL);
+                    code.push(OP_RETURN_CALL);
                     uleb(code, widx as u64);
-                    code.push(OP_RETURN);
                 }
                 // Cross-tier: marshal args into the env scratch, `env.call_interp`, load results back
                 // onto the stack, then return (the tail-call form of the mid-block cross-tier sequence).
@@ -2532,9 +2539,10 @@ fn emit_block_body(
                 }
             }
         }
-        // Indirect tail call: push win/env/args, mask the index into the identity table, `call_indirect`
-        // the declared signature (wasm's signature check = the §3c type-id check), then return. A
-        // cross-tier target resolves to its trampoline slot (which itself bounces to `env.call_interp`).
+        // Indirect tail call: push win/env/args, mask the index into the identity table, then a native
+        // `return_call_indirect` on the declared signature (wasm's signature check = the §3c type-id
+        // check) — frame-reusing like the direct form. A cross-tier target resolves to its trampoline
+        // slot (which itself bounces to `env.call_interp`); tail-calling the trampoline is still correct.
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             code.push(OP_LOCAL_GET);
             uleb(code, 0); // win
@@ -2547,10 +2555,9 @@ fn emit_block_body(
             code.push(OP_I32_CONST);
             sleb32(code, (table_size - 1) as i32);
             code.push(0x71); // i32.and → mask into the table
-            code.push(0x11); // call_indirect
+            code.push(OP_RETURN_CALL_INDIRECT);
             uleb(code, indirect_type_index(types, ty)? as u64);
             uleb(code, 0); // table index 0
-            code.push(OP_RETURN);
         }
     }
     let _ = f;
