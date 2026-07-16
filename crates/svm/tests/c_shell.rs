@@ -129,9 +129,10 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 /// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
 /// and surfaced as `$?`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
 /// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
-/// surface (`open`/`read`/`write`/`close`/`unlink`). `main` supports two
-/// invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs a single line; otherwise
-/// it's a read-eval loop over stdin. `exit` calls the personality `exit`.
+/// surface (`open`/`read`/`write`/`close`/`unlink`). `run_list` sits above `run_line`, splitting a
+/// line on `;`, `&&`, `||` and short-circuiting on `$?`. `main` supports two invocations:
+/// `sh -c "…"` (read via the personality's `argc`/`argv`) runs a command list; otherwise it's a
+/// read-eval loop over stdin. `exit` calls the personality `exit`.
 const SHELL_MAIN: &str = r#"
 #define O_WRONLY 1
 #define O_CREAT  0100
@@ -393,14 +394,39 @@ done:
   return st;
 }
 
+/* Run a list of commands joined by `;`, `&&`, `||`, short-circuiting on `last_status`: `&&` runs the
+   next segment only after success (0), `||` only after failure, `;` always. A skipped segment leaves
+   `last_status` unchanged so it propagates down a chain, matching bash. Returns the final status. */
+static int run_list(char *line) {
+  int i = 0, start = 0, skip = 0;
+  for (;;) {
+    char c = line[i];
+    int is_semi = c == ';';
+    int is_and = c == '&' && line[i + 1] == '&';
+    int is_or = c == '|' && line[i + 1] == '|';
+    if (c == 0 || is_semi || is_and || is_or) {
+      char save = c; line[i] = 0;
+      if (!skip) last_status = run_line(line + start);
+      if (save == 0) break;
+      if (is_and) skip = last_status != 0;
+      else if (is_or) skip = last_status == 0;
+      else skip = 0;                     /* `;` starts a fresh short-circuit context */
+      i += is_semi ? 1 : 2;
+      start = i;
+    } else {
+      i++;
+    }
+  }
+  return last_status;
+}
+
 int main(void) {
   static char cmd[256];
   /* `sh -c "<command>"` — a single command line delivered via argv. */
   if (argc_() >= 3) {
     static char flag[8];
     if (getarg(1, flag, 8) > 0 && streq(flag, "-c") && getarg(2, cmd, 256) > 0) {
-      last_status = run_line(cmd);
-      return last_status;
+      return run_list(cmd);
     }
   }
   /* Otherwise: a read-eval loop over stdin. */
@@ -415,7 +441,7 @@ int main(void) {
       if (n < 255) line[n++] = c;
     }
     line[n] = 0;
-    last_status = run_line(line);
+    run_list(line);
   }
 }
 "#;
@@ -766,4 +792,26 @@ fn stage0_shell_test_builtin() {
         "interp: test string/numeric/-f/-d/-n predicates"
     );
     assert_eq!(jout, iout, "jit: test-builtin output must match interp");
+}
+
+/// Command sequencing: `;` runs unconditionally; `&&` runs the next only after success; `||` only
+/// after failure. Short-circuiting is driven by `$?` and threaded through `run_list`.
+#[test]
+fn stage0_shell_sequencing_and_short_circuit() {
+    let (iout, jout) = run_shell(
+        b"echo a ; echo b\n\
+          true && echo yes\n\
+          false && echo no\n\
+          false || echo fallback\n\
+          true || echo skip\n\
+          false && echo x || echo y\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"a\nb\nyes\nfallback\ny\n",
+        "interp: ; always, && on success, || on failure, with chaining"
+    );
+    assert_eq!(jout, iout, "jit: sequencing output must match interp");
 }
