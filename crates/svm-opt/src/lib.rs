@@ -181,6 +181,9 @@ pub struct OptConfig {
     pub local_cse: bool,
     /// Jump threading through empty conditional forwarders (`jump_thread`).
     pub jump_thread: bool,
+    /// Constant-funcref devirtualization (`svm_opt::interproc::devirtualize`) — module-level, runs
+    /// before inlining (a devirtualized call becomes an inlining candidate).
+    pub devirt: bool,
     /// Budgeted direct-call inlining (`svm_opt::interproc::inline_calls`) — module-level, runs once
     /// before the per-function passes.
     pub inline: bool,
@@ -199,6 +202,7 @@ impl OptConfig {
             licm: true,
             local_cse: true,
             jump_thread: true,
+            devirt: true,
             inline: true,
             dfe: true,
         }
@@ -213,6 +217,7 @@ impl OptConfig {
             licm: false,
             local_cse: false,
             jump_thread: false,
+            devirt: false,
             inline: false,
             dfe: false,
         }
@@ -239,14 +244,20 @@ pub fn optimize_module(m: &Module) -> Module {
 /// Optimize every function in a module, running only the passes enabled in `cfg`. [`optimize_module`]
 /// is this with [`OptConfig::all`]; the benchmark harness varies `cfg` to measure each pass.
 pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
-    // Direct-call inlining (OPT.md Phase 3) runs first, at module scope: it splices small callees into
-    // their callers so the per-function passes below then fold through the inlined bodies, and the now-
-    // uncalled leaves are swept by dead-function elimination at the end. Inlining preserves every
-    // function's signature, so funcidxs and `fn_results` stay valid.
-    let inlined = if cfg.inline {
-        interproc::inline_calls(m)
+    // Interprocedural pre-passes (OPT.md Phase 3), at module scope. Devirtualization turns a constant
+    // `call_indirect` into a direct `call`; inlining then splices small callees into their callers so
+    // the per-function passes below fold through the inlined bodies; and dead-function elimination at
+    // the end sweeps the now-uncalled leaves (its indirect-dispatch gate having lifted once devirt ran).
+    // All three preserve every function's signature, so funcidxs and `fn_results` stay valid.
+    let devirt = if cfg.devirt {
+        interproc::devirtualize(m)
     } else {
         m.clone()
+    };
+    let inlined = if cfg.inline {
+        interproc::inline_calls(&devirt)
+    } else {
+        devirt
     };
     let m = &inlined;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();

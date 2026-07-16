@@ -6,9 +6,18 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{BinOp, Block, Export, Func, FuncType, Inst, IntTy, Module, Terminator, ValType};
-use svm_opt::interproc::{dead_func_elim, inline_calls};
+use svm_opt::interproc::{dead_func_elim, devirtualize, inline_calls};
 use svm_opt::optimize_module;
 use svm_verify::verify_module;
+
+fn n_call_indirect(m: &Module) -> usize {
+    m.funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i, Inst::CallIndirect { .. }))
+        .count()
+}
 
 fn mul(a: u32, b: u32) -> Inst {
     Inst::IntBin {
@@ -380,5 +389,124 @@ fn does_not_inline_a_multiblock_callee() {
             run(&inl, 0, &[Value::I32(a)]),
             "divergence at a={a}"
         );
+    }
+}
+
+#[test]
+fn devirtualizes_constant_funcref_then_inlines_and_dfes() {
+    // entry(a): call_indirect(ref.func(1), a) — a constant funcref whose target signature matches, so
+    // it devirtualizes to a direct call to func 1, which then inlines; func 2 is dead. After the full
+    // pipeline only the entry remains, computing a+1 with no calls at all.
+    let sig = FuncType {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+    };
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::RefFunc { func: 1 }, // v1 = funcref(1)
+                Inst::CallIndirect {
+                    ty: sig.clone(),
+                    idx: 1,
+                    args: vec![0],
+                }, // v2
+            ],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, add_const(1), add_const(100)],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    // Devirtualization alone rewrites the indirect call to a direct one (no renumbering).
+    let dv = devirtualize(&m);
+    verify_module(&dv).expect("devirtualized re-verifies");
+    assert_eq!(
+        n_call_indirect(&dv),
+        0,
+        "constant funcref call should devirtualize"
+    );
+    assert_eq!(n_calls(&dv), 1, "it becomes a direct call to func 1");
+    for a in [-2i32, 0, 9] {
+        assert_eq!(
+            run(&m, 0, &[Value::I32(a)]),
+            run(&dv, 0, &[Value::I32(a)]),
+            "divergence at a={a}"
+        );
+    }
+
+    // Full pipeline: devirt -> inline -> DFE collapses to a single function, no calls of either kind.
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    assert_eq!(
+        opt.funcs.len(),
+        1,
+        "the devirtualized+inlined targets are DCE'd"
+    );
+    assert_eq!(n_call_indirect(&opt), 0);
+    assert_eq!(n_calls(&opt), 0);
+    for a in [-2i32, 0, 9, 50] {
+        assert_eq!(run(&m, 0, &[Value::I32(a)]), run(&opt, 0, &[Value::I32(a)]));
+        assert_eq!(run(&opt, 0, &[Value::I32(a)]), Ok(vec![Value::I32(a + 1)]));
+    }
+}
+
+#[test]
+fn does_not_devirtualize_on_signature_mismatch() {
+    // entry(a): call_indirect(ref.func(1), [a]) but the call's declared ty is (i32)->i32 while func 1
+    // is (i32,i32)->i32 — a runtime signature mismatch that must *trap*. Devirtualizing to a direct
+    // call would run the wrong function instead, so the indirect call must be left untouched.
+    let sig = FuncType {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+    };
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::RefFunc { func: 1 }, // funcref to the 2-arg function
+                Inst::CallIndirect {
+                    ty: sig,
+                    idx: 1,
+                    args: vec![0],
+                },
+            ],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let two_arg = Func {
+        params: vec![ValType::I32, ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32, ValType::I32],
+            insts: vec![add(0, 1)],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, two_arg],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    let dv = devirtualize(&m);
+    assert_eq!(
+        n_call_indirect(&dv),
+        1,
+        "a signature mismatch must not be devirtualized (it must still trap)"
+    );
+    // The runtime signature check traps in both — identically.
+    for a in [0i32, 5] {
+        let r0 = run(&m, 0, &[Value::I32(a)]);
+        let r1 = run(&dv, 0, &[Value::I32(a)]);
+        assert!(r0.is_err(), "mismatched call_indirect should trap");
+        assert_eq!(r0, r1, "trap preserved at a={a}");
     }
 }

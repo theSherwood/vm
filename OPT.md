@@ -241,11 +241,18 @@ tracked enhancement, not a blocker.
     leaf — the end-to-end interprocedural story. Tests in `tests/interproc.rs` (leaf inlined +
     DFE-removed, live code across the call site renumbered, multi-block callee left alone); the peval
     differential suite + `opt_sccp` fuzz target now exercise it on real residuals.
-  - [ ] **Constant-funcref devirtualization.** A `call_indirect`/`return_call_indirect` whose `idx` is
-    a known constant `k` (from `ref.func k` or a `ConstI32 k`) and `funcs[k]`'s signature matches `ty`
-    → rewrite to a direct `call`/`return_call` (identity-table resolution, cf. peval's
-    `resolve_indirect`). Feeds the inliner and unblocks DFE (removes the indirect-dispatch gate).
-    Differential + fuzz.
+  - [x] **Constant-funcref devirtualization** (`svm_opt::interproc::devirtualize`): a
+    `call_indirect`/`return_call_indirect` whose `idx` is a compile-time-constant funcref (a
+    `ref.func k`, or an in-range `ConstI32 k` — a funcref is a plain `i32`, the identity table) and
+    `funcs[k]`'s signature matches `ty` → rewritten **in place** to a direct `call`/`return_call`
+    (matching signatures ⇒ matching result arity ⇒ no renumbering). The sig check is load-bearing: a
+    mismatched/out-of-range index is left as an indirect call so it still *traps* identically rather
+    than silently calling the wrong function. `OptConfig.devirt` toggle (default on), runs before
+    inlining so a devirtualized call becomes an inlining candidate — and, with the indirect dispatch
+    gone, DFE's gate lifts. Tests in `tests/interproc.rs` (devirt → inline → DFE end-to-end; a
+    signature mismatch is left to trap); peval differential + `opt_sccp` fuzz cover the pipeline. This
+    completes the Phase 3 trio (**devirt + inliner + DFE**); multi-block-callee inlining (below) is the
+    remaining interprocedural enhancement.
 - [ ] **Phase 4 — memory passes.** Redundant-load elimination + store-to-load forwarding over
   the effects table (clobber rules 2/4); opt-in scratch-region contract for DSE; simple range
   analysis so LICM/DCE can touch provably in-bounds loads.
@@ -285,6 +292,11 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
 
 ### Enhancements (tracked, not gating)
 
+- [ ] **Multi-block-callee inlining.** The Phase 3 inliner handles single-block straight-line callees
+  in place; a callee with internal control flow needs a structural CFG splice — clone its blocks into
+  the caller and thread every value live across the call site through the cloned region (block-local
+  SSA has no cross-block value visibility except via block params). Reuses `crate::thread` +
+  `map_operands`/`remap_targets`; recursion guard via the inline stack (cf. peval's `is_recursion`).
 - [ ] Debug-info (line map) preservation through transforms.
 - [ ] Loop unrolling / peeling under `OptConfig` budgets.
 - [ ] Interprocedural constant propagation (beyond what inlining exposes).

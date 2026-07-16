@@ -3,14 +3,16 @@
 //! rather than inside `optimize_func`. Output is re-verified like everything else in this crate, so a
 //! bug here is a clean verify error, never an escape (untrusted-for-escape posture, §20a).
 //!
-//! Two passes so far: **dead-function elimination** (drop functions no reachable code can call) and a
-//! **budgeted direct-call inliner** (splice a small straight-line callee into its caller). They
-//! compose — inlining a leaf helper leaves it uncalled, and DFE then removes it. Constant-funcref
-//! devirtualization builds on the same call-graph plumbing and lands next.
+//! Three passes: **constant-funcref devirtualization** (an indirect call on a constant funcref →
+//! direct call), the **budgeted direct-call inliner** (splice a small straight-line callee into its
+//! caller), and **dead-function elimination** (drop functions no reachable code can call). They
+//! compose into the end-to-end interprocedural story: devirtualization turns a `call_indirect` into a
+//! direct `call`, the inliner splices a small callee in, and DFE sweeps the now-uncalled leaf — and,
+//! because devirtualization removes the indirect dispatch, DFE's conservative gate lifts too.
 
 use alloc::vec;
 use alloc::vec::Vec;
-use svm_ir::{Block, Export, Func, FuncIdx, Inst, Module, Terminator};
+use svm_ir::{Block, Export, Func, FuncIdx, FuncType, Inst, Module, Terminator};
 
 use crate::{map_operands, map_term_operands};
 
@@ -347,5 +349,106 @@ pub fn inline_calls(m: &Module) -> Module {
         imports: m.imports.clone(),
         exports: m.exports.clone(),
         debug_info: None, // instruction positions shift once bodies are spliced
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Constant-funcref devirtualization (OPT.md Phase 3).
+// ---------------------------------------------------------------------------------------
+
+/// Per block-local value, the function index it is known to hold *as a funcref* — from a `ref.func`
+/// (a funcref **is** its funcidx) or an in-range `ConstI32` (a funcref is a plain `i32`; the identity
+/// table). Parameters, out-of-range constants, and everything else are `None`. Same block-local
+/// forward scan as [`crate::block_consts`], specialized to funcref constants.
+fn block_funcrefs(b: &Block, fn_results: &[usize], num_funcs: usize) -> Vec<Option<u32>> {
+    let mut known: Vec<Option<u32>> = vec![None; b.params.len()];
+    for inst in &b.insts {
+        let rc = inst.result_count(fn_results);
+        if rc == 1 {
+            known.push(match *inst {
+                Inst::RefFunc { func } => Some(func),
+                Inst::ConstI32(v) if v >= 0 && (v as usize) < num_funcs => Some(v as u32),
+                _ => None,
+            });
+        } else {
+            for _ in 0..rc {
+                known.push(None);
+            }
+        }
+    }
+    known
+}
+
+/// If block-local value `idx` holds a constant funcref whose target function's signature matches `ty`,
+/// return that callee index — otherwise `None`, leaving the indirect call untouched so it dispatches
+/// (and, on a signature mismatch or out-of-range index, **traps**) exactly as before. Direct-calling a
+/// signature-mismatched target would run the wrong function instead of trapping, so the sig check is
+/// load-bearing for soundness, not just an optimization guard.
+fn resolve_devirt(known: &[Option<u32>], idx: u32, ty: &FuncType, funcs: &[Func]) -> Option<u32> {
+    let k = known.get(idx as usize).copied().flatten()?;
+    let f = funcs.get(k as usize)?;
+    (f.params == ty.params && f.results == ty.results).then_some(k)
+}
+
+/// **Constant-funcref devirtualization.** Rewrite a `call_indirect` / `return_call_indirect` whose
+/// index is a compile-time-constant funcref (a `ref.func` or an in-range `ConstI32`) into the
+/// equivalent direct `call` / `return_call`, when the target's signature matches the call's `ty`.
+/// Because the signatures match, the result arity is identical, so the rewrite is **in place** — no
+/// block-local value renumbering. The dead `ref.func`/`const` feeding the index is then DCE'd, the
+/// direct call becomes an inlining candidate, and — with the indirect dispatch gone — dead-function
+/// elimination's conservative gate lifts.
+///
+/// Sound because a `call_indirect` on a constant, in-range, signature-matching funcref deterministically
+/// calls `funcs[idx]` (the identity table; cf. the interpreter's `table_lookup`), which is exactly what
+/// the direct call does. A mismatched or out-of-range index is left as an indirect call so it still
+/// traps identically. Debug info is dropped on any rewrite (an instruction changed).
+pub fn devirtualize(m: &Module) -> Module {
+    let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let num_funcs = m.funcs.len();
+    let mut funcs = m.funcs.clone();
+    let mut changed = false;
+
+    for f in &mut funcs {
+        for b in &mut f.blocks {
+            let known = block_funcrefs(b, &fn_results, num_funcs);
+            for inst in &mut b.insts {
+                let repl = if let Inst::CallIndirect { ty, idx, args } = inst {
+                    resolve_devirt(&known, *idx, ty, &m.funcs).map(|k| Inst::Call {
+                        func: k,
+                        args: core::mem::take(args),
+                    })
+                } else {
+                    None
+                };
+                if let Some(r) = repl {
+                    *inst = r;
+                    changed = true;
+                }
+            }
+            let repl = if let Terminator::ReturnCallIndirect { ty, idx, args } = &mut b.term {
+                resolve_devirt(&known, *idx, ty, &m.funcs).map(|k| Terminator::ReturnCall {
+                    func: k,
+                    args: core::mem::take(args),
+                })
+            } else {
+                None
+            };
+            if let Some(r) = repl {
+                b.term = r;
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return m.clone();
+    }
+    Module {
+        funcs,
+        memory: m.memory,
+        data: m.data.clone(),
+        imports: m.imports.clone(),
+        exports: m.exports.clone(),
+        debug_info: None, // an instruction/terminator changed
     }
 }
