@@ -85,6 +85,7 @@ pub mod gvn;
 pub mod reassociate;
 pub mod sccp;
 pub mod ssa;
+pub mod vn;
 
 /// A value known to be a constant at optimization time. Tracks scalar integers/floats and `v128`.
 /// Floats and `v128` are held as **raw bits/bytes** so equality/hashing are exact and NaN-safe
