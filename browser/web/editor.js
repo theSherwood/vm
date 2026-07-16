@@ -1,7 +1,7 @@
-// The playground editor — a thin facade over a single CodeMirror 5 instance (vendored under
-// `vendor/codemirror/`, loaded as classic scripts in play.html so `window.CodeMirror` exists before
-// this module runs). CodeMirror is UI only: it never touches the sandbox or any authority, so an
-// editor library here doesn't enlarge the trusted core.
+// The playground editor — a thin facade over a single CodeMirror 5 instance (vendored as
+// `codemirror.bundle.js`, loaded as a classic script in play.html so `window.CodeMirror` exists
+// before this module runs). CodeMirror is UI only: it never touches the sandbox or any authority, so
+// an editor library here doesn't enlarge the trusted core.
 //
 // Exposes a small surface the rest of play.js drives: mount once over the existing `<textarea>`, then
 // swap the document / language / read-only state per demo, read it back for a run, and toggle Vim.
