@@ -47,8 +47,8 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
     );
 
     // Prepend the powerbox `_start` for exactly the 2 granted handles (not the fixed 3–8 powerbox).
-    let with_start =
-        svm_ir::synth_powerbox_start(module, 0, 2, false).expect("prepend _start (2 handles)");
+    let with_start = svm_ir::synth_powerbox_start_for_imports(module, 0, false)
+        .expect("prepend _start (2 handles)");
 
     // The host offers each name a host-defined capability with arbitrary semantics. Distinct grants ⇒
     // distinct handles, so the guest reaches the right closure purely by which handle it holds.
@@ -106,7 +106,7 @@ block0(v0: i64):
 fn module_bindings_share_one_instance() {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let module = svm_text::parse_module(MODULE_SRC).expect("parse");
-        let with_start = svm_ir::synth_powerbox_start(module, 0, 2, false).expect("synth");
+        let with_start = svm_ir::synth_powerbox_start_for_imports(module, 0, false).expect("synth");
         // One provider, two fields: `set` is op 0, `get` is op 1 — one closure, one cell.
         let imports = Imports::new().provide_module(
             "kv",
@@ -142,7 +142,7 @@ fn module_bindings_share_one_instance() {
 #[test]
 fn unbound_name_fails_closed() {
     let module = svm_text::parse_module(SRC).expect("parse");
-    let with_start = svm_ir::synth_powerbox_start(module, 0, 2, false).expect("synth");
+    let with_start = svm_ir::synth_powerbox_start_for_imports(module, 0, false).expect("synth");
     // Provide only one of the two imports.
     let imports = Imports::new().provide(
         "add_seven",
@@ -178,7 +178,8 @@ block0(v0: i64):
 }
 ";
     let module = svm_text::parse_module(src).expect("parse");
-    let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth (1 handle)");
+    let with_start =
+        svm_ir::synth_powerbox_start_for_imports(module, 0, false).expect("synth (1 handle)");
     let imports = Imports::new().provide("write", HostCap::stdout());
     let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
     let run = instance.call("_start", &[]).expect("run");
@@ -218,7 +219,7 @@ block0(v0: i64):
 fn resolve_capability_by_name_at_runtime() {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let module = svm_text::parse_module(RESOLVE_SRC).expect("parse");
-        let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+        let with_start = svm_ir::synth_powerbox_start_for_imports(module, 0, false).expect("synth");
         let imports = Imports::new().provide("write", HostCap::stdout());
         let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
         let run = instance
@@ -250,7 +251,8 @@ block0(v0: i64):
 #[test]
 fn resolve_unknown_name_is_fail_closed() {
     let module = svm_text::parse_module(RESOLVE_BOGUS_SRC).expect("parse");
-    let with_start = svm_ir::synth_powerbox_start(module, 0, 0, false).expect("synth (0 handles)");
+    let with_start =
+        svm_ir::synth_powerbox_start_for_imports(module, 0, false).expect("synth (0 handles)");
     let instance = instantiate_with_imports(with_start, Imports::new()).expect("instantiate");
     let run = instance.call("_start", &[]).expect("run");
     assert_eq!(
@@ -324,7 +326,7 @@ block0(v0: i64):
 fn label_a_handle_to_its_registered_name() {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let module = svm_text::parse_module(LABEL_SRC).expect("parse");
-        let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+        let with_start = svm_ir::synth_powerbox_start_for_imports(module, 0, false).expect("synth");
         let imports = Imports::new().provide("write", HostCap::stdout());
         let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
         let run = instance
@@ -359,7 +361,7 @@ block0(v0: i64):
 #[test]
 fn label_too_small_buffer_returns_full_length() {
     let module = svm_text::parse_module(LABEL_SMALL_SRC).expect("parse");
-    let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+    let with_start = svm_ir::synth_powerbox_start_for_imports(module, 0, false).expect("synth");
     let imports = Imports::new().provide("write", HostCap::stdout());
     let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
     let run = instance.call("_start", &[]).expect("run");

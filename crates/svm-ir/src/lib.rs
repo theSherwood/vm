@@ -2557,6 +2557,20 @@ pub const POWERBOX_ARGS_END: u64 = 16384;
 /// [`synth_powerbox_start`] reproduces it byte-for-byte so a frontend that emits SVM-IR directly
 /// gets the identical bootstrap without reaching into the on-ramp.
 pub const POWERBOX_STASH_BASE: u64 = 0;
+/// The canonical **names** of the fixed §3e powerbox capabilities, in `VM_CAP_*` / grant order (the
+/// same order/names `svm_run` grants + registers). A paramless `_start` resolves each by name
+/// (`cap.self.resolve`) into its stash slot ([`synth_powerbox_start`]); `[..n]` is the prefix a
+/// program granted `n` handles uses.
+pub const POWERBOX_CAP_NAMES: [&str; 8] = [
+    "stdout",
+    "stdin",
+    "exit",
+    "memory",
+    "addrspace",
+    "ioring",
+    "blocking",
+    "jit",
+];
 /// The guest heap's bump-pointer word (`i64`), just above the 8-handle stash region (`[0, 32)`).
 /// Seeded by `_start` (to the window's mapped boundary) when the program allocates (`seed_heap`).
 pub const POWERBOX_HEAP_BRK: u64 = 32;
@@ -2684,11 +2698,53 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
 /// [`POWERBOX_STACK_PAGE`] (page 0 is the writable scratch). Returns an error if `n_handles` is
 /// outside `[3, 8]`, `entry` is out of range, or the entry signature isn't `(i64) -> ()`/`(i64) -> (T)`.
 pub fn synth_powerbox_start(
-    mut module: Module,
+    module: Module,
     entry: FuncIdx,
     n_handles: usize,
     seed_heap: bool,
 ) -> Result<Module, String> {
+    // The fixed §3e powerbox: `_start` resolves the first `n_handles` canonical cap names
+    // ([`POWERBOX_CAP_NAMES`]) by name into the stash. A wasm-style arbitrary-imports entry uses
+    // [`synth_powerbox_start_with_names`] with its own import names instead.
+    if n_handles > POWERBOX_CAP_NAMES.len() {
+        return Err(format!(
+            "fixed powerbox has {} named caps, got n_handles={n_handles} (use \
+             synth_powerbox_start_with_names for a larger/custom name set)",
+            POWERBOX_CAP_NAMES.len()
+        ));
+    }
+    synth_powerbox_start_with_names(module, entry, &POWERBOX_CAP_NAMES[..n_handles], seed_heap)
+}
+
+/// [`synth_powerbox_start_with_names`] using the module's **own import names** in declaration order
+/// — the wasm-style arbitrary-imports powerbox, where slot `i` holds the `i`-th import's granted
+/// handle (the entry loads it there, and the host registers each under that import name when it binds
+/// it, so the paramless `_start` re-finds it by `cap.self.resolve`). Sugar for the `instantiate_with_
+/// imports` path; the fixed §3e powerbox uses [`synth_powerbox_start`] instead.
+pub fn synth_powerbox_start_for_imports(
+    module: Module,
+    entry: FuncIdx,
+    seed_heap: bool,
+) -> Result<Module, String> {
+    let names: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    synth_powerbox_start_with_names(module, entry, &refs, seed_heap)
+}
+
+/// The **general form** of [`synth_powerbox_start`] (PROCESS.md S15 (c)): prepend a paramless
+/// `_start` that resolves **each name in `names`** by name (`cap.self.resolve`) into stash slot
+/// `i*4`, in order. For the fixed §3e powerbox pass [`POWERBOX_CAP_NAMES`]`[..n]`; for a wasm-style
+/// entry whose slots hold arbitrary host capabilities, pass the module's **own import names** in
+/// declaration order (the entry loads slot `i` for its `i`-th import — the names the host registers
+/// when it binds them), or use [`synth_powerbox_start_for_imports`]. `names.len()` handles are
+/// stashed at `[0, names.len()*4)`.
+pub fn synth_powerbox_start_with_names(
+    mut module: Module,
+    entry: FuncIdx,
+    names: &[&str],
+    seed_heap: bool,
+) -> Result<Module, String> {
+    let n_handles = names.len();
     // The handle stash occupies `[0, n_handles*4)`. It must not run into the reserved low state that
     // sits above it: the heap bump/boundary words at [`POWERBOX_HEAP_BRK`] (when the program seeds a
     // heap), else the format scratch / §3e args buffer at [`POWERBOX_ARGS_BASE`]. So a *fixed*
@@ -2753,7 +2809,7 @@ pub fn synth_powerbox_start(
     // Every existing funcidx (in code *and* in the export table) shifts up by one — the prepended
     // `_start` becomes function 0.
     offset_func_indices(&mut module, 1);
-    let start = build_powerbox_start(entry + 1, &results, entry_sp, n_handles, heap_base);
+    let start = build_powerbox_start(entry + 1, &results, entry_sp, names, heap_base);
     module.funcs.insert(0, start);
     // Expose the bootstrap as a named export so an embedder reaches it by name (`call("_start")`),
     // not by a magic funcidx. A frontend's own entry export (e.g. "main") survives, shifted above.
@@ -2771,22 +2827,52 @@ fn build_powerbox_start(
     entry_idx: FuncIdx,
     entry_results: &[ValType],
     entry_sp: u64,
-    n_handles: usize,
+    names: &[&str],
     heap_base: Option<u64>,
 ) -> Func {
-    let params = vec![ValType::I32; n_handles];
+    // A **paramless** `_start` (PROCESS.md S15 (c)): instead of receiving the granted handles as
+    // positional arguments, its prologue obtains each **by name** (`cap.self.resolve`) from the §7
+    // name directory the host populates at grant, and stashes it at byte offset `i*4` (the public
+    // STASH layout) — so the entry (which loads the stash) is unchanged, and there is no positional
+    // guest/host agreement. `names[i]` is the name for slot `i`: the fixed-powerbox cap names for the
+    // §3e set, or the module's own import names for a wasm-style arbitrary-imports entry.
+    let params: Vec<ValType> = Vec::new();
     let mut insts: Vec<Inst> = Vec::new();
-    // params v0..v(n-1) = the granted handles; stash param `i` at byte offset `i*4` (the public
-    // STASH layout). A program is granted a prefix sized to the highest capability index it uses.
-    let mut next: ValIdx = n_handles as ValIdx;
-    for i in 0..n_handles {
+    let mut next: ValIdx = 0;
+    // Each name's bytes are written to a scratch cell at the data-stack base (`entry_sp`), reused per
+    // name — transient, since the entry (called below with the data-SP = `entry_sp`) overwrites it.
+    for (i, name) in names.iter().enumerate() {
+        for (k, &b) in name.as_bytes().iter().enumerate() {
+            insts.push(Inst::ConstI64(entry_sp as i64 + k as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI32(b as i32));
+            let val = next;
+            next += 1;
+            insts.push(Inst::Store {
+                op: StoreOp::I32_8,
+                addr,
+                value: val,
+                offset: 0,
+                align: 0,
+            });
+        }
+        insts.push(Inst::ConstI64(entry_sp as i64));
+        let name_ptr = next;
+        next += 1;
+        insts.push(Inst::ConstI64(name.len() as i64));
+        let name_len = next;
+        next += 1;
+        insts.push(Inst::CapSelfResolve { name_ptr, name_len });
+        let handle = next;
+        next += 1;
         insts.push(Inst::ConstI64(POWERBOX_STASH_BASE as i64 + (i as i64) * 4));
         let addr = next;
         next += 1;
         insts.push(Inst::Store {
             op: StoreOp::I32,
             addr,
-            value: i as ValIdx,
+            value: handle,
             offset: 0,
             align: 0,
         });
@@ -3686,12 +3772,20 @@ mod powerbox_start_tests {
     #[test]
     fn prepends_start_and_reindexes() {
         let m = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
-        // `_start` is the new function 0 with three i32 handle params.
+        // `_start` is the new function 0, **paramless** — it resolves its handles by name.
         assert_eq!(m.funcs.len(), 3);
-        assert_eq!(m.funcs[0].params, vec![ValType::I32; 3]);
+        assert!(m.funcs[0].params.is_empty(), "paramless _start (S15 c)");
         assert_eq!(m.funcs[0].results, vec![ValType::I32]); // mirrors the entry's result
-                                                            // It stashes each handle at offset i*4 and ends by calling the (shifted) entry at index 2.
+                                                            // It resolves each cap by name, stashes it at offset i*4, and ends by calling the (shifted) entry.
         let blk = &m.funcs[0].blocks[0];
+        assert_eq!(
+            blk.insts
+                .iter()
+                .filter(|i| matches!(i, Inst::CapSelfResolve { .. }))
+                .count(),
+            3,
+            "three caps resolved by name (stdout/stdin/exit)"
+        );
         assert!(matches!(
             blk.term,
             Terminator::Return(ref v) if v.len() == 1
@@ -3791,15 +3885,26 @@ mod powerbox_start_tests {
 
     #[test]
     fn handle_count_is_bounded_only_by_the_stash_region() {
-        // No lower bound now (a 2-handle name-bound entry is fine), and >8 is allowed without a heap
-        // (the stash may run up to `POWERBOX_ARGS_BASE`).
+        // The fixed powerbox is capped at the 8 canonical cap names; more needs the named form.
         assert!(synth_powerbox_start(entry_module(), 1, 2, false).is_ok());
-        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_ok());
-        assert!(synth_powerbox_start(entry_module(), 1, 32, false).is_ok()); // 32*4 == 128 == ARGS_BASE
-                                                                             // …but the stash can't run into the format/args region, or (with a heap) the heap words.
-        assert!(synth_powerbox_start(entry_module(), 1, 33, false).is_err()); // 33*4 > 128
-        assert!(synth_powerbox_start(entry_module(), 1, 9, true).is_err()); // 9*4 > HEAP_BRK(32)
+        assert!(synth_powerbox_start(entry_module(), 1, 8, false).is_ok());
+        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_err()); // > 8 named caps
         assert!(synth_powerbox_start(entry_module(), 1, 8, true).is_ok()); // the fixed 8-handle heap case
+
+        // The **named** form takes arbitrary names; no lower bound, and >8 is allowed without a heap
+        // (the stash may run up to `POWERBOX_ARGS_BASE`) — bounded only by the reserved stash region.
+        let names = |n: usize| -> Vec<&'static str> {
+            const POOL: [&str; 33] = ["c"; 33];
+            POOL[..n].to_vec()
+        };
+        let synth_n = |n: usize, heap: bool| {
+            synth_powerbox_start_with_names(entry_module(), 1, &names(n), heap)
+        };
+        assert!(synth_n(9, false).is_ok());
+        assert!(synth_n(32, false).is_ok()); // 32*4 == 128 == ARGS_BASE
+        assert!(synth_n(33, false).is_err()); // 33*4 > 128
+        assert!(synth_n(9, true).is_err()); // 9*4 > HEAP_BRK(32)
+        assert!(synth_n(8, true).is_ok()); // the fixed 8-handle heap case
     }
 
     #[test]

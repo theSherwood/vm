@@ -63,7 +63,10 @@ fn name_bound_host_fn_callbacks_run_through_the_c_abi() {
         let ir = CString::new(NAMED).unwrap();
         let m = svm_module_parse_text(ir.as_ptr());
         assert!(!m.is_null(), "parse");
-        assert_eq!(svm_module_synth_powerbox_start(m, 0, 2, false), SVM_OK);
+        assert_eq!(
+            svm_module_synth_powerbox_start_for_imports(m, 0, false),
+            SVM_OK
+        );
 
         let imports = svm_imports_new();
         let n_add = CString::new("add_seven").unwrap();
@@ -120,7 +123,10 @@ fn builtin_stdout_and_each_backend_via_c_abi() {
         for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
             let ir = CString::new(HELLO).unwrap();
             let m = svm_module_parse_text(ir.as_ptr());
-            assert_eq!(svm_module_synth_powerbox_start(m, 0, 1, false), SVM_OK);
+            assert_eq!(
+                svm_module_synth_powerbox_start_for_imports(m, 0, false),
+                SVM_OK
+            );
             let imports = svm_imports_new();
             let n_write = CString::new("write").unwrap();
             assert_eq!(
@@ -163,7 +169,10 @@ fn run_config_threads_fuel_and_memory() {
         let mk = || {
             let ir = CString::new(HELLO).unwrap();
             let m = svm_module_parse_text(ir.as_ptr());
-            assert_eq!(svm_module_synth_powerbox_start(m, 0, 1, false), SVM_OK);
+            assert_eq!(
+                svm_module_synth_powerbox_start_for_imports(m, 0, false),
+                SVM_OK
+            );
             let imports = svm_imports_new();
             let n = CString::new("write").unwrap();
             assert_eq!(svm_imports_provide_stdout(imports, n.as_ptr()), SVM_OK);
@@ -204,7 +213,10 @@ fn errors_are_fail_closed_not_panics() {
         // An unbound import fails closed at instantiate.
         let ir = CString::new(NAMED).unwrap();
         let m = svm_module_parse_text(ir.as_ptr());
-        assert_eq!(svm_module_synth_powerbox_start(m, 0, 2, false), SVM_OK);
+        assert_eq!(
+            svm_module_synth_powerbox_start_for_imports(m, 0, false),
+            SVM_OK
+        );
         let imports = svm_imports_new(); // empty — neither name bound
         let inst = svm_instantiate_with_imports(m, imports);
         assert!(inst.is_null(), "unbound imports must fail closed");
@@ -353,7 +365,10 @@ fn host_fn_reads_and_writes_guest_memory_via_c_abi() {
         for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
             let ir = CString::new(UPCASE_IR).unwrap();
             let m = svm_module_parse_text(ir.as_ptr());
-            assert_eq!(svm_module_synth_powerbox_start(m, 0, 2, false), SVM_OK);
+            assert_eq!(
+                svm_module_synth_powerbox_start_for_imports(m, 0, false),
+                SVM_OK
+            );
             let imports = svm_imports_new();
             let n_up = CString::new("upcase").unwrap();
             let n_write = CString::new("write").unwrap();

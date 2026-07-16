@@ -20,7 +20,7 @@ fn peval_guest_specializes_interpreter_and_jits_in_sandbox() {
     };
     let t = svm_llvm::translate_bc_path(&bc).expect("translate the peval-futamura guest to svm-IR");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
+        svm_run::is_named_powerbox_entry(&t.module),
         "the guest must produce a powerbox entry"
     );
     let win_log2 = t

@@ -1418,8 +1418,8 @@ fn powerbox_diff_cc_flags(
     // The on-ramp: translate → resolve §7 imports to concrete capabilities → verify → run.
     let t = svm_llvm::translate_bc_path(bc).expect("translate bitcode");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
-        "{name}: a libc program must produce a powerbox entry"
+        svm_run::is_named_powerbox_entry(&t.module),
+        "{name}: a libc program must produce a named-export powerbox entry (paramless _start, S15 c)"
     );
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
     svm_verify::verify_module(&module).expect("verify translated IR");
@@ -4911,7 +4911,7 @@ fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
     };
     let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
+        svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a threads/libc program must produce a powerbox entry"
     );
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
@@ -6107,7 +6107,7 @@ int main(void) {
         "expected vm_map + vm_page_size imports, got {import_names:?}"
     );
     assert!(
-        svm_run::is_powerbox_entry(&m),
+        svm_run::is_named_powerbox_entry(&m),
         "a Memory-builtin program must produce a powerbox entry (granting the Memory handle)"
     );
     let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
@@ -6538,6 +6538,11 @@ fn grant_powerbox(
         h.grant_blocking(block, None),
         h.grant_jit(mem_log2),
     ];
+    // S15 (c): the paramless `_start` resolves each cap **by name**, so register the granted prefix
+    // under its canonical name (the entry runs with `&[]`, not these as positional args).
+    for (name, &handle) in svm_ir::POWERBOX_CAP_NAMES.iter().zip(&all[..n]) {
+        h.register_cap_name(name, handle);
+    }
     all[..n].iter().map(|&x| Value::I32(x)).collect()
 }
 
@@ -6573,18 +6578,23 @@ fn vm_async_io_runtime() {
     );
     let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
     svm_verify::verify_module(&module).expect("verify resolved IR");
-    let nparams = module.funcs[0].params.len();
+    // The paramless `_start` resolves its 7 handles by name (S15 c) — count the `cap.self.resolve`s.
+    let ncaps = module.funcs[0].blocks[0]
+        .insts
+        .iter()
+        .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+        .count();
     assert_eq!(
-        nparams, 7,
-        "async program must declare the 7-handle powerbox entry"
+        ncaps, 7,
+        "async program must resolve the 7-handle powerbox by name"
     );
 
     let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut h = svm_interp::Host::new();
-    let args = grant_powerbox(&mut h, win, nparams, std::time::Duration::from_millis(10));
+    grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
     let mut fuel = 500_000_000u64;
     let out =
-        svm_interp::run_with_host(&module, 0, &args, &mut fuel, &mut h).expect("interp async run");
+        svm_interp::run_with_host(&module, 0, &[], &mut fuel, &mut h).expect("interp async run");
     assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
     // NTASKS = 8 (see the demo); the total is Σ of the host's deterministic per-op results.
     let total: u64 = (0..8).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
@@ -6624,18 +6634,23 @@ fn vm_async_work_stealing_runtime() {
     );
     let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
     svm_verify::verify_module(&module).expect("verify resolved IR");
-    let nparams = module.funcs[0].params.len();
+    // The paramless `_start` resolves its 7 handles by name (S15 c) — count the `cap.self.resolve`s.
+    let ncaps = module.funcs[0].blocks[0]
+        .insts
+        .iter()
+        .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+        .count();
     assert_eq!(
-        nparams, 7,
-        "async program must declare the 7-handle powerbox entry"
+        ncaps, 7,
+        "async program must resolve the 7-handle powerbox by name"
     );
 
     let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut h = svm_interp::Host::new();
-    let args = grant_powerbox(&mut h, win, nparams, std::time::Duration::from_millis(10));
+    grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
     let mut fuel = 1_000_000_000u64;
     let out =
-        svm_interp::run_with_host(&module, 0, &args, &mut fuel, &mut h).expect("interp async run");
+        svm_interp::run_with_host(&module, 0, &[], &mut fuel, &mut h).expect("interp async run");
     assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
     // NTASKS = 16 (see the demo); the total is Σ of the host's deterministic per-op results.
     let total: u64 = (0..16).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
@@ -6662,15 +6677,19 @@ int main(void) { return (__vm_cap(6) == __vm_blocking_handle()) ? 7 : 0; }
         return;
     };
     assert_eq!(
-        m.funcs[0].params.len(),
+        m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .count(),
         7,
-        "a Blocking-handle program declares the 7-handle entry"
+        "a Blocking-handle program resolves the 7-handle powerbox by name"
     );
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut h = svm_interp::Host::new();
-    let args = grant_powerbox(&mut h, win, 7, std::time::Duration::ZERO);
+    grant_powerbox(&mut h, win, 7, std::time::Duration::ZERO);
     let mut fuel = 50_000_000u64;
-    let r = svm_interp::run_with_host(&m, 0, &args, &mut fuel, &mut h).expect("interp run");
+    let r = svm_interp::run_with_host(&m, 0, &[], &mut fuel, &mut h).expect("interp run");
     assert_eq!(
         r,
         vec![Value::I32(7)],
@@ -6722,13 +6741,17 @@ int main(void) {
         );
     }
     assert!(
-        svm_run::is_powerbox_entry(&m),
+        svm_run::is_named_powerbox_entry(&m),
         "a JIT-builtin program must produce a powerbox entry"
     );
     assert_eq!(
-        m.funcs[0].params.len(),
+        m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .count(),
         8,
-        "the Jit handle is the last VM_CAP_* index → the full 8-handle powerbox"
+        "the Jit handle is the last VM_CAP_* index → the full 8-handle powerbox, resolved by name"
     );
     // Resolves + re-verifies (every `CallImport` binds to the `Jit` capability).
     let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
@@ -6830,9 +6853,13 @@ fn vm_jit_threads_demo() {
     };
     let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
     assert_eq!(
-        t.module.funcs[0].params.len(),
+        t.module.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .count(),
         8,
-        "a Jit-using program declares the full 8-handle powerbox entry"
+        "a Jit-using program resolves the full 8-handle powerbox by name"
     );
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
     svm_verify::verify_module(&module).expect("verify resolved IR");
@@ -6905,9 +6932,13 @@ int main(void) {
         );
     }
     assert_eq!(
-        m.funcs[0].params.len(),
+        m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .count(),
         5,
-        "a region-minting program grants through the AddressSpace handle (5-handle entry)"
+        "a region-minting program grants through the AddressSpace handle (5-handle entry, by name)"
     );
     let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
     svm_verify::verify_module(&module).expect("verify resolved IR");
@@ -7006,7 +7037,7 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
 
     let t = svm_llvm::translate_bc_path(bc).expect("translate C++ bitcode");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
+        svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
     );
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
@@ -7040,7 +7071,7 @@ fn check_cpp_eh_terminates(name: &str, src: &str) {
     };
     let t = svm_llvm::translate_bc_path(&bc).expect("translate C++ bitcode");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
+        svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
     );
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
@@ -7742,7 +7773,7 @@ fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> 
     let ll = compile_rust_to_ll(name, src)?;
     let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust heap bitcode");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
+        svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a heap-allocating Rust program must produce a powerbox entry"
     );
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
@@ -8689,7 +8720,7 @@ fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
     let ll = compile_rust_to_ll(name, &src)?;
     let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
+        svm_run::is_named_powerbox_entry(&t.module),
         "{name}: an alloc program must produce a powerbox entry (Memory granted)"
     );
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");

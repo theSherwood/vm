@@ -53,10 +53,9 @@ fn handwritten_ir_runs_through_the_powerbox_wrapper() {
     //    heap. The entry is funcidx 0 before the prepend; it becomes funcidx 1 after.
     let with_start =
         svm_ir::synth_powerbox_start(module, 0, 3, false).expect("prepend powerbox _start");
-    assert_eq!(
-        with_start.funcs[0].params,
-        vec![svm_ir::ValType::I32; 3],
-        "function 0 is now the 3-handle powerbox _start"
+    assert!(
+        with_start.funcs[0].params.is_empty(),
+        "function 0 is the **paramless** powerbox _start — it resolves its 3 handles by name (S15 c)"
     );
     // The frontend export shifted with the prepend, and `_start` is now a first-class export too —
     // both reachable by name, no funcidx bookkeeping for the embedder.
