@@ -116,8 +116,13 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
     guest memory op cannot silently go untraced.
   - `crates/svm/tests/mem_hooks_diff.rs` — the three-backend gate: identical event streams
     (incl. v128 through the bytecode engine's `Op::Eval` fallback), unperturbed outcomes,
-    faulting trace ends at the attempted access, veto aborts identically everywhere.
+    faulting trace ends at the attempted access, veto aborts identically everywhere, and a
+    multi-vCPU (`thread.spawn`) guest is observed without crashing (§6 findings).
   - `crates/svm-capi/src/abi_tests.rs` — the C ABI observe + veto over all three backends.
+- **Worked example**: `crates/svm-run/examples/mem_hooks_cache_model.rs` — the educational use
+  case made concrete: a direct-mapped cache + first-touch page-fault model driven by the event
+  stream, scoring a cache-friendly vs a cache-hostile guest (identical 1024 loads, ~7.8× cycle
+  estimate gap). `cargo run -p svm-run --release --example mem_hooks_cache_model`.
 
 ## 5. Zero-cost accounting
 
@@ -156,9 +161,15 @@ Adequate for scoring a student program (≤10⁹ accesses in seconds-to-minutes)
       (`cargo run --release --bin hooks`), hooked vs pristine on all three backends through the
       real `Instance::with_mem_hooks` path; first numbers in §5. `Instance::mem_hook_stats()`
       now exposes the pass's inserted-op count for fuel scaling.
-- [ ] Multi-vCPU hooked runs: events interleave schedule-dependently; v1 consumers should run
-      single-vCPU/deterministic (the `Inspector`'s scope). Revisit if a consumer needs threaded
-      traces (per-vCPU event streams would be the likely shape).
+- [x] Multi-vCPU hooked runs **investigated** (finding, not a new mechanism): a `thread.spawn`
+      guest runs hooked without crashing, and a spawned vCPU's accesses *are* observed. The run's
+      powerbox `Host` is shared across vCPUs via `Arc<Mutex<Host>>` (svm-interp lib.rs ~1881), so
+      the single hook handler is invoked **serialized under the host lock** — no data race, and a
+      handler capturing plain state is sound. The one caveat is that **cross-vCPU event order is
+      schedule-dependent** (within a vCPU it is ordered; `join`/atomics impose happens-before). So
+      hooks are *supported* under threads; a consumer needing per-vCPU attribution or a
+      deterministic order is the only reason to add a vCPU id to the event — deferred until asked.
+      Pinned by the multi-vCPU case in `mem_hooks_diff.rs`.
 - [ ] **P4, only on demonstrated need** (>10⁷ events/s native tracing, or "must observe the
       pristine module's fuel behavior"): native interpreter seam — fold a hooks flag into `Mem`'s
       existing `prot_dirty` gate so the scalar fast paths stay instruction-identical and hooked

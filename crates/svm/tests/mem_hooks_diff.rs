@@ -180,3 +180,51 @@ fn a_hook_veto_aborts_the_run_identically_everywhere() {
         );
     }
 }
+
+/// A `thread.spawn` guest: the child vCPU stores a sentinel into shared memory, the parent joins and
+/// atomic-loads it back. Hooked, this must (a) not crash and (b) observe **both** vCPUs' accesses —
+/// the run's `Host` is shared across vCPUs (`Arc<Mutex<Host>>`), so the single hook handler is
+/// invoked serialized under that lock (HOOKS.md §6). Threads are interpreter-only (the JIT reports
+/// the ops unsupported), so this runs on the two interpreter backends. Cross-vCPU *order* is
+/// schedule-dependent in general, but `join` orders the child's store before the parent's load, so
+/// the multiset of events is fixed here.
+const THREADED: &str = r#"memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 43981
+  v1 = thread.spawn 1 v0 v0
+  v2 = thread.join v1
+  v3 = i64.const 0
+  v4 = i64.atomic.load v3
+  return v4
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
+  v1 = i64.const 0
+  i64.atomic.store v1 v0
+  return v0
+}
+"#;
+
+#[test]
+fn multi_vcpu_guest_is_observed_without_crashing() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+        let (trace, run) = hooked_run(THREADED, backend);
+        let run = run.unwrap_or_else(|e| panic!("threaded hooked run failed on {backend:?}: {e}"));
+        assert_eq!(
+            run.outcome,
+            svm_run::Outcome::Returned(vec![svm_run::Value::I64(43981)]),
+            "the parent reads the child's shared-memory write ({backend:?})"
+        );
+        // The child's atomic store (from the spawned vCPU) and the parent's atomic load are both
+        // observed by the one shared handler; `join` fixes their order here.
+        assert_eq!(
+            trace,
+            vec![
+                MemEvent::AtomicStore { addr: 0, width: 8 },
+                MemEvent::AtomicLoad { addr: 0, width: 8 },
+            ],
+            "both vCPUs' accesses reach the hook ({backend:?})"
+        );
+    }
+}
