@@ -8,7 +8,7 @@
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
-import { mountEditor, setDoc, getDoc, setVim, refresh as refreshEditor } from './editor.js';
+import { mountEditor, setDoc, getDoc, setVim, refresh as refreshEditor, markError, clearError } from './editor.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -747,6 +747,7 @@ async function runReactor(ex) {
 
 async function doRun() {
   if (broken) return;
+  clearError(); // drop any prior parse-error marker before this run
   stopReactor(); // a fresh Run supersedes any running reactor loop
   // A pre-built on-ramp module runs single-shot via svm_run_onramp — no in-browser parse, no Workers.
   const selected = EXAMPLES[$('example').value];
@@ -777,7 +778,9 @@ async function doRun() {
     // `slice` copies out of the SharedArrayBuffer (the stash may move on the next call).
     const out = u8().slice(eng.ex.svm_parse_ptr(), eng.ex.svm_parse_ptr() + eng.ex.svm_parse_len());
     if (ok !== 1) {
-      setState('error', new TextDecoder().decode(out));
+      const msg = new TextDecoder().decode(out);
+      setState('error', msg);
+      markError(msg); // pin the offending line in the editor when we can locate it
       return;
     }
     guest = out;

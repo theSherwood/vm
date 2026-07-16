@@ -76,6 +76,31 @@ try {
   const sqlMode = await page.evaluate(() => document.querySelector('.CodeMirror')?.CodeMirror?.getOption('mode'));
   sqlMode === 'text/x-sql' ? ok('SQL example → sql mode') : fail(`SQL mode: ${sqlMode}`);
 
+  // A parse error pins the offending line: type SVM text with a bad opcode on line 3 (unique token),
+  // Run, and the editor gets a gutter marker + highlighted line + inline message on that line.
+  await page.selectOption('#example', 'hello');
+  await page.waitForTimeout(100);
+  await page.evaluate(() => document.querySelector('.CodeMirror').CodeMirror.setValue(
+    'func () -> (i64) {\nblock0():\n  v0 = i64.notanopcode 1\n  return v0\n}'));
+  await page.click('#run');
+  await page.waitForFunction(() => document.getElementById('state').dataset.state === 'error', { timeout: 20_000 });
+  const mark = await page.evaluate(() => {
+    const cm = document.querySelector('.CodeMirror').CodeMirror;
+    const info = cm.lineInfo(2); // 0-based line 2 = the bad-opcode line
+    return {
+      gutter: !!(info.gutterMarkers && info.gutterMarkers['svm-error-gutter']),
+      lineClass: (info.bgClass || '').includes('cm-error-line'),
+      widget: !!document.querySelector('.cm-error-widget'),
+    };
+  });
+  (mark.gutter && mark.lineClass && mark.widget)
+    ? ok('parse error pinned to the right line (gutter + line + inline message)')
+    : fail(`error decoration: ${JSON.stringify(mark)}`);
+  // Editing clears the decoration.
+  await page.evaluate(() => document.querySelector('.CodeMirror').CodeMirror.setValue('func () -> (i64) {\nblock0():\n  v0 = i64.const 1\n  return v0\n}'));
+  const cleared = await page.evaluate(() => !document.querySelector('.cm-error-widget'));
+  cleared ? ok('error decoration clears on edit') : fail('error decoration not cleared on edit');
+
   // The Vim toggle engages the Vim keymap for real (registered + editor holds vim state).
   await page.check('#vim');
   const vim = await page.evaluate(() => {

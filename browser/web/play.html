@@ -47,6 +47,14 @@
       }
       .CodeMirror.cm-readonly { opacity: 0.82; }
       .CodeMirror.cm-readonly .CodeMirror-cursor { display: none; }
+      /* Parse/verify error decoration: a gutter dot, a highlighted line, and an inline message. */
+      .svm-error-gutter { width: 0.8rem; }
+      .cm-error-marker { color: #d1242f; cursor: help; }
+      .cm-error-line { background: #fbe9eb; }
+      .cm-error-widget {
+        background: #ffeef0; color: #86181d; border-left: 3px solid #d1242f;
+        font: 0.78rem/1.4 ui-monospace, monospace; padding: 0.2rem 0.5rem; white-space: pre-wrap;
+      }
       /* Light-theme token colors (a GitHub-flavored palette). */
       .cm-s-default .cm-comment { color: #6a737d; font-style: italic; }
       .cm-s-default .cm-string { color: #a31515; }
@@ -75,6 +83,9 @@
         .cm-s-default .cm-number { color: #7ee787; }
         .cm-s-default .cm-operator { color: #8b949e; }
         .CodeMirror-dialog { background: #1d1d1d; color: #ddd; }
+        .cm-error-line { background: #3a1d20; }
+        .cm-error-marker { color: #ff7b72; }
+        .cm-error-widget { background: #2d1417; color: #ffb4ac; border-left-color: #f85149; }
       }
     </style>
     <script src="vendor/codemirror/codemirror.js"></script>
