@@ -2045,7 +2045,7 @@ browser — good enough here.
 
 ---
 
-## 19. Debugging & observability  [PARTIALLY BUILT — interpreter stepping + DAP shipped; DWARF & cap.call record/replay staged]
+## 19. Debugging & observability  [PARTIALLY BUILT — interpreter stepping + DAP + memory-access hooks shipped; DWARF & cap.call record/replay staged]
 
 > **Work-breakdown & detailed designs:** `DEBUGGING.md` (workstreams W1–W8, sequencing,
 > open decisions). This section stays the canonical *rationale*; that doc is the *plan*.
@@ -2106,6 +2106,25 @@ fits the ocap model. (§15's metering *properties* — fuel/quota — exist on `
 `Monitor` is still a **pattern**, not a built type — though the `Inspector` half is now real
 (`svm-interp`'s `Inspector`, driven by the `svm-dap` DAP server).) Debug info is **tooling,
 untrusted for escape** (§2a) — strippable, and the verifier never trusts it.
+
+**Memory-access instrumentation hooks (built, all backends — see `HOOKS.md`).** A distinct
+observability seam from the four pillars above, for embedders rather than interactive debuggers:
+an instance can opt into a **hook around every guest memory op** (loads, stores, v128, atomics,
+`mem.copy`/`move`/`fill`) — observe the effective address + width (or bulk span) *before* the
+access, and optionally **veto** it (a backend-identical trap). The two motivating consumers are
+**memory-safety validation** and an **educational platform** that estimates cache misses / page
+faults from the access trace to score student programs. The hard constraint is **zero cost for
+programs that don't opt in**, met *structurally*: hooks are an **IR-to-IR instrumentation pass**
+(`svm-opt`) that inserts a `cap.call` before each memory op and re-verifies (fail-closed, §2a) —
+the engines are untouched, so an un-hooked module is byte-identical, and a hooked module runs on
+all three backends with an event stream **identical by the §3 parity invariant** (the JIT
+included, with no change to the §4 masking lowering). Like the `Inspector`, a hook is a host-side
+*observe* capability that never widens guest authority (it rides the §7 `HostFn` interface). It is
+delivered by module rewrite, so it observes the **post-SSA-promotion** IR (same trade as pillar 4)
+and, under multi-vCPU (§12), the shared-`Host` handler sees every vCPU's accesses but in a
+schedule-dependent order. Surfaced as `Instance::with_mem_hooks` (`svm-run`) and
+`svm_instance_with_mem_hooks` (the C ABI, `svm-capi`); full design, phasing, and measured
+hooked-run overhead in **`HOOKS.md`**.
 
 **Tension to record (it entangles the §3d perf pass — now concrete, not hypothetical):** SSA
 promotion (the implemented headline perf win, §3d) gives a promoted local **no memory

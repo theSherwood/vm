@@ -134,7 +134,10 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > serialized, and restored bytewise (single- and multi-vCPU, both backends); **time-travel-capable
 > debugging** (`svm-dap`, §19; `DEBUGGING.md`) — an interpreter-backed **Debug Adapter Protocol**
 > server (breakpoints / stepping / backtrace / source-level locals over the IR debug info, no DWARF/JIT
-> needed); a **partial evaluator** (`svm-peval`, §20c) — a semantics-preserving IR→IR
+> needed); **memory-access instrumentation hooks** (§19; `HOOKS.md`) — an opt-in, **zero-cost-when-off**
+IR→IR pass that fires an embedder hook (observe or veto) around every guest memory op, identical across
+all three backends, for memory-safety validation and cache/page-fault scoring; a **partial evaluator**
+(`svm-peval`, §20c) — a semantics-preserving IR→IR
 > optimizer plus the first **Futamura projection** (specialize an interpreter + fixed program into a
 > residual); a minimal **WASI preview1** host shim (`svm-wasi`, §7) over the `svm-wasm` import
 > mechanism; **conservative-GC support** (`gc.roots` control-stack root enumeration for a guest's own
