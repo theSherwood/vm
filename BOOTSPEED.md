@@ -113,8 +113,16 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
   seed the `--single` argv → reserved-window bytecode run) boots the real database on V8 to a queried
   backend, ~6–8 s (`browser/bench_pg.mjs`). The reserved-memory path works in wasm; the module stays
   import-free (no graphical caps granted).
-- **The loader/page.** A web page that `svm_alloc`s `{postgres_resolved.svmb, pgdata.img, SQL}`, calls
-  `svm_run_pg`, and shows the backend output — the `bench_pg.mjs` flow behind a UI (Milestone C).
+- **✅ In the playground.** Postgres is a first-class example in the SVM **playground**
+  (`browser/web/play.html` / `play.js`, the "PostgreSQL (17.5 — write & run SQL)" example): the editor's
+  SQL is fed as stdin, the pre-translated+resolved module + `pgdata.img` are fetched (staged into
+  `web/assets/` by `browser/build-pg-assets.mjs` — gitignored, like the Lua/SQLite assets), and
+  `svm_run_pg` boots the backend on the **threads** engine the playground already runs, reading the
+  output back onto the page. `browser/browser-test.mjs` drives it in real Chromium via Playwright —
+  selects the example, clicks Run, asserts the query result — alongside every other playground example
+  (the check skips when the artifacts aren't staged). **The demo is done: a real PostgreSQL, in the
+  browser, in the playground next to Lua and SQLite, sandboxed.** Remaining polish is boot speed
+  (snapshot/restore).
 
 ## Reproducing the measurements
 
