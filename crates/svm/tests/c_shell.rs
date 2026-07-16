@@ -128,7 +128,7 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 /// `exec_line` tokenizes the remainder into `argv[]`, sets a shell variable for a lone `NAME=VALUE`,
 /// then expands `$NAME`/`$?` tokens (shell vars shadow the environment) and glob tokens (`*`/`?`
 /// matched against the memfs, `dir/name` results, literal if no match) before running one builtin —
-/// `echo`, `export`, `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `sort`, `uniq`, `rm`,
+/// `echo`, `export`, `pwd`, `cd`, `cat`, `wc`, `grep` (`-v`/`-c`), `head`/`tail` (`-n N`), `sort`, `uniq`, `rm`,
 /// `ls`, `true`/`false`, `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
 /// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
 /// and surfaced as `$?`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
@@ -436,19 +436,29 @@ static int exec_line(char *line) {
       put_num(lines); puts_(" "); put_num(words); puts_(" "); put_num(bytes); puts_("\n");
     }
   } else if (streq(cmd, "grep")) {
-    int matched = 0;
-    if (argc > 1) {
-      char *pat = argv[1];
-      int ci; long fd = src_fd(argc > 2 ? argv[2] : 0, &ci);
-      if (fd < 0) { puts_(argv[2]); puts_(": not found\n"); st = 2; }
+    int ai = 1, inv = 0, cnt = 0;       /* -v: invert match; -c: print only the match count */
+    while (ai < argc && argv[ai][0] == '-') {
+      if (streq(argv[ai], "-v")) inv = 1;
+      else if (streq(argv[ai], "-c")) cnt = 1;
+      ai++;
+    }
+    long matches = 0;
+    if (ai < argc) {
+      char *pat = argv[ai++];
+      int ci; long fd = src_fd(ai < argc ? argv[ai] : 0, &ci);
+      if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 2; }
       else {
         static char lb[256];
-        while (read_line(fd, lb, 256) >= 0)
-          if (contains(lb, pat)) { puts_(lb); puts_("\n"); matched = 1; }
+        while (read_line(fd, lb, 256) >= 0) {
+          int m = contains(lb, pat);
+          if (inv) m = !m;
+          if (m) { matches++; if (!cnt) { puts_(lb); puts_("\n"); } }
+        }
         if (ci) close(fd);
       }
     }
-    if (st == 0 && !matched) st = 1;   /* grep: no match is exit 1 */
+    if (cnt) { put_num(matches); puts_("\n"); }
+    if (st == 0 && matches == 0) st = 1;   /* grep: no match is exit 1 */
   } else if (streq(cmd, "head")) {
     int ai = 1; long n = 10;
     if (argc > ai && streq(argv[ai], "-n") && argc > ai + 1) { n = atoi_(argv[ai + 1]); ai += 2; }
@@ -929,6 +939,27 @@ fn stage0_shell_grep_filters_lines() {
         "interp: grep keeps lines containing `al`"
     );
     assert_eq!(jout, iout, "jit: grep output must match interp");
+}
+
+/// `grep -v` inverts the match and `grep -c` prints only the count. Both read the redirected file.
+#[test]
+fn stage0_shell_grep_flags() {
+    let (iout, jout) = run_shell(
+        b"echo alpha > /f\n\
+          echo beta >> /f\n\
+          echo alps >> /f\n\
+          grep -v al < /f\n\
+          grep -c al < /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    // -v al → lines without "al" → "beta"; -c al → count of matching lines → 2.
+    assert_eq!(
+        iout, b"beta\n2\n",
+        "interp: grep -v inverts, grep -c counts"
+    );
+    assert_eq!(jout, iout, "jit: grep-flags output must match interp");
 }
 
 /// `head -n N` / `tail -n N` with an explicit path argument select the first / last N lines of a
