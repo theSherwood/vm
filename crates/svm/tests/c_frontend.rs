@@ -739,6 +739,40 @@ fn c_hello_world_end_to_end() {
 }
 
 #[test]
+fn c_defined_write_shadows_the_builtin() {
+    // A guest **definition** of `write` (a body, not a bare `extern`) shadows the powerbox Stream
+    // builtin — the frontend hook the POSIX personality libc relies on to own `write`/`read`/`exit`
+    // with the real signature (PROCESS.md S15 (b)). Here the guest `write` just runs its own body
+    // and returns; the Stream builtin would instead have written to stdout and returned the byte
+    // count. `calls == 1` proves the body ran; empty stdout proves the builtin did *not* fire.
+    let r = run_c_full(
+        "int calls = 0; \
+         int write(int fd, char *b, int n) { calls = calls + 1; return 100 + n; } \
+         int main() { int r = write(1, 0, 7); return r + calls; }",
+    );
+    assert_eq!(
+        r.outcome,
+        Outcome::Returned(vec![Value::I32(108)]),
+        "the guest write body ran (107) and bumped calls (1) — not the Stream builtin"
+    );
+    assert_eq!(r.stdout, b"", "the Stream builtin must not have fired");
+}
+
+#[test]
+fn c_undefined_write_still_hits_the_builtin() {
+    // The negative of the above: a bare `extern write` (no body) keeps the powerbox Stream builtin,
+    // so the existing fixed-powerbox programs are unchanged by the shadowing hook.
+    let r = run_c_full(
+        "int write(int fd, char *buf, int n); \
+         int main() { write(1, \"hey\", 3); return 0; }",
+    );
+    assert_eq!(
+        r.stdout, b"hey",
+        "extern write still routes to Stream.write"
+    );
+}
+
+#[test]
 fn c_stdout_from_loop_end_to_end() {
     // Build a buffer of digits on the data stack, then write it in one call.
     let r = run_c_full(

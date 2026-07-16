@@ -1545,12 +1545,21 @@ static int gen_expr(Node *node) {
     if (direct) {
       char *fname = node->lhs->var->name;
       if (fname) {
-        if (!strcmp(fname, "write"))
-          return gen_builtin_stream(node, STDOUT_SLOT, 1);
-        if (!strcmp(fname, "read"))
-          return gen_builtin_stream(node, STDIN_SLOT, 0);
-        if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
-          return gen_builtin_exit(node);
+        // The stdio builtins (`write`/`read`/`exit`) apply only to a name that is *declared but not
+        // defined* in this unit — a guest **definition** shadows the builtin (correct C: a real
+        // function beats a compiler builtin). This is how a personality libc owns these names: a
+        // guest `write(fd, buf, len)` that forwards (fd preserved) to a `call.import` bound to the
+        // POSIX personality (PROCESS.md S15 (b)). A bare `extern write` (no body) still gets the
+        // powerbox Stream builtin, so the existing fixed-powerbox programs are unchanged. The `__vm_*`
+        // intrinsics below stay unconditional — they are reserved, never legitimately redefined.
+        if (!node->lhs->var->is_definition) {
+          if (!strcmp(fname, "write"))
+            return gen_builtin_stream(node, STDOUT_SLOT, 1);
+          if (!strcmp(fname, "read"))
+            return gen_builtin_stream(node, STDIN_SLOT, 0);
+          if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
+            return gen_builtin_exit(node);
+        }
         if (!strcmp(fname, "__vm_map"))
           return gen_builtin_memory(node, 0, 3);
         if (!strcmp(fname, "__vm_unmap"))

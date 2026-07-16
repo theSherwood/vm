@@ -5,13 +5,18 @@
 //! The module's **import section is its capability manifest** — the discoverable contract between
 //! guest and host. There is no positional agreement anywhere: no powerbox slot for the personality,
 //! no `__vm_cap(n)`, no implicit slot numbering shared out-of-band. A tiny guest libc **shim**
-//! (guest code) gives each libc call its **real C signature** — `open(path, flags)`, `getenv(name)`,
-//! `malloc(n)` — adapting NUL-terminated strings to the personality's explicit-length `(ptr, len)`
-//! ABI (POSIX.md §4), and forwards to a `__px_`-prefixed undefined extern whose first argument is a
-//! literal `0`: the `ConstI32` **placeholder** the resolver patches to the granted handle at
-//! instantiation. Grant happens *before* resolve (the §7 "binding happens once, at instantiation"
-//! ordering); an unknown name fails closed. This is PROCESS.md S15 stage (a) — the fixed 8-slot
-//! `_start` remains only for the legacy powerbox caps until stages (b)–(c) migrate the frontend.
+//! (guest code) gives each libc call its **real C signature** — `write(fd, buf, n)`, `open(path,
+//! flags)`, `getenv(name)`, `exit(code)` — adapting NUL-terminated strings to the personality's
+//! explicit-length `(ptr, len)` ABI (POSIX.md §4), and forwards to a `__px_`-prefixed undefined
+//! extern whose first argument is a literal `0`: the `ConstI32` **placeholder** the resolver patches
+//! to the granted handle at instantiation. Grant happens *before* resolve (the §7 "binding happens
+//! once, at instantiation" ordering); an unknown name fails closed.
+//!
+//! The shim uses the **standard libc names** `write`/`read`/`exit` — its *definitions* shadow
+//! chibicc's Stream/Exit builtins (PROCESS.md S15 (b): a guest definition beats a compiler builtin),
+//! so `write(1, buf, n)` reaches the personality with `fd` preserved rather than the fd-dropping
+//! powerbox Stream call. This is S15 stages (a)+(b); the fixed 8-slot `_start` remains only for the
+//! *other* legacy powerbox caps (stdout/stdin/exit/memory/…) until stage (c) migrates them too.
 //!
 //! Each program runs `_start` (function 0) on **both** the interpreter and the JIT under an identical
 //! host, asserting they agree on the result *and* the observable personality state (captured stdout,
@@ -26,7 +31,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_with_host, Host, StreamRole, Value};
+use svm_interp::{run_with_host, Host, StreamRole, Trap, Value};
 use svm_jit::{compile_and_run_with_host, JitOutcome};
 use svm_posix::Posix;
 use svm_run::cap_thunk;
@@ -113,10 +118,11 @@ fn setup(host: &mut Host, win: u64) -> ([Value; 8], Posix, i32) {
     (args, posix, px)
 }
 
-/// What a program did on one backend: `main`'s returned result values, plus the personality's
-/// captured stdout and the memfs contents of file `"f"`.
+/// What a program did on one backend: either `main` returned values or the personality's `exit` op
+/// terminated it (`exited`), plus the captured stdout and the memfs contents of file `"f"`.
 struct Effects {
     result: Vec<Value>,
+    exited: Option<i32>,
     stdout: Vec<u8>,
     file_f: Option<Vec<u8>>,
 }
@@ -160,12 +166,16 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
         .unwrap_or_else(|e| panic!("resolve imports: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
-    // Interpreter.
+    // Interpreter — a normal return yields values; the personality's `exit` op is `Trap::Exit(code)`.
     let mut fuel = 50_000_000u64;
-    let ires = run_with_host(&m, 0, &iargs, &mut fuel, &mut ih)
-        .unwrap_or_else(|e| panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"));
+    let (iresult, iexited) = match run_with_host(&m, 0, &iargs, &mut fuel, &mut ih) {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
     let interp = Effects {
-        result: ires,
+        result: iresult,
+        exited: iexited,
         stdout: iposix.stdout(),
         file_f: iposix.read_file("f"),
     };
@@ -180,12 +190,14 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
         &mut jh as *mut Host as *mut c_void,
     )
     .expect("jit compiles");
-    let jresult = match jout {
-        JitOutcome::Returned(s) => s.iter().map(|&x| Value::I64(x)).collect(),
-        other => panic!("jit did not return normally: {other:?}\n--- IR ---\n{ir}"),
+    let (jresult, jexited) = match jout {
+        JitOutcome::Returned(s) => (s.iter().map(|&x| Value::I64(x)).collect(), None),
+        JitOutcome::Exited(c) => (Vec::new(), Some(c)),
+        other => panic!("jit ended abnormally: {other:?}\n--- IR ---\n{ir}"),
     };
     let jit = Effects {
         result: jresult,
+        exited: jexited,
         stdout: jposix.stdout(),
         file_f: jposix.read_file("f"),
     };
@@ -196,11 +208,12 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
 /// A tiny guest libc shim (guest code) binding C's libc calls to the POSIX personality by **name
 /// only**. Each `__px_` extern's first argument is a literal `0` — the `ConstI32` placeholder the
 /// resolver patches to the granted handle ([`svm_ir::Resolved::CapBound`]); no `__vm_cap`, no slot.
-/// The wrappers expose the **real C signatures** — `open(path, flags)`, `getenv(name)`, `chdir(path)`,
-/// `malloc(n)` — adapting C's NUL-terminated `char*` convention to the personality's explicit-length
-/// `(ptr, len)` ABI (POSIX.md §4); the adaptation is guest code. `write`/`read` wrappers keep the
-/// `px_` prefix only because chibicc still intercepts those *names* as Stream builtins (the S15
-/// stage-(b) frontend migration collapses them to the plain names); `exit` likewise.
+/// The wrappers expose the **real C signatures** — `write(fd, buf, n)`, `open(path, flags)`,
+/// `getenv(name)`, `exit(code)` — adapting C's NUL-terminated `char*` convention to the personality's
+/// explicit-length `(ptr, len)` ABI (POSIX.md §4); the adaptation is guest code. `write`/`read`/`exit`
+/// are the standard libc names: they *define* those functions, which now **shadows** chibicc's Stream
+/// builtin (PROCESS.md S15 (b)) — so a program's `write(1, buf, n)` reaches the personality with `fd`
+/// preserved, not the fd-dropping powerbox Stream call.
 const SHIM: &str = r#"
 long __px_write(int cap, long fd, long buf, long len);
 long __px_read(int cap, long fd, long buf, long len);
@@ -210,17 +223,19 @@ long __px_lseek(int cap, long fd, long off, long whence);
 long __px_getcwd(int cap, long buf, long size);
 long __px_chdir(int cap, long path, long len);
 long __px_getenv(int cap, long name, long len);
+void __px_exit(int cap, int code);
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
 void *malloc(long size) { return (void *)__px_malloc(0, size); }
 long open(char *path, long flags) { return __px_open(0, (long)path, slen(path), flags); }
-long px_write(long fd, void *buf, long n) { return __px_write(0, fd, (long)buf, n); }
-long px_read(long fd, void *buf, long n) { return __px_read(0, fd, (long)buf, n); }
+long write(long fd, void *buf, long n) { return __px_write(0, fd, (long)buf, n); }
+long read(long fd, void *buf, long n) { return __px_read(0, fd, (long)buf, n); }
 long lseek(long fd, long off, long whence) { return __px_lseek(0, fd, off, whence); }
 char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 ? buf : 0; }
 long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
 char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
+void exit(int code) { __px_exit(0, code); }
 "#;
 
 /// The full round-trip: `malloc` a buffer, write it to the personality's **stdout** (fd 1), `open`
@@ -236,13 +251,13 @@ int main() {{\n\
   long n = slen(msg);\n\
   char *buf = (char *)malloc(32);\n\
   for (long i = 0; i < n; i = i + 1) buf[i] = msg[i];\n\
-  px_write(1, buf, n);          /* fd 1 -> captured stdout */\n\
+  write(1, buf, n);          /* fd 1 -> captured stdout */\n\
   long fd = open(\"f\", 66);    /* O_CREAT|O_RDWR */\n\
-  px_write(fd, buf, n);         /* -> memfs file \"f\" */\n\
+  write(fd, buf, n);         /* -> memfs file \"f\" */\n\
   lseek(fd, 0, 0);              /* SEEK_SET 0 */\n\
   char *buf2 = (char *)malloc(32);\n\
-  long r = px_read(fd, buf2, 32); /* read the file back */\n\
-  px_write(1, buf2, r);         /* echo it to stdout again */\n\
+  long r = read(fd, buf2, 32); /* read the file back */\n\
+  write(1, buf2, r);         /* echo it to stdout again */\n\
   return (int)fd;               /* the first file fd is 3 */\n\
 }}\n"
     );
@@ -277,11 +292,11 @@ fn c_reads_env_and_cwd_through_the_personality() {
         "{SHIM}\n\
 int main() {{\n\
   char *p = getenv(\"PATH\");     /* staged host-side as \"/bin\" */\n\
-  if (p) px_write(1, p, slen(p)); /* -> \"/bin\" */\n\
+  if (p) write(1, p, slen(p)); /* -> \"/bin\" */\n\
   chdir(\"/tmp\");\n\
   char *buf = (char *)malloc(64);\n\
   getcwd(buf, 64);                /* NUL-terminated new cwd */\n\
-  px_write(1, buf, slen(buf));    /* -> \"/tmp\" */\n\
+  write(1, buf, slen(buf));    /* -> \"/tmp\" */\n\
   return 0;\n\
 }}\n"
     );
@@ -298,5 +313,35 @@ int main() {{\n\
         vec![Value::I64(0)],
         "jit: result must match interp"
     );
+    assert_eq!(jit.stdout, interp.stdout, "jit: stdout must match interp");
+}
+
+/// A plain `write` then `exit(code)` from compiled C — both **standard libc names** whose guest
+/// definitions shadow chibicc's Stream/Exit builtins (PROCESS.md S15 (b)), reaching the personality
+/// (fd-routed write; `exit` → `Trap::Exit`). Proves the shadowing hook end to end: the program writes
+/// to the personality's stdout with the real `fd` and terminates with the given code, identically on
+/// both backends. The `return` after `exit` is dead (the personality's `exit` op never returns).
+#[test]
+fn c_write_then_exit_through_the_personality() {
+    let src = format!(
+        "{SHIM}\n\
+int main() {{\n\
+  write(1, \"bye\\n\", 4);   /* fd 1 -> captured stdout, via the shadowing wrapper */\n\
+  exit(7);                  /* -> the personality's exit op (Trap::Exit) */\n\
+  return 99;                /* dead: exit does not return */\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+
+    assert_eq!(
+        interp.exited,
+        Some(7),
+        "interp: exit(7) terminated the program"
+    );
+    assert_eq!(
+        interp.stdout, b"bye\n",
+        "interp: the write flushed before exit"
+    );
+    assert_eq!(jit.exited, Some(7), "jit: exit code must match interp");
     assert_eq!(jit.stdout, interp.stdout, "jit: stdout must match interp");
 }
