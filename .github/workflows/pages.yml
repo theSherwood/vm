@@ -71,9 +71,7 @@ jobs:
         run: |
           SITE="$GITHUB_WORKSPACE/_site"
           mkdir -p "$SITE/web/assets" "$SITE/target/wasm32-unknown-unknown/release"
-          cp web/*.html web/*.js "$SITE/web/"
-          cp web/assets/*.svmb "$SITE/web/assets/"
-          cp web/assets/*.wad "$SITE/web/assets/" 2>/dev/null || true
+          cp -r web/. "$SITE/web/"
           cp target/wasm32-unknown-unknown/release/svm_browser.wasm "$SITE/target/wasm32-unknown-unknown/release/"
           cat > "$SITE/index.html" <<'HTML'
           <!doctype html>
