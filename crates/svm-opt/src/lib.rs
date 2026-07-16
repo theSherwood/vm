@@ -85,6 +85,7 @@ pub mod gvn;
 pub mod reassociate;
 pub mod sccp;
 pub mod ssa;
+mod thread;
 pub mod vn;
 
 /// A value known to be a constant at optimization time. Tracks scalar integers/floats and `v128`.

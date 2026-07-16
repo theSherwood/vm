@@ -23,105 +23,13 @@
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
-use svm_ir::{Func, Terminator, ValType};
+use svm_ir::{Func, ValType};
 use svm_verify::func_value_types;
 
 use crate::cfg::Cfg;
-use crate::ssa::{from_ssa, to_ssa, Def, SsaFunc, Value};
+use crate::ssa::{from_ssa, to_ssa, Def, Value};
+use crate::thread::{dominates, Threader};
 use crate::{map_operands, map_term_operands};
-
-/// Does block `a` dominate block `b`? Walks `b` up the immediate-dominator chain until it reaches `a`
-/// (dominated) or the entry (not). `idom` is [`Cfg::dominators`] (entry / unreachable → `None`).
-fn dominates(idom: &[Option<u32>], a: u32, b: u32) -> bool {
-    let mut x = b;
-    loop {
-        if x == a {
-            return true;
-        }
-        match idom[x as usize] {
-            Some(p) => x = p,
-            None => return false,
-        }
-    }
-}
-
-/// Append `arg` to every edge of `term` that targets block `to` (a predecessor may have several: a
-/// `br_if` with both arms to `to`, or a `br_table` repeating it). Keeps edge args aligned with the
-/// new parameter appended at `to`.
-fn append_edge_arg(term: &mut Terminator, to: u32, arg: Value) {
-    match term {
-        Terminator::Br { target, args } => {
-            if *target == to {
-                args.push(arg);
-            }
-        }
-        Terminator::BrIf {
-            then_blk,
-            then_args,
-            else_blk,
-            else_args,
-            ..
-        } => {
-            if *then_blk == to {
-                then_args.push(arg);
-            }
-            if *else_blk == to {
-                else_args.push(arg);
-            }
-        }
-        Terminator::BrTable {
-            targets, default, ..
-        } => {
-            for (t, a) in targets.iter_mut() {
-                if *t == to {
-                    a.push(arg);
-                }
-            }
-            if default.0 == to {
-                default.1.push(arg);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Threads a dominating value to the blocks that need it, adding block parameters + edge args. Holds
-/// the mutable SSA function plus the immutable analysis it reads (predecessors, value types).
-struct Threader<'a> {
-    s: &'a mut SsaFunc,
-    preds: &'a [Vec<u32>],
-    gtype: Vec<ValType>,
-    /// Memo: value `e` made available at block `b` is represented by `avail[(e, b)]`.
-    avail: BTreeMap<(Value, u32), Value>,
-}
-
-impl Threader<'_> {
-    /// Return a value valid **in block `at`** that equals `e` (defined in `def_b`, which dominates
-    /// `at`). Adds a parameter to `at` and threads `e` in along each predecessor edge when needed.
-    fn make_available(&mut self, e: Value, def_b: u32, at: u32) -> Value {
-        if at == def_b {
-            return e; // e is defined right here
-        }
-        if let Some(&v) = self.avail.get(&(e, at)) {
-            return v;
-        }
-        // Add a fresh parameter to `at`, typed like `e`, at the end of its parameter list.
-        let ty = self.gtype[e as usize];
-        let slot = self.s.blocks[at as usize].params.len();
-        self.s.blocks[at as usize].params.push(ty);
-        let g = self.s.num_values;
-        self.s.num_values += 1;
-        self.gtype.push(ty);
-        self.s.values[at as usize].insert(slot, g); // new param sits right after existing params
-        self.avail.insert((e, at), g); // record before recursing so cycles (loops) terminate
-                                       // Feed the new parameter from every predecessor.
-        for p in self.preds[at as usize].clone() {
-            let arg = self.make_available(e, def_b, p);
-            append_edge_arg(&mut self.s.blocks[p as usize].term, at, arg);
-        }
-        g
-    }
-}
 
 /// Run global value numbering / CSE on a function. `funcs` is the whole module's function list and
 /// `has_memory` its memory presence — both only for `func_value_types` (call result types / memory
