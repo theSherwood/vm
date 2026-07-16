@@ -234,6 +234,27 @@ tracked enhancement, not a blocker.
     while LICM/GVN *cost* static size — motivating a hoist cost model. Broaden the corpus (more
     realistic residuals, branch-heavy shapes) and add Wasmtime-relative numbers next.
 
+### Benchmark follow-ups (from `OPT_BENCH.md`, PR #337)
+
+The first ablation surfaced concrete next steps, tracked here so they aren't lost:
+
+- [ ] **LICM/GVN hoist cost model.** The clearest actionable finding: on a loop with *nothing worth
+  hoisting* (the tight sum loop), LICM/GVN still add block-parameter threading, so they grow static
+  size **and** make the interpreter slightly slower (removing them was 0.94–0.97×). Gate hoisting on a
+  cheap benefit estimate (invariant op count / loop-body share) so a pass only fires when it pays.
+  Until then the passes are a net loss on hoist-free loops.
+- [ ] **Broaden the ablation corpus.** SCCP and jump-threading barely move on the current corpus
+  (their speed effect is ~0 there). Add branch-heavy / constant-propagation-heavy shapes and more
+  realistic residuals so each pass has a case that actually exercises its run-time win.
+- [ ] **Multi-run statistics in the harness.** Single-run numbers show visible variance (one JIT row
+  read 2× its neighbors). Report medians + spread over several runs before treating any delta as load-
+  bearing.
+- [ ] **Wasmtime-relative numbers** (also under Phase 5): measure optimized-residual run time against
+  Wasmtime on the same workloads, per DESIGN.md §1a — the "measured relative to wasm/Wasmtime" bar.
+- [ ] **Note for Phase 3/4 targeting.** Because the JIT backend (`opt_level="speed"`) already does its
+  own GVN/CSE/LICM, scalar passes are ~JIT-run-time-neutral; the higher-leverage host-JIT wins are the
+  cross-boundary transforms Cranelift *cannot* see — inlining (Phase 3) and memory passes (Phase 4).
+
 ### Enhancements (tracked, not gating)
 
 - [ ] Debug-info (line map) preservation through transforms.
