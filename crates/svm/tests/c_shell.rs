@@ -88,6 +88,8 @@ fn resolver(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
 const SHIM: &str = r#"
 long __px_write(int cap, long fd, long buf, long len);
 long __px_read(int cap, long fd, long buf, long len);
+long __px_open(int cap, long path, long len, long flags);
+long __px_close(int cap, long fd);
 long __px_getcwd(int cap, long buf, long size);
 long __px_chdir(int cap, long path, long len);
 long __px_getenv(int cap, long name, long len);
@@ -102,6 +104,8 @@ static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
 long write(long fd, void *buf, long n) { return __px_write(0, fd, (long)buf, n); }
 long read(long fd, void *buf, long n) { return __px_read(0, fd, (long)buf, n); }
+long open(char *path, long flags) { return __px_open(0, (long)path, slen(path), flags); }
+long close(long fd) { return __px_close(0, fd); }
 char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 ? buf : 0; }
 long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
 char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
@@ -115,17 +119,26 @@ int argc_(void) { return (int)__px_argc(0); }
 long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap); }
 "#;
 
-/// The Stage-0 shell itself (guest code). `run_line` executes one command line (builtins only —
-/// `echo` with `$VAR`, `pwd`, `cd`, `ls`, `exit`; unknown → `<cmd>: not found`), tokenizing it into a
-/// command and a single argument on the first space. `main` supports two invocations: `sh -c "…"`
-/// (read via the personality's `argc`/`argv`) runs a single line; otherwise it's a read-eval loop
-/// over stdin. `exit` calls the personality `exit` (terminal).
+/// The Stage-0 shell itself (guest code). `run_line` first strips a trailing `> file` / `>> file`
+/// redirect (pointing a global `out_fd` at the target via `open`, restored after), then `exec_line`
+/// runs one command line (builtins only — `echo` with `$VAR`, `pwd`, `cd`, `cat`, `ls`, `exit`;
+/// unknown → `<cmd>: not found`), tokenizing it into a command and a single argument on the first
+/// space. `cat` and redirection exercise the real file surface (`open`/`read`/`write`/`close`).
+/// `main` supports two invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs a
+/// single line; otherwise it's a read-eval loop over stdin. `exit` calls the personality `exit`.
 const SHELL_MAIN: &str = r#"
+#define O_WRONLY 1
+#define O_CREAT  0100
+#define O_TRUNC  01000
+#define O_APPEND 02000
 static char cwd[256];
+/* Current output fd: 1 (stdout) unless a `>`/`>>` redirect is in effect. */
+static long out_fd = 1;
 static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }
-static void puts_(char *s) { write(1, s, slen(s)); }
+static void puts_(char *s) { write(out_fd, s, slen(s)); }
 
-static void run_line(char *line) {
+/* Execute one command after redirection has been stripped: `cmd` plus an optional single `arg`. */
+static void exec_line(char *line) {
   int sp = 0; while (line[sp] && line[sp] != ' ') sp++;
   char *cmd = line, *arg = 0;
   if (line[sp] == ' ') { line[sp] = 0; arg = line + sp + 1; }
@@ -139,6 +152,17 @@ static void run_line(char *line) {
     puts_("\n");
   } else if (streq(cmd, "cd")) {
     if (arg) chdir(arg);
+  } else if (streq(cmd, "cat")) {
+    if (arg) {
+      long fd = open(arg, 0);   /* O_RDONLY */
+      if (fd < 0) { puts_(arg); puts_(": not found\n"); }
+      else {
+        static char buf[256];
+        long r;
+        while ((r = read(fd, buf, 256)) > 0) write(out_fd, buf, r);
+        close(fd);
+      }
+    }
   } else if (streq(cmd, "ls")) {
     char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
     long d = opendir(dir);
@@ -153,6 +177,30 @@ static void run_line(char *line) {
   } else {
     puts_(cmd); puts_(": not found\n");
   }
+}
+
+/* Strip a trailing `> file` / `>> file` redirect, point `out_fd` at the target for the duration of
+   the command, then restore stdout. Absent a redirect, run the line straight to stdout. */
+static void run_line(char *line) {
+  int gt = 0; while (line[gt] && line[gt] != '>') gt++;
+  if (line[gt] != '>') { exec_line(line); return; }
+  char *p = line + gt;
+  int append = 0;
+  *p = 0; p++;                       /* cut the command portion at `>` */
+  if (*p == '>') { append = 1; p++; }
+  while (*p == ' ') p++;             /* skip spaces before the filename */
+  char *target = p;
+  while (*p && *p != ' ') p++;       /* the filename ends at a space or EOL */
+  *p = 0;
+  int end = gt; while (end > 0 && line[end - 1] == ' ') line[--end] = 0;  /* rtrim command */
+  if (target[0] == 0) { exec_line(line); return; }
+  long flags = append ? (O_WRONLY | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_TRUNC);
+  long fd = open(target, flags);
+  if (fd < 0) { puts_(target); puts_(": cannot open\n"); return; }
+  out_fd = fd;
+  exec_line(line);
+  close(fd);
+  out_fd = 1;
 }
 
 int main(void) {
@@ -299,4 +347,46 @@ fn stage0_shell_dash_c_runs_one_command() {
     );
     assert_eq!(iout, b"/home/user\n", "interp: sh -c ran the argv command");
     assert_eq!(jout, iout, "jit: sh -c output must match interp");
+}
+
+/// I/O redirection + `cat` end to end (S7 item 3): `echo … > f` opens/truncates a memfs file and
+/// writes there instead of stdout (so the redirected lines are absent from captured stdout); `>>`
+/// appends; `cat f` reads it back to stdout. Only the final `cat`s reach stdout, proving the
+/// `open`/`write`/`read`/`close` round-trip through the personality on both backends.
+#[test]
+fn stage0_shell_redirection_and_cat() {
+    let (iout, jout) = run_shell(
+        b"echo first > /out\n\
+          echo second >> /out\n\
+          cat /out\n\
+          echo only-stdout\n\
+          cat /missing\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"first\nsecond\nonly-stdout\n/missing: not found\n",
+        "interp: `>`/`>>` divert to the file; only the cats + bare echo hit stdout"
+    );
+    assert_eq!(jout, iout, "jit: redirection/cat output must match interp");
+}
+
+/// A truncating redirect (`>`) replaces the file's prior contents rather than appending: after two
+/// separate `>` writes, `cat` sees only the second. Confirms `O_TRUNC` on re-open.
+#[test]
+fn stage0_shell_redirect_truncates() {
+    let (iout, jout) = run_shell(
+        b"echo one > /f\n\
+          echo two > /f\n\
+          cat /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"two\n",
+        "interp: the second `>` truncated the first write"
+    );
+    assert_eq!(jout, iout, "jit: truncation output must match interp");
 }
