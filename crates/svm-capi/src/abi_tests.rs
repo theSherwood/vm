@@ -293,6 +293,109 @@ fn reactor_session_persists_state_across_calls_via_c_abi() {
     }
 }
 
+// ---- Memory-access hooks over the C ABI ----
+
+/// A recording hook context: the flattened events seen so far, and an optional index at which to
+/// veto (fail-closed) instead of recording — so one callback drives both the observe and veto tests.
+#[derive(Default)]
+struct HookRec {
+    events: Vec<(i32, u64, u64, u64)>,
+    veto_at: i32,
+}
+
+/// The C callback: record each event, or return non-zero to veto when the count reaches `veto_at`.
+extern "C" fn record_hook(ctx: *mut c_void, ev: *const SvmMemEvent) -> i32 {
+    unsafe {
+        let rec = &mut *(ctx as *mut HookRec);
+        let e = &*ev;
+        if rec.veto_at >= 0 && rec.events.len() as i32 == rec.veto_at {
+            return 1; // veto → the run aborts with a capability trap
+        }
+        rec.events.push((e.kind, e.addr, e.src, e.size));
+        0
+    }
+}
+
+// `store 7 @ 64+8; load @ 64+8` — a bare kernel (0 params) that runs under the fixed powerbox.
+const MEM_KERNEL: &str = "\
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 64
+  v1 = i64.const 7
+  i64.store v0 v1 offset=8
+  v2 = i64.load v0 offset=8
+  return v2
+}
+";
+
+#[test]
+fn mem_hooks_observe_every_access_via_c_abi() {
+    unsafe {
+        for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
+            let ir = CString::new(MEM_KERNEL).unwrap();
+            let m = svm_module_parse_text(ir.as_ptr());
+            assert!(!m.is_null(), "parse (backend {backend})");
+            let inst = svm_instantiate(m);
+            assert!(!inst.is_null(), "instantiate (backend {backend})");
+
+            let mut rec = HookRec {
+                veto_at: -1,
+                ..Default::default()
+            };
+            let hooked =
+                svm_instance_with_mem_hooks(inst, record_hook, &mut rec as *mut _ as *mut c_void);
+            assert!(
+                !hooked.is_null(),
+                "with_mem_hooks: {:?}",
+                CStr::from_ptr(svm_last_error())
+            );
+
+            let run = svm_instance_run(hooked, backend, ptr::null());
+            assert!(!run.is_null(), "run backend {backend}");
+            assert_eq!(svm_run_result(run, 0), 7, "kernel returns the stored value");
+            // Effective address is 64 + 8; store then load, each width 8.
+            assert_eq!(
+                rec.events,
+                vec![(SVM_MEM_STORE, 72, 0, 8), (SVM_MEM_LOAD, 72, 0, 8),],
+                "C hook saw the store then the load (backend {backend})"
+            );
+            svm_run_free(run);
+            svm_instance_free(hooked);
+        }
+    }
+}
+
+#[test]
+fn mem_hook_veto_aborts_the_run_via_c_abi() {
+    unsafe {
+        for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
+            let ir = CString::new(MEM_KERNEL).unwrap();
+            let m = svm_module_parse_text(ir.as_ptr());
+            let inst = svm_instantiate(m);
+            assert!(!inst.is_null());
+
+            // Veto the second event (the load): observe the store, then trap.
+            let mut rec = HookRec {
+                veto_at: 1,
+                ..Default::default()
+            };
+            let hooked =
+                svm_instance_with_mem_hooks(inst, record_hook, &mut rec as *mut _ as *mut c_void);
+            assert!(!hooked.is_null());
+
+            let run = svm_instance_run(hooked, backend, ptr::null());
+            assert!(run.is_null(), "vetoed run must fail (backend {backend})");
+            assert_eq!(
+                rec.events,
+                vec![(SVM_MEM_STORE, 72, 0, 8)],
+                "the veto landed after exactly one observed event (backend {backend})"
+            );
+            svm_instance_free(hooked);
+        }
+    }
+}
+
 // A C-ABI host capability that touches the guest window (F5): `upcase(ptr, len)` reads `len` bytes
 // from the window via `svm_guest_read`, uppercases ASCII, and writes them back via `svm_guest_write`.
 extern "C" fn upcase(

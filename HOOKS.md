@@ -96,7 +96,13 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
 - **Embedder API**: `crates/svm-run/src/lib.rs` — `Instance::with_mem_hooks(make)` instruments,
   re-verifies (fail-closed), and stores the handler factory; `MemEvent` / `MemHookFn` are the
   public surface. The factory builds a fresh handler per host (`run_diff` grants two hosts);
-  shared consumer state goes behind an `Arc` in the closure.
+  shared consumer state goes behind an `Arc` in the closure. `Instance::mem_hook_stats()` exposes
+  the pass's inserted-op count for fuel scaling.
+- **C ABI**: `crates/svm-capi` — `svm_instance_with_mem_hooks(instance, hook, ctx)` consumes the
+  instance and returns a hooked one; the callback gets a flattened `SvmMemEvent { kind, addr, src,
+  size }` (the `SVM_MEM_*` kinds) and returns non-zero to veto. Trampolines into
+  `Instance::with_mem_hooks` exactly as `svm_imports_provide_host_fn` does for host-fns. Declared
+  in `include/svm.h`.
 - **Handle binding**: `cap.call` needs a handle constant at instrument time. Grants are
   deterministic, so `with_mem_hooks` discovers the value with a scratch first-grant on a fresh
   `Host`, bakes it, and `grant_caps` grants the hook **first** on every run's fresh host
@@ -111,6 +117,7 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
   - `crates/svm/tests/mem_hooks_diff.rs` — the three-backend gate: identical event streams
     (incl. v128 through the bytecode engine's `Op::Eval` fallback), unperturbed outcomes,
     faulting trace ends at the attempted access, veto aborts identically everywhere.
+  - `crates/svm-capi/src/abi_tests.rs` — the C ABI observe + veto over all three backends.
 
 ## 5. Zero-cost accounting
 
@@ -121,10 +128,21 @@ construction. The only touched crates are `svm-opt` (a new, never-called-by-defa
 Benchmark A/B against `bench/baseline.txt` is still worth running on any commit that later
 touches an engine file; for this change the diff itself is the proof.
 
-Hooked-run cost (measured expectations, not gates): one `cap.call` + 1–3 consts per memory op —
-roughly 50–100 ns/event on the interpreters, ~10–20 ns/event on the JIT, on top of whatever the
-consumer's handler does. Adequate for scoring a student program (≤10⁹ accesses in
-seconds-to-minutes); not aimed at >10⁷ events/s tracing.
+Hooked-run cost is **measured** by the overhead probe (`bench/`, `cargo run --release --bin
+hooks`): a counting hook (one relaxed `fetch_add` per event) on the store+load mem kernel,
+subtraction-isolated, min-of-5. First recorded numbers (2026-07-16, dev container — absolute ns
+are machine-dependent; watch the trend, not the value):
+
+| backend | pristine/iter | hooked/iter | overhead/event | hooked events/s |
+|---|---|---|---|---|
+| TreeWalk | 121.6 ns | 267.0 ns | 72.7 ns | 7.5 M/s |
+| Bytecode | 109.1 ns | 199.3 ns | 45.1 ns | 10.0 M/s |
+| Jit | 0.3 ns | 102.5 ns | 51.1 ns | 19.5 M/s |
+
+Right in the design's estimated band, and the JIT is the fastest hooked configuration as
+predicted (its per-event cost is the host-call boundary; the consumer's own handler is on top).
+Adequate for scoring a student program (≤10⁹ accesses in seconds-to-minutes); not aimed at
+>10⁷–10⁸ events/s tracing — that remains the P4 trigger.
 
 ## 6. Status & follow-ups
 
@@ -132,10 +150,12 @@ seconds-to-minutes); not aimed at >10⁷ events/s tracing.
 - [x] P1 — instrumentation pass + re-verify + unit tests (`svm-opt`).
 - [x] P2 — `Instance::with_mem_hooks` + deterministic handle grant (`svm-run`).
 - [x] P3 — three-backend trace parity gate (`crates/svm/tests/mem_hooks_diff.rs`).
-- [ ] C ABI surface (`svm-capi`): `svm_instance_with_mem_hooks(instance, fn_ptr, user_ctx)` —
-      when an FFI embedder asks.
-- [ ] Published hooked-run overhead number in the benchmark harness (a hooked mem kernel next to
-      the pristine one), so regressions in hooked throughput are visible over time.
+- [x] C ABI surface (`svm-capi`): `svm_instance_with_mem_hooks(instance, hook, ctx)` +
+      `SvmMemEvent`/`SvmMemHook` in `include/svm.h`, observe + veto exercised in `abi_tests.rs`.
+- [x] Published hooked-run overhead number in the benchmark harness — `bench/`'s `hooks` bin
+      (`cargo run --release --bin hooks`), hooked vs pristine on all three backends through the
+      real `Instance::with_mem_hooks` path; first numbers in §5. `Instance::mem_hook_stats()`
+      now exposes the pass's inserted-op count for fuel scaling.
 - [ ] Multi-vCPU hooked runs: events interleave schedule-dependently; v1 consumers should run
       single-vCPU/deterministic (the `Inspector`'s scope). Revisit if a consumer needs threaded
       traces (per-vCPU event streams would be the likely shape).
