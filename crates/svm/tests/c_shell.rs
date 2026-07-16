@@ -123,9 +123,11 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 
 /// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
 /// redirects (pointing globals `in_fd`/`out_fd` at the targets via `open`, restored after), then
-/// `exec_line` tokenizes the remainder into `argv[]` and runs one builtin — `echo` (with `$VAR`),
-/// `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `rm`, `ls`, `exit`; unknown →
-/// `<cmd>: not found`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
+/// `exec_line` tokenizes the remainder into `argv[]` and runs one builtin — `echo` (with `$VAR` and
+/// `$?`), `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `rm`, `ls`, `true`/`false`,
+/// `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
+/// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
+/// and surfaced as `$?`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
 /// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
 /// surface (`open`/`read`/`write`/`close`/`unlink`). `main` supports two
 /// invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs a single line; otherwise
@@ -140,6 +142,8 @@ static char cwd[256];
    `in_fd` is 0 unless a `<` redirect is active. run_line points them at files and restores them. */
 static long out_fd = 1;
 static long in_fd = 0;
+/* Exit status of the last command, surfaced as `$?` and consumed by `&&`/`||`. 0 = success. */
+static int last_status = 0;
 static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }
 static void puts_(char *s) { write(out_fd, s, slen(s)); }
 
@@ -202,22 +206,64 @@ static int tokenize(char *line, char **argv) {
   return argc;
 }
 
+/* Evaluate `test`/`[ … ]` and return a shell status (0 = true). Supports: a lone non-empty string;
+   unary `-f`/`-d`/`-e` (file / dir / either exists), `-z`/`-n` (empty / non-empty); and binary
+   `=`/`!=` (string) and `-eq`/`-ne`/`-lt`/`-gt` (numeric). Anything else is false. */
+static int do_test(int argc, char **argv) {
+  int top = argc;
+  if (streq(argv[0], "[") && top > 1 && streq(argv[top - 1], "]")) top--;   /* drop the closing `]` */
+  char **a = argv + 1;
+  int n = top - 1;
+  if (n == 1) return a[0][0] ? 0 : 1;
+  if (n == 2) {
+    if (streq(a[0], "-f")) { long fd = open(a[1], 0); if (fd >= 0) { close(fd); return 0; } return 1; }
+    if (streq(a[0], "-d")) { long d = opendir(a[1]); if (d >= 0) { closedir(d); return 0; } return 1; }
+    if (streq(a[0], "-e")) {
+      long fd = open(a[1], 0); if (fd >= 0) { close(fd); return 0; }
+      long d = opendir(a[1]); if (d >= 0) { closedir(d); return 0; }
+      return 1;
+    }
+    if (streq(a[0], "-z")) return a[1][0] ? 1 : 0;
+    if (streq(a[0], "-n")) return a[1][0] ? 0 : 1;
+    return 1;
+  }
+  if (n == 3) {
+    if (streq(a[1], "=")) return streq(a[0], a[2]) ? 0 : 1;
+    if (streq(a[1], "!=")) return streq(a[0], a[2]) ? 1 : 0;
+    if (streq(a[1], "-eq")) return atoi_(a[0]) == atoi_(a[2]) ? 0 : 1;
+    if (streq(a[1], "-ne")) return atoi_(a[0]) != atoi_(a[2]) ? 0 : 1;
+    if (streq(a[1], "-lt")) return atoi_(a[0]) < atoi_(a[2]) ? 0 : 1;
+    if (streq(a[1], "-gt")) return atoi_(a[0]) > atoi_(a[2]) ? 0 : 1;
+    return 1;
+  }
+  return 1;
+}
+
 /* Execute one command after redirection has been stripped. `line` is tokenized into argv; builtins
-   read their input from a path argument or, absent one, the (possibly redirected) in_fd. */
-static void exec_line(char *line) {
+   read their input from a path argument or, absent one, the (possibly redirected) in_fd. Returns the
+   command's exit status (0 = success). */
+static int exec_line(char *line) {
   char *argv[MAXARGS];
   int argc = tokenize(line, argv);
-  if (argc == 0) return;
+  if (argc == 0) return 0;
   char *cmd = argv[0];
   char *arg = argc > 1 ? argv[1] : 0;
+  int st = 0;
   if (streq(cmd, "echo")) {
     for (int i = 1; i < argc; i++) {
       char *a = argv[i];
-      if (a[0] == '$') { char *v = getenv(a + 1); if (v) puts_(v); }
+      if (streq(a, "$?")) put_num(last_status);
+      else if (a[0] == '$') { char *v = getenv(a + 1); if (v) puts_(v); }
       else puts_(a);
       if (i + 1 < argc) puts_(" ");
     }
     puts_("\n");
+  } else if (streq(cmd, "true")) {
+    st = 0;
+  } else if (streq(cmd, "false")) {
+    st = 1;
+  } else if (streq(cmd, "test") || streq(cmd, "[")) {
+    st = do_test(argc, argv);
   } else if (streq(cmd, "pwd")) {
     if (getcwd(cwd, 256)) puts_(cwd);
     puts_("\n");
@@ -225,7 +271,7 @@ static void exec_line(char *line) {
     if (arg) chdir(arg);
   } else if (streq(cmd, "cat")) {
     int ci; long fd = src_fd(arg, &ci);
-    if (fd < 0) { puts_(arg); puts_(": not found\n"); }
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
     else {
       static char buf[256];
       long r;
@@ -234,7 +280,7 @@ static void exec_line(char *line) {
     }
   } else if (streq(cmd, "wc")) {
     int ci; long fd = src_fd(arg, &ci);
-    if (fd < 0) { puts_(arg); puts_(": not found\n"); }
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
     else {
       static char buf[256];
       long r, lines = 0, words = 0, bytes = 0; int inword = 0;
@@ -250,22 +296,24 @@ static void exec_line(char *line) {
       put_num(lines); puts_(" "); put_num(words); puts_(" "); put_num(bytes); puts_("\n");
     }
   } else if (streq(cmd, "grep")) {
+    int matched = 0;
     if (argc > 1) {
       char *pat = argv[1];
       int ci; long fd = src_fd(argc > 2 ? argv[2] : 0, &ci);
-      if (fd < 0) { puts_(argv[2]); puts_(": not found\n"); }
+      if (fd < 0) { puts_(argv[2]); puts_(": not found\n"); st = 2; }
       else {
         static char lb[256];
         while (read_line(fd, lb, 256) >= 0)
-          if (contains(lb, pat)) { puts_(lb); puts_("\n"); }
+          if (contains(lb, pat)) { puts_(lb); puts_("\n"); matched = 1; }
         if (ci) close(fd);
       }
     }
+    if (st == 0 && !matched) st = 1;   /* grep: no match is exit 1 */
   } else if (streq(cmd, "head")) {
     int ai = 1; long n = 10;
     if (argc > ai && streq(argv[ai], "-n") && argc > ai + 1) { n = atoi_(argv[ai + 1]); ai += 2; }
     int ci; long fd = src_fd(argc > ai ? argv[ai] : 0, &ci);
-    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); }
+    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 1; }
     else {
       static char lb[256];
       for (long k = 0; k < n && read_line(fd, lb, 256) >= 0; k++) { puts_(lb); puts_("\n"); }
@@ -276,7 +324,7 @@ static void exec_line(char *line) {
     if (argc > ai && streq(argv[ai], "-n") && argc > ai + 1) { n = atoi_(argv[ai + 1]); ai += 2; }
     if (n > 16) n = 16;   /* the ring holds at most 16 lines */
     int ci; long fd = src_fd(argc > ai ? argv[ai] : 0, &ci);
-    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); }
+    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 1; }
     else {
       static char ring[16][256];
       long count = 0;
@@ -287,29 +335,30 @@ static void exec_line(char *line) {
     }
   } else if (streq(cmd, "rm")) {
     for (int i = 1; i < argc; i++)
-      if (unlink(argv[i]) < 0) { puts_(argv[i]); puts_(": not found\n"); }
+      if (unlink(argv[i]) < 0) { puts_(argv[i]); puts_(": not found\n"); st = 1; }
   } else if (streq(cmd, "ls")) {
     char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
     long d = opendir(dir);
-    if (d < 0) { puts_(dir); puts_(": not found\n"); }
+    if (d < 0) { puts_(dir); puts_(": not found\n"); st = 1; }
     else {
       static char name[128];
       while (readdir(d, name, 128) > 0) { puts_(name); puts_("\n"); }
       closedir(d);
     }
   } else if (streq(cmd, "exit")) {
-    exit(0);
+    exit(argc > 1 ? (int)atoi_(argv[1]) : last_status);
   } else {
-    puts_(cmd); puts_(": not found\n");
+    puts_(cmd); puts_(": not found\n"); st = 127;
   }
+  return st;
 }
 
 /* Strip `< file`, `> file`, and `>> file` redirects out of the line, pointing in_fd/out_fd at the
    targets for the duration of the command, then restore stdio. Absent any redirect, run straight to
    stdin/stdout. Multiple redirects are honored (e.g. `wc < in > out`). */
-static void run_line(char *line) {
+static int run_line(char *line) {
   long ifd = 0, ofd = 1, ci = -1, co = -1;
-  int cmd_end = -1, i = 0;
+  int cmd_end = -1, i = 0, st = 1;
   while (line[i]) {
     char op = line[i];
     if (op != '<' && op != '>') { i++; continue; }
@@ -336,11 +385,12 @@ static void run_line(char *line) {
   }
   if (cmd_end >= 0) { int e = cmd_end; while (e > 0 && line[e - 1] == ' ') line[--e] = 0; }
   in_fd = ifd; out_fd = ofd;
-  exec_line(line);
+  st = exec_line(line);
 done:
   if (ci >= 0) close(ci);
   if (co >= 0) close(co);
   in_fd = 0; out_fd = 1;
+  return st;
 }
 
 int main(void) {
@@ -349,8 +399,8 @@ int main(void) {
   if (argc_() >= 3) {
     static char flag[8];
     if (getarg(1, flag, 8) > 0 && streq(flag, "-c") && getarg(2, cmd, 256) > 0) {
-      run_line(cmd);
-      return 0;
+      last_status = run_line(cmd);
+      return last_status;
     }
   }
   /* Otherwise: a read-eval loop over stdin. */
@@ -365,7 +415,7 @@ int main(void) {
       if (n < 255) line[n++] = c;
     }
     line[n] = 0;
-    run_line(line);
+    last_status = run_line(line);
   }
 }
 "#;
@@ -663,4 +713,57 @@ fn stage0_shell_echo_joins_argv() {
         "interp: argv tokens rejoin with single spaces; $WHO expands"
     );
     assert_eq!(jout, iout, "jit: echo-join output must match interp");
+}
+
+/// Exit status via `$?`: `true`/`false` set 0/1, an unknown command sets 127, `grep` with no match
+/// sets 1, and `echo $?` reports the previous command's status. Proves `exec_line` returns a status
+/// that `main` threads into `last_status`.
+#[test]
+fn stage0_shell_exit_status() {
+    let (iout, jout) = run_shell(
+        b"true\n\
+          echo $?\n\
+          false\n\
+          echo $?\n\
+          nope\n\
+          echo $?\n\
+          echo hit > /f\n\
+          grep zzz < /f\n\
+          echo $?\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"0\n1\nnope: not found\n127\n1\n",
+        "interp: $? tracks true/false/unknown/grep-miss"
+    );
+    assert_eq!(jout, iout, "jit: exit-status output must match interp");
+}
+
+/// `test` / `[ … ]`: string equality, numeric comparison, and file/dir predicates over the memfs.
+/// Each result is read back through `$?`.
+#[test]
+fn stage0_shell_test_builtin() {
+    let (iout, jout) = run_shell(
+        b"test a = a\n\
+          echo $?\n\
+          [ 3 -gt 5 ]\n\
+          echo $?\n\
+          echo hi > /f\n\
+          test -f /f\n\
+          echo $?\n\
+          test -d /nodir\n\
+          echo $?\n\
+          [ -n hello ]\n\
+          echo $?\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"0\n1\n0\n1\n0\n",
+        "interp: test string/numeric/-f/-d/-n predicates"
+    );
+    assert_eq!(jout, iout, "jit: test-builtin output must match interp");
 }
