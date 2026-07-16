@@ -90,6 +90,7 @@ long __px_write(int cap, long fd, long buf, long len);
 long __px_read(int cap, long fd, long buf, long len);
 long __px_open(int cap, long path, long len, long flags);
 long __px_close(int cap, long fd);
+long __px_unlink(int cap, long path, long len);
 long __px_getcwd(int cap, long buf, long size);
 long __px_chdir(int cap, long path, long len);
 long __px_getenv(int cap, long name, long len);
@@ -106,6 +107,7 @@ long write(long fd, void *buf, long n) { return __px_write(0, fd, (long)buf, n);
 long read(long fd, void *buf, long n) { return __px_read(0, fd, (long)buf, n); }
 long open(char *path, long flags) { return __px_open(0, (long)path, slen(path), flags); }
 long close(long fd) { return __px_close(0, fd); }
+long unlink(char *path) { return __px_unlink(0, (long)path, slen(path)); }
 char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 ? buf : 0; }
 long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
 char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
@@ -121,10 +123,11 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 
 /// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
 /// redirects (pointing globals `in_fd`/`out_fd` at the targets via `open`, restored after), then
-/// `exec_line` runs one command line (builtins only — `echo` with `$VAR`, `pwd`, `cd`, `cat`, `wc`,
-/// `ls`, `exit`; unknown → `<cmd>: not found`), tokenizing it into a command and a single argument
-/// on the first space. `cat`/`wc` read a path arg or the redirected `in_fd`; together with `>`/`>>`
-/// this exercises the real file surface (`open`/`read`/`write`/`close`). `main` supports two
+/// `exec_line` tokenizes the remainder into `argv[]` and runs one builtin — `echo` (with `$VAR`),
+/// `pwd`, `cd`, `cat`, `wc`, `grep`, `head`/`tail` (`-n N`), `rm`, `ls`, `exit`; unknown →
+/// `<cmd>: not found`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
+/// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
+/// surface (`open`/`read`/`write`/`close`/`unlink`). `main` supports two
 /// invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs a single line; otherwise
 /// it's a read-eval loop over stdin. `exit` calls the personality `exit`.
 const SHELL_MAIN: &str = r#"
@@ -148,21 +151,72 @@ static void put_num(long n) {
   write(out_fd, b + i, 24 - i);
 }
 
-/* Read source for cat/wc: an explicit path arg (caller must close), else the current in_fd. */
-static long src_fd(char *arg, int *close_it) {
-  if (arg) { *close_it = 1; return open(arg, 0); }   /* O_RDONLY */
+/* Read source for a filter: an explicit path (caller must close), else the current in_fd. */
+static long src_fd(char *path, int *close_it) {
+  if (path) { *close_it = 1; return open(path, 0); }   /* O_RDONLY */
   *close_it = 0; return in_fd;
 }
 
-/* Execute one command after redirection has been stripped: `cmd` plus an optional single `arg`. */
+/* Parse a non-negative decimal prefix (head/tail counts). */
+static long atoi_(char *s) {
+  long v = 0; int i = 0;
+  while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+  return v;
+}
+
+/* Substring test: does `hay` contain `needle`? An empty needle matches. */
+static int contains(char *hay, char *needle) {
+  for (int i = 0; hay[i]; i++) {
+    int j = 0; while (needle[j] && hay[i + j] == needle[j]) j++;
+    if (needle[j] == 0) return 1;
+  }
+  return needle[0] == 0;
+}
+
+/* Read one newline-delimited line from fd into buf (NUL-terminated, newline dropped); returns its
+   length, or -1 at EOF with nothing read. One byte per read keeps it correct across any source. */
+static long read_line(long fd, char *buf, long lim) {
+  long n = 0; char c;
+  for (;;) {
+    long r = read(fd, &c, 1);
+    if (r <= 0) { if (n == 0) return -1; break; }
+    if (c == '\n') break;
+    if (n < lim - 1) buf[n++] = c;
+  }
+  buf[n] = 0;
+  return n;
+}
+
+/* Split `line` into space-separated tokens (runs of spaces collapse), writing pointers into argv and
+   returning the count (capped at MAXARGS). Mutates `line` in place with NUL terminators. */
+#define MAXARGS 16
+static int tokenize(char *line, char **argv) {
+  int argc = 0, i = 0;
+  for (;;) {
+    while (line[i] == ' ') i++;
+    if (line[i] == 0 || argc >= MAXARGS) break;
+    argv[argc++] = line + i;
+    while (line[i] && line[i] != ' ') i++;
+    if (line[i] == ' ') line[i++] = 0;
+  }
+  return argc;
+}
+
+/* Execute one command after redirection has been stripped. `line` is tokenized into argv; builtins
+   read their input from a path argument or, absent one, the (possibly redirected) in_fd. */
 static void exec_line(char *line) {
-  int sp = 0; while (line[sp] && line[sp] != ' ') sp++;
-  char *cmd = line, *arg = 0;
-  if (line[sp] == ' ') { line[sp] = 0; arg = line + sp + 1; }
-  if (line[0] == 0) return;
+  char *argv[MAXARGS];
+  int argc = tokenize(line, argv);
+  if (argc == 0) return;
+  char *cmd = argv[0];
+  char *arg = argc > 1 ? argv[1] : 0;
   if (streq(cmd, "echo")) {
-    if (arg && arg[0] == '$') { char *v = getenv(arg + 1); if (v) puts_(v); }
-    else if (arg) puts_(arg);
+    for (int i = 1; i < argc; i++) {
+      char *a = argv[i];
+      if (a[0] == '$') { char *v = getenv(a + 1); if (v) puts_(v); }
+      else puts_(a);
+      if (i + 1 < argc) puts_(" ");
+    }
     puts_("\n");
   } else if (streq(cmd, "pwd")) {
     if (getcwd(cwd, 256)) puts_(cwd);
@@ -195,6 +249,45 @@ static void exec_line(char *line) {
       if (ci) close(fd);
       put_num(lines); puts_(" "); put_num(words); puts_(" "); put_num(bytes); puts_("\n");
     }
+  } else if (streq(cmd, "grep")) {
+    if (argc > 1) {
+      char *pat = argv[1];
+      int ci; long fd = src_fd(argc > 2 ? argv[2] : 0, &ci);
+      if (fd < 0) { puts_(argv[2]); puts_(": not found\n"); }
+      else {
+        static char lb[256];
+        while (read_line(fd, lb, 256) >= 0)
+          if (contains(lb, pat)) { puts_(lb); puts_("\n"); }
+        if (ci) close(fd);
+      }
+    }
+  } else if (streq(cmd, "head")) {
+    int ai = 1; long n = 10;
+    if (argc > ai && streq(argv[ai], "-n") && argc > ai + 1) { n = atoi_(argv[ai + 1]); ai += 2; }
+    int ci; long fd = src_fd(argc > ai ? argv[ai] : 0, &ci);
+    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); }
+    else {
+      static char lb[256];
+      for (long k = 0; k < n && read_line(fd, lb, 256) >= 0; k++) { puts_(lb); puts_("\n"); }
+      if (ci) close(fd);
+    }
+  } else if (streq(cmd, "tail")) {
+    int ai = 1; long n = 10;
+    if (argc > ai && streq(argv[ai], "-n") && argc > ai + 1) { n = atoi_(argv[ai + 1]); ai += 2; }
+    if (n > 16) n = 16;   /* the ring holds at most 16 lines */
+    int ci; long fd = src_fd(argc > ai ? argv[ai] : 0, &ci);
+    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); }
+    else {
+      static char ring[16][256];
+      long count = 0;
+      while (read_line(fd, ring[count % 16], 256) >= 0) count++;
+      if (ci) close(fd);
+      long start = count > n ? count - n : 0;
+      for (long k = start; k < count; k++) { puts_(ring[k % 16]); puts_("\n"); }
+    }
+  } else if (streq(cmd, "rm")) {
+    for (int i = 1; i < argc; i++)
+      if (unlink(argv[i]) < 0) { puts_(argv[i]); puts_(": not found\n"); }
   } else if (streq(cmd, "ls")) {
     char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
     long d = opendir(dir);
@@ -487,4 +580,87 @@ fn stage0_shell_input_and_output_redirection() {
         jout, iout,
         "jit: combined-redirection output must match interp"
     );
+}
+
+/// `grep` over a redirected file: only lines containing the pattern survive. Exercises the argv
+/// tokenizer (pattern in argv[1], file via `<`) and line-buffered reading (`read_line`).
+#[test]
+fn stage0_shell_grep_filters_lines() {
+    let (iout, jout) = run_shell(
+        b"echo alpha > /f\n\
+          echo beta >> /f\n\
+          echo alps >> /f\n\
+          grep al < /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"alpha\nalps\n",
+        "interp: grep keeps lines containing `al`"
+    );
+    assert_eq!(jout, iout, "jit: grep output must match interp");
+}
+
+/// `head -n N` / `tail -n N` with an explicit path argument select the first / last N lines of a
+/// six-line file. Exercises `-n` flag parsing (`atoi_`) and tail's ring buffer.
+#[test]
+fn stage0_shell_head_and_tail() {
+    let (iout, jout) = run_shell(
+        b"echo l1 > /f\n\
+          echo l2 >> /f\n\
+          echo l3 >> /f\n\
+          echo l4 >> /f\n\
+          echo l5 >> /f\n\
+          echo l6 >> /f\n\
+          head -n 2 /f\n\
+          tail -n 2 /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"l1\nl2\nl5\nl6\n",
+        "interp: head -n 2 → first two, tail -n 2 → last two"
+    );
+    assert_eq!(jout, iout, "jit: head/tail output must match interp");
+}
+
+/// `rm` removes a memfs file (`unlink`, op 8): after `rm /f`, `cat /f` reports not-found, and
+/// removing an absent file reports not-found too. Multi-arg `rm` deletes each argument.
+#[test]
+fn stage0_shell_rm_removes_files() {
+    let (iout, jout) = run_shell(
+        b"echo x > /a\n\
+          echo y > /b\n\
+          rm /a /b\n\
+          cat /a\n\
+          rm /gone\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"/a: not found\n/gone: not found\n",
+        "interp: rm unlinks; cat of a removed/absent file is not-found"
+    );
+    assert_eq!(jout, iout, "jit: rm output must match interp");
+}
+
+/// `echo` now joins multiple argv tokens with single spaces (argv tokenizer), collapsing the runs of
+/// spaces in the source line. A `$VAR` token still expands mid-line.
+#[test]
+fn stage0_shell_echo_joins_argv() {
+    let (iout, jout) = run_shell(
+        b"echo  a   b    c\n\
+          echo hi $WHO !\n",
+        &[("WHO", "bob")],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"a b c\nhi bob !\n",
+        "interp: argv tokens rejoin with single spaces; $WHO expands"
+    );
+    assert_eq!(jout, iout, "jit: echo-join output must match interp");
 }
