@@ -1086,15 +1086,29 @@ fn translate_impl(
             imports,
             // First-class function exports: each defined function's name → its final `module.funcs`
             // index, so a C-compiled module is name-addressable (`call("main")`) like the wasm path.
-            // Mirrors the out-of-band `Translated::exports` (the `.syms` sidecar source).
-            exports: defined
-                .iter()
-                .enumerate()
-                .map(|(i, f)| svm_ir::Export {
-                    name: f.name.clone(),
-                    func: base + i as u32,
-                })
-                .collect(),
+            // Mirrors the out-of-band `Translated::exports` (the `.syms` sidecar source). When a
+            // powerbox `_start` was synthesized, export it at funcidx 0 too — the named-entry marker
+            // the runtime keys off (S15 (c): a paramless `_start` is tagged by its export, not params).
+            exports: {
+                let mut ex: Vec<svm_ir::Export> = defined
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| svm_ir::Export {
+                        name: f.name.clone(),
+                        func: base + i as u32,
+                    })
+                    .collect();
+                if synth {
+                    ex.insert(
+                        0,
+                        svm_ir::Export {
+                            name: "_start".to_string(),
+                            func: 0,
+                        },
+                    );
+                }
+                ex
+            },
             // §6 debug-info waist: the source-line half, mapped from each LLVM `!DILocation` (the
             // variable/type half is blocked on the `llvm-ir` metadata reader — see `DebugAcc`).
             // `None` for a non-`-g` build (no instruction carried a location).
@@ -3418,6 +3432,58 @@ type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32], bool, u
 /// slot (offset `i*4`) so every capability call site can reload its handle, then calls the C
 /// `main(sp)` at the page-aligned data-stack base and returns its exit code. The runner grants
 /// exactly `n_handles` (a contiguous prefix, by declared arity — `run_powerbox`).
+/// Emit the **by-name** powerbox prologue (PROCESS.md S15 (c)): for `i in 0..n_handles`, resolve the
+/// canonical cap name `svm_ir::POWERBOX_CAP_NAMES[i]` (`cap.self.resolve`) and stash the handle at
+/// byte offset `i*4`. Each name's bytes are staged **in its own stash slot** (offset `i*4`) — always
+/// in the mapped low reserved region `[0, 32)` (unlike the data-stack base, which svm-llvm puts at the
+/// window's mapped edge) — resolved, then overwritten by the 4-byte handle. Names are processed in
+/// order, and each slot's final write is its handle (a longer name's overhang into the next slot is
+/// overwritten when that slot is processed), so the whole `[0, n_handles*4)` stash ends correct.
+/// Appends to `insts`, threading and returning the next free `ValIdx`. Shared by `synth_start` /
+/// `synth_start_argv` so a paramless `_start` obtains its handles by name — no positional handle
+/// parameters, no implicit slot-index agreement.
+fn emit_resolve_prologue(insts: &mut Vec<Inst>, n_handles: usize, mut next: ValIdx) -> ValIdx {
+    use svm_ir::{StoreOp, POWERBOX_CAP_NAMES};
+    for (i, name) in POWERBOX_CAP_NAMES[..n_handles].iter().enumerate() {
+        let slot = (i as i64) * 4;
+        for (k, &b) in name.as_bytes().iter().enumerate() {
+            insts.push(Inst::ConstI64(slot + k as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI32(b as i32));
+            let val = next;
+            next += 1;
+            insts.push(Inst::Store {
+                op: StoreOp::I32_8,
+                addr,
+                value: val,
+                offset: 0,
+                align: 0,
+            });
+        }
+        insts.push(Inst::ConstI64(slot));
+        let name_ptr = next;
+        next += 1;
+        insts.push(Inst::ConstI64(name.len() as i64));
+        let name_len = next;
+        next += 1;
+        insts.push(Inst::CapSelfResolve { name_ptr, name_len });
+        let handle = next;
+        next += 1;
+        insts.push(Inst::ConstI64(slot));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: handle,
+            offset: 0,
+            align: 0,
+        });
+    }
+    next
+}
+
 #[allow(clippy::too_many_arguments)] // shares the StartBuilder shape with synth_start_argv (8 params)
 fn synth_start(
     main_idx: u32,
@@ -3433,24 +3499,10 @@ fn synth_start(
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
-    // params v0..v(n-1) = the granted handles. Each slot offset is just `i*4` (the `STASH_*` layout),
-    // so stashing is a uniform loop: store param `i` at byte offset `i*4`. A program is granted a
-    // prefix sized to the highest capability index it uses (e.g. 4 with `malloc`/Memory, 7 with the
-    // async-ring builtins through `Blocking`).
-    let params = vec![ValType::I32; n_handles];
-    let mut next: ValIdx = n_handles as ValIdx;
-    for i in 0..n_handles {
-        insts.push(Inst::ConstI64((i as i64) * 4));
-        let addr = next;
-        next += 1;
-        insts.push(Inst::Store {
-            op: StoreOp::I32,
-            addr,
-            value: i as ValIdx,
-            offset: 0,
-            align: 0,
-        });
-    }
+    // A **paramless** `_start` (S15 c): resolve the granted handles **by name** into the stash slots
+    // (the name bytes staged transiently at `entry_sp`), rather than receiving them as positional args.
+    let params: Vec<ValType> = Vec::new();
+    let mut next: ValIdx = emit_resolve_prologue(&mut insts, n_handles, 0);
     // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base` (the
     // window's mapped boundary — the first reserved page); the allocator `vm_map`-commits upward.
     if let Some(hb) = heap_base {
@@ -3499,7 +3551,7 @@ fn synth_start(
             insts,
             term,
         }],
-        params,
+        params: params.clone(),
     }
 }
 
@@ -3555,22 +3607,13 @@ fn synth_start_argv(
         align: 0,
     };
 
-    // ---- block 0: entry — stash handles, seed the heap, load argc, jump into the argv loop. ----
-    let params = vec![ValType::I32; n_handles];
+    // ---- block 0: entry — resolve handles by name, seed the heap, load argc, jump into the argv loop.
+    // A **paramless** `_start` (S15 c): the granted handles are resolved by name into the stash (the
+    // name bytes staged transiently at `entry_sp`, above the argv array the loop below writes), not
+    // received as positional args.
+    let params: Vec<ValType> = Vec::new();
     let mut insts: Vec<Inst> = Vec::new();
-    let mut next: ValIdx = n_handles as ValIdx;
-    for i in 0..n_handles {
-        insts.push(Inst::ConstI64((i as i64) * 4));
-        let addr = next;
-        next += 1;
-        insts.push(Inst::Store {
-            op: StoreOp::I32,
-            addr,
-            value: i as ValIdx,
-            offset: 0,
-            align: 0,
-        });
-    }
+    let mut next: ValIdx = emit_resolve_prologue(&mut insts, n_handles, 0);
     if let Some(hb) = heap_base {
         for off in [HEAP_BRK, HEAP_TOP] {
             insts.push(Inst::ConstI64(off as i64));
@@ -3605,7 +3648,7 @@ fn synth_start_argv(
     insts.push(Inst::ConstI64(0)); // i = 0
     let v_i0 = next;
     let b0 = Block {
-        params,
+        params: params.clone(),
         insts,
         term: Terminator::Br {
             target: 1,
@@ -3739,7 +3782,7 @@ fn synth_start_argv(
         return Func {
             results: main_results.to_vec(),
             blocks: vec![b0, b1, b2, b3, b4, b5],
-            params: vec![ValType::I32; n_handles],
+            params: params.clone(),
         };
     }
 
@@ -3909,7 +3952,7 @@ fn synth_start_argv(
     Func {
         results: main_results.to_vec(),
         blocks: vec![b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10],
-        params: vec![ValType::I32; n_handles],
+        params: params.clone(),
     }
 }
 

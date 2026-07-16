@@ -27,7 +27,7 @@ fn peval_guest_specializes_and_jits_in_sandbox() {
     };
     let t = svm_llvm::translate_bc_path(&bc).expect("translate the peval-jit guest to svm-IR");
     assert!(
-        svm_run::is_powerbox_entry(&t.module),
+        svm_run::is_named_powerbox_entry(&t.module),
         "the guest must produce a powerbox entry"
     );
     // The window the on-ramp assigned this guest — the residual must declare the same one.

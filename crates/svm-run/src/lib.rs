@@ -3696,16 +3696,23 @@ impl Instance {
                 h.set_region_factory(new_shared_region);
                 h.set_jit_validator(jit_blob_validator);
                 // Grant in import order, and register each grant under the guest's own import name in
-                // the §7 capability-name directory (F7) so the guest can `cap.self`-resolve it at
-                // runtime — the same names it wrote as `call.import "<name>"`.
-                b.order
-                    .iter()
-                    .map(|name| {
-                        let handle = (b.imports.map[name].grant)(h, win);
-                        h.register_cap_name(name, handle);
-                        Value::I32(handle)
-                    })
-                    .collect()
+                // the §7 capability-name directory (F7). A **paramless** `_start` (the by-name synth,
+                // S15 (c)) resolves each by name (`cap.self.resolve`) and takes no positional args; a
+                // legacy positional entry still receives the handles as arguments, in slot order.
+                let paramless = self
+                    .module
+                    .funcs
+                    .first()
+                    .is_some_and(|f| f.params.is_empty());
+                let mut args = Vec::new();
+                for name in &b.order {
+                    let handle = (b.imports.map[name].grant)(h, win);
+                    h.register_cap_name(name, handle);
+                    if !paramless {
+                        args.push(Value::I32(handle));
+                    }
+                }
+                args
             }
             None if is_named_powerbox_entry(&self.module) => {
                 // S15 (c2): grant + register the full fixed powerbox (the guest resolves each by name
