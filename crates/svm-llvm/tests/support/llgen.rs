@@ -1,18 +1,23 @@
-//! Structured generator of **well-defined, terminating** LLVM-IR functions for the on-ramp
+//! Structured generator of **well-defined, terminating** LLVM-IR modules for the on-ramp
 //! differential harness (`onramp_diff.rs` stable test + `fuzz/onramp_diff` target).
 //!
-//! It emits a single `define i64 @run()` whose body is a straight-line sequence of ops over a
-//! typed SSA value pool, **computing each value's concrete result as it emits** — so the final
-//! `ret i64` value is known by construction (the *oracle*), with no separate interpreter to carry
-//! its own bugs. The generated program is UB-free by construction (shift amounts `< width`, array
-//! indices masked in-bounds, no div, no poison flags), so it must **never trap**, and all three
-//! svm backends (tree-walker, bytecode, JIT) must return the oracle value. A divergence is an
-//! **on-ramp translation bug** — the I23 class, where every backend agrees with the *wrong* IR
-//! (so an interp-vs-JIT differential can't see it; the source-semantics oracle can).
+//! It emits `define i64 @run()` (plus a few pure helper functions and a read-only global) while
+//! **computing each value's concrete result as it emits** — so the final `ret i64` value is known
+//! by construction (the *oracle*), with no separate interpreter to carry its own bugs. Every
+//! program is UB-free by construction (shift amounts `< width`, in-bounds array indices, fixed loop
+//! bounds, no div, no poison flags), so it must **never trap**, and all three svm backends
+//! (tree-walker, bytecode, JIT) must return the oracle value. A divergence is an **on-ramp
+//! translation bug** — the I23 class, where every backend agrees with the *wrong* IR (so an
+//! interp-vs-JIT differential can't see it; the source-semantics oracle can).
 //!
-//! Coverage is biased to the translation surface that has bitten us: `getelementptr` with distinct
-//! source element types (`i8` vs `[N x i32]`), 2-lane (`<2 x i32>`, packed-i64) *and* 128-bit
-//! vector min/max, vector widen/narrow, and integer width conversions.
+//! Coverage spans the translation surface that has bitten us and its neighbours:
+//! - `getelementptr` with distinct source element types — instruction-form over an `alloca` **and**
+//!   **constexpr** GEPs over a global (`i8` vs `[N x i32]` — the I23 const-GEP-stride path);
+//! - 2-lane (`<2 x i32>`, packed-i64) *and* 128-bit vector min/max, widen/narrow, and width
+//!   conversions (the I23 vec2-minmax path);
+//! - control flow — phi-merge diamonds and fixed-bound counted loops (back-edges, phi lowering,
+//!   loop-variant GEP indices); and
+//! - function calls to pure helpers (the call ABI: threaded data-SP, arg passing, scalar return).
 #![allow(dead_code)]
 
 /// Entropy: consume libFuzzer bytes first (coverage-guided), then a deterministic xorshift so a
@@ -131,10 +136,61 @@ pub struct Prog {
     /// The label of the block currently being generated into — a phi's predecessor edge from the
     /// straight-line code before a construct.
     cur_block: String,
+    /// Pure `i64,i64 -> i64` helpers `@run` can call (exercises the call ABI).
+    helpers: Vec<Helper>,
 }
 
 /// A per-lane binary op on raw lane values `(x, y, lane_bits) -> result`.
 type LaneOp = fn(u64, u64, u32) -> u64;
+
+/// A wrapping i64 binop selector (`0=add 1=sub 2=mul _=xor`) — shared by generated helper bodies
+/// and their Rust oracle so both agree exactly.
+fn apply_i64(op: u8, a: u64, b: u64) -> u64 {
+    match op {
+        0 => a.wrapping_add(b),
+        1 => a.wrapping_sub(b),
+        2 => a.wrapping_mul(b),
+        _ => a ^ b,
+    }
+}
+fn op_name(op: u8) -> &'static str {
+    ["add", "sub", "mul", "xor"][(op & 3) as usize]
+}
+
+/// A pure `i64 f(i64 a, i64 b)` helper: `(a op1 c1) op2 (b op3 c2)` (all wrapping). Emitted as its
+/// own `define` and callable from `@run` — exercises the on-ramp's call ABI (the threaded data-SP,
+/// arg passing, scalar return). Small and closed-form so the oracle evaluates it directly.
+#[derive(Clone)]
+struct Helper {
+    name: String,
+    op1: u8,
+    c1: i64,
+    op2: u8,
+    op3: u8,
+    c2: i64,
+}
+impl Helper {
+    fn eval(&self, a: u64, b: u64) -> u64 {
+        let x = apply_i64(self.op1, a, self.c1 as u64);
+        let y = apply_i64(self.op3, b, self.c2 as u64);
+        apply_i64(self.op2, x, y)
+    }
+    fn define(&self) -> String {
+        format!(
+            "define i64 @{}(i64 %a, i64 %b) {{\n  \
+             %x = {} i64 %a, {}\n  \
+             %y = {} i64 %b, {}\n  \
+             %r = {} i64 %x, %y\n  \
+             ret i64 %r\n}}\n",
+            self.name,
+            op_name(self.op1),
+            self.c1,
+            op_name(self.op3),
+            self.c2,
+            op_name(self.op2),
+        )
+    }
+}
 
 const SCALAR_TYS: [u32; 2] = [32, 64];
 const SHAPES: [Shape; 3] = [
@@ -265,9 +321,20 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
         glob: [0; 16],
         blk: 0,
         cur_block: String::from("entry"),
+        helpers: Vec::new(),
     };
     for slot in p.glob.iter_mut() {
         *slot = g.boundary_scalar(32) as u32;
+    }
+    for h in 0..(1 + g.u(3)) {
+        p.helpers.push(Helper {
+            name: format!("f{h}"),
+            op1: g.byte() & 3,
+            c1: sext(g.boundary_scalar(64), 64),
+            op2: g.byte() & 3,
+            op3: g.byte() & 3,
+            c2: sext(g.boundary_scalar(64), 64),
+        });
     }
 
     // A stack array for GEP/load/store coverage.
@@ -276,7 +343,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
 
     let steps = 12 + g.u(40);
     for _ in 0..steps {
-        match g.u(18) {
+        match g.u(19) {
             // ---- scalar integer binops (wrapping / bitwise) ----
             0 => {
                 let bits = SCALAR_TYS[g.u(2)];
@@ -587,6 +654,16 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 }
                 p.push_scalar(accnext, 64, acc);
             }
+            // ---- call a pure helper (the call ABI: threaded data-SP, arg passing, scalar return) ----
+            17 => {
+                let hi = g.u(p.helpers.len());
+                let h = p.helpers[hi].clone();
+                let (a, av) = p.any_scalar(g, 64);
+                let (b, bv) = p.any_scalar(g, 64);
+                let d = p.fresh();
+                p.emit(&format!("{d} = call i64 @{}(i64 {a}, i64 {b})", h.name));
+                p.push_scalar(d, 64, h.eval(av, bv));
+            }
             // ---- build a vector by insertelement from scalars ----
             _ => {
                 let s = SHAPES[g.u(3)];
@@ -677,6 +754,9 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 s.lanes, s.lane_bits
             ));
         }
+    }
+    for h in &p.helpers {
+        m.push_str(&h.define());
     }
     m.push_str("define i64 @run() {\nentry:\n");
     m.push_str(&p.body);
