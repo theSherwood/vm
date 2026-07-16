@@ -129,8 +129,10 @@ long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap)
 /// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
 /// and surfaced as `$?`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
 /// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
-/// surface (`open`/`read`/`write`/`close`/`unlink`). `run_list` sits above `run_line`, splitting a
-/// line on `;`, `&&`, `||` and short-circuiting on `$?`. `main` supports two invocations:
+/// surface (`open`/`read`/`write`/`close`/`unlink`). `run_list` (splitting on `;`/`&&`/`||`, short-
+/// circuiting on `$?`) sits above `run_pipeline` (splitting on `|`, staging each stage's stdout
+/// through a memfs temp the next stage reads as stdin) above `run_line`. `main` supports two
+/// invocations:
 /// `sh -c "…"` (read via the personality's `argc`/`argv`) runs a command list; otherwise it's a
 /// read-eval loop over stdin. `exit` calls the personality `exit`.
 const SHELL_MAIN: &str = r#"
@@ -355,10 +357,12 @@ static int exec_line(char *line) {
 }
 
 /* Strip `< file`, `> file`, and `>> file` redirects out of the line, pointing in_fd/out_fd at the
-   targets for the duration of the command, then restore stdio. Absent any redirect, run straight to
-   stdin/stdout. Multiple redirects are honored (e.g. `wc < in > out`). */
-static int run_line(char *line) {
-  long ifd = 0, ofd = 1, ci = -1, co = -1;
+   targets (or the caller-supplied `def_in`/`def_out` when a stream is not explicitly redirected) for
+   the duration of the command, then restore stdio. An explicit redirect wins over the default — so a
+   pipe stage that also redirects behaves like bash. `def_in`/`def_out` fds are owned by the caller
+   and are not closed here. Multiple redirects on one line are honored (`wc < in > out`). */
+static int run_line_io(char *line, long def_in, long def_out) {
+  long ifd = def_in, ofd = def_out, ci = -1, co = -1;
   int cmd_end = -1, i = 0, st = 1;
   while (line[i]) {
     char op = line[i];
@@ -394,6 +398,45 @@ done:
   return st;
 }
 
+/* A command with its own redirects but default stdin/stdout. */
+static int run_line(char *line) { return run_line_io(line, 0, 1); }
+
+/* Run a pipeline `A | B | C`: each stage's stdout is staged into a fresh memfs temp file that the
+   next stage reads as stdin. Not real concurrent processes — the playground has no fork yet — but it
+   reproduces pipeline *semantics* (each stage sees the previous stage's full output) end to end on
+   the personality's file surface. The exit status is the last stage's. A stage may still carry its
+   own `<`/`>` redirects, which override the pipe. Temp files are unlinked when the pipeline ends. */
+static int run_pipeline(char *seg) {
+  char *stages[8];
+  int ns = 0, i = 0, start = 0;
+  for (;;) {
+    char c = seg[i];
+    if (c == '|' && ns < 7) { seg[i] = 0; stages[ns++] = seg + start; start = i + 1; i++; }
+    else if (c == 0) { stages[ns++] = seg + start; break; }
+    else i++;
+  }
+  if (ns == 1) return run_line(stages[0]);
+  static char tmp[8];                    /* "/.pipeN" — one name per producing stage */
+  tmp[0] = '/'; tmp[1] = '.'; tmp[2] = 'p'; tmp[3] = 'i'; tmp[4] = 'p'; tmp[5] = 'e'; tmp[7] = 0;
+  long prev_in = 0;                      /* stage 0 reads real stdin */
+  int st = 0;
+  for (int s = 0; s < ns; s++) {
+    long def_out = 1, tmpfd = -1;
+    if (s + 1 < ns) {
+      tmp[6] = '0' + s;
+      tmpfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC);
+      def_out = tmpfd;
+    }
+    st = run_line_io(stages[s], prev_in, def_out);
+    if (tmpfd >= 0) close(tmpfd);
+    if (prev_in > 0) close(prev_in);     /* done reading the previous stage's temp */
+    if (s + 1 < ns) { tmp[6] = '0' + s; prev_in = open(tmp, 0); }   /* next stage reads it */
+  }
+  if (prev_in > 0) close(prev_in);
+  for (int s = 0; s + 1 < ns; s++) { tmp[6] = '0' + s; unlink(tmp); }
+  return st;
+}
+
 /* Run a list of commands joined by `;`, `&&`, `||`, short-circuiting on `last_status`: `&&` runs the
    next segment only after success (0), `||` only after failure, `;` always. A skipped segment leaves
    `last_status` unchanged so it propagates down a chain, matching bash. Returns the final status. */
@@ -406,7 +449,7 @@ static int run_list(char *line) {
     int is_or = c == '|' && line[i + 1] == '|';
     if (c == 0 || is_semi || is_and || is_or) {
       char save = c; line[i] = 0;
-      if (!skip) last_status = run_line(line + start);
+      if (!skip) last_status = run_pipeline(line + start);
       if (save == 0) break;
       if (is_and) skip = last_status != 0;
       else if (is_or) skip = last_status == 0;
@@ -814,4 +857,54 @@ fn stage0_shell_sequencing_and_short_circuit() {
         "interp: ; always, && on success, || on failure, with chaining"
     );
     assert_eq!(jout, iout, "jit: sequencing output must match interp");
+}
+
+/// Pipelines: a multi-stage `cat FILE | grep P | wc` streams each stage's full output into the next
+/// via memfs temps, and the final stage's result reaches stdout. Also checks a per-stage redirect
+/// inside a pipeline (`| grep P > out`) overrides the pipe. This is the shell's process-driven core
+/// (emulated in-process, no fork yet).
+#[test]
+fn stage0_shell_pipelines() {
+    let (iout, jout) = run_shell(
+        b"echo apple > /f\n\
+          echo apricot >> /f\n\
+          echo banana >> /f\n\
+          echo cherry >> /f\n\
+          cat /f | grep ap | wc\n\
+          cat /f | grep ap > /hits\n\
+          cat /hits\n",
+        &[],
+        &[],
+        &[],
+    );
+    // grep ap → "apple\napricot\n" (2 lines, 2 words, 14 bytes); the redirected pipeline writes the
+    // same two lines to /hits, surfaced by cat.
+    assert_eq!(
+        iout, b"2 2 14\napple\napricot\n",
+        "interp: pipeline stages chain; a stage redirect overrides the pipe"
+    );
+    assert_eq!(jout, iout, "jit: pipeline output must match interp");
+}
+
+/// A pipeline reading real (redirected) stdin at its head: `grep b < /f | wc -l`-style chain, here
+/// `cat < /f | tail -n 1` — the first stage consumes the `<` file, the last emits to stdout.
+#[test]
+fn stage0_shell_pipeline_from_stdin_redirect() {
+    let (iout, jout) = run_shell(
+        b"echo one > /f\n\
+          echo two >> /f\n\
+          echo three >> /f\n\
+          cat < /f | tail -n 1\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"three\n",
+        "interp: `<` feeds stage 0; tail -n 1 ends the pipe"
+    );
+    assert_eq!(
+        jout, iout,
+        "jit: pipeline-from-stdin output must match interp"
+    );
 }
