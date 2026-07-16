@@ -219,6 +219,10 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
         // Re-fold: merging brings a constant's definition into the same block as its use, and
         // dropping params can expose new constants — both newly foldable here.
         blocks = blocks.iter().map(|b| fold_block(b, fn_results)).collect();
+        // Jump threading: redirect an edge that reaches an empty conditional forwarder with a
+        // constant selector straight to the resolved target (correlated branches). The next
+        // iteration's prune/merge cleans up any forwarder left with no predecessors.
+        blocks = jump_thread(&blocks, fn_results);
         if blocks == before {
             break;
         }
@@ -2346,6 +2350,164 @@ fn remove_params(b: &Block, dropped: &[usize]) -> Block {
         insts,
         term,
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Jump threading (OPT.md Phase 2): thread an edge through an empty conditional forwarder.
+// ---------------------------------------------------------------------------------------
+
+/// The constants a block defines, indexed by block-local value: parameters are unknown, and each
+/// single-result instruction contributes its literal value (after folding, every folded op has
+/// become a `const`). This is the same seeding as [`fold_block`], minus the folding — it runs after
+/// `fold_block` in the fixpoint, so operands are already materialized where they can be.
+fn block_consts(b: &Block, fn_results: &[usize]) -> Vec<Option<Known>> {
+    let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
+    for inst in &b.insts {
+        let rc = inst.result_count(fn_results);
+        if rc == 1 {
+            known.push(const_value(inst));
+        } else {
+            for _ in 0..rc {
+                known.push(None);
+            }
+        }
+    }
+    known
+}
+
+/// If out-edge `(target, args)` reaches an **empty conditional forwarder** — a block with no
+/// instructions whose terminator is a `br_if`/`br_table` on one of its own parameters — and the
+/// value the predecessor passes for that selector parameter is a known constant, resolve the
+/// forwarder's branch and return the edge that skips it: the resolved target, with its arguments
+/// mapped back through `args` to values valid in the predecessor.
+///
+/// Sound because the forwarder has **no instructions** (no side effects, no defs): entering it only
+/// selects a branch from a parameter, so threading the predecessor straight to the resolved target
+/// with the same argument values is observationally identical. Since the forwarder defines nothing,
+/// every value its terminator names is a parameter index `j`, which binds to `args[j]` on this edge.
+fn thread_edge(
+    target: u32,
+    args: &[ValIdx],
+    blocks: &[Block],
+    q_consts: &[Option<Known>],
+) -> Option<(u32, Vec<ValIdx>)> {
+    let b = &blocks[target as usize];
+    if !b.insts.is_empty() {
+        return None; // only empty forwarders: nothing to clone into the predecessor
+    }
+    // Resolve the forwarder's branch using the constant the predecessor passes for its selector.
+    let (rt, rargs): (u32, &Vec<ValIdx>) = match &b.term {
+        Terminator::BrIf {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        } => {
+            let sel = *cond as usize;
+            if sel >= args.len() {
+                return None;
+            }
+            let c = get(q_consts, args[sel]).and_then(Known::as_i32)?;
+            if c != 0 {
+                (*then_blk, then_args)
+            } else {
+                (*else_blk, else_args)
+            }
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            let sel = *idx as usize;
+            if sel >= args.len() {
+                return None;
+            }
+            let c = get(q_consts, args[sel]).and_then(Known::as_i32)?;
+            let entry = targets.get(c as u32 as usize).unwrap_or(default);
+            (entry.0, &entry.1)
+        }
+        _ => return None,
+    };
+    if rt == target {
+        return None; // the forwarder branches to itself — leave it for prune/merge
+    }
+    // The forwarder defines nothing, so each resolved-edge argument is a forwarder-parameter index;
+    // map it back through `args` to the value the predecessor passes for that parameter.
+    let mut mapped = Vec::with_capacity(rargs.len());
+    for &v in rargs {
+        if (v as usize) >= args.len() {
+            return None;
+        }
+        mapped.push(args[v as usize]);
+    }
+    Some((rt, mapped))
+}
+
+/// Redirect every out-edge of `term` that threads through an empty conditional forwarder
+/// ([`thread_edge`]), keeping the terminator's kind; edges that do not thread are left unchanged.
+fn redirect_edges(term: &Terminator, blocks: &[Block], q_consts: &[Option<Known>]) -> Terminator {
+    let thread = |target: u32, args: &Vec<ValIdx>| -> (u32, Vec<ValIdx>) {
+        thread_edge(target, args, blocks, q_consts).unwrap_or_else(|| (target, args.clone()))
+    };
+    match term {
+        Terminator::Br { target, args } => {
+            let (t, a) = thread(*target, args);
+            Terminator::Br { target: t, args: a }
+        }
+        Terminator::BrIf {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        } => {
+            let (tt, ta) = thread(*then_blk, then_args);
+            let (et, ea) = thread(*else_blk, else_args);
+            Terminator::BrIf {
+                cond: *cond,
+                then_blk: tt,
+                then_args: ta,
+                else_blk: et,
+                else_args: ea,
+            }
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            let targets = targets.iter().map(|(t, a)| thread(*t, a)).collect();
+            let default = thread(default.0, &default.1);
+            Terminator::BrTable {
+                idx: *idx,
+                targets,
+                default,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Jump threading: redirect edges that reach an empty conditional forwarder with a constant selector
+/// straight to the resolved target — the classic correlated-branch simplification (`if c { … } ;
+/// if c { … }`) that SCCP cannot catch, because the forwarder's selector parameter is a *different*
+/// constant on each incoming edge (so its meet is not constant). Analysis reads the original blocks;
+/// the surrounding fixpoint's prune/merge then cleans up any forwarder left with no predecessors, and
+/// re-runs threading so multi-hop chains collapse a hop per iteration.
+fn jump_thread(blocks: &[Block], fn_results: &[usize]) -> Vec<Block> {
+    let consts: Vec<Vec<Option<Known>>> =
+        blocks.iter().map(|b| block_consts(b, fn_results)).collect();
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(q, b)| Block {
+            params: b.params.clone(),
+            insts: b.insts.clone(),
+            term: redirect_edges(&b.term, blocks, &consts[q]),
+        })
+        .collect()
 }
 
 /// In a terminator, remove the edge arguments at the dropped-parameter positions of each target.

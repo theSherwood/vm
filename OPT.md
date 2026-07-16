@@ -144,7 +144,7 @@ tracked enhancement, not a blocker.
     (no configurability until something concrete demands it), this lands with the first budgeted pass
     (the inliner / unroller), where a size/fuel budget actually bites; adding toggles now, with only
     the always-on cleanup passes, would be speculative surface.
-- [ ] **Phase 2 — global scalar passes.**
+- [x] **Phase 2 — global scalar passes.**
   - [x] **SCCP** (`svm_opt::sccp`): sparse conditional constant propagation on the internal SSA
     form — a `Top ⊒ Const ⊒ Bottom` lattice propagated across the CFG (through block-parameter phis
     and loops) together with per-edge executability, so a value is only marked varying on account of
@@ -199,7 +199,19 @@ tracked enhancement, not a blocker.
     loops with a unique preheader only). Reuses the shared `vn` / `thread` modules (extracted from GVN).
     Tests: invariant op hoisted out of every loop (SCC check) + variant op stays, behavior preserved;
     covered by the `opt_sccp` fuzz target (whole pipeline).
-  - [ ] jump threading. Differential + fuzz.
+  - [x] **Jump threading** (`jump_thread` in the `optimize_func` fixpoint): redirects an edge that
+    reaches an **empty conditional forwarder** — a block with no instructions whose `br_if`/`br_table`
+    tests one of its own parameters — straight to the resolved target when the predecessor passes a
+    constant for that selector parameter. This is the correlated-branch pattern (`if c { … } ; if c
+    { … }`) that SCCP structurally cannot catch, because the forwarder's selector parameter meets a
+    *different* constant on each incoming edge (so its lattice value is not constant). Sound because
+    the forwarder has no instructions (no defs, no effects): entering it only selects a branch, so
+    threading past it with the same argument values is observationally identical; the resolved edge's
+    args are forwarder-parameter indices, mapped back through the predecessor's edge args to values
+    valid there. The fixpoint's prune then drops any forwarder left with no predecessors, and re-runs
+    threading so multi-hop chains collapse a hop per iteration. Tests (`tests/jump_thread.rs`):
+    correlated branch threaded + forwarder eliminated, behavior preserved; covered by the `opt_sccp`
+    fuzz target (whole pipeline, gen → verify → optimize → re-verify + interp differential).
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).
