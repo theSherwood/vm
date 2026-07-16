@@ -1021,6 +1021,49 @@ rather than reverting to the channel.
    or install only the mingw packages actually needed. Workflow-file change (`workflow` scope), so a
    maintainer applies it.
 
+### I26 — GitHub Pages deploy silently drops any playground asset not matched by `web/*.js` / `web/*.html`; nothing checks the published site (S3) — surfaced when the CodeMirror editor 404'd in production (2026-07-16)
+
+**Where:** `.github/workflows/pages.yml` → the "assemble site" step. It hand-copies `web/*.html`
+`web/*.js` (plus `web/assets/*.svmb`, the WAD, and the one wasm engine path) into `_site`, then
+uploads that. Anything else under `web/` — a subdirectory, a `.css`, any file not on those two globs —
+is never copied into the deployed site.
+
+**Symptom.** #335 vendored CodeMirror under `web/vendor/…` (subdirectories + `.css`). Local dev
+(`serve.mjs` serves all of `web/`) and the Chromium CI test (same server) were green, but the
+**deployed** site 404'd every editor file and `editor.js` threw `Cannot read properties of undefined
+(reading 'defineSimpleMode')`. The deploy path has **no automated check**, so "works locally + passes
+the browser CI test" still shipped a broken production playground.
+
+**Worked around (PR #340):** collapse the editor into a single top-level `web/codemirror.bundle.js`
+(matched by the existing `web/*.js` copy) that also injects its CSS. That clears the immediate outage
+but not the class of bug — the next asset added under a subdirectory or with a new extension will
+silently 404 again.
+
+**Fix sketch (needs `workflow` scope, so a maintainer applies it):** either (a) copy `web/`
+**recursively** into `_site/web/` (`cp -r web "$SITE/"`, pruning anything that shouldn't ship) instead
+of globbing two extensions; or (b) add a post-assemble gate that scans `play.html` / `index.html` for
+every `<script src>` / `<link href>` / module `import` and fails the job if the referenced file is
+absent from `_site`. (b) is the general guard — it turns a missing asset into a red deploy instead of
+a published broken page.
+
+### I27 — the playground editor smoke isn't gating CI; it exists but isn't invoked (S4) — `browser-play-editor-test.mjs`, added with the editor (2026-07-16)
+
+**Where:** `.github/workflows/ci.yml`, the `real-browser` job. `browser/browser-play-editor-test.mjs`
+(#335) drives `play.html` in Chromium — editor mount, SVM highlighting, a run, per-example language
+switch, the parse-error gutter, and Vim — and *did* catch a mis-pathed vendored script (a `vim.js`
+404) during development. It is **not** wired into CI: the automation that pushes these branches lacks
+GitHub's `workflow` scope, so it cannot modify `.github/workflows/`.
+
+**Fix (a maintainer with `workflow` scope):** add one line to the `real-browser` job, right after
+`node browser-jit-reactor-test.mjs`:
+
+```yaml
+          node browser-play-editor-test.mjs
+```
+
+Until then, run it locally: `node browser/browser-play-editor-test.mjs` (after the wasm32 threads
+module is built, per the job's build step).
+
 ---
 
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
