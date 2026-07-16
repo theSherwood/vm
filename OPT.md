@@ -140,10 +140,13 @@ tracked enhancement, not a blocker.
     `opt_ssa_roundtrip` cargo-fuzz target (reuses `irgen` → round-trip identity + interp-vs-JIT
     differential on the lowered module). Cross-block-use lowering (param threading) is deferred to the
     first Phase 2 pass that needs it — today every value is used only in its defining block.
-  - [ ] (d) `OptConfig` (budgets, pass toggles) — **deferred to Phase 2**. Per the prime directive
-    (no configurability until something concrete demands it), this lands with the first budgeted pass
-    (the inliner / unroller), where a size/fuel budget actually bites; adding toggles now, with only
-    the always-on cleanup passes, would be speculative surface.
+  - [x] (d) `OptConfig` (pass toggles) — landed once something concrete demanded it: the **ablation
+    benchmark** (`OPT_BENCH.md`), which needs to disable one pass at a time to attribute a size/speed
+    delta to it. `OptConfig { sccp, reassociate, gvn, licm, local_cse, jump_thread }` (all default
+    on) + `optimize_module_with` / `optimize_func_with`; `optimize_module` is the `all()` pipeline
+    unchanged. Only the six global/analysis passes toggle — the always-on intra-block canonicalization
+    is the shared substrate and the honest "no optimization" baseline. Budgets stay deferred to the
+    first budgeted pass (inliner / unroller), where a size/fuel budget actually bites.
 - [x] **Phase 2 — global scalar passes.**
   - [x] **SCCP** (`svm_opt::sccp`): sparse conditional constant propagation on the internal SSA
     form — a `Top ⊒ Const ⊒ Bottom` lattice propagated across the CFG (through block-parameter phis
@@ -221,6 +224,15 @@ tracked enhancement, not a blocker.
 - [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `svm-opt` on a module and JITs the
   result, peval-demo shape); PEVAL_BENCH + Wasmtime-relative numbers with the optimizer on;
   fold the settled design into `DESIGN.md` §20 and retire this doc to a tracker stub.
+  - [x] **Per-pass ablation harness** (`crates/svm-peval/tests/opt_bench.rs`, report in
+    `OPT_BENCH.md`): leave-one-out over the six togglable passes on a corpus of a realistic
+    specialization residual + pass-targeted micro-modules, reporting encoded size and both JIT and
+    interpreter run time. Every variant is re-verified + interp-differential-tested, so the size test
+    is also a correctness/size guard. First findings: the JIT's own optimizer washes out svm-opt's
+    scalar passes (native run time flat), so their JIT-path value is size/compile; on the interpreter
+    the full pipeline is ~1.3× on an invariant-heavy loop, LICM the dominant run-time pass (~1.17×),
+    while LICM/GVN *cost* static size — motivating a hoist cost model. Broaden the corpus (more
+    realistic residuals, branch-heavy shapes) and add Wasmtime-relative numbers next.
 
 ### Enhancements (tracked, not gating)
 
