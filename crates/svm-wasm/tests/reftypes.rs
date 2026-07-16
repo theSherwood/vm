@@ -154,6 +154,33 @@ fn table_copy_slots() {
     assert_eq!(eval(wat, "f"), 7);
 }
 
+/// `table.copy` with **overlapping** ranges (`dest > src`) — the memmove path must read the whole
+/// source before overwriting, so a forward byte-copy that clobbers slot `src+1` before reading it
+/// would corrupt the result. Copy slots 0..3 → 1..4, then dispatch the (shifted-up) copies.
+#[test]
+fn table_copy_overlapping_slots() {
+    let wat = r#"
+    (module
+      (table 8 funcref)
+      (type $r (func (result i32)))
+      (elem declare func $a $b $c)
+      (func $a (result i32) (i32.const 3))
+      (func $b (result i32) (i32.const 4))
+      (func $c (result i32) (i32.const 5))
+      (func (export "f") (result i32)
+        (table.set (i32.const 0) (ref.func $a))
+        (table.set (i32.const 1) (ref.func $b))
+        (table.set (i32.const 2) (ref.func $c))
+        (table.copy (i32.const 1) (i32.const 0) (i32.const 3)) ;; slots 0..3 → 1..4 (overlap, dest>src)
+        (i32.add
+          (call_indirect (type $r) (i32.const 1))              ;; $a → 3
+          (i32.add
+            (call_indirect (type $r) (i32.const 2))            ;; $b → 4
+            (call_indirect (type $r) (i32.const 3))))))        ;; $c → 5, total 12
+    "#;
+    assert_eq!(eval(wat, "f"), 12);
+}
+
 /// `table.init` from a **passive** element segment: copy its funcref entries into the table, dispatch.
 #[test]
 fn table_init_from_passive_elem() {

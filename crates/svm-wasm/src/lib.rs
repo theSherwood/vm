@@ -3283,7 +3283,8 @@ fn init_unroll(lo: &mut Lower, dest: ValIdx, bytes: &[u8]) {
 /// `memory.copy(dest, src, len)`: copy `len` bytes, overlap-safe (wasm `memory.copy` is memmove
 /// semantics). Lowers to the D62 [`Inst::MemMove`] — one whole-span confinement then a `memmove` (the
 /// JIT emits the platform libcall), matching the LLVM frontend's `llvm.memmove` fast path. No 64 KiB
-/// constant cap and no runtime byte loop. (`table.copy` still uses [`copy_dynamic`] below.)
+/// constant cap and no runtime byte loop. (`table.copy` lowers to the same op — the table is window
+/// memory.)
 fn mem_copy_op(lo: &mut Lower) -> Result<(), Error> {
     let (len_v, _) = lo.pop()?;
     let src = pop_addr(lo)?;
@@ -3295,149 +3296,6 @@ fn mem_copy_op(lo: &mut Lower) -> Result<(), Error> {
         len,
     });
     Ok(())
-}
-
-/// Runtime-length copy as a **memmove** byte loop: copy forward when `dest ≤ src`, backward when
-/// `dest > src` (so overlapping ranges are correct). Synthesized as a direction branch into a
-/// forward and a backward header/body, both exiting to one continuation block. All blocks thread the
-/// prefix + operand stack + the loop-private `(dest, src, n, i)`.
-fn copy_dynamic(lo: &mut Lower, dest: ValIdx, src: ValIdx, len: ValIdx) -> Result<(), Error> {
-    let below_t: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
-    let below_v = lo.stack_vals();
-    let n = widen_to_i64(lo, len);
-    let extra = [ValType::I64, ValType::I64, ValType::I64, ValType::I64]; // dest, src, n, i
-    let lsig = lo.synth_sig(&below_t, &extra);
-    let fwd_h = lo.new_block(lsig.clone());
-    let fwd_b = lo.new_block(lsig.clone());
-    let bwd_h = lo.new_block(lsig.clone());
-    let bwd_b = lo.new_block(lsig);
-    let exit = {
-        let s = lo.synth_sig(&below_t, &[]);
-        lo.new_block(s)
-    };
-
-    // Direction: backward (start i = n) when dest > src, else forward (start i = 0).
-    let desc = lo.emit(Inst::IntCmp {
-        ty: IntTy::I64,
-        op: CmpOp::GtU,
-        a: dest,
-        b: src,
-    });
-    let zero = lo.emit(Inst::ConstI64(0));
-    let fwd_args = lo.synth_args(&below_v, &[dest, src, n, zero]);
-    let bwd_args = lo.synth_args(&below_v, &[dest, src, n, n]);
-    lo.set_term(Terminator::BrIf {
-        cond: desc,
-        then_blk: bwd_h as u32,
-        then_args: bwd_args,
-        else_blk: fwd_h as u32,
-        else_args: fwd_args,
-    });
-
-    // Forward: while i < n → copy [i], i++.
-    let hx = lo.enter_synth(fwd_h, &below_t, 4);
-    let (d, s, nn, i) = (hx[0], hx[1], hx[2], hx[3]);
-    let cond = lo.emit(Inst::IntCmp {
-        ty: IntTy::I64,
-        op: CmpOp::LtU,
-        a: i,
-        b: nn,
-    });
-    let bv = lo.stack_vals();
-    let ta = lo.synth_args(&bv, &[d, s, nn, i]);
-    let ea = lo.synth_args(&bv, &[]);
-    lo.set_term(Terminator::BrIf {
-        cond,
-        then_blk: fwd_b as u32,
-        then_args: ta,
-        else_blk: exit as u32,
-        else_args: ea,
-    });
-    let bx = lo.enter_synth(fwd_b, &below_t, 4);
-    let (d, s, nn, i) = (bx[0], bx[1], bx[2], bx[3]);
-    copy_one(lo, d, s, i); // store8(d+i, load8(s+i))
-    let one = lo.emit(Inst::ConstI64(1));
-    let i1 = lo.emit(Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::Add,
-        a: i,
-        b: one,
-    });
-    let bv = lo.stack_vals();
-    let back = lo.synth_args(&bv, &[d, s, nn, i1]);
-    lo.set_term(Terminator::Br {
-        target: fwd_h as u32,
-        args: back,
-    });
-
-    // Backward: while i > 0 → i--, copy [i].
-    let hx = lo.enter_synth(bwd_h, &below_t, 4);
-    let (d, s, nn, i) = (hx[0], hx[1], hx[2], hx[3]);
-    let z = lo.emit(Inst::ConstI64(0));
-    let cond = lo.emit(Inst::IntCmp {
-        ty: IntTy::I64,
-        op: CmpOp::Ne,
-        a: i,
-        b: z,
-    });
-    let bv = lo.stack_vals();
-    let ta = lo.synth_args(&bv, &[d, s, nn, i]);
-    let ea = lo.synth_args(&bv, &[]);
-    lo.set_term(Terminator::BrIf {
-        cond,
-        then_blk: bwd_b as u32,
-        then_args: ta,
-        else_blk: exit as u32,
-        else_args: ea,
-    });
-    let bx = lo.enter_synth(bwd_b, &below_t, 4);
-    let (d, s, nn, i) = (bx[0], bx[1], bx[2], bx[3]);
-    let one = lo.emit(Inst::ConstI64(1));
-    let j = lo.emit(Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::Sub,
-        a: i,
-        b: one,
-    });
-    copy_one(lo, d, s, j); // store8(d+j, load8(s+j))
-    let bv = lo.stack_vals();
-    let back = lo.synth_args(&bv, &[d, s, nn, j]);
-    lo.set_term(Terminator::Br {
-        target: bwd_h as u32,
-        args: back,
-    });
-
-    lo.enter(exit, &below_t);
-    Ok(())
-}
-
-/// Emit `store8(d + idx, load8(s + idx))` (one byte of a runtime-length copy).
-fn copy_one(lo: &mut Lower, d: ValIdx, s: ValIdx, idx: ValIdx) {
-    let sa = lo.emit(Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::Add,
-        a: s,
-        b: idx,
-    });
-    let byte = lo.emit(Inst::Load {
-        op: LoadOp::I32_8U,
-        addr: sa,
-        offset: 0,
-        align: 0,
-    });
-    let da = lo.emit(Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::Add,
-        a: d,
-        b: idx,
-    });
-    lo.emit_void(Inst::Store {
-        op: StoreOp::I32_8,
-        addr: da,
-        value: byte,
-        offset: 0,
-        align: 0,
-    });
 }
 
 // ---- §RT table access ops — the table is i32-granular window memory at `table_base`, so these are
@@ -3609,7 +3467,7 @@ fn table_fill_loop(lo: &mut Lower, dest64: ValIdx, val: ValIdx, n: ValIdx) {
 }
 
 /// The absolute window byte address of table slot `index` (an i32 on the stack): `table_base +
-/// index*4`, as an i64 (the form `copy_dynamic` consumes).
+/// index*4`, as an i64 (the `dst`/`src` form `Inst::MemMove` consumes).
 fn table_byte_addr(lo: &mut Lower, index: ValIdx, base: u64) -> ValIdx {
     let idx64 = lo.emit(Inst::Convert {
         op: ConvOp::ExtendI32U,
@@ -3631,8 +3489,10 @@ fn table_byte_addr(lo: &mut Lower, index: ValIdx, base: u64) -> ValIdx {
     })
 }
 
-/// `table.copy`: copy `count` slots — `count*4` bytes — between table regions, reusing the
-/// `memory.copy` memmove (overlap-correct). Stack: `[dest, src, count]`. (Single-table for now.)
+/// `table.copy`: copy `count` slots — `count*4` bytes — between table regions. Lowers to the D62
+/// [`Inst::MemMove`] (overlap-safe, one whole-span confinement + a `memmove` libcall in the JIT), the
+/// same fast path `memory.copy` takes — the table is just i32-granular window memory. Stack:
+/// `[dest, src, count]`. (Single-table for now.)
 fn table_copy_op(lo: &mut Lower) -> Result<(), Error> {
     let (count, _) = lo.pop()?;
     let (src_idx, _) = lo.pop()?;
@@ -3640,30 +3500,25 @@ fn table_copy_op(lo: &mut Lower) -> Result<(), Error> {
     let base = lo.table_base;
     let dest = table_byte_addr(lo, dest_idx, base);
     let src = table_byte_addr(lo, src_idx, base);
-    // `copy_dynamic` widens its length via `widen_to_i64` (i32 unless `memory64`); table counts are
-    // always i32, so hand it the byte length in the width `widen_to_i64` expects.
-    let byte_len = if lo.mem64 {
-        let n64 = lo.emit(Inst::Convert {
-            op: ConvOp::ExtendI32U,
-            a: count,
-        });
-        let four = lo.emit(Inst::ConstI64(4));
-        lo.emit(Inst::IntBin {
-            ty: IntTy::I64,
-            op: BinOp::Mul,
-            a: n64,
-            b: four,
-        })
-    } else {
-        let four = lo.emit(Inst::ConstI32(4));
-        lo.emit(Inst::IntBin {
-            ty: IntTy::I32,
-            op: BinOp::Mul,
-            a: count,
-            b: four,
-        })
-    };
-    copy_dynamic(lo, dest, src, byte_len)
+    // `count` is always an i32 slot count (both mem32 and mem64); the byte length is `count*4` as i64,
+    // the width `MemMove` expects.
+    let count64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: count,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    let byte_len = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: count64,
+        b: four,
+    });
+    lo.emit_void(Inst::MemMove {
+        dst: dest,
+        src,
+        len: byte_len,
+    });
+    Ok(())
 }
 
 /// `table.init(elem_index, dest, src, count)`: copy `count` funcref indices from element segment
