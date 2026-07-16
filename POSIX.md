@@ -115,6 +115,8 @@ only to mark the boundary.
 | 14 | `opendir(path, len)` | `-> dir \| -errno` | memfs | **done** — snapshots immediate children; `-ENOTDIR`/`-ENOENT` |
 | 15 | `readdir(dir, buf, cap)` | `-> namelen \| 0 \| -errno` | dir stream | **done** — NUL-terminated name; `0` at end, `-ERANGE`/`-EBADF` |
 | 16 | `closedir(dir)` | `-> 0 \| -errno` | dir stream | **done** — `-EBADF` on a stale handle |
+| 17 | `argc()` | `-> n` | host arg vector | **done** — personality ext. (the `sh -c` path; `argv[0]` = program name) |
+| 18 | `argv(i, buf, cap)` | `-> len \| -errno` | host arg vector | **done** — NUL-terminated arg `i`; `-EINVAL`/`-ERANGE` |
 | — | `fstat/environ` | / `-errno` | memfs + host fd table | todo |
 | — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
 | — | `pipe/dup/dup2/fcntl` | `-> fd \| -errno` | `Pipe` cap + host fd table | todo |

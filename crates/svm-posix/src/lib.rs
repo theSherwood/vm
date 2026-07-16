@@ -44,6 +44,8 @@ pub const OP_STAT: u32 = 13;
 pub const OP_OPENDIR: u32 = 14;
 pub const OP_READDIR: u32 = 15;
 pub const OP_CLOSEDIR: u32 = 16;
+pub const OP_ARGC: u32 = 17;
+pub const OP_ARGV: u32 = 18;
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
@@ -133,6 +135,11 @@ struct Inner {
     /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
     /// read cursor. Separate from [`Inner::fds`] (a directory stream is not a file fd here).
     dirs: Vec<Option<DirStream>>,
+    /// The program's argument vector (`args[0]` is the program name), delivered **host-side** — the
+    /// symmetric analogue of the environment: `argc`/`argv` read it, the embedder sets it. This is how
+    /// a personality program gets `sh -c "…"` without the window args buffer (POSIX.md §5); a guest
+    /// crt that wants a standard `main(int, char**)` builds `argv[]` from these ops.
+    args: Vec<String>,
     /// The current working directory `getcwd` reports and `chdir` updates. A plain string — the memfs
     /// is flat (paths are used as-given), so `cwd` is not validated against it; path normalization/
     /// resolution is a follow-up (POSIX.md §6).
@@ -207,6 +214,14 @@ impl Posix {
             .cwd
             .clone()
     }
+
+    /// Set the program's argument vector (`args[0]` is conventionally the program name) — how an
+    /// embedder hands a personality program its `argv` (e.g. `["sh", "-c", "echo hi"]`), read back by
+    /// the guest through the `argc`/`argv` ops.
+    pub fn set_args(&self, args: &[&str]) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).args =
+            args.iter().map(|s| s.to_string()).collect();
+    }
 }
 
 /// The §7 import-name resolver for the POSIX subset: binds libc symbol names to the
@@ -234,6 +249,10 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "opendir" => OP_OPENDIR,
         "readdir" => OP_READDIR,
         "closedir" => OP_CLOSEDIR,
+        // Personality extensions (not standard libc functions): the host-side argument vector, the
+        // symmetric analogue of `getenv`/`environ`. A guest crt reads these to build `main`'s argv.
+        "argc" => OP_ARGC,
+        "argv" => OP_ARGV,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -278,6 +297,7 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         files: HashMap::new(),
         fds: Vec::new(),
         dirs: Vec::new(),
+        args: Vec::new(),
         cwd: "/".to_string(),
         env: HashMap::new(),
         env_ptrs: HashMap::new(),
@@ -311,6 +331,8 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_OPENDIR => st.opendir(args, mem),
             OP_READDIR => st.readdir(args, mem),
             OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
+            OP_ARGC => Ok(vec![st.args.len() as i64]),
+            OP_ARGV => st.argv(args, mem),
             OP_GETCWD => st.getcwd(args, mem),
             OP_CHDIR => st.chdir(args, mem),
             OP_GETENV => st.getenv(args, mem),
@@ -579,6 +601,27 @@ impl Inner {
         } else {
             EBADF
         }
+    }
+
+    /// `argv(i, buf, cap) -> len | -errno`: write argument `i` (NUL-terminated) into the caller's
+    /// buffer and return its length (excluding the NUL). An out-of-range index is `-EINVAL`; a name
+    /// that won't fit `cap` is `-ERANGE`. (`argc` is a fieldless op: `self.args.len()`.)
+    fn argv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let i = *args.first().ok_or(Trap::Malformed)?;
+        let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
+        let Some(arg) = usize::try_from(i).ok().and_then(|i| self.args.get(i)) else {
+            return Ok(vec![EINVAL]);
+        };
+        let mut bytes = arg.clone().into_bytes();
+        let len = bytes.len() as i64;
+        bytes.push(0);
+        if bytes.len() as u64 > cap {
+            return Ok(vec![ERANGE]);
+        }
+        mem.write_bytes(buf, &bytes).ok_or(Trap::Malformed)?;
+        Ok(vec![len])
     }
 
     /// Allocate the first free fd at [`FIRST_FD`] or above for `of`, extending the table if needed.
@@ -1333,6 +1376,25 @@ block0(vph: i32):\n\
     /// Write `bytes` into `mem` at `off` (test helper — `WindowMem` has no direct slice setter).
     fn win_write(mem: &mut svm_interp::WindowMem, off: u64, bytes: &[u8]) {
         mem.write_bytes(off, bytes).unwrap();
+    }
+
+    #[test]
+    fn argc_argv_deliver_the_argument_vector() {
+        // The host-side argument vector (the `sh -c "…"` path): `argc` reports the count, `argv(i, …)`
+        // writes arg `i` NUL-terminated; an out-of-range index is -EINVAL.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_args(&["sh", "-c", "echo hi"]);
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        let mut st = posix.inner.lock().unwrap();
+
+        assert_eq!(st.args.len() as i64, 3, "argc");
+        assert_eq!(st.argv(&[1, 0, 64], Some(&mut mem)).unwrap()[0], 2); // "-c" len 2
+        assert_eq!(mem.read_bytes(0, 3).unwrap(), b"-c\0");
+        assert_eq!(st.argv(&[2, 100, 64], Some(&mut mem)).unwrap()[0], 7); // "echo hi"
+        assert_eq!(mem.read_bytes(100, 8).unwrap(), b"echo hi\0");
+        assert_eq!(st.argv(&[9, 0, 64], Some(&mut mem)).unwrap()[0], EINVAL);
     }
 
     #[test]

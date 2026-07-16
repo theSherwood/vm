@@ -9,9 +9,11 @@
 //! are ordinary generic imports. The resolver binds each name to the granted personality handle
 //! (`svm_ir::Resolved::CapBound`, S15a), so there is no positional powerbox anywhere.
 //!
-//! The shell reads a **script from preloaded stdin** (the personality's `read(0, …)` drains it), so
-//! no `argv` plumbing is needed for Stage 0. It runs on **both** backends under identical
-//! personalities, asserting they agree on the captured stdout — a cross-backend differential.
+//! The shell runs either a **script from preloaded stdin** (the personality's `read(0, …)` drains it)
+//! or a single `sh -c "<command>"` — its `argv` delivered by the personality's host-side argument
+//! vector (`argc`/`argv`, the symmetric analogue of `getenv`). It reaches the fs surface too:
+//! `ls` drives `opendir`/`readdir`. It runs on **both** backends under identical personalities,
+//! asserting they agree on the captured stdout — a cross-backend differential.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -93,6 +95,8 @@ void __px_exit(int cap, int code);
 long __px_opendir(int cap, long path, long len);
 long __px_readdir(int cap, long dir, long namebuf, long namecap);
 long __px_closedir(int cap, long dir);
+long __px_argc(int cap);
+long __px_argv(int cap, long i, long buf, long cap2);
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
@@ -106,18 +110,63 @@ void exit(int code) { __px_exit(0, code); }
 long opendir(char *path) { return __px_opendir(0, (long)path, slen(path)); }
 long readdir(long dir, char *namebuf, long cap) { return __px_readdir(0, dir, (long)namebuf, cap); }
 long closedir(long dir) { return __px_closedir(0, dir); }
+/* The host-side argument vector (personality extension): sh reads its own argv here. */
+int argc_(void) { return (int)__px_argc(0); }
+long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap); }
 "#;
 
-/// The Stage-0 shell itself (guest code): a read-eval loop over stdin. Builtins only — `echo`
-/// (with `$VAR` expansion via `getenv`), `pwd`, `cd`, `exit`; an unknown command reports
-/// `<cmd>: not found`. Tokenizes each line into a command and a single argument on the first space.
+/// The Stage-0 shell itself (guest code). `run_line` executes one command line (builtins only —
+/// `echo` with `$VAR`, `pwd`, `cd`, `ls`, `exit`; unknown → `<cmd>: not found`), tokenizing it into a
+/// command and a single argument on the first space. `main` supports two invocations: `sh -c "…"`
+/// (read via the personality's `argc`/`argv`) runs a single line; otherwise it's a read-eval loop
+/// over stdin. `exit` calls the personality `exit` (terminal).
 const SHELL_MAIN: &str = r#"
+static char cwd[256];
 static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }
 static void puts_(char *s) { write(1, s, slen(s)); }
 
+static void run_line(char *line) {
+  int sp = 0; while (line[sp] && line[sp] != ' ') sp++;
+  char *cmd = line, *arg = 0;
+  if (line[sp] == ' ') { line[sp] = 0; arg = line + sp + 1; }
+  if (line[0] == 0) return;
+  if (streq(cmd, "echo")) {
+    if (arg && arg[0] == '$') { char *v = getenv(arg + 1); if (v) puts_(v); }
+    else if (arg) puts_(arg);
+    puts_("\n");
+  } else if (streq(cmd, "pwd")) {
+    if (getcwd(cwd, 256)) puts_(cwd);
+    puts_("\n");
+  } else if (streq(cmd, "cd")) {
+    if (arg) chdir(arg);
+  } else if (streq(cmd, "ls")) {
+    char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
+    long d = opendir(dir);
+    if (d < 0) { puts_(dir); puts_(": not found\n"); }
+    else {
+      static char name[128];
+      while (readdir(d, name, 128) > 0) { puts_(name); puts_("\n"); }
+      closedir(d);
+    }
+  } else if (streq(cmd, "exit")) {
+    exit(0);
+  } else {
+    puts_(cmd); puts_(": not found\n");
+  }
+}
+
 int main(void) {
+  static char cmd[256];
+  /* `sh -c "<command>"` — a single command line delivered via argv. */
+  if (argc_() >= 3) {
+    static char flag[8];
+    if (getarg(1, flag, 8) > 0 && streq(flag, "-c") && getarg(2, cmd, 256) > 0) {
+      run_line(cmd);
+      return 0;
+    }
+  }
+  /* Otherwise: a read-eval loop over stdin. */
   static char line[256];
-  static char cwd[256];
   for (;;) {
     int n = 0;
     for (;;) {
@@ -128,33 +177,7 @@ int main(void) {
       if (n < 255) line[n++] = c;
     }
     line[n] = 0;
-    if (n == 0) continue;
-    int sp = 0; while (line[sp] && line[sp] != ' ') sp++;
-    char *cmd = line, *arg = 0;
-    if (line[sp] == ' ') { line[sp] = 0; arg = line + sp + 1; }
-    if (streq(cmd, "echo")) {
-      if (arg && arg[0] == '$') { char *v = getenv(arg + 1); if (v) puts_(v); }
-      else if (arg) puts_(arg);
-      puts_("\n");
-    } else if (streq(cmd, "pwd")) {
-      if (getcwd(cwd, 256)) puts_(cwd);
-      puts_("\n");
-    } else if (streq(cmd, "cd")) {
-      if (arg) chdir(arg);
-    } else if (streq(cmd, "ls")) {
-      char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
-      long d = opendir(dir);
-      if (d < 0) { puts_(dir); puts_(": not found\n"); }
-      else {
-        static char name[128];
-        while (readdir(d, name, 128) > 0) { puts_(name); puts_("\n"); }
-        closedir(d);
-      }
-    } else if (streq(cmd, "exit")) {
-      return 0;
-    } else {
-      puts_(cmd); puts_(": not found\n");
-    }
+    run_line(line);
   }
 }
 "#;
@@ -163,7 +186,12 @@ int main(void) {
 /// hosts, resolve libc by name, and run on **both** backends. `env` seeds the personality environment
 /// and `files` seeds the memfs before the run. Returns each backend's captured stdout (asserted equal
 /// for the differential).
-fn run_shell(stdin: &[u8], env: &[(&str, &str)], files: &[&str]) -> (Vec<u8>, Vec<u8>) {
+fn run_shell(
+    stdin: &[u8],
+    env: &[(&str, &str)],
+    files: &[&str],
+    args: &[&str],
+) -> (Vec<u8>, Vec<u8>) {
     let src = format!("{SHIM}\n{SHELL_MAIN}");
     let ir = c_to_ir(&src);
     let raw = parse_module_raw(&ir)
@@ -182,6 +210,10 @@ fn run_shell(stdin: &[u8], env: &[(&str, &str)], files: &[&str]) -> (Vec<u8>, Ve
     for path in files {
         iposix.write_file(path, b"");
         jposix.write_file(path, b"");
+    }
+    if !args.is_empty() {
+        iposix.set_args(args);
+        jposix.set_args(args);
     }
 
     let m = svm_ir::resolve_imports_with(&raw, resolver(ipx))
@@ -216,7 +248,7 @@ fn stage0_shell_runs_a_script() {
                    pwd\n\
                    frobnicate\n\
                    exit\n";
-    let (iout, jout) = run_shell(script, &[("HOME", "/root")], &[]);
+    let (iout, jout) = run_shell(script, &[("HOME", "/root")], &[], &[]);
     assert_eq!(
         iout, b"hello, shell\n/root\n/tmp\nfrobnicate: not found\n",
         "interp: the shell ran the script (echo, $VAR, cd+pwd, unknown cmd)"
@@ -228,7 +260,7 @@ fn stage0_shell_runs_a_script() {
 /// end of the preloaded script, and `main` returns. Also checks a bare `pwd` at the default cwd `/`.
 #[test]
 fn stage0_shell_handles_eof_and_default_cwd() {
-    let (iout, jout) = run_shell(b"pwd\necho done", &[], &[]);
+    let (iout, jout) = run_shell(b"pwd\necho done", &[], &[], &[]);
     assert_eq!(
         iout, b"/\ndone\n",
         "interp: default cwd is / then echo, then EOF ends it"
@@ -245,10 +277,26 @@ fn stage0_shell_ls_lists_a_directory() {
         b"ls /tmp\nls /nope\n",
         &[],
         &["/tmp/a.txt", "/tmp/b.txt", "/tmp/sub/c"],
+        &[],
     );
     assert_eq!(
         iout, b"a.txt\nb.txt\nsub\n/nope: not found\n",
         "interp: ls lists sorted children (subdir once), then a miss"
     );
     assert_eq!(jout, iout, "jit: ls output must match interp");
+}
+
+/// `sh -c "<command>"` — the standard non-interactive shell invocation, delivered through the
+/// personality's host-side argument vector (`argc`/`argv`, S7 item 1). No stdin script; the command
+/// comes from `argv[2]`. Runs one line (`echo $HOME`) and returns, differential on both backends.
+#[test]
+fn stage0_shell_dash_c_runs_one_command() {
+    let (iout, jout) = run_shell(
+        b"", // no stdin script — the command is in argv
+        &[("HOME", "/home/user")],
+        &[],
+        &["sh", "-c", "echo $HOME"],
+    );
+    assert_eq!(iout, b"/home/user\n", "interp: sh -c ran the argv command");
+    assert_eq!(jout, iout, "jit: sh -c output must match interp");
 }
