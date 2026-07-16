@@ -156,11 +156,75 @@ impl Known {
     }
 }
 
-/// Optimize every function in a module. Memory/data/imports/exports are carried through unchanged
-/// (optimization is per-function and order-preserving, so funcidxs — and the names that point at
-/// them — stay valid); `debug_info` is **dropped** because its `(func, block, inst)` positions go
-/// stale once we fold instructions and drop blocks (it is strippable and untrusted for escape, §3a).
+/// Which optional passes the optimizer runs. Every field defaults to **on** ([`OptConfig::all`], the
+/// pipeline [`optimize_module`] uses); turning one off is what lets the benchmark harness attribute a
+/// size/speed delta to a single pass (leave-one-out ablation — see `OPT.md` Phase 2(d) / Phase 5).
+///
+/// Only the *global/analysis* passes are togglable. The intra-block canonicalization the fixpoint
+/// always runs — constant folding, branch resolution, copy propagation, dead-value elimination, block
+/// merging, dead-block/param pruning — is the shared substrate every other pass leans on to pay off
+/// (e.g. GVN only helps once the duplicate it exposes is DCE'd), so it stays on unconditionally; that
+/// is also the honest "no optimization" baseline against which the toggled passes are measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptConfig {
+    /// Sparse conditional constant propagation (`svm_opt::sccp`).
+    pub sccp: bool,
+    /// Constant reassociation of `(x OP c1) OP c2` chains (`svm_opt::reassociate`).
+    pub reassociate: bool,
+    /// Global value numbering / cross-block redundancy elimination (`svm_opt::gvn`).
+    pub gvn: bool,
+    /// Loop-invariant code motion (`svm_opt::licm`).
+    pub licm: bool,
+    /// Intra-block common-subexpression elimination (`local_cse`).
+    pub local_cse: bool,
+    /// Jump threading through empty conditional forwarders (`jump_thread`).
+    pub jump_thread: bool,
+}
+
+impl OptConfig {
+    /// Everything on — the full pipeline (what [`optimize_module`] runs).
+    pub const fn all() -> Self {
+        OptConfig {
+            sccp: true,
+            reassociate: true,
+            gvn: true,
+            licm: true,
+            local_cse: true,
+            jump_thread: true,
+        }
+    }
+    /// Every optional pass off — only the always-on intra-block canonicalization runs. The ablation
+    /// baseline.
+    pub const fn none() -> Self {
+        OptConfig {
+            sccp: false,
+            reassociate: false,
+            gvn: false,
+            licm: false,
+            local_cse: false,
+            jump_thread: false,
+        }
+    }
+}
+
+impl Default for OptConfig {
+    fn default() -> Self {
+        OptConfig::all()
+    }
+}
+
+/// Optimize every function in a module with the full pipeline. Memory/data/imports/exports are
+/// carried through unchanged (optimization is per-function and order-preserving, so funcidxs — and
+/// the names that point at them — stay valid); `debug_info` is **dropped** because its
+/// `(func, block, inst)` positions go stale once we fold instructions and drop blocks (it is
+/// strippable and untrusted for escape, §3a).
 pub fn optimize_module(m: &Module) -> Module {
+    optimize_module_with(m, &OptConfig::all())
+}
+
+/// Optimize every function in a module, running only the passes enabled in `cfg`. [`optimize_module`]
+/// is this with [`OptConfig::all`]; the benchmark harness varies `cfg` to measure each pass.
+pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let has_memory = m.memory.is_some();
     Module {
@@ -172,11 +236,19 @@ pub fn optimize_module(m: &Module) -> Module {
                 // eliminates cross-block redundant pure computations (threading the dominating value
                 // through block params), then `optimize_func` (SCCP + fixpoint) DCEs the dead
                 // duplicates and drops any parameter left unused.
-                let g = gvn::gvn(f, &m.funcs, has_memory);
+                let g = if cfg.gvn {
+                    gvn::gvn(f, &m.funcs, has_memory)
+                } else {
+                    f.clone()
+                };
                 // Loop-invariant code motion (OPT.md Phase 2): hoist pure, non-trapping invariants
                 // out of loops; the fixpoint below DCEs the emptied-out originals.
-                let g = licm::licm(&g, &m.funcs, has_memory);
-                optimize_func(&g, &fn_results)
+                let g = if cfg.licm {
+                    licm::licm(&g, &m.funcs, has_memory)
+                } else {
+                    g
+                };
+                optimize_func_with(&g, &fn_results, cfg)
             })
             .collect(),
         memory: m.memory,
@@ -187,18 +259,32 @@ pub fn optimize_module(m: &Module) -> Module {
     }
 }
 
-/// Optimize a single function to a fixpoint: fold + resolve branches, prune dead blocks, merge
-/// straight-line chains, drop dead block parameters, and drop dead values — repeating until
-/// nothing changes. Every pass only simplifies, so this terminates; the cap guards pathologies.
+/// Optimize a single function with the full pipeline (see [`optimize_func_with`]).
 pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
+    optimize_func_with(f, fn_results, &OptConfig::all())
+}
+
+/// Optimize a single function to a fixpoint, running only the passes enabled in `cfg`: fold + resolve
+/// branches, prune dead blocks, merge straight-line chains, drop dead block parameters, and drop dead
+/// values — repeating until nothing changes. Every pass only simplifies, so this terminates; the cap
+/// guards pathologies.
+pub fn optimize_func_with(f: &Func, fn_results: &[usize], cfg: &OptConfig) -> Func {
     // SCCP (OPT.md Phase 2) runs first: it propagates constants *globally* — through block
     // parameters and around loops, with conditional reachability — folding what the per-block passes
     // below cannot see. It materializes constants and resolves constant branches; the fixpoint then
     // prunes the newly-unreachable blocks, DCEs the dead selector code, merges, and re-folds.
-    let f = sccp::sccp(f, fn_results);
+    let f = if cfg.sccp {
+        sccp::sccp(f, fn_results)
+    } else {
+        f.clone()
+    };
     // Constant reassociation (OPT.md Phase 2): fold `(x OP c1) OP c2` chains so the fixpoint below
     // then folds the combined constants and DCEs the dead inner ops.
-    let f = reassociate::reassociate(&f, fn_results);
+    let f = if cfg.reassociate {
+        reassociate::reassociate(&f, fn_results)
+    } else {
+        f
+    };
     let mut blocks: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
     for _ in 0..1000 {
         let before = blocks.clone();
@@ -214,7 +300,9 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
             .collect();
         // Common-subexpression elimination: dedup redundant *pure* computations within a block, so
         // the duplicates become dead for the DCE below.
-        blocks = blocks.iter().map(|b| local_cse(b, fn_results)).collect();
+        if cfg.local_cse {
+            blocks = blocks.iter().map(|b| local_cse(b, fn_results)).collect();
+        }
         blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
         // Re-fold: merging brings a constant's definition into the same block as its use, and
         // dropping params can expose new constants — both newly foldable here.
@@ -222,7 +310,9 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
         // Jump threading: redirect an edge that reaches an empty conditional forwarder with a
         // constant selector straight to the resolved target (correlated branches). The next
         // iteration's prune/merge cleans up any forwarder left with no predecessors.
-        blocks = jump_thread(&blocks, fn_results);
+        if cfg.jump_thread {
+            blocks = jump_thread(&blocks, fn_results);
+        }
         if blocks == before {
             break;
         }
