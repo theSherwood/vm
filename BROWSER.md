@@ -774,14 +774,20 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `tests/jit_module.rs` (hello_c; Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their
    giant hot functions, which V8 runs fine) and the committed `browser/browser-jit-module-test.mjs` (V8
    differential + timing). **Finding — the speedup here is modest** (Lua ~3×, SQLite ~1.3×, vs the
-   reactor demos' 24–34×): V8 compiles the emitted module in ~6 ms, so it is **not** a compile cost — it
-   is the **block dispatcher**. Lua/SQLite's hot functions (`luaV_execute`, `sqlite3VdbeExec`) are *giant*
-   with huge dispatch switches, and every basic-block transition routes through the `br_table` dispatcher
-   loop instead of a direct branch; the reactor demos won big precisely because their hot loops are
-   *small* functions. So the **relooper** (below — reducible-CFG lowering) is the real unlock for
-   interpreter-style guests, not more emitter breadth. (Light scripts run net *slower* under the JIT —
-   the emit/setup overhead isn't repaid — so a playground toggle for the module demos waits on the
-   relooper.)
+   reactor demos' 24–34×), and it is **not** a compile cost (V8 compiles the emitted 3 MB Lua module in
+   ~6 ms). The reactor demos win big because their hot loops are *small* functions; Lua/SQLite's hot
+   functions (`luaV_execute`, `sqlite3VdbeExec`) are *giant*, and giant emitted functions run slowly.
+   **Measured negative result (do not re-attempt blindly): the block dispatcher is NOT the bottleneck.**
+   A full **relooper** — structured `loop`/`block` + direct branches for reducible CFGs — was built and
+   verified (differential-clean; Lua is 100% reducible, so `luaV_execute` *was* structured) and made
+   **no difference** in an A/B: Lua's 5M-loop ran 16.9 s (relooper) vs 16.8 s (dispatcher). Control-flow
+   shape is irrelevant to V8 here; the cost is the giant function itself (V8's optimizing tier declines
+   functions that large, and the all-SSA-values-in-locals model blocks register allocation) — both
+   orthogonal to the relooper. The real levers, if this is ever worth pursuing, are **function
+   splitting** (break the giant into V8-optimizable pieces) or **value stackification** (fewer locals) —
+   larger, uncertain work. So the relooper was reverted, and a playground toggle for the module demos
+   waits on a lever that actually moves the needle (light scripts also run net *slower* under the JIT —
+   the emit/setup overhead isn't repaid).
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
