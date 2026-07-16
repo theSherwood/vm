@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use svm_interp::{GuestMem, HostFn, Trap};
 use svm_run::{
-    instantiate, instantiate_with_imports, Backend, HostCap, Imports, Instance, Limits, Outcome,
-    Run, RunConfig, Value,
+    instantiate, instantiate_with_imports, Backend, HostCap, Imports, Instance, Limits, MemEvent,
+    MemHookFn, Outcome, Run, RunConfig, Value,
 };
 
 // ----------------------------------------------------------------------------
@@ -50,6 +50,19 @@ pub const SVM_BACKEND_JIT: i32 = 2;
 /// `svm_run_outcome_kind` values.
 pub const SVM_OUTCOME_RETURNED: i32 = 0;
 pub const SVM_OUTCOME_EXITED: i32 = 1;
+
+/// `SvmMemEvent::kind` values (mirror the [`svm_run::MemEvent`] variants). For scalar and atomic
+/// events, `addr` is the effective guest address and `size` the access width in bytes; for `COPY`,
+/// `addr` is the destination, `src` the source, `size` the byte length; for `FILL`, `addr` is the
+/// destination and `size` the byte length (`src` is 0). v128 accesses are `LOAD`/`STORE`, size 16.
+pub const SVM_MEM_LOAD: i32 = 0;
+pub const SVM_MEM_STORE: i32 = 1;
+pub const SVM_MEM_ATOMIC_LOAD: i32 = 2;
+pub const SVM_MEM_ATOMIC_STORE: i32 = 3;
+pub const SVM_MEM_ATOMIC_RMW: i32 = 4;
+pub const SVM_MEM_ATOMIC_CMPXCHG: i32 = 5;
+pub const SVM_MEM_COPY: i32 = 6;
+pub const SVM_MEM_FILL: i32 = 7;
 
 /// The max results a host-capability callback may return (the closure's scratch buffer size).
 const SVM_MAX_RESULTS: usize = 16;
@@ -499,6 +512,103 @@ pub unsafe extern "C" fn svm_instance_free(i: *mut SvmInstance) {
     if !i.is_null() {
         drop(Box::from_raw(i));
     }
+}
+
+// ----------------------------------------------------------------------------
+// Memory-access hooks (instrument the module; observe every guest access)
+// ----------------------------------------------------------------------------
+
+/// One guest memory access, handed to an [`SvmMemHook`] **before** the access executes. `kind` is one
+/// of the `SVM_MEM_*` constants; the other fields are interpreted per that kind (see the constants).
+#[repr(C)]
+pub struct SvmMemEvent {
+    pub kind: i32,
+    /// Scalar/atomic: effective guest address. `COPY`/`FILL`: destination address.
+    pub addr: u64,
+    /// `COPY`: source address. Otherwise `0`.
+    pub src: u64,
+    /// Scalar/atomic: access width in bytes. `COPY`/`FILL`: span length in bytes.
+    pub size: u64,
+}
+
+/// A memory-access hook callback. Invoked before each guest access with a flattened [`SvmMemEvent`]
+/// (valid only for the call — do not retain the pointer). Return `0` to allow the access; return
+/// non-zero to **veto** it — the run aborts with a capability trap, identically on every backend.
+/// `ctx` is the opaque pointer registered alongside the callback.
+pub type SvmMemHook = extern "C" fn(ctx: *mut c_void, ev: *const SvmMemEvent) -> i32;
+
+/// Flatten a [`MemEvent`] into the C-ABI [`SvmMemEvent`].
+fn c_mem_event(ev: MemEvent) -> SvmMemEvent {
+    let scalar = |kind, addr, width: u32| SvmMemEvent {
+        kind,
+        addr,
+        src: 0,
+        size: width as u64,
+    };
+    match ev {
+        MemEvent::Load { addr, width } => scalar(SVM_MEM_LOAD, addr, width),
+        MemEvent::Store { addr, width } => scalar(SVM_MEM_STORE, addr, width),
+        MemEvent::AtomicLoad { addr, width } => scalar(SVM_MEM_ATOMIC_LOAD, addr, width),
+        MemEvent::AtomicStore { addr, width } => scalar(SVM_MEM_ATOMIC_STORE, addr, width),
+        MemEvent::AtomicRmw { addr, width } => scalar(SVM_MEM_ATOMIC_RMW, addr, width),
+        MemEvent::AtomicCmpxchg { addr, width } => scalar(SVM_MEM_ATOMIC_CMPXCHG, addr, width),
+        MemEvent::Copy { dst, src, len } => SvmMemEvent {
+            kind: SVM_MEM_COPY,
+            addr: dst,
+            src,
+            size: len,
+        },
+        MemEvent::Fill { dst, len } => SvmMemEvent {
+            kind: SVM_MEM_FILL,
+            addr: dst,
+            src: 0,
+            size: len,
+        },
+    }
+}
+
+/// Opt `i` into **memory-access hooks**: instrument its module so every guest memory access (loads,
+/// stores, v128, atomics, `mem.copy`/`move`/`fill`) calls `hook` before it executes, then re-verify.
+/// **Consumes `i`** (do not use or free it afterward) and returns a new, hooked instance handle — run
+/// it on any backend with `svm_instance_run`/`svm_instance_run_diff`. `NULL` on failure (e.g. the
+/// instrumented module failed re-verification; see [`svm_last_error`]).
+///
+/// The un-hooked path is untouched — a program that never opts in pays nothing. A hooked run executes
+/// more instructions, so give it more fuel than the pristine module. `hook` observes and may veto
+/// (non-zero return aborts the run); it cannot rewrite values or addresses.
+///
+/// # Safety
+/// `i` is a live instance handle from this library; `hook` is a valid function pointer for the
+/// lifetime of the returned instance; `ctx` is valid for that lifetime (and thread-safe if the guest
+/// is concurrent).
+#[no_mangle]
+pub unsafe extern "C" fn svm_instance_with_mem_hooks(
+    i: *mut SvmInstance,
+    hook: SvmMemHook,
+    ctx: *mut c_void,
+) -> *mut SvmInstance {
+    guard_ptr(|| {
+        if i.is_null() {
+            return Err("svm_instance_with_mem_hooks: null instance".into());
+        }
+        // Consume the instance (`with_mem_hooks` takes `self` by value).
+        let inst = Box::from_raw(i).0;
+        let ctx = CtxPtr(ctx);
+        // `make` is called once per backend host; each builds a fresh handler that trampolines into
+        // the C callback. `hook` (a fn pointer) and `ctx` are `Copy`, so `make` stays `Fn`.
+        let hooked = inst.with_mem_hooks(move || -> MemHookFn {
+            let ctx = ctx;
+            Box::new(move |ev| {
+                let ctx = ctx;
+                let cev = c_mem_event(ev);
+                if hook(ctx.0, &cev as *const SvmMemEvent) != 0 {
+                    return Err(Trap::CapFault);
+                }
+                Ok(())
+            })
+        })?;
+        Ok(Box::into_raw(Box::new(SvmInstance(hooked))))
+    })
 }
 
 // ----------------------------------------------------------------------------

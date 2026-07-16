@@ -90,6 +90,35 @@ SvmInstance *svm_instantiate(SvmModule *m);                          /* fixed §
 SvmInstance *svm_instantiate_with_imports(SvmModule *m, SvmImports *imports); /* by name */
 void svm_instance_free(SvmInstance *i);
 
+/*
+ * ---- Memory-access hooks ----
+ * Opt an instance into observing every guest memory access. SvmMemEvent.kind is one of the
+ * SVM_MEM_* constants; for LOAD/STORE/ATOMIC_* addr is the effective guest address and size the
+ * access width in bytes (v128 is LOAD/STORE, size 16); for COPY addr=dst, src=src, size=len; for
+ * FILL addr=dst, size=len (src=0). The hook returns 0 to allow the access, non-zero to veto it (the
+ * run aborts with a capability trap). The ev pointer is valid only for the callback.
+ */
+enum {
+  SVM_MEM_LOAD = 0,
+  SVM_MEM_STORE = 1,
+  SVM_MEM_ATOMIC_LOAD = 2,
+  SVM_MEM_ATOMIC_STORE = 3,
+  SVM_MEM_ATOMIC_RMW = 4,
+  SVM_MEM_ATOMIC_CMPXCHG = 5,
+  SVM_MEM_COPY = 6,
+  SVM_MEM_FILL = 7
+};
+typedef struct {
+  int32_t kind;  /* SVM_MEM_* */
+  uint64_t addr; /* scalar/atomic: effective addr; COPY/FILL: dst */
+  uint64_t src;  /* COPY: src; else 0 */
+  uint64_t size; /* scalar/atomic: width in bytes; COPY/FILL: len in bytes */
+} SvmMemEvent;
+typedef int32_t (*SvmMemHook)(void *ctx, const SvmMemEvent *ev);
+/* Consumes `i`; returns a new hooked instance (run on any backend), or NULL on failure. Give a
+ * hooked run more fuel than the pristine module (it executes more instructions). */
+SvmInstance *svm_instance_with_mem_hooks(SvmInstance *i, SvmMemHook hook, void *ctx);
+
 /* ---- Run config ---- (a NULL pointer means all defaults; *_set flags select a field). */
 typedef struct {
   uint64_t fuel;       /* per-op budget for the interpreters (if fuel_set); ignored by the JIT */

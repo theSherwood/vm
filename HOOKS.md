@@ -96,7 +96,13 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
 - **Embedder API**: `crates/svm-run/src/lib.rs` — `Instance::with_mem_hooks(make)` instruments,
   re-verifies (fail-closed), and stores the handler factory; `MemEvent` / `MemHookFn` are the
   public surface. The factory builds a fresh handler per host (`run_diff` grants two hosts);
-  shared consumer state goes behind an `Arc` in the closure.
+  shared consumer state goes behind an `Arc` in the closure. `Instance::mem_hook_stats()` exposes
+  the pass's inserted-op count for fuel scaling.
+- **C ABI**: `crates/svm-capi` — `svm_instance_with_mem_hooks(instance, hook, ctx)` consumes the
+  instance and returns a hooked one; the callback gets a flattened `SvmMemEvent { kind, addr, src,
+  size }` (the `SVM_MEM_*` kinds) and returns non-zero to veto. Trampolines into
+  `Instance::with_mem_hooks` exactly as `svm_imports_provide_host_fn` does for host-fns. Declared
+  in `include/svm.h`.
 - **Handle binding**: `cap.call` needs a handle constant at instrument time. Grants are
   deterministic, so `with_mem_hooks` discovers the value with a scratch first-grant on a fresh
   `Host`, bakes it, and `grant_caps` grants the hook **first** on every run's fresh host
@@ -111,6 +117,7 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
   - `crates/svm/tests/mem_hooks_diff.rs` — the three-backend gate: identical event streams
     (incl. v128 through the bytecode engine's `Op::Eval` fallback), unperturbed outcomes,
     faulting trace ends at the attempted access, veto aborts identically everywhere.
+  - `crates/svm-capi/src/abi_tests.rs` — the C ABI observe + veto over all three backends.
 
 ## 5. Zero-cost accounting
 
@@ -143,8 +150,8 @@ Adequate for scoring a student program (≤10⁹ accesses in seconds-to-minutes)
 - [x] P1 — instrumentation pass + re-verify + unit tests (`svm-opt`).
 - [x] P2 — `Instance::with_mem_hooks` + deterministic handle grant (`svm-run`).
 - [x] P3 — three-backend trace parity gate (`crates/svm/tests/mem_hooks_diff.rs`).
-- [ ] C ABI surface (`svm-capi`): `svm_instance_with_mem_hooks(instance, fn_ptr, user_ctx)` —
-      when an FFI embedder asks.
+- [x] C ABI surface (`svm-capi`): `svm_instance_with_mem_hooks(instance, hook, ctx)` +
+      `SvmMemEvent`/`SvmMemHook` in `include/svm.h`, observe + veto exercised in `abi_tests.rs`.
 - [x] Published hooked-run overhead number in the benchmark harness — `bench/`'s `hooks` bin
       (`cargo run --release --bin hooks`), hooked vs pristine on all three backends through the
       real `Instance::with_mem_hooks` path; first numbers in §5. `Instance::mem_hook_stats()`
