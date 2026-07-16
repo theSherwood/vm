@@ -1826,15 +1826,20 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
 /// empty (the doomgeneric `DG_GetKey` shape: pump until empty each frame).
 type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>>;
 
-/// Grant the **on-ramp powerbox** onto `host` for module `m`: the arity-selected §3e prefix
+/// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `cap.self.resolve` name,
 /// plus the two by-name graphical `HostFn` capabilities every on-ramp run carries — `display` (op 0 =
 /// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
-/// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`). Returns
-/// the entry `slots` (the prefix handles, passed to `_start`/func 0) plus the frame cell and key queue
-/// the host side reads/writes. A guest that resolves neither graphical cap is unaffected (single-shot
-/// `onramp_exec` guests: the queue stays empty, the frame cell `None`). Shared by [`onramp_exec`] and
-/// the per-frame [`OnrampReactor`], so both grant the identical powerbox.
+/// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
+///
+/// The on-ramp emits `_start` in one of two forms (mirroring `svm-run`'s `grant_caps`):
+/// a **paramless** by-name entry (the S15 synth) that resolves each capability by name from the stash
+/// via `cap.self.resolve`, or a **legacy positional** entry that takes its handles as arguments in slot
+/// order. Either way we grant the prefix and register every name; a positional entry additionally gets
+/// its first `arity` handles as `slots` (the by-name entry runs with none). A guest resolves only the
+/// names it uses, so registering the whole prefix is a harmless superset; one that resolves neither
+/// graphical cap is unaffected (the queue stays empty, the frame cell `None`). Shared by [`onramp_exec`]
+/// and the per-frame [`OnrampReactor`], so both grant the identical powerbox.
 fn grant_onramp_caps(
     host: &mut Host,
     m: &svm_ir::Module,
@@ -1846,27 +1851,34 @@ fn grant_onramp_caps(
 ) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
-    let mut slots: Vec<Value> = Vec::new();
-    if arity >= 1 {
-        slots.push(Value::I32(host.grant_stream(StreamRole::Out)));
+    // A paramless (by-name) entry resolves the whole prefix by name, so grant+register all of it; a
+    // positional entry gets exactly its `arity` handles as args (the old, slot-order grant).
+    let n = if arity == 0 { ONRAMP_CAP_NAMES.len() } else { arity };
+    let mut handles: Vec<i32> = Vec::new();
+    if n >= 1 {
+        handles.push(host.grant_stream(StreamRole::Out));
     }
-    if arity >= 2 {
-        slots.push(Value::I32(host.grant_stream(StreamRole::In)));
+    if n >= 2 {
+        handles.push(host.grant_stream(StreamRole::In));
     }
-    if arity >= 3 {
-        slots.push(Value::I32(host.grant_exit()));
+    if n >= 3 {
+        handles.push(host.grant_exit());
     }
-    if arity >= 4 {
-        slots.push(Value::I32(host.grant_memory()));
+    if n >= 4 {
+        handles.push(host.grant_memory());
     }
-    if arity >= 5 {
-        slots.push(Value::I32(host.grant_address_space(0, win)));
+    if n >= 5 {
+        handles.push(host.grant_address_space(0, win));
     }
-    for (name, slot) in ONRAMP_CAP_NAMES.iter().zip(&slots) {
-        if let Value::I32(handle) = slot {
-            host.register_cap_name(name, *handle);
-        }
+    for (name, handle) in ONRAMP_CAP_NAMES.iter().zip(&handles) {
+        host.register_cap_name(name, *handle);
     }
+    // Positional args for a legacy entry; empty for a by-name (paramless) entry.
+    let slots: Vec<Value> = if arity == 0 {
+        Vec::new()
+    } else {
+        handles.iter().map(|h| Value::I32(*h)).collect()
+    };
     // `display` — the framebuffer output waist (Doom slice 1). `present(ptr, w, h)` copies the frame out.
     let frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -2009,14 +2021,16 @@ fn grant_onramp_caps(
 /// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `svm-llvm`'s synthesized `_start`
 /// expects, so a `.svmb` straight off `svm-llvm-translate` (Lua, SQLite, …) runs unchanged. This is
 /// the twin of [`powerbox_exec`] with the fixed §3e `VM_CAP_*` grant prefix instead of the browser
-/// corpus's `(…, stderr, clock)` set: capabilities are granted by the entry's **arity**, in the
-/// canonical order `stdout, stdin, exit, memory, addrspace` (mirroring `svm-run`'s
-/// `grant_powerbox_prefix`), and each is registered under its name for `cap.self.resolve`.
+/// corpus's `(…, stderr, clock)` set: [`grant_onramp_caps`] grants `stdout, stdin, exit, memory,
+/// addrspace` (mirroring `svm-run`'s `grant_powerbox_prefix`) and registers each under its name, and
+/// the by-name `_start` resolves what it needs via `cap.self.resolve`.
 ///
-/// Slots 6–8 (`ioring`/`blocking`/`jit`) need region/JIT wiring the browser powerbox doesn't carry
-/// yet, so an entry with arity > 5 is **fail-closed** (`STATUS_UNSUPPORTED`) rather than mis-granted.
-/// The `fs` capability (SQLite Phase B, Lua `files.lua`) is a `host_fn` resolved by name — a Stage-1
-/// follow-on, not part of this fixed prefix.
+/// [`grant_onramp_caps`] handles both on-ramp entry forms — the paramless by-name `_start` (S15) and a
+/// legacy positional one. Prefix slots 6–8 (`ioring`/`blocking`/`jit`) need region/JIT wiring the
+/// browser powerbox doesn't carry yet, so a **positional** entry with arity > 5 is **fail-closed**
+/// (`STATUS_UNSUPPORTED`) rather than mis-granted; a paramless entry resolves by name and is unbounded
+/// by arity (an unregistered name simply fails to resolve). The `fs` capability (SQLite Phase B, Lua
+/// `files.lua`) is a `host_fn` resolved by name — a Stage-1 follow-on, not part of this prefix.
 pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
@@ -2034,8 +2048,8 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         Err(_) => return unsupported(),
     };
     let m = &resolved;
-    let arity = m.funcs.first().map_or(0, |f| f.params.len());
-    if arity > 5 {
+    // A positional entry beyond the granted prefix (arity > 5) would be mis-granted; fail closed.
+    if m.funcs.first().map_or(0, |f| f.params.len()) > 5 {
         return unsupported();
     }
     let mut host = Host::new();
