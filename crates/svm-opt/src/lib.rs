@@ -82,6 +82,7 @@ use svm_ir::{
 
 pub mod cfg;
 pub mod gvn;
+pub mod reassociate;
 pub mod sccp;
 pub mod ssa;
 
@@ -189,6 +190,9 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
     // below cannot see. It materializes constants and resolves constant branches; the fixpoint then
     // prunes the newly-unreachable blocks, DCEs the dead selector code, merges, and re-folds.
     let f = sccp::sccp(f, fn_results);
+    // Constant reassociation (OPT.md Phase 2): fold `(x OP c1) OP c2` chains so the fixpoint below
+    // then folds the combined constants and DCEs the dead inner ops.
+    let f = reassociate::reassociate(&f, fn_results);
     let mut blocks: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
     for _ in 0..1000 {
         let before = blocks.clone();
@@ -286,7 +290,20 @@ pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
             // operand known (or `a == b`): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0.
             fold_absorbing(ty, op, a, b, known)
         }
-        Inst::IntCmp { ty, op, a, b } => fold_int_cmp(ty, op, get(known, a)?, get(known, b)?),
+        Inst::IntCmp { ty, op, a, b } => {
+            // Self-comparison folds without knowing the value: `x == x`/`x <= x`/`x >= x` are 1,
+            // `x != x`/`x < x`/`x > x` are 0. Integer only — this is unsound for floats (NaN), but
+            // float compares are `FCmp`, never here. (The other self-ops — `x-x`, `x^x`, `x&x`,
+            // `x|x` — are handled by `fold_absorbing` / `forward_to_operand`.)
+            if a == b {
+                let is_true = matches!(
+                    op,
+                    CmpOp::Eq | CmpOp::LeS | CmpOp::LeU | CmpOp::GeS | CmpOp::GeU
+                );
+                return Some(Known::I32(is_true as i32));
+            }
+            fold_int_cmp(ty, op, get(known, a)?, get(known, b)?)
+        }
         Inst::IntUn { ty, op, a } => fold_int_un(ty, op, get(known, a)?),
         Inst::Eqz { ty, a } => {
             let zero = match ty {

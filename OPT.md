@@ -183,8 +183,12 @@ tracked enhancement, not a blocker.
     routinely emit such degenerate branches/selects. Tests (`tests/simplify.rs`): coincident
     `br_if`→`br` (+ dead condition removed + block merged), coincident `br_table`→`br`, equal-arm
     `select`→copy.
-  - [ ] instcombine-style rules + strength reduction, jump threading, LICM for pure non-trapping ops.
-    Each with differential + fuzz.
+  - [x] **Instcombine peepholes** (`try_fold` + `reassociate`): integer **self-comparison** folds
+    (`x==x`/`x<=x`/`x>=x` → 1, `x!=x`/`x<x`/`x>x` → 0; integer only — floats are `FCmp`); and
+    **constant reassociation** `(x OP c1) OP c2 → x OP (c1 OP c2)` for associative+commutative ops
+    (Add/Mul/And/Or/Xor), which shrinks constant chains an op at a time and exposes CSE (two paths that
+    reassociate to `x+8` then share one op). Tests in `tests/peephole.rs`.
+  - [ ] jump threading, LICM for pure non-trapping ops. Each with differential + fuzz.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).
