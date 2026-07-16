@@ -41,37 +41,47 @@ fn parse_module(ir: &str) -> Result<svm_ir::Module, svm_text::ParseError> {
         .unwrap_or_else(|e| panic!("resolve capability imports: {e}")))
 }
 
-fn to_slot(v: Value) -> i64 {
-    match v {
-        Value::I32(x) => x as i64,
-        Value::I64(x) => x,
-        Value::F32(x) => x.to_bits() as i64,
-        Value::F64(x) => x.to_bits() as i64,
-        Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
-        Value::Ref(x) => x as i64,
-    }
-}
-
-/// The fixed **8-handle powerbox** a chibicc `_start` imports — stdout, stdin, exit, memory,
-/// addrspace (§14), ioring + blocking (§9/§12), jit (DESIGN.md §22) — granted in that order so the
-/// handle values are deterministic (and identical across two hosts). Every entry imports the
-/// same set (one `_start` shape); a guest that never touches the ring or the JIT just leaves
-/// those handles stashed and unused. `block_for` is the mock Blocking op's duration — `ZERO`
-/// for ordinary programs, non-zero for an async demo that wants its I/O to actually block.
+/// The fixed **8-handle powerbox** — stdout, stdin, exit, memory, addrspace (§14), ioring + blocking
+/// (§9/§12), jit (DESIGN.md §22) — granted in that order so the handle values are deterministic (and
+/// identical across two hosts), and **registered under their canonical names** (S15 (c2)): the
+/// paramless `_start` resolves each by name (`cap.self.resolve`), so callers run function 0 with
+/// `&[]`, not these as positional args. Every guest gets the same set (one `_start` shape); one that
+/// never touches the ring or the JIT just leaves those handles stashed and unused. `block_for` is the
+/// mock Blocking op's duration — `ZERO` for ordinary programs, non-zero for an async demo that wants
+/// its I/O to actually block. The returned handles are still handy for naming a specific one.
 fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 8] {
     h.set_region_factory(svm_run::new_shared_region);
     h.set_jit_validator(svm_run::jit_blob_validator);
     let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
-    [
-        Value::I32(h.grant_stream(StreamRole::Out)),
-        Value::I32(h.grant_stream(StreamRole::In)),
-        Value::I32(h.grant_exit()),
-        Value::I32(h.grant_memory()),
-        Value::I32(h.grant_address_space(0, win)),
-        Value::I32(h.grant_io_ring()),
-        Value::I32(h.grant_blocking(block_for, None)),
-        Value::I32(h.grant_jit(mem_log2)),
-    ]
+    let handles = [
+        h.grant_stream(StreamRole::Out),
+        h.grant_stream(StreamRole::In),
+        h.grant_exit(),
+        h.grant_memory(),
+        h.grant_address_space(0, win),
+        h.grant_io_ring(),
+        h.grant_blocking(block_for, None),
+        h.grant_jit(mem_log2),
+    ];
+    // S15 (c2): the frontend `_start` now resolves each cap **by name** (`cap.self.resolve`), so
+    // register the fixed powerbox under its canonical names (the order matches
+    // `svm_run::POWERBOX_CAP_NAMES` / the `VM_CAP_*` order). The entry takes no positional handle
+    // arguments — callers run function 0 with `&[]` — but the returned handles are still handy for
+    // tests that name a specific one (e.g. an explicit `__vm_cap`-style call).
+    const NAMES: [&str; 8] = [
+        "stdout",
+        "stdin",
+        "exit",
+        "memory",
+        "addrspace",
+        "ioring",
+        "blocking",
+        "jit",
+    ];
+    for (name, &handle) in NAMES.iter().zip(&handles) {
+        h.register_cap_name(name, handle);
+    }
+    handles.map(Value::I32)
 }
 
 fn repo_root() -> PathBuf {
@@ -235,9 +245,10 @@ fn run_c_interp(src: &str) -> CRun {
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     let mut h = Host::new();
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let args = powerbox(&mut h, win, std::time::Duration::ZERO);
+    // Grant + register the powerbox (the paramless `_start` resolves it by name); no entry args.
+    powerbox(&mut h, win, std::time::Duration::ZERO);
     let mut fuel = 50_000_000u64;
-    let outcome = match run_with_host(&m, 0, &args, &mut fuel, &mut h) {
+    let outcome = match run_with_host(&m, 0, &[], &mut fuel, &mut h) {
         Ok(v) => Outcome::Returned(v),
         Err(Trap::Exit(c)) => Outcome::Exited(c),
         Err(e) => panic!("interp trapped: {e:?}\n{src}\n{ir}"),
@@ -277,19 +288,12 @@ fn c_write_to_string_literal_faults() {
     let mut hi = Host::new();
     let mut hj = Host::new();
     let grant = |h: &mut Host| powerbox(h, 1 << 20, std::time::Duration::ZERO);
-    let args = grant(&mut hi);
+    grant(&mut hi);
     grant(&mut hj);
     let mut fuel = 50_000_000u64;
-    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let jit = compile_and_run_with_host(
-        &m,
-        0,
-        &slots,
-        cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
-    )
-    .expect("jit compiles");
+    let interp = run_with_host(&m, 0, &[], &mut fuel, &mut hi);
+    let jit = compile_and_run_with_host(&m, 0, &[], cap_thunk, &mut hj as *mut Host as *mut c_void)
+        .expect("jit compiles");
 
     assert_eq!(
         interp,
@@ -383,19 +387,12 @@ fn c_ungrown_tail_access_faults() {
     let grant = |h: &mut Host| powerbox(h, 1 << 20, std::time::Duration::ZERO);
     let mut hi = Host::new();
     let mut hj = Host::new();
-    let args = grant(&mut hi);
+    grant(&mut hi);
     grant(&mut hj);
     let mut fuel = 50_000_000u64;
-    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let jit = compile_and_run_with_host(
-        &m,
-        0,
-        &slots,
-        cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
-    )
-    .expect("jit compiles");
+    let interp = run_with_host(&m, 0, &[], &mut fuel, &mut hi);
+    let jit = compile_and_run_with_host(&m, 0, &[], cap_thunk, &mut hj as *mut Host as *mut c_void)
+        .expect("jit compiles");
     assert_eq!(
         interp,
         Err(Trap::MemoryFault),
@@ -736,6 +733,40 @@ fn c_hello_world_end_to_end() {
     );
     assert_eq!(r.outcome, Outcome::Returned(vec![Value::I32(0)]));
     assert_eq!(r.stdout, b"hello, world\n");
+}
+
+#[test]
+fn c_defined_write_shadows_the_builtin() {
+    // A guest **definition** of `write` (a body, not a bare `extern`) shadows the powerbox Stream
+    // builtin — the frontend hook the POSIX personality libc relies on to own `write`/`read`/`exit`
+    // with the real signature (PROCESS.md S15 (b)). Here the guest `write` just runs its own body
+    // and returns; the Stream builtin would instead have written to stdout and returned the byte
+    // count. `calls == 1` proves the body ran; empty stdout proves the builtin did *not* fire.
+    let r = run_c_full(
+        "int calls = 0; \
+         int write(int fd, char *b, int n) { calls = calls + 1; return 100 + n; } \
+         int main() { int r = write(1, 0, 7); return r + calls; }",
+    );
+    assert_eq!(
+        r.outcome,
+        Outcome::Returned(vec![Value::I32(108)]),
+        "the guest write body ran (107) and bumped calls (1) — not the Stream builtin"
+    );
+    assert_eq!(r.stdout, b"", "the Stream builtin must not have fired");
+}
+
+#[test]
+fn c_undefined_write_still_hits_the_builtin() {
+    // The negative of the above: a bare `extern write` (no body) keeps the powerbox Stream builtin,
+    // so the existing fixed-powerbox programs are unchanged by the shadowing hook.
+    let r = run_c_full(
+        "int write(int fd, char *buf, int n); \
+         int main() { write(1, \"hey\", 3); return 0; }",
+    );
+    assert_eq!(
+        r.stdout, b"hey",
+        "extern write still routes to Stream.write"
+    );
 }
 
 #[test]
@@ -1168,19 +1199,12 @@ fn c_function_pointer_signature_mismatch_traps() {
     let mut hi = Host::new();
     let mut hj = Host::new();
     let grant = |h: &mut Host| powerbox(h, 1 << 20, std::time::Duration::ZERO);
-    let args = grant(&mut hi);
+    grant(&mut hi);
     grant(&mut hj);
     let mut fuel = 50_000_000u64;
-    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let jit = compile_and_run_with_host(
-        &m,
-        0,
-        &slots,
-        cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
-    )
-    .expect("jit compiles");
+    let interp = run_with_host(&m, 0, &[], &mut fuel, &mut hi);
+    let jit = compile_and_run_with_host(&m, 0, &[], cap_thunk, &mut hj as *mut Host as *mut c_void)
+        .expect("jit compiles");
     assert_eq!(
         interp,
         Err(Trap::IndirectCallType),
@@ -1931,14 +1955,14 @@ fn c_thread_shares_powerbox_for_io() {
 #[test]
 fn c_threads_deterministic_sweep() {
     // Same compiled C run through the seeded explorer (§18): every interleaving yields 2000, and each
-    // is reproducible from its seed. The program makes no cap.calls, so dummy powerbox handles + the
-    // explorer's empty host suffice.
+    // is reproducible from its seed. The program makes no powerbox cap.calls (the paramless `_start`'s
+    // by-name resolves just stash `-errno` against the explorer's empty host and are never loaded), so
+    // no entry args and no granted powerbox are needed.
     let ir = c_to_ir(C_ATOMIC_COUNTER);
     let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse: {e:?}\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
-    let args = [Value::I32(0); 8]; // 8 dummy powerbox handles (the program makes no cap.calls)
     for seed in 0..100u64 {
-        let r = run_scheduled(&m, 0, &args, 50_000_000, seed);
+        let r = run_scheduled(&m, 0, &[], 50_000_000, seed);
         assert_eq!(r, Ok(vec![Value::I32(2000)]), "explorer seed {seed}");
     }
 }
@@ -2258,7 +2282,9 @@ fn run_jit_repl_session(
         panic!("the 8th powerbox handle is the JIT domain");
     };
     let domain = host.resolve_jit_domain(jit_handle).expect("jit domain");
-    let slot_args: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    // The paramless `_start` resolves the powerbox by name (powerbox() registered the names); the
+    // entry takes no positional args.
+    let slot_args: Vec<i64> = Vec::new();
 
     // The session takes ownership of the host (boxed `Mutex<Host>`); recover it for stdout below.
     let mut session = svm_run::JitSession::new(
@@ -2405,6 +2431,8 @@ fn run_async_demo(src: &str) -> (Vec<u8>, Vec<u8>) {
 
     let mut hi = Host::new();
     let mut hj = Host::new();
+    // Grant + register the powerbox on both hosts (the paramless `_start` resolves it by name); the
+    // entry takes no positional args. Grants are deterministic, so both hosts match.
     let args = powerbox(&mut hi, win, Duration::from_millis(10));
     assert_eq!(
         args,
@@ -2413,10 +2441,10 @@ fn run_async_demo(src: &str) -> (Vec<u8>, Vec<u8>) {
     );
 
     let mut fuel = 500_000_000u64;
-    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi).expect("interp ran ok");
+    let interp = run_with_host(&m, 0, &[], &mut fuel, &mut hi).expect("interp ran ok");
     assert_eq!(interp, vec![Value::I32(0)], "demo returns 0 (interp)");
 
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let slots: Vec<i64> = Vec::new();
     let init = vec![0u8; win as usize];
     // SAFETY: `hj` is the live cap-ctx Host for this run and outlives it.
     let hooks = unsafe { svm_run::HostAsyncHooks::new(&mut hj as *mut Host) };

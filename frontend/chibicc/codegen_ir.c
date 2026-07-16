@@ -1545,12 +1545,21 @@ static int gen_expr(Node *node) {
     if (direct) {
       char *fname = node->lhs->var->name;
       if (fname) {
-        if (!strcmp(fname, "write"))
-          return gen_builtin_stream(node, STDOUT_SLOT, 1);
-        if (!strcmp(fname, "read"))
-          return gen_builtin_stream(node, STDIN_SLOT, 0);
-        if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
-          return gen_builtin_exit(node);
+        // The stdio builtins (`write`/`read`/`exit`) apply only to a name that is *declared but not
+        // defined* in this unit — a guest **definition** shadows the builtin (correct C: a real
+        // function beats a compiler builtin). This is how a personality libc owns these names: a
+        // guest `write(fd, buf, len)` that forwards (fd preserved) to a `call.import` bound to the
+        // POSIX personality (PROCESS.md S15 (b)). A bare `extern write` (no body) still gets the
+        // powerbox Stream builtin, so the existing fixed-powerbox programs are unchanged. The `__vm_*`
+        // intrinsics below stay unconditional — they are reserved, never legitimately redefined.
+        if (!node->lhs->var->is_definition) {
+          if (!strcmp(fname, "write"))
+            return gen_builtin_stream(node, STDOUT_SLOT, 1);
+          if (!strcmp(fname, "read"))
+            return gen_builtin_stream(node, STDIN_SLOT, 0);
+          if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
+            return gen_builtin_exit(node);
+        }
         if (!strcmp(fname, "__vm_map"))
           return gen_builtin_memory(node, 0, 3);
         if (!strcmp(fname, "__vm_unmap"))
@@ -2476,37 +2485,55 @@ static void emit_data_segments(Obj *prog) {
   }
 }
 
-// Synthetic entry (function 0): stash the powerbox capability handles, then call `main` with
-// the initial data-SP (= data_end). Global data is now placed by module-level `data` segments
-// (§3a, see `emit_data_segments`), not written here. The runtime invokes this with the granted
-// handles `(stdout, stdin, exit)` as i32 arguments.
-// Does any node in this subtree call an async-ring builtin? (Walks the AST so `_start` knows whether
+// Synthetic entry (function 0): resolve the powerbox capability handles **by name** into their
+// reserved stash slots, then call `main` with the initial data-SP (= data_end). Global data is
+// placed by module-level `data` segments (§3a, see `emit_data_segments`), not written here. The
+// runtime grants the fixed powerbox and invokes this with **no** arguments (§7 name binding).
 static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  // A single **fixed** powerbox: every entry imports the same 8 handles regardless of which it uses
-  // (mirroring how the frontend already always imports Memory/AddressSpace). A guest that never
-  // touches the ring or the JIT just leaves those handles stashed and unused — one `_start` shape,
-  // so every runner/harness grants the same set.
+  // The powerbox is bound **by name**, not positionally (PROCESS.md S15 (c)). `_start` takes **no
+  // handle parameters**; instead its prologue resolves each capability by name from the runtime's
+  // §7 name directory (`cap.self.resolve`, which the runner populates when it grants the fixed set)
+  // and stashes it in the reserved slot — so every builtin below (which still *loads* the stash) is
+  // unchanged, and there is no implicit guest/host slot-index agreement: the guest asks for
+  // "stdout", the host answers or fails closed. A `export "_start" 0` marks func 0 as the powerbox
+  // entry (the old 3-8 `i32` params that used to tag it are gone; see `is_named_powerbox_entry`).
+  // Names + slot order match `svm_run::POWERBOX_CAP_NAMES` / the `VM_CAP_*` order. (All 8 are
+  // resolved unconditionally — a per-program used-caps mask is a follow-up; an unused/ungranted name
+  // resolves to a negative errno that is stashed and never loaded.)
 #define NHANDLES 8
+  static const char *const cap_names[NHANDLES] = {"stdout", "stdin",  "exit",     "memory",
+                                                  "addrspace", "ioring", "blocking", "jit"};
   int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,     MEMORY_SLOT,
                          ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT, JIT_SLOT};
-  cg("func (");
-  for (int i = 0; i < NHANDLES; i++)
-    cg("%si32", i ? ", " : "");
-  cg(") -> (%s) {\n", is_void ? "" : irty(mret));
-  // stdout, stdin, exit, memory, addrspace (§14), ioring, blocking (§9/§12), jit (DESIGN.md §22)
-  cg("block0(");
-  for (int i = 0; i < NHANDLES; i++)
-    cg("%sv%d: i32", i ? ", " : "", i);
-  cg("):\n");
-  nv = NHANDLES;
-  // Stash each handle in its reserved slot so the builtins can load it.
+  cg("export \"_start\" 0\n");
+  cg("func () -> (%s) {\n", is_void ? "" : irty(mret));
+  cg("block0():\n");
+  nv = 0;
+  // Resolve each powerbox cap by name into its stash slot. Each name's bytes are written to a
+  // scratch cell at the data-stack base (`data_end`), reused per name — transient, since `main`
+  // (called below with the data-SP = `data_end`) overwrites it as it grows its frame.
   for (int i = 0; i < NHANDLES; i++) {
-    int a = nv++;
-    cg("  v%d = i64.const %d\n", a, slots[i]);
-    cg("  i32.store v%d v%d\n", a, i);
+    const char *nm = cap_names[i];
+    int len = (int)strlen(nm);
+    for (int k = 0; k < len; k++) {
+      int vp = nv++;
+      cg("  v%d = i64.const %d\n", vp, data_end + k);
+      int vc = nv++;
+      cg("  v%d = i32.const %d\n", vc, (unsigned char)nm[k]);
+      cg("  i32.store8 v%d v%d\n", vp, vc);
+    }
+    int vptr = nv++;
+    cg("  v%d = i64.const %d\n", vptr, data_end);
+    int vlen = nv++;
+    cg("  v%d = i64.const %d\n", vlen, len);
+    int vh = nv++;
+    cg("  v%d = cap.self.resolve v%d v%d\n", vh, vptr, vlen);
+    int vslot = nv++;
+    cg("  v%d = i64.const %d\n", vslot, slots[i]);
+    cg("  i32.store v%d v%d\n", vslot, vh);
   }
 #undef NHANDLES
   int sp = nv++;

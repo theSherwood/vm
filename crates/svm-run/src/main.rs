@@ -25,8 +25,8 @@ use std::{env, fs, process};
 
 use svm_ir::Module;
 use svm_run::{
-    is_powerbox_entry, run_kernel, run_powerbox_with_args_and_limits, specialize_module, Outcome,
-    Quota, SpecArg, SpecializeOpts, Value,
+    is_named_powerbox_entry, is_powerbox_entry, run_kernel, run_powerbox_with_args_and_limits,
+    specialize_module, Outcome, Quota, SpecArg, SpecializeOpts, Value,
 };
 use svm_verify::verify_module;
 
@@ -134,7 +134,7 @@ fn try_main() -> Result<(), String> {
         );
     }
 
-    if is_powerbox_entry(&module) {
+    if is_powerbox_entry(&module) || is_named_powerbox_entry(&module) {
         // §5 kill-path: `SVM_DEADLINE_MS` (CLI policy) bounds a possibly-runaway guest so it is
         // detect-and-killed after the deadline instead of hanging the process; unset ⇒ unbounded.
         let deadline = std::env::var("SVM_DEADLINE_MS")
