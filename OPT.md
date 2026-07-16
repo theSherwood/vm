@@ -188,7 +188,18 @@ tracked enhancement, not a blocker.
     **constant reassociation** `(x OP c1) OP c2 → x OP (c1 OP c2)` for associative+commutative ops
     (Add/Mul/And/Or/Xor), which shrinks constant chains an op at a time and exposes CSE (two paths that
     reassociate to `x+8` then share one op). Tests in `tests/peephole.rs`.
-  - [ ] jump threading, LICM for pure non-trapping ops. Each with differential + fuzz.
+  - [x] **LICM** (`svm_opt::licm`): hoists pure, non-trapping loop-invariant computations to the
+    loop preheader. Invariance is computed iteratively through block-param phis (a value defined
+    outside the loop is invariant; a loop parameter is invariant when every incoming arg is invariant
+    or is the parameter itself — the archetypal `x` passed unchanged around the back edge; a pure op is
+    invariant when its operands are). An invariant op is cloned into the preheader (operands rewritten
+    to preheader-valid values — a dominating value as is, or an invariant header param's entry arg) and
+    its result threaded back in (`crate::thread`), leaving the original for DCE. Sound by construction
+    (pure+non-trapping speculated above the loop) and conservative on shape (reducible single-header
+    loops with a unique preheader only). Reuses the shared `vn` / `thread` modules (extracted from GVN).
+    Tests: invariant op hoisted out of every loop (SCC check) + variant op stays, behavior preserved;
+    covered by the `opt_sccp` fuzz target (whole pipeline).
+  - [ ] jump threading. Differential + fuzz.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).

@@ -82,6 +82,7 @@ use svm_ir::{
 
 pub mod cfg;
 pub mod gvn;
+pub mod licm;
 pub mod reassociate;
 pub mod sccp;
 pub mod ssa;
@@ -172,6 +173,9 @@ pub fn optimize_module(m: &Module) -> Module {
                 // through block params), then `optimize_func` (SCCP + fixpoint) DCEs the dead
                 // duplicates and drops any parameter left unused.
                 let g = gvn::gvn(f, &m.funcs, has_memory);
+                // Loop-invariant code motion (OPT.md Phase 2): hoist pure, non-trapping invariants
+                // out of loops; the fixpoint below DCEs the emptied-out originals.
+                let g = licm::licm(&g, &m.funcs, has_memory);
                 optimize_func(&g, &fn_results)
             })
             .collect(),
