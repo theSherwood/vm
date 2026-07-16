@@ -33,6 +33,59 @@
         textarea { background: #1d1d1d; color: #ddd; }
       }
     </style>
+
+    <!-- Editor: CodeMirror 5, vendored under vendor/codemirror/ (UI only — never touches the sandbox
+         or any authority). Loaded as classic scripts so window.CodeMirror is populated before the
+         deferred play.js module runs. Order: core, then the simple-mode + edit addons, then the
+         dialog/search addons Vim needs, then the Vim keymap and language modes. -->
+    <link rel="stylesheet" href="vendor/codemirror/codemirror.css" />
+    <link rel="stylesheet" href="vendor/codemirror/addon/dialog.css" />
+    <style>
+      .CodeMirror {
+        height: 30rem; border: 1px solid #ccc; border-radius: 4px;
+        font: 0.85rem/1.4 ui-monospace, monospace;
+      }
+      .CodeMirror.cm-readonly { opacity: 0.82; }
+      .CodeMirror.cm-readonly .CodeMirror-cursor { display: none; }
+      /* Light-theme token colors (a GitHub-flavored palette). */
+      .cm-s-default .cm-comment { color: #6a737d; font-style: italic; }
+      .cm-s-default .cm-string { color: #a31515; }
+      .cm-s-default .cm-keyword { color: #0b5fa5; font-weight: 600; }
+      .cm-s-default .cm-builtin { color: #8250df; }
+      .cm-s-default .cm-type { color: #067d6f; }
+      .cm-s-default .cm-def { color: #953800; font-weight: 600; }
+      .cm-s-default .cm-variable-2 { color: #0550ae; }
+      .cm-s-default .cm-number { color: #1a7f37; }
+      .cm-s-default .cm-operator { color: #6a737d; }
+      @media (prefers-color-scheme: dark) {
+        .CodeMirror {
+          border-color: #333; background: #1d1d1d; color: #ddd;
+        }
+        .CodeMirror-gutters { background: #1a1a1a; border-color: #333; }
+        .CodeMirror-linenumber { color: #666; }
+        .CodeMirror-cursor { border-left-color: #ddd; }
+        .CodeMirror-selected { background: #33415580 !important; }
+        .cm-s-default .cm-comment { color: #8b949e; }
+        .cm-s-default .cm-string { color: #ff7b72; }
+        .cm-s-default .cm-keyword { color: #79c0ff; }
+        .cm-s-default .cm-builtin { color: #d2a8ff; }
+        .cm-s-default .cm-type { color: #56d4c4; }
+        .cm-s-default .cm-def { color: #ffa657; }
+        .cm-s-default .cm-variable-2 { color: #a5d6ff; }
+        .cm-s-default .cm-number { color: #7ee787; }
+        .cm-s-default .cm-operator { color: #8b949e; }
+        .CodeMirror-dialog { background: #1d1d1d; color: #ddd; }
+      }
+    </style>
+    <script src="vendor/codemirror/codemirror.js"></script>
+    <script src="vendor/codemirror/addon/simple.js"></script>
+    <script src="vendor/codemirror/addon/matchbrackets.js"></script>
+    <script src="vendor/codemirror/addon/dialog.js"></script>
+    <script src="vendor/codemirror/addon/searchcursor.js"></script>
+    <script src="vendor/codemirror/vim.js"></script>
+    <script src="vendor/codemirror/mode/lua.js"></script>
+    <script src="vendor/codemirror/mode/sql.js"></script>
+    <script src="vendor/codemirror/mode/clike.js"></script>
   </head>
   <body>
     <h1>SVM playground — SVM text across real Web Workers, and real C/C++ guests via the LLVM on-ramp</h1>
@@ -53,6 +106,9 @@
       <button id="stop" disabled>Stop</button>
       <label id="jitLabel" title="Run the reactor's tick() on emitted wasm (wasm-JIT tier) instead of the interpreter — smooths DOOM's frame rate" hidden>
         <input type="checkbox" id="jit" checked> wasm-JIT
+      </label>
+      <label title="Vim keybindings in the editor">
+        <input type="checkbox" id="vim"> vim
       </label>
       <span id="state" data-state="loading">loading engine…</span>
     </div>
