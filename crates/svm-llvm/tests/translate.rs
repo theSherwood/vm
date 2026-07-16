@@ -5481,6 +5481,53 @@ fn vector_bswap_128() {
 }
 
 #[test]
+fn vec_widen_narrow_native() {
+    // Native SIMD widen/narrow (D64): a full-128 ×2 `sext`/`zext` lowers to `swiden`/`uwiden` (not a
+    // per-lane explode/repack), and a 256→128 wrapping `trunc` to a byte `shuffle` (not the saturating
+    // `VNarrow`). Checks the lane values on both backends. Folds four conversions into one `i64`:
+    //   sext <8 x i16>→<8 x i32> lane0 = -1              → i64 -1
+    //   zext <8 x i16>→<8 x i32> lane0 = 0xFFFF = 65535  → i64 65535
+    //   trunc <8 x i32>→<8 x i16> lane0 = 0x0001_0001 & 0xFFFF = 1 (WRAP, not saturate to 0x7FFF)
+    //   sext <8 x i32>→<8 x i64> lane7 = -8              → i64 -8
+    //   fold: (-1)*1_000_000 + 65535*100 + 1*10 + (-8) = -1_000_000 + 6_553_500 + 10 - 8 = 5_553_502
+    let ll = "define i64 @run() {\n\
+        entry:\n  \
+        %sw = sext <8 x i16> <i16 -1, i16 2, i16 3, i16 4, i16 5, i16 6, i16 7, i16 8> to <8 x i32>\n  \
+        %s0 = extractelement <8 x i32> %sw, i32 0\n  \
+        %s0e = sext i32 %s0 to i64\n  \
+        %zw = zext <8 x i16> <i16 -1, i16 2, i16 3, i16 4, i16 5, i16 6, i16 7, i16 8> to <8 x i32>\n  \
+        %z0 = extractelement <8 x i32> %zw, i32 0\n  \
+        %z0e = zext i32 %z0 to i64\n  \
+        %nw = trunc <8 x i32> <i32 65537, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8> to <8 x i16>\n  \
+        %n0 = extractelement <8 x i16> %nw, i32 0\n  \
+        %n0e = zext i16 %n0 to i64\n  \
+        %ww = sext <8 x i32> <i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 -8> to <8 x i64>\n  \
+        %w7 = extractelement <8 x i64> %ww, i32 7\n  \
+        %a = mul i64 %s0e, 1000000\n  \
+        %b = mul i64 %z0e, 100\n  \
+        %c = mul i64 %n0e, 10\n  \
+        %ab = add i64 %a, %b\n  \
+        %cd = add i64 %c, %w7\n  \
+        %r = add i64 %ab, %cd\n  \
+        ret i64 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate widen/narrow .ll");
+    svm_verify::verify_module(&t.module).expect("verify widen/narrow");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run widen/narrow");
+    assert_eq!(
+        r,
+        vec![Value::I64(5_553_502)],
+        "sext/zext widen + wrapping narrow + i32→i64 widen lanes"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0], 5_553_502, "JIT widen/narrow"),
+        other => panic!("JIT widen/narrow: unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn vec2_minmax_per_lane() {
     // A **2-lane 32-bit** integer min/max (`<2 x i32>`, packed into an `i64` — §V). It has no 128-bit
     // `VShape`, so it must be scalarized **per lane**: comparing the whole packed `i64` is a silent
