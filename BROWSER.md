@@ -781,29 +781,35 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    A full **relooper** — structured `loop`/`block` + direct branches for reducible CFGs — was built and
    verified (differential-clean; Lua is 100% reducible, so `luaV_execute` *was* structured) and made
    **no difference** in an A/B: Lua's 5M-loop ran 16.9 s (relooper) vs 16.8 s (dispatcher). Control-flow
-   shape is irrelevant to V8 here; the cost is the giant function itself (V8's optimizing tier declines
-   functions that large, and the all-SSA-values-in-locals model blocks register allocation) — both
-   orthogonal to the relooper. The real levers, if this is ever worth pursuing, are **function
-   splitting** (break the giant into V8-optimizable pieces) or **value stackification** (fewer locals) —
-   larger, uncertain work. So the relooper was reverted, and a playground toggle for the module demos
-   waits on a lever that actually moves the needle (light scripts also run net *slower* under the JIT —
-   the emit/setup overhead isn't repaid).
+   shape is irrelevant to V8 here; the cost is the giant function itself. So the relooper was reverted,
+   and a playground toggle for the module demos waits on a lever that actually moves the needle (light
+   scripts also run net *slower* under the JIT — the emit/setup overhead isn't repaid).
 
-   **The relooper is not a dead end — it is a *prerequisite* for value stackification.** The reason it
-   did nothing *alone* is the same reason it is the half that must land *first*: with the `br_table`
-   dispatcher, the operand stack must be empty (or a fixed type) at every dispatch edge, so **every SSA
-   value that crosses a basic-block boundary is forced into a wasm local**. That all-values-in-locals
-   model is precisely what starves V8's register allocator. You can only keep those cross-block values on
-   the operand stack — the fewer-locals win — if the control flow is *structured*, i.e. the relooper has
-   run. (Intra-block stackification is possible under the dispatcher; the cross-block form is not.) So the
-   real lever is **relooper + stackification together**: the relooper reshapes control flow, stackification
-   then drains locals onto the operand stack. Measured alone the relooper is inert (the A/B above) because
-   the emitter still spilled every value to a local; it only pays off once stackification consumes the
-   structure it creates. Caveat against reviving it casually: the relooper adds genuinely complex code
-   (RPO, dominators, reducibility test) to the **most security-sensitive file in the tree** — simpler
-   *output*, more complex *emitter*, which for this project normally cuts the wrong way. Revive it only as
-   **step 1 of a committed stackification effort**, where the added TCB buys a payoff, never as a
-   standalone change.
+   **Why "the giant function" is slow — a tier-up probe settles it (do not re-run the false leads).** It
+   was tempting to blame the giant function on two things: that V8's optimizer *declines* functions that
+   large, or that the *all-SSA-values-in-locals* model starves its register allocator (which would make
+   **value stackification** — emitting fewer locals, with the relooper as its structural prerequisite —
+   the real unlock). A cheap probe running the emitted Lua 1M-loop under three V8 configs **refutes both**
+   (post-warmup medians):
+
+   | V8 config | Lua 1M-loop | reading |
+   | --- | --- | --- |
+   | `--liftoff-only` (baseline) | 9610 ms | every local naively materialized |
+   | `--no-liftoff` (TurboFan only) | 4308 ms | the optimizer **does** compile `luaV_execute` — no size bail |
+   | default (tier-up) | 4160 ms | tiers up to TurboFan within one run |
+
+   TurboFan compiles the giant function fine (no decline for size) and is **2.2× faster than Liftoff on
+   the identical wasm** — so its register allocator is plainly *not* defeated by our locals; it rebuilds
+   SSA from the `local.set`/`local.get` pairs and coalesces them. That guts the premise behind
+   stackification: the win it chases (fewer locals → better RA) is one TurboFan already mostly banks for
+   us, leaving only residual headroom (~10–30%, uncertain) in exchange for the most invasive, highest-risk
+   surgery yet on the confinement-critical emitter (rewriting operand materialization in every instruction
+   arm, plus the relooper as a dependency). Not worth it on this evidence. The time actually goes to
+   **per-access confinement** — every Lua-stack register read/write in `luaV_execute` carries
+   `emit_confine`'s ~7-op bounds-check-and-mask — i.e. the security hinge itself, a far more sensitive
+   lever than locals. If module-guest throughput is ever worth pursuing, that (redundant-check elimination
+   with a proof the confinement invariant holds) or **function splitting** are the real targets;
+   stackification is not.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
