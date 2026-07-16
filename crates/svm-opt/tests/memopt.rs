@@ -50,6 +50,23 @@ fn add(a: u32, b: u32) -> Inst {
         b,
     }
 }
+fn load_off(addr: u32, offset: u64) -> Inst {
+    Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset,
+        align: 0,
+    }
+}
+fn store_off(op: StoreOp, addr: u32, value: u32, offset: u64) -> Inst {
+    Inst::Store {
+        op,
+        addr,
+        value,
+        offset,
+        align: 0,
+    }
+}
 
 fn count(m: &Module, pred: impl Fn(&Inst) -> bool) -> usize {
     m.funcs
@@ -181,5 +198,67 @@ fn store_to_an_unknown_address_blocks_forwarding() {
     assert_eq!(
         run(&opt, &[Value::I64(0), Value::I64(0)]),
         Ok(vec![Value::I64(99)])
+    );
+}
+
+#[test]
+fn disjoint_offset_store_does_not_block_forwarding() {
+    // f(base): x = mem[base+0]; mem[base+8] = 5; y = mem[base+0]; return x + y.  The store writes bytes
+    // [8,16), disjoint from the loaded [0,8) off the *same base*, so under trap-confinement it cannot
+    // touch the cached load — the second load still forwards. Result is 2*mem[base].
+    let f = Func {
+        params: vec![ValType::I64], // base = v0
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64],
+            insts: vec![
+                load_off(0, 0),                   // v1 = mem[base+0]
+                Inst::ConstI64(5),                // v2
+                store_off(StoreOp::I64, 0, 2, 8), // mem[base+8] = 5  (disjoint)
+                load_off(0, 0),                   // v3 = mem[base+0]  → forwards to v1
+                add(1, 3),                        // v4
+            ],
+            term: Terminator::Return(vec![4]),
+        }],
+    };
+    let m = module(f);
+    let args: Vec<Vec<Value>> = [0i64, 96, 4096]
+        .iter()
+        .map(|&b| vec![Value::I64(b)])
+        .collect();
+    let opt = check(&m, &args);
+    assert_eq!(
+        n_loads(&opt),
+        1,
+        "a store to a disjoint offset off the same base must not block forwarding"
+    );
+}
+
+#[test]
+fn overlapping_offset_store_blocks_forwarding() {
+    // f(base): x = mem64[base+0]; mem32[base+4] = 0x7777; y = mem64[base+0]; return x + y.  The 4-byte
+    // store at offset 4 overlaps the loaded [0,8), so the second load must NOT forward — it reads the
+    // modified high word. Checked with base=0, where the store changes the value (y != x).
+    let f = Func {
+        params: vec![ValType::I64], // base = v0
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64],
+            insts: vec![
+                load_off(0, 0),                   // v1 = mem64[base+0]  reads [0,8)
+                Inst::ConstI32(0x7777),           // v2
+                store_off(StoreOp::I32, 0, 2, 4), // mem32[base+4] = 0x7777  overlaps [4,8)
+                load_off(0, 0),                   // v3 = mem64[base+0]  — must NOT forward
+                add(1, 3),                        // v4
+            ],
+            term: Terminator::Return(vec![4]),
+        }],
+    };
+    let m = module(f);
+    let opt = check(&m, &[vec![Value::I64(0)], vec![Value::I64(4096)]]);
+    assert_eq!(
+        n_loads(&opt),
+        2,
+        "a store overlapping the loaded bytes must block forwarding"
     );
 }

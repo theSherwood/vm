@@ -1834,19 +1834,38 @@ fn store_forward_load_op(op: StoreOp) -> Option<LoadOp> {
     }
 }
 
+/// The number of bytes a store op writes (the low bytes of the value).
+fn store_width(op: StoreOp) -> u64 {
+    match op {
+        StoreOp::I32 | StoreOp::F32 | StoreOp::I64_32 => 4,
+        StoreOp::I64 | StoreOp::F64 => 8,
+        StoreOp::I32_8 | StoreOp::I64_8 => 1,
+        StoreOp::I32_16 | StoreOp::I64_16 => 2,
+    }
+}
+
+/// Whether two byte ranges `[o1, o1+w1)` and `[o2, o2+w2)` are disjoint. Saturating arithmetic makes a
+/// (pathological, giant-offset) overflow read as *not disjoint* — the conservative, sound direction.
+fn ranges_disjoint(o1: u64, w1: u64, o2: u64, w2: u64) -> bool {
+    o1.saturating_add(w1) <= o2 || o2.saturating_add(w2) <= o1
+}
+
 /// Intra-block **redundant-load elimination + store-to-load forwarding** (OPT.md Phase 4). Scanning a
 /// block forward, a value is *available* at a memory location keyed by `(address value, offset, load
 /// op)` once a load reads it or a matching store writes it. A later `Load` of the same key with no
 /// intervening memory clobber is redundant: it is **removed** and its result forwarded to the
 /// available value (block-local value indices renumber, exactly as [`dce_block`]).
 ///
-/// The alias model is deliberately minimal and conservative: two accesses touch the same location only
-/// when they name the **same address SSA value** (same block-local value ⇒ same runtime address), the
-/// same offset, and the same op. Any instruction that **writes memory or has a side effect** (a store,
-/// an atomic, a `mem.copy`/`fill`, a call — via [`svm_ir::Inst::effects`]) could alias anything, so it
-/// **clobbers the whole availability map**; a plain store then re-establishes just the cell it wrote.
-/// Recomputed addresses are unified by the CSE pass that runs just before this, so the same-value key
-/// matches in practice.
+/// The alias model is deliberately minimal: two accesses touch the same location only when they name
+/// the **same address SSA value** (same block-local value ⇒ same runtime address), the same offset, and
+/// the same op. A **plain store** clobbers only the cells it could actually overwrite — a cell off a
+/// *different* base value (may alias) or the *same* base with an **overlapping** byte range — and keeps
+/// same-base cells at disjoint offsets; it then records its own written cell. This is sound under
+/// svm_mask's **trap-confinement**: two admitted accesses off one base differ by exactly their offset
+/// gap (an out-of-range address traps rather than wrapping to alias), so disjoint offset ranges are
+/// disjoint bytes. Any *other* memory write or side effect with an unknown reach — an atomic, a
+/// `mem.copy`/`fill`, a call (via [`svm_ir::Inst::effects`]) — clobbers the whole map. Recomputed
+/// addresses are unified by the CSE pass that runs just before this, so the same-value key matches.
 ///
 /// Sound on both value and traps: a redundant load reads the identical bytes because an earlier access
 /// to the same location established the value and nothing wrote memory since; and it cannot trap
@@ -1898,12 +1917,27 @@ fn mem_forward(b: &Block, fn_results: &[usize]) -> Block {
             } => {
                 let na = map[*addr as usize];
                 let nv = map[*value as usize];
+                let ws = store_width(*op);
                 let mut ni = inst.clone();
                 map_operands(&mut ni, &mut |o| map[o as usize]);
                 insts.push(ni);
-                // A store could alias any cached cell (only same-value addresses are known disjoint),
-                // so clobber all, then record the one cell it definitely wrote (if forwardable).
-                avail.clear();
+                // Keep only cells this store provably does not touch: same base **value** with a
+                // disjoint byte range. Under trap-confinement (svm_mask), two admitted accesses off the
+                // same base address differ by exactly their offset gap (no wrap-aliasing), so disjoint
+                // offset ranges are disjoint bytes. A different base value could alias, so it is dropped.
+                avail.retain(|&(base_c, offset_c, op_c), _| {
+                    base_c == na
+                        && ranges_disjoint(
+                            offset_c,
+                            LoadOp::from_index(op_c)
+                                .expect("cached op index is valid")
+                                .info()
+                                .2 as u64,
+                            *offset,
+                            ws,
+                        )
+                });
+                // Record the cell this store wrote (when a same-type load reads it back exactly).
                 if let Some(lop) = store_forward_load_op(*op) {
                     avail.insert((na, *offset, lop.index()), nv);
                 }
