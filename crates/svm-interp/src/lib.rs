@@ -1816,6 +1816,11 @@ fn drive(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> TracedRun {
+    // Opt-in instrumentation: stamp the host's memory-access hooks onto the run's window before
+    // entry (a hook-free host — the default — leaves `mem` and every access path untouched).
+    if let (Some(h), Some(m)) = (host.mem_hooks(), mem.as_mut()) {
+        m.install_hooks(h);
+    }
     let funcs: Arc<[Func]> = funcs.to_vec().into();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -9859,6 +9864,11 @@ pub struct Host {
     /// DURABILITY.md §12.8). `false` (the default) ⇒ an ordinary run that never touches the
     /// durable reserve. Set with [`Host::set_durable`] before [`run_with_host`] / friends.
     durable: bool,
+    /// Opt-in guest memory-access instrumentation ([`MemHooks`]): the engines' drive seams install
+    /// it into the run's window, so every guest data access fires (and may be vetoed by) the hooks.
+    /// `None` (the default) ⇒ no instrumentation and no cost — every path runs exactly as before.
+    /// Set with [`Host::set_mem_hooks`] before [`run_with_host`] / friends.
+    mem_hooks: Option<Arc<dyn MemHooks>>,
     /// The freeze/thaw fiber residue (slice 3.1.5): **out** of a freeze run (the driver flattens
     /// each parked fiber and records it here for the snapshot) and **in** to a thaw run (`drive`
     /// re-seeds the registry from it before re-entering under `REWINDING`). Empty for an ordinary run.
@@ -10020,6 +10030,7 @@ impl Host {
             cap_record: None,
             cap_replay: None,
             durable: false,
+            mem_hooks: None,
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
             frozen_nested: Vec::new(),
@@ -10039,6 +10050,21 @@ impl Host {
     /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
     pub fn is_durable(&self) -> bool {
         self.durable
+    }
+
+    /// Install opt-in **memory-access hooks** (the [`MemHooks`] instrumentation seam): every guest
+    /// data access of the run is reported to — and may be vetoed by — `hooks`. Set before handing
+    /// the host to [`run_with_host`] / friends; both interpreter engines consume it at their drive
+    /// seam. A host with no hooks installed runs exactly as before (see [`MemHooks`] for the
+    /// zero-cost contract and the v1 coverage list).
+    pub fn set_mem_hooks(&mut self, hooks: Arc<dyn MemHooks>) {
+        self.mem_hooks = Some(hooks);
+    }
+
+    /// The installed memory-access hooks, if any (a cloned `Arc`) — read by the engines' drive
+    /// seams to stamp the run's window ([`Mem::install_hooks`]).
+    pub fn mem_hooks(&self) -> Option<Arc<dyn MemHooks>> {
+        self.mem_hooks.clone()
     }
 
     /// The fibers the freeze driver flattened on the last freeze run (slice 3.1.5) — the host-side
@@ -12345,6 +12371,53 @@ enum PageProt {
     },
 }
 
+// ===========================================================================================
+// Memory-access hooks — the opt-in instrumentation seam around guest loads/stores (§19).
+// ===========================================================================================
+
+/// Opt-in hooks around guest linear-memory accesses — the embedder-facing **instrumentation
+/// seam** (memory-safety validators, access tracers, working-set profilers, taint engines, …).
+///
+/// Install on the powerbox with [`Host::set_mem_hooks`] before a run; the interpreter engines
+/// (the tree-walker oracle and the bytecode engine) then report every **guest data access**:
+/// scalar and `v128` loads/stores, atomics (an `atomic.rmw`/`atomic.cmpxchg` reports a read
+/// *and* a write — a `cmpxchg` reports its write whether or not it swaps, since the op is a
+/// may-write access), and bulk ops (`memory.copy`/`memory.move` report one read span + one
+/// write span; `memory.fill` one write span). A hook fires **after** confinement and
+/// page-protection checks pass and **before** any byte is touched, so it sees exactly the
+/// accesses that will actually happen. `addr` is the guest-relative effective address
+/// (`addr + offset`; a §14 nested child reports its own zero-based addresses) and `len` the
+/// access span in bytes.
+///
+/// Returning `false` **vetoes** the access: it raises `Trap::MemoryFault` (§5 detect-and-kill)
+/// with memory untouched — so a validator can enforce, not just observe. Hooks are shared with
+/// spawned vCPUs (`thread.spawn`) and §14 nested children (`Send + Sync`; use interior
+/// mutability to record), so instrumentation sees the whole run.
+///
+/// Deliberately **not** reported (v1): host-side traffic (data-segment init at instantiation,
+/// `cap.call` buffer copies, debugger window reads), address-space ops (`map`/`unmap`/
+/// `protect`/`grow`), the futex value compare of `atomic.wait`, and the host-less diagnostic
+/// drivers (`run_scheduled`/`explore_all`/the [`Inspector`]). The JIT tier never consults
+/// hooks — a hooked run executes on the interpreter engines.
+///
+/// **Cost when not opted in: none.** A run with no hooks installed takes exactly the code paths
+/// it does today — the scalar fast paths fold `hooks.is_none()` into their existing one-branch
+/// gate, and the JIT is untouched (the benchmark harness gates this).
+pub trait MemHooks: Send + Sync {
+    /// A `len`-byte guest read at guest address `addr` is about to happen. Return `false` to
+    /// veto it (the access raises `Trap::MemoryFault` instead of reading).
+    fn read(&self, addr: u64, len: u64) -> bool {
+        let _ = (addr, len);
+        true
+    }
+    /// A `len`-byte guest write at guest address `addr` is about to happen. Return `false` to
+    /// veto it (the access raises `Trap::MemoryFault` instead of writing).
+    fn write(&self, addr: u64, len: u64) -> bool {
+        let _ = (addr, len);
+        true
+    }
+}
+
 /// A guest linear-memory window. Confinement itself lives in [`svm_mask::Window`]
 /// (the isolated, separately-fuzzed security unit, §4); `Mem` owns the lazily paged backing
 /// store, threads accesses through that confinement, and carries the guest-visible page
@@ -12392,6 +12465,12 @@ struct Mem {
     /// to the same local configuration is a pure spin → park it) and spin wakeups (a change wakes
     /// spinners parked on the written address). Per-`Mem` (only the running vCPU writes through its own).
     writes: u64,
+    /// Opt-in instrumentation hooks ([`MemHooks`]), installed from [`Host::set_mem_hooks`] by the
+    /// engines' drive seams. `None` — the overwhelmingly common case — keeps every access path
+    /// exactly as it is today: the scalar fast paths fold `hooks.is_none()` into their existing
+    /// gate, everything else fires through [`Mem::hook_read`]/[`Mem::hook_write`] no-ops. Cloned
+    /// into forked vCPUs and §14 nested children, so instrumentation sees the whole run.
+    hooks: Option<Arc<dyn MemHooks>>,
 }
 
 /// Sentinel for [`Mem::last_fault`] meaning "no recoverable fault pending" — never a valid confined
@@ -12433,6 +12512,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            hooks: None,
         }
     }
 
@@ -12456,6 +12536,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            hooks: None,
         }
     }
 
@@ -12480,7 +12561,15 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            hooks: None,
         }
+    }
+
+    /// Install opt-in instrumentation hooks ([`MemHooks`]) on this window. Called by the engines'
+    /// drive seams with [`Host::mem_hooks`] before entry; every subsequent guest data access fires
+    /// (and may be vetoed by) the hooks. Propagated to forked vCPUs and §14 nested children.
+    fn install_hooks(&mut self, hooks: Arc<dyn MemHooks>) {
+        self.hooks = Some(hooks);
     }
 
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
@@ -12511,6 +12600,7 @@ impl Mem {
             prot_dirty: Arc::clone(&self.prot_dirty),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            hooks: self.hooks.clone(),
         }
     }
 
@@ -12536,6 +12626,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            hooks: self.hooks.clone(),
         }
     }
 
@@ -12661,10 +12752,35 @@ impl Mem {
         Ok(out)
     }
 
+    /// Fire the installed [`MemHooks`] read callback for a guest access at guest-relative `addr`
+    /// (a `None` hooks — the common case — is a no-op). A veto raises `Trap::MemoryFault` (§5
+    /// detect-and-kill) *before* any byte is touched; it is a real trap, not a recoverable page
+    /// fault, so `last_fault` stays clear (matching an out-of-window fault).
+    #[inline]
+    fn hook_read(&self, addr: u64, len: u64) -> Result<(), Trap> {
+        match &self.hooks {
+            None => Ok(()),
+            Some(h) if h.read(addr, len) => Ok(()),
+            _ => Err(Trap::MemoryFault),
+        }
+    }
+
+    /// Write counterpart of [`Mem::hook_read`].
+    #[inline]
+    fn hook_write(&self, addr: u64, len: u64) -> Result<(), Trap> {
+        match &self.hooks {
+            None => Ok(()),
+            Some(h) if h.write(addr, len) => Ok(()),
+            _ => Err(Trap::MemoryFault),
+        }
+    }
+
     fn load(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Value, Trap> {
         let (_, rty, width, signed) = op.info();
         let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, false)?;
+        // Hooks see the guest-relative effective address (`confine_checked` proved the add exact).
+        self.hook_read(addr.wrapping_add(offset), width as u64)?;
         let raw = self.read_le(base, width);
         Ok(decode_loaded(rty, width, signed, raw))
     }
@@ -12673,6 +12789,7 @@ impl Mem {
         let (_, _, width) = op.info();
         let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, true)?;
+        self.hook_write(addr.wrapping_add(offset), width as u64)?;
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
         self.writes += 1;
@@ -12743,6 +12860,9 @@ impl Mem {
         let dbase = self.confine_span(dst, len)?;
         self.check_prot_span(sbase, len, false)?;
         self.check_prot_span(dbase, len, true)?;
+        // One read span + one write span (either veto faults before any byte moves).
+        self.hook_read(src, len)?;
+        self.hook_write(dst, len)?;
         self.copy_span(dbase, sbase, len);
         self.writes += 1;
         Ok(())
@@ -12756,6 +12876,7 @@ impl Mem {
         }
         let base = self.confine_span(dst, len)?;
         self.check_prot_span(base, len, true)?;
+        self.hook_write(dst, len)?;
         if !self.has_regions.load(Ordering::Relaxed) {
             for k in 0..len {
                 self.back.set_byte(base + k, val);
@@ -12785,6 +12906,8 @@ impl Mem {
         let dbase = self.confine_span(dst, len)?;
         self.check_prot_span(sbase, len, false)?;
         self.check_prot_span(dbase, len, true)?;
+        self.hook_read(src, len)?;
+        self.hook_write(dst, len)?;
         if !self.has_regions.load(Ordering::Relaxed) {
             self.back.copy_within(dbase, sbase, len);
         } else {
@@ -12802,6 +12925,7 @@ impl Mem {
         }
         let base = self.confine_span(dst, len)?;
         self.check_prot_span(base, len, true)?;
+        self.hook_write(dst, len)?;
         if !self.has_regions.load(Ordering::Relaxed) {
             self.back.fill(base, len, val);
         } else {
@@ -12825,7 +12949,10 @@ impl Mem {
     #[inline]
     fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
         let (_, rty, width, signed) = op.info();
-        if !self.prot_dirty.load(Ordering::Acquire) {
+        // `hooks.is_none()` folds into the existing gate (one predicted-not-taken test on a plain
+        // field — the no-hook path is unchanged); a hooked access takes the cold `load`, which fires
+        // the hook.
+        if self.hooks.is_none() && !self.prot_dirty.load(Ordering::Acquire) {
             if let Some(abs) = self.window.checked(addr, offset, width) {
                 // `!prot_dirty ⟹ !has_regions`, so the bytes live in `back` (no §13 redirect); the
                 // cooperative bytecode engine is the sole accessor, so a single non-atomic word read
@@ -12843,7 +12970,8 @@ impl Mem {
     #[inline]
     fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
         let (_, _, width) = op.info();
-        if !self.prot_dirty.load(Ordering::Acquire) {
+        // Same hook gate as `load_scalar`: hooked stores take the cold `store`, which fires the hook.
+        if self.hooks.is_none() && !self.prot_dirty.load(Ordering::Acquire) {
             if let Some(abs) = self.window.checked(addr, offset, width) {
                 self.back.write_word(abs, width, lo);
                 self.writes += 1;
@@ -12859,6 +12987,7 @@ impl Mem {
     fn load_v128(&self, addr: u64, offset: u64) -> Result<Value, Trap> {
         let base = self.confine_checked(addr, offset, 16)?;
         self.check_prot(base, 16, false)?;
+        self.hook_read(addr.wrapping_add(offset), 16)?;
         let mut b = [0u8; 16];
         for (k, slot) in b.iter_mut().enumerate() {
             *slot = self.byte(base + k as u64);
@@ -12870,6 +12999,7 @@ impl Mem {
     fn store_v128(&mut self, addr: u64, offset: u64, b: [u8; 16]) -> Result<(), Trap> {
         let base = self.confine_checked(addr, offset, 16)?;
         self.check_prot(base, 16, true)?;
+        self.hook_write(addr.wrapping_add(offset), 16)?;
         for (k, byte) in b.iter().enumerate() {
             self.set_byte(base + k as u64, *byte);
         }
@@ -12974,6 +13104,7 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, false)?;
+        self.hook_read(addr.wrapping_add(offset), width as u64)?;
         let raw = if self.is_backed(base) {
             self.read_le(base, width)
         } else {
@@ -12987,6 +13118,7 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
+        self.hook_write(addr.wrapping_add(offset), width as u64)?;
         if self.is_backed(base) {
             self.write_le(base, width, store_bits(v));
         } else {
@@ -13009,6 +13141,9 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
+        // An RMW reads and writes its cell: report both (either veto faults before it's touched).
+        self.hook_read(addr.wrapping_add(offset), width as u64)?;
+        self.hook_write(addr.wrapping_add(offset), width as u64)?;
         let old = if self.is_backed(base) {
             let old = self.read_le(base, width);
             self.write_le(base, width, atomic_rmw_apply(ty, op, old, store_bits(v)));
@@ -13033,6 +13168,10 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
+        // A cmpxchg is a may-write access: report read + write up front (whether or not it swaps),
+        // so the hook decision never depends on the cell's current value.
+        self.hook_read(addr.wrapping_add(offset), width as u64)?;
+        self.hook_write(addr.wrapping_add(offset), width as u64)?;
         let want = store_bits(expected) & width_mask(width);
         let old = if self.is_backed(base) {
             let old = self.read_le(base, width); // already the low `width` bytes, zero-extended

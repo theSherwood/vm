@@ -1413,6 +1413,11 @@ pub fn compile_and_run_with_host_traced(
     }
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
+    // This single-step path drives the `Vm` directly (it never reaches `drive`), so it stamps the
+    // host's memory-access hooks itself.
+    if let (Some(h), Some(mm)) = (host.mem_hooks(), mem.as_mut()) {
+        mm.install_hooks(h);
+    }
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
         Err(e) => return Some((Err(e), Vec::new(), None)),
@@ -4629,6 +4634,11 @@ fn drive(
     host: &mut Host,
     budget: u64,
 ) -> Result<Vec<Value>, Trap> {
+    // Opt-in instrumentation: stamp the host's memory-access hooks onto the run's window before
+    // entry (mirrors the tree-walker's `drive`; a hook-free host leaves every path untouched).
+    if let (Some(h), Some(m)) = (host.mem_hooks(), mem.as_mut()) {
+        m.install_hooks(h);
+    }
     let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
         vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
         threads: Vec::new(),

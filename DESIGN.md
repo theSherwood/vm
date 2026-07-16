@@ -2090,6 +2090,15 @@ realized in their interpreter-tier form; the DWARF/record-replay work remains.
    and deterministic with no JIT plumbing; address watchpoints are trivial (the window is one
    buffer). The interpreter (`svm-interp`) is mature and is already the deterministic oracle,
    it now also exposes the `Inspector` stepping API (breakpoints/step/backtrace/watchpoints) that `svm-dap` drives.
+   **Memory-access hooks (built).** The same tier carries the embedder-facing *instrumentation
+   seam*: `Host::set_mem_hooks` installs opt-in `MemHooks` callbacks that both interpreter
+   engines fire on every guest data access (scalar/`v128` loads & stores, atomics, bulk-op
+   spans) after confinement passes and before the bytes are touched; a `false` return vetoes
+   the access as a `MemoryFault` (§5), so validators (shadow memory, taint, working-set
+   profiling) can enforce, not just observe. **Zero cost without opt-in:** the scalar fast
+   paths fold `hooks.is_none()` into their existing gate and the JIT tier never consults hooks
+   (a hooked run executes on the interpreter engines — consistent with §5's "hardened/
+   instrumented tier" being a swap, not a tax on the fast tier).
 4. **Source-level debugging (the real work, staged).** Preserve source-location +
    variable-location info **frontend → an IR debug-info side-table (§3a) → Cranelift →
    DWARF**, so gdb/lldb and VS Code (via **DAP**) set breakpoints and inspect variables in
