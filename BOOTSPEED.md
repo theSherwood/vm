@@ -94,12 +94,20 @@ fs-cap-in-wasm boot, i.e. building the demo itself (see "What's left").
   (Getting there needed three `mem_fs` fixes: consistent path normalization across all file ops, a
   read-only *directory* open so Postgres can `fsync` dirs at checkpoint, and a `0700` data-dir mode.)
   The seed step (~40 MB image) takes ~35 ms; the guest run ~1.2 s natively.
-- **Measure the guest boot in wasm directly** (the one number still extrapolated). With Milestone A the
-  `fs` cap is now backend-agnostic (pure in-memory), so this is: build a `svm-browser` cdylib entry that
-  mounts a seeded `mem_fs` and streams stdin/stdout, then time the boot on V8.
-- **The demo build + loader.** Emit `{postgres_resolved.svmb, data-image}` from the pipeline; the
-  browser loads → `decode → verify → run on the interpreter` (the `svm_run`/`svm_prep_bench` shape
-  already in the cdylib) with stdin/stdout streamed and the data image mounted on the `fs` cap.
+- **✅ Data image — a self-contained, shippable filesystem blob.** `encode_image`/`decode_image` +
+  `mem_fs_from_archive` (`crates/svm-run/src/fs.rs`) serialize a cluster into one `SVMFSIM1` byte blob
+  that mounts on the `fs` cap with **no host filesystem** — the browser's data half. `build_image`
+  (example) produces it from an on-disk cluster (Postgres' 39 MB `initdb` tree → a 41 MB image in ~3 s);
+  Postgres `--single` boots from the mounted archive and runs the round-trip (`Exited(0)`). So the
+  demo's two artifacts are now both buildable: `{postgres_resolved.svmb, pgdata.img}`.
+- **Measure the guest boot in wasm directly** (the one number still extrapolated). The `fs` cap is
+  backend-agnostic now, so this needs a `svm-browser` cdylib entry that mounts `mem_fs_from_archive`
+  and streams stdin/stdout — blocked only on making the in-memory `fs` cap reachable from wasm (it lives
+  in `svm-run`, which pulls in the unix-only Cranelift JIT; the pure `mem_fs` half wants extracting to a
+  wasm-safe crate).
+- **The loader/page.** The browser loads → `decode → verify → run on the interpreter` (the
+  `svm_run`/`svm_prep_bench` shape already in the cdylib) with stdin/stdout streamed and `pgdata.img`
+  mounted on the `fs` cap.
 
 ## Reproducing the measurements
 
