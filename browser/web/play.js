@@ -447,6 +447,26 @@ WITH RECURSIVE fib(n, a, b) AS (
 SELECT n, a AS fib FROM fib;
 `,
   },
+  'PostgreSQL (17.5 — write & run SQL)': {
+    kind: 'pg',
+    editable: true,
+    lang: 'sql',
+    url: './assets/postgres_resolved.svmb',
+    image: './assets/pgdata.img',
+    mode: 'io',
+    desc: 'A whole, unmodified PostgreSQL 17.5 --single backend — ~15,000 functions compiled LLVM → ' +
+      'SVM IR, verified, and run on the bytecode interpreter inside wasm. Its data directory is an ' +
+      'in-memory image mounted on a capability-scoped filesystem — no host filesystem, network, or ' +
+      'ambient authority. Edit the SQL on the left and click Run: each Run is a fresh boot of the ' +
+      'backend (a few seconds), so this is real Postgres running client-side in the sandbox. The two ' +
+      'large artifacts (a ~20 MB module + a ~40 MB data image) download once.',
+    src: `-- Write SQL here, then click Run. Each Run is a fresh postgres --single boot.
+CREATE TABLE t (x int, s text);
+INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+SELECT * FROM t WHERE x > 1 ORDER BY x DESC;
+SELECT count(*), sum(x), avg(x) FROM t;
+`,
+  },
 };
 
 // Size the run's shared window from the source's `memory N` declaration (64 KiB minimum — the wasm
@@ -574,6 +594,68 @@ async function runModule(ex) {
   } else {
     setState('error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
     log(`svm_run_onramp status ${status}`);
+  }
+}
+
+// Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
+// pre-translated+resolved module + the data image, feed the editor's SQL as stdin, mount the image on
+// an in-memory `fs` cap, run to a queried backend, read the captured stdout. A fresh boot per Run (a
+// few synchronous seconds), like the standalone bench — no Workers (Postgres --single is
+// single-threaded), so it never touches par.js's shared-window path; it just runs on `eng.ex`.
+async function runPg(ex) {
+  setState('running', 'fetching module + image…');
+  $('result').textContent = '';
+  $('stdout').textContent = '';
+  $('canvas').style.display = 'none';
+  let modBytes, imgBytes;
+  try {
+    [modBytes, imgBytes] = await Promise.all([fetchModule(ex.url), fetchModule(ex.image)]);
+  } catch (e) {
+    setState('error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
+    log(`fetch failed: ${e.message}`);
+    return;
+  }
+  log(`fetched ${ex.url}: ${modBytes.length}B module, ${ex.image}: ${imgBytes.length}B image`);
+  const sql = new TextEncoder().encode(getDoc());
+  setState('running', 'booting postgres… (a few seconds — the whole backend runs in the sandbox)');
+  $('run').disabled = true;
+  // Yield one paint so "booting…" lands before the synchronous, multi-second boot blocks the thread.
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    // Alloc all three before filling: svm_alloc may grow (detach) the linear memory, so take one fresh
+    // view after the last allocation and write into that.
+    const modP = eng.ex.svm_alloc(modBytes.length);
+    const imgP = eng.ex.svm_alloc(imgBytes.length);
+    const inP = sql.length ? eng.ex.svm_alloc(sql.length) : 0;
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(modBytes, modP);
+    view.set(imgBytes, imgP);
+    if (inP) view.set(sql, inP);
+    const t0 = performance.now();
+    const rv = eng.ex.svm_run_pg(modP, modBytes.length, imgP, imgBytes.length, inP, sql.length);
+    const ms = (performance.now() - t0).toFixed(0);
+    const status = eng.ex.svm_status();
+    const sp = eng.ex.svm_stdout_ptr();
+    const sl = eng.ex.svm_stdout_len();
+    const stdout = new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
+    eng.ex.svm_dealloc(modP, modBytes.length);
+    eng.ex.svm_dealloc(imgP, imgBytes.length);
+    if (inP) eng.ex.svm_dealloc(inP, sql.length);
+    $('stdout').textContent = stdout;
+    $('result').textContent = `${rv}`;
+    // 0 = OK, 5 = clean Exit (the boot always ends in exit(0)); anything else is a fault.
+    if (status === 0 || status === 5) {
+      setState('done', `booted + ran in ${ms}ms · status ${status}`);
+      log(`svm_run_pg → ${rv} (status ${status}) in ${ms}ms`);
+    } else {
+      setState('error', `boot failed: status ${status} (1=decode 3=trap 6=verify)`);
+      log(`svm_run_pg status ${status}`);
+    }
+  } catch (e) {
+    setState('error', `run error: ${e.message}`);
+    log(`run error: ${e.message}`);
+  } finally {
+    $('run').disabled = broken;
   }
 }
 
@@ -752,6 +834,7 @@ async function doRun() {
   // A pre-built on-ramp module runs single-shot via svm_run_onramp — no in-browser parse, no Workers.
   const selected = EXAMPLES[$('example').value];
   if (selected?.kind === 'reactor') return runReactor(selected);
+  if (selected?.kind === 'pg') return runPg(selected);
   if (selected?.kind === 'module') return runModule(selected);
   // Leave the terminal states synchronously on click, so an observer (the Playwright smoke) that
   // clicks Run and polls for done/error never reads the PREVIOUS run's state.

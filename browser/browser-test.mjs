@@ -16,6 +16,7 @@
 //   cargo run --bin gencorpus
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { startServer } from './serve.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -284,6 +285,34 @@ try {
     checks.push(lifeOk);
     console.log(`  play/life-reactor: ${a?.w}×${a?.h} glider a=(${a?.minx},${a?.miny}) ` +
       `b=(${b?.minx},${b?.miny}) live=${a?.n}/${b?.n} ${lifeOk ? 'PASS' : 'FAIL'}`);
+  }
+
+  // PostgreSQL in the playground (the `svm_run_pg` path): a whole `postgres --single` boots inside wasm
+  // on the same threads engine, mounts its data image on the `fs` cap, and runs the editor's SQL. The
+  // two large artifacts (module + image) are gitignored / built by the heavy demo pipeline, so this
+  // check SKIPS when they aren't staged (CI without them stays green); when present it's the end-to-end
+  // proof that a real database runs in the browser. Boot is multi-second — a generous timeout.
+  if (existsSync(join(ROOT, 'web/assets/postgres_resolved.svmb')) &&
+      existsSync(join(ROOT, 'web/assets/pgdata.img'))) {
+    await play.selectOption('#example', 'PostgreSQL (17.5 — write & run SQL)');
+    await play.click('#run');
+    await play.waitForFunction(
+      () => ['done', 'error'].includes(document.getElementById('state').dataset.state),
+      { timeout: 180_000 },
+    );
+    const pg = {
+      state: await play.$eval('#state', (e) => e.dataset.state),
+      status: await play.$eval('#state', (e) => e.textContent),
+      stdout: await play.$eval('#stdout', (e) => e.textContent),
+    };
+    const want = ['PostgreSQL stand-alone backend', 's = "three"', 'count'];
+    const missing = want.filter((w) => !pg.stdout.includes(w));
+    const pgOk = pg.state === 'done' && missing.length === 0;
+    checks.push(pgOk);
+    console.log(`  play/postgres: state=${pg.state} status=${JSON.stringify(pg.status)} ` +
+      `missing=${JSON.stringify(missing)} ${pgOk ? 'PASS' : 'FAIL'}`);
+  } else {
+    console.log('  play/postgres: SKIP (artifacts not staged — run `node build-pg-assets.mjs`)');
   }
 
   const ok = pageOk && checks.every(Boolean);
