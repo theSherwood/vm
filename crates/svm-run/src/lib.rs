@@ -2519,6 +2519,44 @@ pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     Some(svm_ir::ResolvedCap { type_id, op })
 }
 
+/// The §7 **general-form** powerbox resolver (PROCESS.md S15 (c)): binds each fixed powerbox cap
+/// **name** to its `(type_id, op)` — via [`default_cap_resolver`] — **plus the granted handle**
+/// ([`Resolved::CapBound`]), so a module whose `_start` takes **no positional handle parameters**
+/// resolves the entire powerbox by name. This is what retires the fixed 8-slot entry: the handle
+/// stops being a positional entry argument the guest threads from a stashed slot and becomes part of
+/// the instantiation-time binding, exactly as the POSIX personality already binds (`CapBound`).
+///
+/// `handles` are the granted powerbox handles in the fixed §3e slot order — stdout, stdin, exit,
+/// memory, addrspace, ioring, blocking, jit (the order [`grant_powerbox_prefix`] grants and
+/// [`POWERBOX_CAP_NAMES`] names). The handle for a name is selected by its interface, with `Stream`
+/// disambiguated by op (`write`→stdout, `read`→stdin). Names whose handle is **not** a powerbox slot
+/// — the `SharedRegion` ops, whose region handle is minted at runtime by `vm_region_create` and
+/// stays a call-site operand — return `None`, so a program using them composes this with a
+/// runtime-handle resolver (fall through to [`default_cap_resolver`] as a plain `Resolved::Cap`).
+pub fn powerbox_resolver(handles: [i32; 8]) -> impl Fn(&str) -> Option<Resolved> {
+    use svm_interp::iface;
+    let [stdout, stdin, exit, memory, addrspace, ioring, _blocking, jit] = handles;
+    move |name| {
+        let cap = default_cap_resolver(name)?;
+        let handle = match (cap.type_id, cap.op) {
+            (iface::STREAM, 1) => stdout, // write
+            (iface::STREAM, _) => stdin,  // read / close
+            (iface::EXIT, _) => exit,
+            (iface::MEMORY, _) => memory,
+            (iface::ADDRESS_SPACE, _) => addrspace,
+            (iface::IO_RING, _) => ioring,
+            (iface::JIT, _) => jit,
+            // e.g. SharedRegion: the handle is a runtime-minted region, not a powerbox slot.
+            _ => return None,
+        };
+        Some(Resolved::CapBound {
+            type_id: cap.type_id,
+            op: cap.op,
+            handle,
+        })
+    }
+}
+
 /// Lower a module's §7 named capability imports to concrete `cap.call`s using the reference host
 /// policy ([`default_cap_resolver`]), to be called **before** `verify_module` (the resolved module
 /// is what the verifier and backends run). A module with no imports is returned unchanged, so this
