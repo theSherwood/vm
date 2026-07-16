@@ -25,6 +25,7 @@ svm-text.workspace = true
 svm-encode.workspace = true
 svm-verify.workspace = true
 svm-interp.workspace = true
+svm-fs.workspace = true
 svm-jit.workspace = true
 # The partial-evaluation on-ramp (§20c): the `--specialize` path turns an interpreter + a fixed
 # program into a compiled residual (a pure `Module → Module` transform; the residual is re-verified).

@@ -100,11 +100,13 @@ fs-cap-in-wasm boot, i.e. building the demo itself (see "What's left").
   (example) produces it from an on-disk cluster (Postgres' 39 MB `initdb` tree → a 41 MB image in ~3 s);
   Postgres `--single` boots from the mounted archive and runs the round-trip (`Exited(0)`). So the
   demo's two artifacts are now both buildable: `{postgres_resolved.svmb, pgdata.img}`.
-- **Measure the guest boot in wasm directly** (the one number still extrapolated). The `fs` cap is
-  backend-agnostic now, so this needs a `svm-browser` cdylib entry that mounts `mem_fs_from_archive`
-  and streams stdin/stdout — blocked only on making the in-memory `fs` cap reachable from wasm (it lives
-  in `svm-run`, which pulls in the unix-only Cranelift JIT; the pure `mem_fs` half wants extracting to a
-  wasm-safe crate).
+- **✅ The in-memory `fs` cap is now wasm-reachable.** Extracted the pure protocol + `mem_fs` +
+  data-image format into the **`svm-fs`** crate (depends only on `svm-interp`, builds for `wasm32`);
+  `svm-run` keeps the real-filesystem `host_fs` + the `HostCap` wrappers and re-exports `svm-fs`, so
+  `svm_run::fs::*` is unchanged.
+- **Measure the guest boot in wasm directly** (the one number still extrapolated). Now unblocked: a
+  `svm-browser` cdylib entry that grants `svm_fs::mem_fs_seeded_handler` (mounting `pgdata.img`) + streams
+  stdin/stdout, then time the boot on V8.
 - **The loader/page.** The browser loads → `decode → verify → run on the interpreter` (the
   `svm_run`/`svm_prep_bench` shape already in the cdylib) with stdin/stdout streamed and `pgdata.img`
   mounted on the `fs` cap.
