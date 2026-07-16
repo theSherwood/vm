@@ -15,8 +15,9 @@
 //! The shim uses the **standard libc names** `write`/`read`/`exit` — its *definitions* shadow
 //! chibicc's Stream/Exit builtins (PROCESS.md S15 (b): a guest definition beats a compiler builtin),
 //! so `write(1, buf, n)` reaches the personality with `fd` preserved rather than the fd-dropping
-//! powerbox Stream call. This is S15 stages (a)+(b); the fixed 8-slot `_start` remains only for the
-//! *other* legacy powerbox caps (stdout/stdin/exit/memory/…) until stage (c) migrates them too.
+//! powerbox Stream call. The frontend `_start` is now paramless (S15 (c2)): these personality-only
+//! programs grant no powerbox, so `_start`'s by-name resolves of it stash `-errno` and are never
+//! loaded — the libc reaches the personality, bound by name (`resolver`), and the entry runs `&[]`.
 //!
 //! Each program runs `_start` (function 0) on **both** the interpreter and the JIT under an identical
 //! host, asserting they agree on the result *and* the observable personality state (captured stdout,
@@ -31,7 +32,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_with_host, Host, StreamRole, Trap, Value};
+use svm_interp::{run_with_host, Host, Trap, Value};
 use svm_jit::{compile_and_run_with_host, JitOutcome};
 use svm_posix::Posix;
 use svm_run::cap_thunk;
@@ -95,27 +96,15 @@ fn resolver(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
     move |name| bound(name.strip_prefix("__px_")?)
 }
 
-/// Grant the fixed 8-handle powerbox on `host` (what the legacy `_start` still expects — PROCESS.md
-/// S15 stages (b)–(c) retire it), then the POSIX personality with a window-heap region in the upper
-/// half of the guest window (clear of chibicc's low data image + data stack). The personality handle
-/// is **not** in the entry args — it binds by name at resolve. Returns the entry args, a [`Posix`]
-/// handle to the personality's captured state, and the granted personality handle for the resolver.
-fn setup(host: &mut Host, win: u64) -> ([Value; 8], Posix, i32) {
-    host.set_region_factory(svm_run::new_shared_region);
-    host.set_jit_validator(svm_run::jit_blob_validator);
-    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
-    let args = [
-        Value::I32(host.grant_stream(StreamRole::Out)),
-        Value::I32(host.grant_stream(StreamRole::In)),
-        Value::I32(host.grant_exit()),
-        Value::I32(host.grant_memory()),
-        Value::I32(host.grant_address_space(0, win)),
-        Value::I32(host.grant_io_ring()),
-        Value::I32(host.grant_blocking(std::time::Duration::ZERO, None)),
-        Value::I32(host.grant_jit(mem_log2)),
-    ];
+/// Grant the POSIX personality on `host`, with a window-heap region in the upper half of the guest
+/// window (clear of chibicc's low data image + data stack). These programs are **personality-only**:
+/// the paramless `_start` (S15 (c2)) resolves the fixed powerbox by name, but this host grants none
+/// of it — those resolves stash `-errno` and are never loaded, since the libc shim reaches the
+/// personality, bound by name via [`resolver`]. The personality handle is **not** an entry argument;
+/// it binds at resolve. Returns a [`Posix`] handle to the captured state + the granted handle.
+fn setup(host: &mut Host, win: u64) -> (Posix, i32) {
     let (px, posix) = svm_posix::grant(host, win / 2, win, Vec::new());
-    (args, posix, px)
+    (posix, px)
 }
 
 /// What a program did on one backend: either `main` returned values or the personality's `exit` op
@@ -125,15 +114,6 @@ struct Effects {
     exited: Option<i32>,
     stdout: Vec<u8>,
     file_f: Option<Vec<u8>>,
-}
-
-fn to_slot(v: Value) -> i64 {
-    match v {
-        Value::I32(x) => x as i64,
-        Value::I64(x) => x,
-        Value::Ref(x) => x as i64,
-        other => panic!("unexpected entry-arg value {other:?}"),
-    }
 }
 
 /// Compile a C program, **grant first** on two identical hosts (resolution needs the granted
@@ -155,9 +135,9 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     // Grant before resolve, identically on both hosts; deterministic grant order gives both
     // backends the same handle value, so one resolved module serves both.
     let mut ih = Host::new();
-    let (iargs, iposix, ipx) = setup(&mut ih, win);
+    let (iposix, ipx) = setup(&mut ih, win);
     let mut jh = Host::new();
-    let (jargs, jposix, jpx) = setup(&mut jh, win);
+    let (jposix, jpx) = setup(&mut jh, win);
     assert_eq!(ipx, jpx, "identical grant order → identical handle");
     prep(&iposix);
     prep(&jposix);
@@ -167,8 +147,9 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
     // Interpreter — a normal return yields values; the personality's `exit` op is `Trap::Exit(code)`.
+    // The paramless `_start` takes no entry args.
     let mut fuel = 50_000_000u64;
-    let (iresult, iexited) = match run_with_host(&m, 0, &iargs, &mut fuel, &mut ih) {
+    let (iresult, iexited) = match run_with_host(&m, 0, &[], &mut fuel, &mut ih) {
         Ok(v) => (v, None),
         Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
         Err(e) => panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"),
@@ -181,15 +162,9 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     };
 
     // JIT.
-    let slots: Vec<i64> = jargs.iter().copied().map(to_slot).collect();
-    let jout = compile_and_run_with_host(
-        &m,
-        0,
-        &slots,
-        cap_thunk,
-        &mut jh as *mut Host as *mut c_void,
-    )
-    .expect("jit compiles");
+    let jout =
+        compile_and_run_with_host(&m, 0, &[], cap_thunk, &mut jh as *mut Host as *mut c_void)
+            .expect("jit compiles");
     let (jresult, jexited) = match jout {
         JitOutcome::Returned(s) => (s.iter().map(|&x| Value::I64(x)).collect(), None),
         JitOutcome::Exited(c) => (Vec::new(), Some(c)),
