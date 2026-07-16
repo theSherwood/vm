@@ -122,6 +122,10 @@ pub struct Prog {
     /// Shadow of the `[16 x i32]` stack array (concrete bytes as u32 lanes).
     mem: [u32; 16],
     have_mem: bool,
+    /// Contents of the module-level `@g = constant [16 x i32]` (known to the oracle), read via
+    /// **constexpr** GEPs — the path where I23's const-GEP-stride bug lived (a `getelementptr
+    /// (i8, ptr @g, …)` whose source element type differs from `@g`'s pointee).
+    glob: [u32; 16],
 }
 
 /// A per-lane binary op on raw lane values `(x, y, lane_bits) -> result`.
@@ -230,7 +234,11 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
         n: 0,
         mem: [0; 16],
         have_mem: false,
+        glob: [0; 16],
     };
+    for slot in p.glob.iter_mut() {
+        *slot = g.boundary_scalar(32) as u32;
+    }
 
     // A stack array for GEP/load/store coverage.
     p.emit("%arr = alloca [16 x i32], align 16");
@@ -238,7 +246,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
 
     let steps = 12 + g.u(40);
     for _ in 0..steps {
-        match g.u(14) {
+        match g.u(16) {
             // ---- scalar integer binops (wrapping / bitwise) ----
             0 => {
                 let bits = SCALAR_TYS[g.u(2)];
@@ -454,6 +462,26 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 p.emit(&format!("{d} = load i32, ptr {ptr}, align 4"));
                 p.push_scalar(d, 32, p.mem[idx] as u64);
             }
+            // ---- load @g[idx] via a **constexpr** array-typed GEP (source element `[16 x i32]`) ----
+            13 => {
+                let idx = g.u(16);
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = load i32, ptr getelementptr inbounds ([16 x i32], ptr @g, i64 0, i64 {idx}), align 4"
+                ));
+                p.push_scalar(d, 32, p.glob[idx] as u64);
+            }
+            // ---- load @g[idx] via a **constexpr** i8-typed GEP (source element `i8`, byte offset —
+            //      the exact I23 const-GEP-stride path: strides by `i8`, not by `@g`'s pointee) ----
+            14 => {
+                let idx = g.u(16);
+                let byteoff = idx * 4;
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = load i32, ptr getelementptr (i8, ptr @g, i64 {byteoff}), align 4"
+                ));
+                p.push_scalar(d, 32, p.glob[idx] as u64);
+            }
             // ---- build a vector by insertelement from scalars ----
             _ => {
                 let s = SHAPES[g.u(3)];
@@ -524,8 +552,18 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
     }
     p.emit(&format!("ret i64 {acc_name}"));
 
-    // Assemble the module: declare the min/max intrinsics used, define @run.
+    // Assemble the module: the read-only global (read via constexpr GEPs), the min/max intrinsic
+    // declarations, then define @run.
     let mut m = String::new();
+    let gelems: Vec<String> = p
+        .glob
+        .iter()
+        .map(|&v| format!("i32 {}", sext(v as u64, 32)))
+        .collect();
+    m.push_str(&format!(
+        "@g = internal constant [16 x i32] [{}]\n",
+        gelems.join(", ")
+    ));
     for s in SHAPES {
         for nm in ["smax", "smin", "umax", "umin"] {
             let tv = ty_str_vec(s);
