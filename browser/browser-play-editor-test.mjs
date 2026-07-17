@@ -117,15 +117,20 @@ try {
   const cleared = await page.evaluate((sel) => !document.querySelector(`${sel} .cm-error-widget`), card('hello'));
   cleared ? ok('error decoration clears on edit') : fail('error decoration not cleared on edit');
 
-  // Phase 3: every JIT-emittable reactor (not just Doom) exposes the wasm-JIT toggle + a "Prove it"
-  // button, and running the parity check confirms the interpreter and wasm-JIT tiers are byte-identical.
+  // Phase 3/4: every JIT-emittable demo exposes the wasm-JIT toggle + a "Prove it" button — both the
+  // interactive reactors (per-frame tick) and the run-to-completion modules (whole _start). Running the
+  // parity check confirms the interpreter and wasm-JIT tiers are byte-identical.
   const jitCards = await page.evaluate(() =>
     [...document.querySelectorAll('.demo')].filter((d) => d.querySelector('.jit-label')).map((d) => d.dataset.demo));
-  jitCards.includes('bounce (interactive — arrow keys)') && jitCards.includes('life (Conway — heap persistence)')
-    ? ok(`wasm-JIT toggle on ${jitCards.length} reactors (bounce/life/mandelzoom/DOOM)`)
+  const hasReactorJit = jitCards.includes('bounce (interactive — arrow keys)')
+    && jitCards.includes('life (Conway — heap persistence)');
+  const hasModuleJit = jitCards.includes('hello (C → SVM)')
+    && jitCards.includes('SQLite (:memory: — write & run SQL)');
+  hasReactorJit && hasModuleJit
+    ? ok(`wasm-JIT toggle on ${jitCards.length} demos (reactors + hello/Lua/SQLite modules)`)
     : fail(`jit cards: ${JSON.stringify(jitCards)}`);
 
-  // Prove interp ≡ JIT on the bounce reactor (committed asset, fast).
+  // Prove interp ≡ JIT on the bounce reactor (committed asset, fast) — framebuffer byte-identical.
   await page.click(`${card('bounce (interactive — arrow keys)')} .prove`);
   await page.waitForFunction(
     (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
@@ -133,8 +138,20 @@ try {
   const parity = await page.evaluate((sel) => document.querySelector(sel).textContent,
     `${card('bounce (interactive — arrow keys)')} .state`);
   parity.includes('interpreter ≡ wasm-JIT') && parity.includes('byte-identical')
-    ? ok(`parity proven in-page: ${parity}`)
+    ? ok(`reactor parity proven in-page: ${parity}`)
     : fail(`parity: ${parity}`);
+
+  // Prove interp ≡ JIT on the hello module (committed asset): the whole _start runs on both tiers and
+  // the captured stdout is byte-identical (the module twin of the reactor's per-frame parity).
+  await page.click(`${card('hello (C → SVM)')} .prove`);
+  await page.waitForFunction(
+    (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
+    `${card('hello (C → SVM)')} .state`, { timeout: 30_000 });
+  const modParity = await page.evaluate((sel) => document.querySelector(sel).textContent,
+    `${card('hello (C → SVM)')} .state`);
+  modParity.includes('interpreter ≡ wasm-JIT') && modParity.includes('byte-identical stdout')
+    ? ok(`module parity proven in-page: ${modParity}`)
+    : fail(`module parity: ${modParity}`);
 
   // The Vim toggle engages the Vim keymap on the editors (registered + editor holds vim state).
   await page.check('#vim');

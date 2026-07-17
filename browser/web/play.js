@@ -7,6 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
+import { runJitModule } from './wasmjit-module.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
 
@@ -295,11 +296,13 @@ block0(v0: i64):
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
   'hello (C → SVM)': {
     kind: 'module',
+    jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
     url: './assets/hello_c.svmb',
     mode: 'io',
     desc: 'crates/svm-run/demos/hello.c — a C program compiled with stock clang, translated by the ' +
       'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
-      'below is the guest’s real stdout.',
+      'below is the guest’s real stdout. Toggle "wasm-JIT" to run the whole program (_start) on ' +
+      'emitted wasm instead of the interpreter — "Prove interp ≡ JIT" checks the stdout matches.',
   },
   'gradient (C → framebuffer)': {
     kind: 'module',
@@ -381,6 +384,7 @@ block0(v0: i64):
   },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
+    jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
     editable: true,
     lang: 'lua',
     url: './assets/lua_eval.svmb',
@@ -388,7 +392,9 @@ block0(v0: i64):
     desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math/' +
       'coroutine/io/os libraries, compiled through the LLVM on-ramp. Edit the Lua on the left and ' +
       'click Run: your code is piped to the guest as stdin, evaluated, and its output appears below. ' +
-      'Real Lua, running client-side in the sandbox.',
+      'Real Lua, running client-side in the sandbox. Toggle "wasm-JIT" to run the whole interpreter ' +
+      'on emitted wasm (near-native — the ~7% cross-tier helpers bounce to the interpreter); ' +
+      '"Prove interp ≡ JIT" checks the stdout is byte-identical on both tiers.',
     src: `-- Write Lua here, then click Run.
 print("Hello from " .. _VERSION)
 
@@ -424,6 +430,7 @@ print("squares:", table.concat(sq, " "))
   },
   'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
+    jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
     editable: true,
     lang: 'sql',
     url: './assets/sqlite_repl.svmb',
@@ -431,7 +438,8 @@ print("squares:", table.concat(sq, " "))
     desc: 'The unmodified SQLite 3.50.2 amalgamation (~257k lines of C), compiled through the LLVM ' +
       'on-ramp. Edit the SQL on the left and click Run: it executes against a fresh in-memory ' +
       'database (each Run starts clean) and prints result tables, change counts, and errors below. ' +
-      'Real SQLite, running client-side in the sandbox.',
+      'Real SQLite, running client-side in the sandbox. Toggle "wasm-JIT" to run the whole engine on ' +
+      'emitted wasm (near-native); "Prove interp ≡ JIT" checks the stdout is byte-identical on both tiers.',
     src: `-- Write SQL here, then click Run. Each Run is a fresh :memory: database.
 CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INT);
 INSERT INTO users(name, age) VALUES ('Ada', 36), ('Alan', 41), ('Grace', 45), ('Edsger', 40);
@@ -519,15 +527,45 @@ function presentFrame(c, w, h) {
   canvas.hidden = false;
 }
 
-// Run a pre-built on-ramp module single-shot on the main engine: alloc a buffer, copy the module in,
-// `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read the captured stdout. No
-// Workers (these guests are single-threaded), so it never touches the par.js shared-window path.
+// Read the captured stdout stash (a stable region, independent of the module buffer — safe to read
+// after the module has been deallocated). Shared by the interpreter and wasm-JIT module paths.
+const readModuleStdout = () =>
+  new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
+    eng.ex.svm_stdout_ptr(), eng.ex.svm_stdout_ptr() + eng.ex.svm_stdout_len()));
+
+// Run a pre-built on-ramp module single-shot on the interpreter: alloc a buffer, copy the module in
+// (plus optional stdin), `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read
+// the captured stdout, free. Returns { rv, status, stdout }. No Workers (these guests are
+// single-threaded), so it never touches the par.js shared-window path.
+function moduleInterp(bytes, stdinBytes) {
+  // Alloc both buffers *before* filling: svm_alloc may grow (detach) the linear memory, so take one
+  // fresh view after all allocations and write into it.
+  const p = eng.ex.svm_alloc(bytes.length);
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) stdinP = eng.ex.svm_alloc(stdinLen);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(bytes, p);
+  if (stdinP) view.set(stdinBytes, stdinP);
+  const rv = eng.ex.svm_run_onramp(p, bytes.length, stdinP, stdinLen);
+  const status = eng.ex.svm_status();
+  const stdout = readModuleStdout();
+  eng.ex.svm_dealloc(p, bytes.length);
+  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  return { rv, status, stdout };
+}
+
+// A card's Run for an on-ramp module. The "wasm-JIT" toggle (offered on the emittable guests —
+// hello_c/Lua/SQLite) emits the whole `_start` and runs it on wasm near-natively, servicing the ~7%
+// cross-tier helpers through the interpreter; it falls back to the interpreter if the module isn't
+// emittable (runJitModule throws). Both tiers share the fixed powerbox, so the stdout is identical.
 async function runModule(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching module…');
   c.el.result.textContent = '';
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
+  const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
   let bytes;
   try {
     bytes = await fetchModule(ex.url);
@@ -537,43 +575,45 @@ async function runModule(c) {
     return;
   }
   logTo(c, `fetched ${ex.url}: ${bytes.length}B module`);
-  const p = eng.ex.svm_alloc(bytes.length);
-  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua). Alloc
-  // both buffers *before* filling: svm_alloc may grow (detach) the linear memory, so take one fresh
-  // view after all allocations and write into it.
-  let stdinP = 0, stdinLen = 0, stdinBytes = null;
+  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua).
+  let stdinBytes = null;
   if (ex.editable) {
-    stdinBytes = new TextEncoder().encode(c.editor.getValue());
-    if (stdinBytes.length > 0) {
-      stdinP = eng.ex.svm_alloc(stdinBytes.length);
-      stdinLen = stdinBytes.length;
+    const enc = new TextEncoder().encode(c.editor.getValue());
+    if (enc.length > 0) stdinBytes = enc;
+  }
+  setState(c, 'running', `running…${useJit ? ' [wasm-JIT]' : ''}`);
+  const t0 = performance.now();
+  let rv = 0, status, tier = 'interpreter', stdout = '';
+  if (useJit) {
+    try {
+      // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit into the
+      // shared slots (read back via the usual accessors, exactly like the interpreter path).
+      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
+      rv = eng.ex.svm_exit_code();
+      stdout = readModuleStdout();
+      tier = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
+      status = undefined;
     }
   }
-  const view = new Uint8Array(eng.memory.buffer);
-  view.set(bytes, p);
-  if (stdinP) view.set(stdinBytes, stdinP);
-  setState(c, 'running', 'running…');
-  const t0 = performance.now();
-  const rv = eng.ex.svm_run_onramp(p, bytes.length, stdinP, stdinLen);
-  const status = eng.ex.svm_status();
-  const sp = eng.ex.svm_stdout_ptr();
-  const sl = eng.ex.svm_stdout_len();
-  const stdout = new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
-  const fbW = eng.ex.svm_framebuffer_width();
-  const fbH = eng.ex.svm_framebuffer_height();
-  presentFrame(c, fbW, fbH);
-  eng.ex.svm_dealloc(p, bytes.length);
-  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  if (status === undefined) {
+    const r = moduleInterp(bytes, stdinBytes);
+    rv = r.rv; status = r.status; stdout = r.stdout;
+    // A framebuffer guest (gradient) presents through the interpreter path; the emittable JIT guests
+    // above are stdout-only, so only the interpreter path blits a frame.
+    presentFrame(c, eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
+  }
   const ms = (performance.now() - t0).toFixed(0);
   c.el.stdout.textContent = stdout;
   c.el.result.textContent = `${rv}`;
   // 0 = OK, 5 = clean Exit; anything else is a decode error / trap / unsupported.
   if (status === 0 || status === 5) {
-    setState(c, 'done', `done · status ${status} · ${ms}ms`);
-    logTo(c, `svm_run_onramp → ${rv} (status ${status}) in ${ms}ms`);
+    setState(c, 'done', `done (${tier}) · status ${status} · ${ms}ms`);
+    logTo(c, `module run (${tier}) → ${rv} (status ${status}) in ${ms}ms`);
   } else {
     setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
-    logTo(c, `svm_run_onramp status ${status}`);
+    logTo(c, `module run (${tier}) status ${status}`);
   }
 }
 
@@ -898,6 +938,60 @@ async function proveParity(c) {
   }
 }
 
+// The module twin of proveParity: run the SAME on-ramp module (with the same editor stdin) on the
+// interpreter and on the wasm-JIT tier and assert the captured **stdout** is byte-identical — the
+// "verified ⇒ same result on both tiers" claim for a run-to-completion guest (framebuffer demos prove
+// it per-frame instead). This is exactly what browser-jit-module-test.mjs asserts in CI.
+async function proveModuleParity(c) {
+  if (broken) return;
+  stopReactor();
+  const ex = c.ex;
+  setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
+  c.el.run.disabled = true;
+  c.el.prove.disabled = true;
+  let bytes;
+  try {
+    bytes = await fetchModule(ex.url);
+  } catch (e) {
+    setState(c, 'error', `${e.message}`);
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  let stdinBytes = null;
+  if (ex.editable) {
+    const enc = new TextEncoder().encode(c.editor.getValue());
+    if (enc.length > 0) stdinBytes = enc;
+  }
+  try {
+    // Yield a paint so "proving…" lands before the synchronous interpreter run blocks the thread.
+    await new Promise((r) => setTimeout(r, 30));
+    const interp = moduleInterp(bytes, stdinBytes);
+    let jitOut;
+    try {
+      await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
+      jitOut = readModuleStdout();
+    } catch (e) {
+      setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
+      logTo(c, `parity: JIT emit failed: ${e.message}`);
+      return;
+    }
+    if (interp.stdout === jitOut) {
+      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical stdout (${jitOut.length}B)`);
+      logTo(c, `parity: ${jitOut.length}B stdout byte-identical on both tiers`);
+    } else {
+      setState(c, 'error', `✗ tiers diverged (interp ${interp.stdout.length}B / jit ${jitOut.length}B stdout)`);
+      logTo(c, `parity: stdout diverged (interp ${interp.stdout.length}B vs jit ${jitOut.length}B)`);
+    }
+  } catch (e) {
+    setState(c, 'error', `parity run failed: ${e.message}`);
+    logTo(c, `parity run failed: ${e.message}`);
+  } finally {
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+  }
+}
+
 // SVM **text** guests: parse+verify inside the sandbox (`svm_parse`), then run across Workers under the
 // card's selected powerbox recipe.
 async function runText(c) {
@@ -1050,16 +1144,23 @@ function buildCard(name, ex) {
   let jit = null;
   let proveBtn = null;
   if (ex.jit) {
+    // A reactor emits its per-frame tick(); a module emits the whole _start. The parity check compares
+    // the framebuffer (reactor, per frame) or the stdout (module, run-to-completion) accordingly.
+    const isModule = ex.kind === 'module';
     const l = el('label', 'jit-label');
-    l.title = 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
+    l.title = isModule
+      ? 'Run the whole guest (_start) on emitted wasm (wasm-JIT tier) instead of the interpreter'
+      : 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
     jit = el('input');
     jit.type = 'checkbox';
     jit.checked = true;
     l.append(jit, ' wasm-JIT');
     controls.appendChild(l);
-    // "Prove it": run the guest on both tiers and assert the framebuffer is byte-identical.
+    // "Prove it": run the guest on both tiers and assert the result is byte-identical.
     proveBtn = el('button', 'prove', 'Prove interp ≡ JIT');
-    proveBtn.title = 'Run 30 frames on the interpreter and the wasm-JIT tier and check the framebuffer is byte-identical';
+    proveBtn.title = isModule
+      ? 'Run the guest on the interpreter and the wasm-JIT tier and check stdout is byte-identical'
+      : 'Run 30 frames on the interpreter and the wasm-JIT tier and check the framebuffer is byte-identical';
     proveBtn.disabled = true;
     controls.appendChild(proveBtn);
   }
@@ -1086,7 +1187,7 @@ function buildCard(name, ex) {
   };
   runBtn.addEventListener('click', () => runDemo(c));
   stopBtn.addEventListener('click', () => stopDemo(c));
-  if (proveBtn) proveBtn.addEventListener('click', () => proveParity(c));
+  if (proveBtn) proveBtn.addEventListener('click', () => (c.ex.kind === 'module' ? proveModuleParity : proveParity)(c));
   return c;
 }
 
