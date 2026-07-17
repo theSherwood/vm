@@ -378,6 +378,9 @@ jobs:
           # Reuses the threads module built above + the committed `.svmb` assets — no extra toolchain.
           node browser-jit-reactor-test.mjs
           node browser-play-editor-test.mjs
+          # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
+          # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
+          node browser-dap-test.mjs
 
   embench-differential:
     # Whole-stack differential on the real Embench-IoT suite — every engine's `verify` must equal

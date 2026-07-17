@@ -3858,6 +3858,81 @@ pub extern "C" fn svm_parse_len() -> usize {
 /// The stashed [`svm_parse`] output (same cdylib-managed lifetime as `OUT`/`ERR`).
 static mut PARSE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
+// ---- Debug Adapter Protocol (DEBUGGING.md) — the debugger, over the bytecode engine --------------
+// The playground drives the same `svm-dap` server the CLI/editor use, but selecting the **bytecode**
+// backend (`"engine":"bytecode"` in `launch`) so it debugs the engine that actually ships, never the
+// tree-walker (which stays the differential oracle). The wire is trivial: JS sends a DAP request JSON,
+// the cdylib parses it, calls the pure `DapServer::handle`, and stashes the reply (a JSON array of one
+// response + any events) for the JS to read back — the same request→messages logic the `dap.rs` tests
+// drive, minus the `Content-Length` framing (`run_stdio`, unused in wasm).
+
+/// The live DAP session's server (single-threaded, main-thread only, like every stash here).
+static mut DAP_SERVER: Option<svm_dap::DapServer> = None;
+/// The stashed reply of the most recent [`svm_dap_request`] (cdylib-managed, like `PARSE`).
+static mut DAP_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+
+/// Start a fresh debug session (drop any prior server). Call before the `initialize` request so each
+/// session begins clean.
+#[no_mangle]
+pub extern "C" fn svm_dap_reset() -> i32 {
+    // SAFETY: single-threaded main-thread state, like `PARSE`/`OUT`.
+    unsafe {
+        *core::ptr::addr_of_mut!(DAP_SERVER) = Some(svm_dap::DapServer::new());
+    }
+    0
+}
+
+/// Feed one DAP request (a JSON object at `[ptr, len)`) to the session server and stash the JSON array
+/// of reply messages (`[response, event…]`) for [`svm_dap_response_ptr`] + [`svm_dap_response_len`].
+/// Returns `0`, or `-1` if the request isn't valid UTF-8 / JSON. Lazily creates the server if
+/// [`svm_dap_reset`] wasn't called first.
+#[no_mangle]
+pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
+    let bytes: &[u8] = if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        // SAFETY: the host guarantees `[ptr, len)` is a live allocation it just filled.
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    };
+    // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
+    let put = |data: Vec<u8>| unsafe { stash(&mut *core::ptr::addr_of_mut!(DAP_OUT), data) };
+    let text = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            put(Vec::new());
+            return -1;
+        }
+    };
+    let req = match svm_dap::parse(text) {
+        Some(j) => j,
+        None => {
+            put(Vec::new());
+            return -1;
+        }
+    };
+    // SAFETY: single-threaded; the server is only ever touched from the main thread.
+    let server = unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(DAP_SERVER);
+        if slot.is_none() {
+            *slot = Some(svm_dap::DapServer::new());
+        }
+        slot.as_mut().unwrap()
+    };
+    let reply = svm_dap::Json::Arr(server.handle(&req)).to_string().into_bytes();
+    put(reply);
+    0
+}
+
+/// Pointer / length of the most recent [`svm_dap_request`] reply (a JSON array of DAP messages).
+#[no_mangle]
+pub extern "C" fn svm_dap_response_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(DAP_OUT)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_dap_response_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(DAP_OUT)).1 }
+}
+
 // ---- wasm-JIT tier (BROWSER.md § "wasm-JIT tier"), slice 2: emit + expose to the JS host ---------
 
 /// Trap codes the emitted wasm delivers through its `env.trap` import — re-exported from the

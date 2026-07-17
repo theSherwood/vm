@@ -162,6 +162,25 @@ different things depending on which pair you compare:
   is what a browser DAP frontend (over the wasm FFI) drives. The JIT path is Stage 5 (separate). The
   *static* source-map half is covered transitively by **G1**.
 
+  **Browser wire landed (slice 2).** The `browser/` cdylib exposes `svm_dap_request` — a JSON-in /
+  JSON-out pump over `DapServer::handle`, backed by the bytecode `Debuggee` — plus `svm_dap_reset` and
+  the `svm_dap_response_ptr`/`_len` accessors; `web/dap.js` is the JS client, and
+  `browser-dap-test.mjs` drives a full initialize→launch→breakpoint→variables→terminate conversation
+  in real Chromium on the bytecode engine.
+
+  **Direction — the forward-only gaps are all bytecode-engine work, never tree-walker delegation.** The
+  tree-walker is the differential oracle only; it is far too slow to sit on any user-facing path, so
+  reverse/watch/multithread must each be built *on the bytecode engine*:
+  - **Reverse** (`seek`/`step_back`/`reverseContinue`) — deterministic replay: `seek(t)` rebuilds a
+    `DebugRun` and steps to `t` (cheap on the fast engine), with periodic state checkpoints to bound
+    the replay. Parity-test against the tree-walker's replay-based reverse.
+  - **Watchpoints** (`set_watchpoint`) — a per-op watched-range check in `DebugRun`'s single-op loop,
+    using the effective address the confinement-masking already computes; kept off the `run_fast`
+    hot path.
+  - **Multithreading** (`threads`/`select_task`/`stopped_task`) — the largest: a deterministic
+    cooperative multi-vCPU **debug scheduler** for the bytecode VM (fibers, controlled interleaving),
+    distinct from the real-Web-Worker production mode. Wanted eventually; sequenced last.
+
 ---
 
 ## 2. Workstreams
