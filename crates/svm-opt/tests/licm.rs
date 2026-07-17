@@ -149,3 +149,90 @@ fn variant_computation_stays_in_the_loop() {
         "a loop-variant multiply must not be hoisted"
     );
 }
+
+#[test]
+fn an_invariant_bare_constant_is_not_hoisted() {
+    // body = i * a' (variant, stays). The loop also holds `ConstI32(1)` (the `i - 1` decrement): it is
+    // loop-invariant, but a constant is free to recompute — hoisting it would only thread a parameter
+    // around the loop (pure overhead, DESIGN §hoist cost model). So the constant must stay in the loop
+    // alongside the variant decrement that uses it, not be lifted to the preheader.
+    let m = loop_module(bin(BinOp::Mul, 0, 2));
+    let opt = check_equiv(&m);
+    assert!(
+        matches_inside_loop(&opt.funcs[0], |i| matches!(i, Inst::ConstI32(_))),
+        "an invariant constant used only by loop-variant code must not be hoisted out"
+    );
+}
+
+#[test]
+fn an_invariant_op_over_a_constant_is_still_hoisted() {
+    // b1 computes `k = 100; t = a' + k` — loop-invariant (a' is passed through unchanged). The add is
+    // hoisted out even though one operand is a loop-body constant: the constant is rematerialized in
+    // the preheader (not threaded), so the add can still move. The add must end up outside the loop and
+    // results must be unchanged.
+    let m = module(Func {
+        params: vec![ValType::I32, ValType::I32], // n, a
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32, ValType::I32], // n, a
+                insts: vec![Inst::ConstI32(0)],           // v2 = acc0
+                term: Terminator::Br {
+                    target: 1,
+                    args: vec![0, 2, 1], // (i=n, acc=0, a'=a)
+                },
+            },
+            Block {
+                params: vec![ValType::I32, ValType::I32, ValType::I32], // i, acc, a'
+                insts: vec![
+                    Inst::ConstI32(100),   // v3 = k (loop-body constant)
+                    bin(BinOp::Add, 2, 3), // v4 = a' + k  (invariant)
+                    bin(BinOp::Add, 1, 4), // v5 = acc + t
+                    Inst::ConstI32(1),     // v6
+                    bin(BinOp::Sub, 0, 6), // v7 = i - 1
+                ],
+                term: Terminator::BrIf {
+                    cond: 7,
+                    then_blk: 1,
+                    then_args: vec![7, 5, 2], // (i-1, acc2, a')
+                    else_blk: 2,
+                    else_args: vec![5],
+                },
+            },
+            Block {
+                params: vec![ValType::I32], // r
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
+        ],
+    });
+    verify_module(&m).expect("verifies");
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    for n in [1i32, 2, 5, 8] {
+        for a in [3i32, 0, -2] {
+            let args = [Value::I32(n), Value::I32(a)];
+            assert_eq!(
+                run(&m, &args),
+                run(&opt, &args),
+                "divergence at n={n} a={a}"
+            );
+        }
+    }
+    // The invariant `a' + 100` is hoisted, and its constant operand `100` is rematerialized in the
+    // preheader — so `ConstI32(100)` leaves the loop entirely (it still exists out-of-loop, since `a'`
+    // is a runtime value the add can't be folded away).
+    let is_100 = |i: &Inst| matches!(i, Inst::ConstI32(100));
+    assert!(
+        !matches_inside_loop(&opt.funcs[0], is_100),
+        "the invariant add's constant operand must be rematerialized out of the loop"
+    );
+    assert!(
+        opt.funcs[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(is_100),
+        "the constant is rematerialized in the preheader, not dropped"
+    );
+}

@@ -45,9 +45,9 @@ win). Passes not listed for a case had zero delta there.
 
 | case | input→all (i/b) | pass contributions (Δbytes if removed) |
 |---|---|---|
-| reg-sum residual (loop) | 7/233 → 5/142 | gvn −5, licm −10, local_cse +2 |
-| licm+cse kernel | 7/71 → 6/77 | licm −9, local_cse +3 |
-| sccp const-loop | 6/57 → 4/63 | sccp +1, gvn −6, licm −9, local_cse +4 |
+| reg-sum residual (loop) | 7/233 → 5/132 | gvn −5 |
+| licm+cse kernel | 7/71 → 6/74 | licm −6, local_cse +3 |
+| sccp const-loop | 6/57 → 5/59 | sccp +1, reassociate −2, gvn −3, licm −5 |
 | reassoc chain | 8/41 → 2/26 | **reassociate +15** |
 | correlated branch | 8/73 → 6/55 | **jump_thread +18** |
 | memory (mem + load_elim) | 5/85 → 3/77 | **mem +4, load_elim +4** |
@@ -68,7 +68,12 @@ Reading it:
   cross-block `load_elim` can reach (a multi-predecessor block can't be merged, so intra-block
   forwarding never sees it) — +4 each here.
 - **LICM and GVN carry *negative* size deltas** on loops: they hoist/thread invariants through new
-  block params, which is larger static code — deliberately, to save run time (next section).
+  block params, which is larger static code — deliberately, to save run time (next section). LICM's
+  **hoist cost model** keeps that cost honest: it never hoists a bare constant (free to recompute —
+  threading one is pure overhead), and rematerializes an invariant's constant operands in the preheader
+  instead of threading them. So on the **hoist-free reg-sum loop LICM's delta is now +0** (was −10), and
+  on the real-invariant loops the hoist still fires while the module *shrinks* (licm+cse −6 not −9;
+  heavy-invariant loop 100→94 B in the run-time section).
 
 ## Run-time ablation (N = 1,000,000)
 
@@ -78,43 +83,55 @@ each variant's interpreter run time ÷ the full pipeline's; `>1` means removing 
 interpreter slower — the pass was buying that run time. Rows for passes that don't apply to a loop
 (the interproc/memory passes, and the simplifiers here) sit at ~1.00× and are elided.
 
+Ratios are normalized to `all = 1.00×`. Absolute ms are from one run on a noisier host than the first
+report (both `jit_ms` and `interp_ms` are ~1.5–2× the earlier absolutes) — hence the standing multi-run
+follow-up; the **bytes** column and the ratio *ordering* are the load-bearing parts.
+
 ### reg-machine sum 1..=N (already-tight loop)
 
-| variant | bytes | jit_ms | interp_ms | interp/all |
-|---|---|---|---|---|
-| none | 127 | 0.620 | 65.76 | 1.10× |
-| all | 142 | 0.622 | 59.68 | 1.00× |
-| −gvn | 137 | 0.624 | 56.40 | 0.94× |
-| −licm | 132 | 0.630 | 60.95 | 1.02× |
-| _(sccp / reassoc / cse / jump_thread / devirt / inline / dfe / mem / load_elim)_ | 142 | ~0.62 | ~59 | ~1.00× |
+| variant | bytes | interp_ms | interp/all |
+|---|---|---|---|
+| none | 127 | 81.46 | 1.08× |
+| all | 132 | 75.12 | 1.00× |
+| −gvn | 127 | 79.87 | 1.06× |
+| −licm | 132 | 73.64 | 0.98× |
+| _(all other passes)_ | 132 | ~73 | ~0.97× |
+
+Nothing in this loop is worth hoisting, so every pass sits within run-to-run noise (±~5%) of `all`. The
+point is the **bytes**: `all` is now **132** (was 142) — LICM's constant-hoist cost model removed the
+useless threading, and `−licm` is byte-identical to `all` (LICM changes nothing here, as it should).
 
 ### heavy-invariant loop (LICM showcase)
 
-| variant | bytes | jit_ms | interp_ms | interp/all |
-|---|---|---|---|---|
-| none | 87 | 0.589 | 103.15 | 1.32× |
-| all | 100 | 0.589 | 81.07 | 1.00× |
-| −gvn | 97 | 0.592 | 76.64 | 0.98× |
-| −licm | 85 | 0.589 | 90.69 | **1.16×** |
-| _(all other passes)_ | 100 | ~0.59 | ~78–79 | ~1.00× |
+| variant | bytes | interp_ms | interp/all |
+|---|---|---|---|
+| none | 87 | 183.3 | 1.53× |
+| all | 94 | 120.2 | 1.00× |
+| −gvn | 93 | 127.8 | 1.06× |
+| −licm | 85 | 167.5 | **1.39×** |
+| _(all other passes)_ | 94 | ~119 | ~0.99× |
+
+`all` is **94 B** (was 100) — the invariant chain still hoists, but its constant operands are
+rematerialized in the preheader instead of threaded, so the hoisted form is smaller. Removing LICM is
+**1.39×**: it remains the dominant interp-path pass by a wide margin.
 
 ## Takeaways
 
-1. **On the JIT, svm-opt's passes are ~run-time-neutral** (`jit_ms` flat ~0.6 ms across every variant on
-   both loops). Cranelift (`opt_level="speed"`) re-derives the same native code, so the IR-level win is
+1. **On the JIT, svm-opt's passes are ~run-time-neutral** (`jit_ms` flat across every variant on both
+   loops). Cranelift (`opt_level="speed"`) re-derives the same native code, so the IR-level win is
    washed out. svm-opt's JIT-path value is **code size / compile time** — where the interprocedural
    passes shine (halving the interproc module) — not native speed.
-2. **On the interpreter, the optimizer buys real run time**: the full pipeline is **1.32×** on the
-   heavy-invariant loop and **1.10×** on the already-tight sum loop.
-3. **LICM is the dominant run-time pass** — **1.16×** on the heavy loop by itself (it moves the five-op
-   invariant chain out of the per-iteration path). It's a pure run-time optimization: it *costs* static
-   size (the negative deltas) and only pays off when there's real invariant work to hoist. On the tight
-   sum loop, which has nothing worth hoisting, LICM/GVN slightly *hurt* both size and interp time — the
-   signal for a **hoist cost model** (only hoist when the loop body warrants it), still the clearest
-   actionable follow-up.
+2. **On the interpreter, the optimizer buys real run time**: the full pipeline is **~1.5×** on the
+   heavy-invariant loop; the already-tight sum loop has nothing to hoist and sits in the noise.
+3. **LICM is the dominant run-time pass** — **1.39×** on the heavy loop by itself (it moves the
+   invariant chain out of the per-iteration path). Its **hoist cost model** now keeps it from *costing*
+   size where it can't pay: it never threads a bare constant out of a loop and rematerializes invariant
+   constant operands in the preheader, so on the hoist-free sum loop LICM is size-neutral (was −10 B)
+   while the heavy loop still hoists — *and* shrinks (100→94 B). This closes the clearest earlier
+   follow-up.
 4. **The interprocedural + simplifier passes are size plays** (devirt/inline/dfe, reassociate,
    jump_threading, CSE) and are loop-run-time-neutral — but code size *is* the JIT-path win, so they
    earn their keep where the loop passes don't.
 
-_The corpus is small and hand-built to isolate each pass. Remaining follow-ups (OPT.md): a LICM/GVN
-hoist cost model, multi-run medians + variance, and Wasmtime-relative numbers._
+_The corpus is small and hand-built to isolate each pass. Remaining follow-ups (OPT.md): multi-run
+medians + variance, and Wasmtime-relative numbers._

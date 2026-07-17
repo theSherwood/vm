@@ -196,12 +196,18 @@ tracked enhancement, not a blocker.
     outside the loop is invariant; a loop parameter is invariant when every incoming arg is invariant
     or is the parameter itself — the archetypal `x` passed unchanged around the back edge; a pure op is
     invariant when its operands are). An invariant op is cloned into the preheader (operands rewritten
-    to preheader-valid values — a dominating value as is, or an invariant header param's entry arg) and
-    its result threaded back in (`crate::thread`), leaving the original for DCE. Sound by construction
-    (pure+non-trapping speculated above the loop) and conservative on shape (reducible single-header
-    loops with a unique preheader only). Reuses the shared `vn` / `thread` modules (extracted from GVN).
-    Tests: invariant op hoisted out of every loop (SCC check) + variant op stays, behavior preserved;
-    covered by the `opt_sccp` fuzz target (whole pipeline).
+    to preheader-valid values — a dominating value as is, an invariant header param's entry arg, or a
+    loop-body **constant rematerialized** in the preheader) and its result threaded back in
+    (`crate::thread`), leaving the original for DCE. A **hoist cost model** keeps the threading honest: a
+    bare constant is never hoisted (free to recompute — threading one out is pure overhead), and an
+    invariant's constant operands are re-emitted in the preheader (`Threader::emit`) rather than threaded,
+    so a worthwhile hoist still fires without dragging a constant around the loop (measured: size-neutral
+    on hoist-free loops, smaller output on real-invariant loops — see `OPT_BENCH.md`). Sound by
+    construction (pure+non-trapping speculated above the loop) and conservative on shape (reducible
+    single-header loops with a unique preheader only). Reuses the shared `vn` / `thread` modules.
+    Tests: invariant op hoisted out of every loop (SCC check) + variant op stays, behavior preserved; a
+    bare invariant constant is *not* hoisted, while an invariant op over a loop-body constant still is
+    (its constant rematerialized out of the loop); covered by the `opt_sccp` fuzz target (whole pipeline).
   - [x] **Jump threading** (`jump_thread` in the `optimize_func` fixpoint): redirects an edge that
     reaches an **empty conditional forwarder** — a block with no instructions whose `br_if`/`br_table`
     tests one of its own parameters — straight to the resolved target when the predecessor passes a
@@ -321,11 +327,17 @@ tracked enhancement, not a blocker.
 
 The first ablation surfaced concrete next steps, tracked here so they aren't lost:
 
-- [ ] **LICM/GVN hoist cost model.** The clearest actionable finding: on a loop with *nothing worth
-  hoisting* (the tight sum loop), LICM/GVN still add block-parameter threading, so they grow static
-  size **and** make the interpreter slightly slower (removing them was 0.94–0.97×). Gate hoisting on a
-  cheap benefit estimate (invariant op count / loop-body share) so a pass only fires when it pays.
-  Until then the passes are a net loss on hoist-free loops.
+- [x] **LICM hoist cost model (constants).** The clearest actionable finding: on a loop with *nothing
+  worth hoisting* (the tight sum loop), LICM still hoisted the loop's constants, adding block-parameter
+  threading that grew static size for no run-time gain. A constant is free to recompute, so hoisting one
+  only threads a copy around the loop — pure overhead. LICM now (1) **never hoists a bare constant**, and
+  (2) when a worthwhile invariant *uses* a loop-body constant, **rematerializes that constant in the
+  preheader** instead of threading it in (`Threader::emit`). Result (`opt_size_ablation`): on the
+  hoist-free reg-sum loop LICM's size delta is now **+0** (was −10) — it hoists nothing useless; on the
+  real-invariant loops the LICM win is preserved *and* output shrinks (heavy-invariant loop 100→94 B,
+  licm+cse 77→74 B) because invariant const operands no longer thread. Removing LICM on the heavy loop is
+  still ~1.4× (it remains the dominant interp-path run-time pass). A GVN variant of the same cost concern
+  is deferred until a corpus case demands it.
 - [x] **Broaden the ablation corpus + measure the full pass set.** The harness now leaves out **all
   eleven** togglable passes (was six) and adds two cases so the Phase-3/4 passes have a shape that
   exercises them: a **memory** case (a redundant same-address load for `mem`, a diamond-join reload
