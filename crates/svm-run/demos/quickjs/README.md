@@ -16,48 +16,65 @@ passes test262, very little of the language surface is left unproven. It is a
   surface): eval a fixed JS program, stringify the result, print it. The
   program exercises recursion, closures (a `sort` comparator), the object/GC
   machinery + `JSON.stringify`, string methods, and `toFixed` float formatting.
+- `libc_shim.c` — the small libc surface the on-ramp neither synthesizes nor
+  covers via a reused shim: `fesetround`/`fegetround`, `strtol` (+ the C23
+  `__isoc23_strtol` alias), `lrint`, `abort`, `malloc_usable_size`.
 - `build_bitcode.sh` — the fetch → compile → `llvm-link` pipeline the test
   automates (fetched-not-vendored, skips cleanly offline).
+
+The rest of the libc/stdio waist is **reused, not rewritten**: the Postgres
+guest printf engine (`../postgres/printf_shim.c`, the runtime-`va_list`
+`vsnprintf` family) and the correctly-rounded guest `strtod`
+(`../strtod/strtod.c`). The native oracle keeps real libc — the shims match it
+byte-for-byte — so they go into the guest link only.
 
 The QuickJS sources are **not vendored** (MIT, fetched + cached at test time
 from `bellard.org`). Core set: `quickjs.c` (~55k lines) + `libregexp.c` +
 `libunicode.c` + `cutils.c` + `libbf.c`.
 
-## Spike status — the gap inventory (analogous to Postgres slice BM)
+## Progress + the live gap list
 
 The linked eval build is ~1.9 MB of bitcode. Pushing it through
 `cargo run --example try_translate` (in `crates/svm-llvm`) walks the fail-closed
-chokepoint and quantifies the remaining work. Two classes, both already solved
-for SQLite/Postgres:
+chokepoint one gap at a time. Status:
 
-1. **Address-taken libm — `js_math_funcs`.** The `Math` object stores raw C
-   function pointers (`JS_CFUNC_SPECIAL_DEF("sin", 1, f_f, sin)`, …) in a
-   *constant* global table, so a `&sin`/`&fabs`/`&pow`/`&atan2`/… constexpr
-   appears in an initializer. The on-ramp lowers these inline for *direct*
-   calls but has no funcref for an address-taken one → `Unsupported("constexpr
-   reference to @fabs")`. **Fix:** `llvm-link` a real guest libm (openlibm),
-   exactly as the Postgres capstone does (LLVM.md slice CO) — a guest def gives
-   each name a real funcref. The full set QuickJS takes the address of:
-   `fabs floor ceil trunc sqrt sin cos tan asin acos atan atan2 exp log log2
-   log10 expm1 log1p sinh cosh tanh asinh acosh atanh cbrt hypot pow`.
+**DONE — address-taken libm (`js_math_funcs`).** The `Math` object stores raw C
+function pointers (`JS_CFUNC_SPECIAL_DEF("sin", 1, f_f, sin)`, …) in a
+*constant* global table, so a `&sin`/`&fabs`/`&pow`/… constexpr appears in an
+initializer with no funcref → `Unsupported("constexpr reference to @fabs")`.
+Closed by `llvm-link`ing guest **openlibm** (the slice BQ/CO mechanism), the
+set + the five extras QuickJS adds (`asinh`/`acosh`/`atanh`/`log1p`/`hypot`).
 
-2. **The libc waist** (undefined externs, after `-DNDEBUG` clears
-   `__assert_fail`). Almost all are on-ramp-synthesized or covered by the
-   Postgres shims (`libc_shim.c`/`printf_shim.c`/`os_shim.c`):
-   - mem/string: `memchr memcmp bcmp strlen strcat strchr strcmp strcpy strrchr`
-   - alloc: `malloc realloc free malloc_usable_size` (the §slice-X sized header)
-   - stdio (printf family): `printf fprintf snprintf sprintf vsnprintf fwrite
-     fputc putc puts`
-   - number parse/format: `__isoc23_strtol strtod lrint`
-   - **new / worth attention:** `fesetround` (FP rounding-mode control — SVM
-     ops are round-to-nearest; QuickJS toggles it around some conversions),
-     time (`clock_gettime gettimeofday localtime_r`), and `pthread_cond_*` /
-     `pthread_mutex_*` (unused on a single-threaded eval → stubbable), `abort`.
+**DONE — struct-constant operands (a translator fix).** QuickJS returns
+`JS_EXCEPTION` as a 16-byte `JSValue` struct constant — `ret {i64,i64} {0,6}`.
+The on-ramp tracked only *local* aggregates field-wise, so the constant fell to
+the scalar path and fail-closed. Fixed in `svm-llvm` (`agg_fields`); test
+`struct_constant_return`.
 
-Ordering (proposed slices): (a) openlibm link + the libc/stdio shim → first
-eval runs; (b) `fesetround` semantics + `strtod`/number parity; (c) widen the
-JS program, then (d) the `run-test262.c` harness over an embedded slice as the
-self-validating suite (the QuickJS analog of SQLite's sqllogictest).
+**DONE — the libc/stdio waist.** After `-DNDEBUG` (drops `__assert_fail`), the
+undefined externs are the reused printf engine (`vsnprintf`/`snprintf`/… — the
+runtime-`va_list` family), the guest `strtod`, and the small `libc_shim.c`
+(`fesetround`/`strtol`/`__isoc23_strtol`/`lrint`/`abort`/`malloc_usable_size`).
+The mem/string + alloc + non-varargs stdio names (`memcpy`/`fwrite`/`puts`/
+`malloc`/…) are on-ramp-synthesized (slices N/O/X), not gaps.
+
+**NEXT (blocking) — dynamic `alloca`.** `JS_CallInternal` (the bytecode
+interpreter core) allocates its operand stack with a **runtime-sized `alloca`**
+(`alloca(alloc_size)`); the on-ramp lowers only constant-size `alloca` (→ window
+frame slots). A variable-length `alloca` needs a runtime data-SP bump + restore
+— a translator slice of its own (cf. the §3d data-stack), the current wall.
+
+**NEXT (semantic) — directed-rounding dtoa.** QuickJS's shortest Number→string
+(`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` to find the shortest round-trip
+decimal, but the SVM float ops are round-to-nearest only (no rounding-mode op).
+`toFixed`/`toPrecision` use `FE_TONEAREST` (which `fesetround` honors), so the
+current driver is unaffected; general `String(0.1)` needs a rounding-mode
+primitive or a directed-rounding-free guest dtoa.
+
+Then: (a) widen the JS program (regex, BigInt, `try`/`catch` — note JS
+exceptions ride QuickJS's own bytecode, not host unwinding); (b) the
+`run-test262.c` harness over an embedded slice — the self-validating suite,
+QuickJS's analog of SQLite's sqllogictest.
 
 ## Running by hand
 

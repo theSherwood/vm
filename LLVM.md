@@ -622,12 +622,29 @@ shape SQLite/Postgres already solved**:
    conversions), time (`clock_gettime`/`gettimeofday`/`localtime_r`), and `pthread_cond_*`/`pthread_mutex_*`
    (unused on a single-threaded eval → stubbable), `abort`.
 
-**Proposed slice sequence.** (a) openlibm link + a QuickJS libc/stdio shim (mirroring `demos/postgres/`)
-→ first `JS_Eval` runs byte-identical to native; (b) `fesetround` semantics + `strtod`/number-format
-parity; (c) widen the JS program (regex, BigInt, exceptions — note EH is still the open substrate
-sub-slice, and QuickJS's `try`/`catch` rides its own bytecode, not host unwinding, so it may not force
-it); (d) the `run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's
-analog of SQLite's sqllogictest.
+**Progress (this session).** **DONE:** (1) the address-taken-libm link (openlibm + 5 QuickJS extras
+`asinh`/`acosh`/`atanh`/`log1p`/`hypot`); (2) a **translator fix — struct-constant operands**: QuickJS
+returns `JS_EXCEPTION` as a 16-byte `JSValue` struct constant (`ret {i64,i64} {0,6}`), which the `ret`
+path dropped to the scalar operand path and rejected — `agg_fields` now materializes a constant
+aggregate field-wise (test `struct_constant_return`; helps any by-value-aggregate frontend); (3) the
+**libc/stdio waist** — the reused Postgres printf engine (runtime-`va_list` `vsnprintf` family) + the
+correctly-rounded guest `strtod` + a small `demos/quickjs/libc_shim.c` (`fesetround`/`strtol`/`lrint`/
+`abort`/`malloc_usable_size`); the mem/alloc/non-varargs-stdio names are on-ramp-synthesized, not gaps.
+
+**Blocking gaps now (the two walls the spike reached).** (1) **Dynamic `alloca`** — `JS_CallInternal`
+(the bytecode interpreter core) allocates its operand stack with a *runtime-sized* `alloca`; the on-ramp
+lowers only constant-size `alloca` (→ window frame slots). A variable-length `alloca` is a translator
+slice of its own — a runtime data-SP bump + restore on the §3d data-stack. (2) **Directed-rounding dtoa**
+— QuickJS's shortest Number→string (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are
+round-to-nearest only (no rounding-mode op); `toFixed`/`toPrecision` use `FE_TONEAREST` (honored), so the
+current driver is unaffected, but general `String(0.1)` needs a rounding-mode primitive or a
+directed-rounding-free guest dtoa.
+
+**Remaining slice sequence.** (a) **dynamic `alloca`** (the current wall) → the interpreter core
+translates; (b) widen the JS program past `toFixed` + the directed-rounding dtoa follow-up; (c) regex /
+BigInt / `try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH
+dependency); (d) the `run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's
+analog of SQLite's sqllogictest. Harness: `demo_quickjs_eval_vs_native` (`#[ignore]`d at the alloca wall).
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

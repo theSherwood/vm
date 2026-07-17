@@ -1817,15 +1817,17 @@ fn fetch_quickjs() -> Option<PathBuf> {
 /// (the Postgres set) — inverse hyperbolics, `log1p`, `hypot`.
 const QUICKJS_OPENLIBM_EXTRA: &[&str] = &["s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot"];
 
-/// **▶ QuickJS eval — the full-JS-engine breadth target (SPIKE, in progress).** Ignored until the
-/// libc waist is shimmed: this harness wires the whole differential pipeline — fetch QuickJS +
-/// openlibm, compile the engine TUs + the `demos/quickjs/qjs_eval.c` driver + the guest libm to
-/// bitcode, `llvm-link` into one module, then translate → verify → run vs a native `cc` oracle.
-/// The remaining gap is the libc/stdio shim (mirroring `demos/postgres/libc_shim.c`); see LLVM.md
-/// "Active target — QuickJS" for the quantified gap list. Run by hand:
+/// **▶ QuickJS eval — the full-JS-engine breadth target (SPIKE, in progress).** Wires the whole
+/// differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the
+/// `demos/quickjs/qjs_eval.c` driver + the guest libm + the libc/stdio shims to bitcode,
+/// `llvm-link` into one module, then translate → verify → run vs a native `cc` oracle. The libc
+/// waist is now shimmed (printf engine + `strtod` + `libc_shim.c`); it is **ignored** because the
+/// interpreter core (`JS_CallInternal`) uses a **dynamic `alloca`** (runtime-sized operand stack)
+/// the on-ramp doesn't yet lower, and general Number→string needs directed-rounding dtoa — see
+/// LLVM.md "Active target — QuickJS" for the live gap list. Run by hand:
 /// `cargo test --test translate demo_quickjs_eval_vs_native -- --ignored --nocapture`.
 #[test]
-#[ignore = "QuickJS spike: needs the libc/stdio shim (gap list in LLVM.md)"]
+#[ignore = "QuickJS spike: blocked on dynamic alloca in JS_CallInternal (translator gap, LLVM.md)"]
 fn demo_quickjs_eval_vs_native() {
     let (Some(qjs), Some(ol)) = (fetch_quickjs(), fetch_openlibm()) else {
         return;
@@ -1889,6 +1891,25 @@ fn demo_quickjs_eval_vs_native() {
             Some(bc) => bcs.push(bc),
             None => {
                 eprintln!("note: skipping quickjs (clang failed on libm {name})");
+                return;
+            }
+        }
+    }
+    // The guest libc/stdio waist the on-ramp doesn't synthesize: the reused Postgres printf engine
+    // (the runtime-va_list `vsnprintf` family), the correctly-rounded guest `strtod`, and the
+    // QuickJS misc shim (`fesetround`/`strtol`/`abort`/…). The native oracle keeps real libc — the
+    // shims match it byte-for-byte — so they go into the guest link only.
+    let demos = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos");
+    let shims = [
+        (demos.join("postgres/printf_shim.c"), "printf_shim"),
+        (demos.join("strtod/strtod.c"), "strtod"),
+        (demos.join("quickjs/libc_shim.c"), "libc_shim"),
+    ];
+    for (src, tag) in &shims {
+        match compile(src.clone(), tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping quickjs (clang failed on shim {tag})");
                 return;
             }
         }
