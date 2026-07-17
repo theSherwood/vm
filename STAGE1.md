@@ -48,6 +48,22 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 
 ## Slice plan
 
+0. **Unmodified `main(argc, argv)` on chibicc** *(done —
+   `stage1_argv_main.rs`)* — the "as close to native as the security model
+   allows" milestone. An **ordinary** C program — `int main(int argc, char
+   **argv)`, `write(1, …)` to an *ambient* fd, no capability threading in the
+   source — compiles through chibicc and runs with a real `argv`. chibicc's
+   synthesized `_start` now parses the §3e powerbox args buffer at
+   `POWERBOX_ARGS_BASE` (`{argc, envc}` + packed strings) into an `argv[]`
+   pointer array parked at the entry SP, then calls `main(main_sp, argc, argv)`
+   with `main`'s frame relocated a page above; writable globals shift past
+   `POWERBOX_ARGS_END` so the seeded argv never collides with a global (both
+   opt-in for a `main`-with-params, so every `main(void)` program — incl. the
+   Stage-0 shell — is byte-identical). Modeled on svm-llvm's `synth_start_argv`
+   (already vs-native there, but that frontend is an excluded LLVM-dependent
+   crate; the self-contained demo needs chibicc parity). Output tracks argv,
+   exit code = `argc`, differential interp==JIT; no confinement-path change. This
+   is the crt that makes a compiled C program a **first-class bash command**.
 1. **Spawn/wait spike** *(done — `stage1_spawn_wait.rs`)* — a differential
    (interp+JIT) test proving the core: a parent seeds `argv` bytes into a child's
    carve, `instantiate_module`s it, `join`s, and the child's return (a function

@@ -218,6 +218,18 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 // segment ever overlaps a stashed handle (a collision corrupts a global, e.g. a pthread mutex).
 #define RESERVED_BYTES 32
 
+// The §3e powerbox **args buffer** (argv/env) the runtime seeds at `[POWERBOX_ARGS_BASE,
+// POWERBOX_ARGS_END)` (matching `svm_ir::POWERBOX_ARGS_BASE`/`POWERBOX_ARGS_END`): `{ argc:u32-LE,
+// envc:u32-LE }` then the packed NUL-terminated argv+env strings. A `main(int, char**)` program's
+// `_start` parses this into `argc`/`argv` (see `emit_start`); to keep the buffer clear of writable
+// globals, such a program's data region is shifted to start at `POWERBOX_ARGS_END` (`layout_globals`).
+#define POWERBOX_ARGS_BASE 128
+#define POWERBOX_ARGS_END 16384
+
+// True when `main` takes `argc`/`argv` (>= 2 params), so the entry parses the args buffer and the
+// globals shift past it. Computed once in `codegen_ir` before `layout_globals`.
+static bool needs_argv;
+
 // Globals + string literals live at fixed window offsets in the data region [RESERVED_BYTES,
 // data_end); the data stack starts at data_end (main's initial data-SP, baked into `_start`).
 // The low RESERVED_BYTES are the runtime-reserved region holding the powerbox capability handles
@@ -2406,7 +2418,9 @@ static bool is_rodata(Obj *g) {
 // before the data stack — so the `data ro` segments are page-isolated for protection (§3a / D40).
 // Returns true if any global.
 static bool layout_globals(Obj *prog) {
-  int off = RESERVED_BYTES;
+  // A `main(int, char**)` program shifts its writable globals past the §3e args buffer at
+  // `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)`, so seeded argv/env never collides with a global.
+  int off = needs_argv ? POWERBOX_ARGS_END : RESERVED_BYTES;
   bool any = false;
   // Pass 1: writable globals (and BSS) packed from `RESERVED_BYTES`.
   for (Obj *g = prog; g; g = g->next) {
@@ -2596,6 +2610,76 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  i32.store v%d v%d\n", vslot, vh);
   }
 #undef NHANDLES
+
+  // `main(int, char**)`: parse the §3e args buffer into an `argv[]` pointer array. The runtime seeds
+  // `{ argc:u32, envc:u32 }` at `POWERBOX_ARGS_BASE` followed by the packed NUL-terminated strings; we
+  // build `argv[]` (a `char*` per arg, plus the `argv[argc] == NULL` terminator) at `data_end` (the
+  // entry SP, reused after the transient name scratch above), then call `main(main_sp, argc, argv)`
+  // with `main`'s frame relocated a full page above the array so it never overwrites `argv[]`. The
+  // loop mirrors `svm-llvm`'s `synth_start_argv`. Block value numbers are block-local (chibicc IR).
+  if (needs_argv) {
+    int mi = func_index(main_fn);
+    int vab = nv++;
+    cg("  v%d = i64.const %d\n", vab, POWERBOX_ARGS_BASE);
+    int vac32 = nv++;
+    cg("  v%d = i32.load v%d\n", vac32, vab); // argc (u32)
+    int vac = nv++;
+    cg("  v%d = i64.extend_i32_u v%d\n", vac, vac32);
+    int vp0 = nv++;
+    cg("  v%d = i64.const %d\n", vp0, POWERBOX_ARGS_BASE + 8); // first string
+    int vi0 = nv++;
+    cg("  v%d = i64.const 0\n", vi0);
+    cg("  br block1(v%d, v%d, v%d)\n", vac, vi0, vp0);
+    // loop_head(argc, i, p): while i <u argc, write argv[i] and scan; else finish.
+    cg("block1(v0: i64, v1: i64, v2: i64):\n");
+    cg("  v3 = i64.lt_u v1 v0\n");
+    cg("  br_if v3 block2(v0, v1, v2) block5(v0)\n");
+    // body: argv[i] = p, then scan p to the byte past its NUL.
+    cg("block2(v0: i64, v1: i64, v2: i64):\n");
+    cg("  v3 = i64.const %d\n", data_end);
+    cg("  v4 = i64.const 8\n");
+    cg("  v5 = i64.mul v1 v4\n");
+    cg("  v6 = i64.add v3 v5\n");
+    cg("  i64.store v6 v2\n");
+    cg("  br block3(v0, v1, v2, v2)\n");
+    // scan(argc, i, p, q): advance q past the NUL.
+    cg("block3(v0: i64, v1: i64, v2: i64, v3: i64):\n");
+    cg("  v4 = i32.load8_u v3\n");
+    cg("  v5 = i64.const 1\n");
+    cg("  v6 = i64.add v3 v5\n");
+    cg("  v7 = i32.eqz v4\n");
+    cg("  br_if v7 block4(v0, v1, v6) block3(v0, v1, v2, v6)\n");
+    // next: i++ and loop.
+    cg("block4(v0: i64, v1: i64, v2: i64):\n");
+    cg("  v3 = i64.const 1\n");
+    cg("  v4 = i64.add v1 v3\n");
+    cg("  br block1(v0, v4, v2)\n");
+    // done: argv[argc] = NULL, main_sp = page-align(entry_sp + (argc+1)*8), call main.
+    cg("block5(v0: i64):\n");
+    cg("  v1 = i64.const %d\n", data_end);
+    cg("  v2 = i64.const 8\n");
+    cg("  v3 = i64.mul v0 v2\n");
+    cg("  v4 = i64.add v1 v3\n");
+    cg("  v5 = i64.const 0\n");
+    cg("  i64.store v4 v5\n");
+    cg("  v6 = i64.const 1\n");
+    cg("  v7 = i64.add v0 v6\n");
+    cg("  v8 = i64.mul v7 v2\n");
+    cg("  v9 = i64.add v1 v8\n");
+    cg("  v10 = i64.const %d\n", POWERBOX_ARGS_END - 1);
+    cg("  v11 = i64.add v9 v10\n");
+    cg("  v12 = i64.const %d\n", -POWERBOX_ARGS_END);
+    cg("  v13 = i64.and v11 v12\n");
+    cg("  v14 = i32.wrap_i64 v0\n");
+    if (is_void) {
+      cg("  call %d (v13, v14, v1)\n  return\n", mi);
+    } else {
+      cg("  v15 = call %d (v13, v14, v1)\n  return v15\n", mi);
+    }
+    cg("}\n\n");
+    return;
+  }
+
   int sp = nv++;
   cg("  v%d = i64.const %d\n", sp, data_end);
   // `int main()` (empty parens) is variadic in chibicc, so it expects the hidden va
@@ -2876,6 +2960,11 @@ void codegen_ir(Obj *prog, FILE *out) {
   bool has_main = nfuncs > 0 && funcs[0]->name && !strcmp(funcs[0]->name, "main");
   start_off = has_main ? 1 : 0;
 
+  // Does `main` take `argc`/`argv` (>= 2 params)? If so, `_start` parses the §3e args buffer and the
+  // globals shift past it. Must be known before `layout_globals`. (`guest_params` drops a hidden sret
+  // pointer; `main` never returns an aggregate, so it's just the C params.)
+  needs_argv = has_main && guest_params(funcs[0]) && guest_params(funcs[0])->next;
+
   // `_start` stashes the capability handles in the window, so a module with an entry
   // always needs one.
   bool need_mem = layout_globals(prog) || has_main;
@@ -2894,6 +2983,10 @@ void codegen_ir(Obj *prog, FILE *out) {
     // Reserve stack/heap headroom: a generous flat 48 KiB for small programs (so they stay
     // at 64 KiB), or an amount equal to the globals for large ones (proportional stack).
     long reserve = data_end < (16 << 10) ? (48 << 10) : data_end;
+    // A `main(int, char**)` entry parks `argv[]` at `data_end` and relocates `main`'s frame a full
+    // page (`POWERBOX_ARGS_END`) above it, so add that page (plus the argv-array slack) as headroom.
+    if (needs_argv)
+      reserve += (long)POWERBOX_ARGS_END + (16 << 10);
     long need = (long)data_end + reserve;
     int wlog2 = 16;
     while (((long)1 << wlog2) < need)
