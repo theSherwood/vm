@@ -1205,6 +1205,16 @@ const SP: ValueId = usize::MAX;
 /// makes at least one direct varargs call. See `frame_layout` / the varargs call-site lowering.
 const VARARG_SCRATCH: ValueId = usize::MAX - 1;
 
+/// A sentinel `frame` key (never a real SSA value) holding the `sp`-relative offset of this
+/// function's **dynamic-alloca running top**: an 8-byte slot storing the current top-of-dynamic-
+/// stack window pointer. Initialized at function entry to `sp + frame_size` (just above the fixed
+/// frame) and bumped by each dynamic (`alloca T, i32 %n`) `alloca`; a call in such a function hands
+/// the callee *this* pointer (not `sp + frame_size`) so its frame sits above the variable-length
+/// allocations. Present in `frame` only when the function has a dynamic alloca. Dynamic allocas are
+/// function-lifetime here (no `llvm.stacksave`/`stackrestore` — a clean `Unsupported` if seen), so
+/// the top only grows within an activation and is discarded on return.
+const DYN_TOP: ValueId = usize::MAX - 2;
+
 /// Accumulates the §6 debug-info **neutral core** as functions are lowered — the LLVM on-ramp as a
 /// third independent producer feeding the frontend-neutral waist (DEBUGGING.md §6 / D-DBG-7).
 ///
@@ -2482,15 +2492,27 @@ fn frame_layout(
     if f.is_var_arg {
         off = 8;
     }
+    let mut has_dyn = false;
     for bb in &f.basic_blocks {
         for instr in &bb.instrs {
             if let Instruction::Alloca(a) = instr {
                 let n = match &a.num_elements {
                     Operand::ConstantOperand(c) => match c.as_ref() {
                         Constant::Int { value, .. } => *value as u64,
-                        _ => return unsup("dynamic alloca (non-constant element count)"),
+                        // A non-`Int` constant count is unusual; treat it as dynamic (laid out at
+                        // runtime by the `Alloca` lowering) rather than fixed-slot.
+                        _ => {
+                            has_dyn = true;
+                            continue;
+                        }
                     },
-                    _ => return unsup("dynamic alloca (non-constant element count)"),
+                    // A **dynamic** alloca (runtime element count, e.g. QuickJS's `JS_CallInternal`
+                    // operand stack): no fixed frame slot — the `Alloca` lowering bumps the `DYN_TOP`
+                    // running top at runtime. Just note the function has one.
+                    _ => {
+                        has_dyn = true;
+                        continue;
+                    }
                 };
                 let size = type_size(a.allocated_type.as_ref(), types)?.saturating_mul(n);
                 // Natural alignment: the larger of the type's alignment and the `alloca`'s declared
@@ -2528,6 +2550,14 @@ fn frame_layout(
         off = off.div_ceil(8) * 8;
         frame.insert(VARARG_SCRATCH, off);
         off += max_vararg_slots.max(1) * 8;
+    }
+    // Reserve the 8-byte **dynamic-alloca running-top** slot at the end of the fixed frame, so the
+    // variable-length region begins cleanly at `frame_size` (16-aligned). The entry prologue seeds it
+    // to `sp + frame_size`; each dynamic `alloca` bumps it (see `DYN_TOP`).
+    if has_dyn {
+        off = off.div_ceil(8) * 8;
+        frame.insert(DYN_TOP, off);
+        off += 8;
     }
     Ok((frame, off.div_ceil(16) * 16))
 }
@@ -14577,9 +14607,7 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
                 offset: 0,
                 align: 8,
             });
-            let sp = ctx.sp()?;
-            let fs = ctx.const_i64(ctx.frame_size as i64);
-            let callee_sp = ctx.add_i64(sp, fs);
+            let callee_sp = ctx.callee_base()?;
             ctx.push_effect(Inst::Call {
                 func: helper,
                 args: vec![callee_sp, exn, dtor],
@@ -15341,6 +15369,38 @@ impl<'a> BlockCtx<'a> {
         })
     }
 
+    /// Address of this function's dynamic-alloca running-top slot (`sp + DYN_TOP_off`), or `None`
+    /// when the function has no dynamic alloca.
+    fn dyn_top_addr(&mut self) -> Result<Option<ValIdx>, Error> {
+        match self.frame.get(&DYN_TOP).copied() {
+            Some(off) => {
+                let sp = self.sp()?;
+                let c = self.const_i64(off as i64);
+                Ok(Some(self.add_i64(sp, c)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The data-SP base to hand a callee. In a function with a dynamic `alloca` this is the current
+    /// `DYN_TOP` (loaded from its slot), so the callee's frame sits *above* any variable-length
+    /// allocations; otherwise the fixed `sp + frame_size`. Before the first dynamic alloca `DYN_TOP`
+    /// still reads `sp + frame_size` (its entry-seeded value), so both paths agree.
+    fn callee_base(&mut self) -> Result<ValIdx, Error> {
+        if let Some(slot) = self.dyn_top_addr()? {
+            Ok(self.push(Inst::Load {
+                op: LoadOp::I64,
+                addr: slot,
+                offset: 0,
+                align: 0,
+            }))
+        } else {
+            let sp = self.sp()?;
+            let fs = self.const_i64(self.frame_size as i64);
+            Ok(self.add_i64(sp, fs))
+        }
+    }
+
     /// The reserved C++ EH region's base window address (`Helpers::eh_base`), or `Unsupported` if an
     /// EH op was reached without the region having been reserved (a gating bug — should never fire).
     fn eh_base(&self) -> Result<u64, Error> {
@@ -15728,6 +15788,24 @@ fn translate_block(
         ctx.agg.insert(vid, parts);
     }
     ctx.next_val = params.len() as ValIdx;
+
+    // Entry prologue: seed the dynamic-alloca running top (`DYN_TOP` slot) to `sp + frame_size` — the
+    // base of the variable-length region, just above this activation's fixed frame. Emitted first in
+    // the entry block (which dominates all uses), before any dynamic `alloca` or call reads it.
+    if bi == 0 {
+        if let Some(slot) = ctx.dyn_top_addr()? {
+            let sp = ctx.sp()?;
+            let fs = ctx.const_i64(ctx.frame_size as i64);
+            let base = ctx.add_i64(sp, fs);
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: slot,
+                value: base,
+                offset: 0,
+                align: 0,
+            });
+        }
+    }
 
     // A tail-position call in this block (final instruction is a `tail`/`musttail` call whose result
     // the `ret` returns) lowers to a `return_call` terminator instead of a `call` + `ret`.
@@ -16780,11 +16858,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 return Ok(());
             }
         }
-        // Pass the callee its own data-stack frame at `sp + frame_size` (§3d), then the mapped
-        // arguments. The IR signature is `(sp, c-args…)`, so the callee's frame never overlaps ours.
+        // Pass the callee its own data-stack frame (§3d), then the mapped arguments. The IR
+        // signature is `(sp, c-args…)`, so the callee's frame never overlaps ours. `callee_base`
+        // is `sp + frame_size` normally, or the dynamic-alloca running top when this function has
+        // variable-length allocations (so the callee sits above them).
         let sp = ctx.sp()?;
-        let fs = ctx.const_i64(ctx.frame_size as i64);
-        let callee_sp = ctx.add_i64(sp, fs);
+        let callee_sp = ctx.callee_base()?;
         let mut args = vec![callee_sp];
         // A call to a `(...)` function (§varargs) — direct or **indirect** (a `(...)` function
         // pointer): only the fixed parameters are IR arguments; the variadic arguments are marshaled
@@ -16994,19 +17073,66 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
 
     let (dest, idx) = match instr {
         I::Alloca(a) => {
-            // The slot's `sp`-relative offset (laid out by `frame_layout`): address = `sp + off`.
             let vid = *ctx
                 .s
                 .name2id
                 .get(&a.dest)
                 .ok_or_else(|| Error::Unsupported("alloca without result".into()))?;
-            let off = *ctx
-                .frame
-                .get(&vid)
-                .ok_or_else(|| Error::Unsupported("alloca missing frame slot".into()))?;
-            let sp = ctx.sp()?;
-            let c = ctx.const_i64(off as i64);
-            (&a.dest, ctx.add_i64(sp, c))
+            if let Some(&off) = ctx.frame.get(&vid) {
+                // Static alloca: its `sp`-relative slot (laid out by `frame_layout`) — address `sp + off`.
+                let sp = ctx.sp()?;
+                let c = ctx.const_i64(off as i64);
+                (&a.dest, ctx.add_i64(sp, c))
+            } else {
+                // Dynamic alloca (runtime element count): bump the `DYN_TOP` running top by
+                // `align16(count * elem_size)` and hand back the *old* top as the base address. The
+                // stored top stays 16-aligned so the next alloca / callee frame is aligned.
+                let slot = ctx.dyn_top_addr()?.ok_or_else(|| {
+                    Error::Unsupported("dynamic alloca without a DYN_TOP slot".into())
+                })?;
+                // Count → i64 (clang emits an i64 count on x86-64; zero-extend a narrower one).
+                let raw = ctx.operand(&a.num_elements)?;
+                let n = match int_bits(a.num_elements.get_type(ctx.types).as_ref()) {
+                    Some(64) => raw,
+                    Some(w) if w < 64 => ctx.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: raw,
+                    }),
+                    _ => return unsup("dynamic alloca with a non-integer element count"),
+                };
+                let elem = type_size(a.allocated_type.as_ref(), ctx.types)?;
+                let bytes = if elem == 1 {
+                    n
+                } else {
+                    let e = ctx.const_i64(elem as i64);
+                    ctx.mul_i64(n, e)
+                };
+                // align16(bytes) = (bytes + 15) & ~15
+                let c15 = ctx.const_i64(15);
+                let summed = ctx.add_i64(bytes, c15);
+                let mask = ctx.const_i64(!15i64);
+                let bytes16 = ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::And,
+                    a: summed,
+                    b: mask,
+                });
+                let top = ctx.push(Inst::Load {
+                    op: LoadOp::I64,
+                    addr: slot,
+                    offset: 0,
+                    align: 0,
+                });
+                let new_top = ctx.add_i64(top, bytes16);
+                ctx.push_effect(Inst::Store {
+                    op: StoreOp::I64,
+                    addr: slot,
+                    value: new_top,
+                    offset: 0,
+                    align: 0,
+                });
+                (&a.dest, top)
+            }
         }
         I::Load(l) => {
             let addr = ctx.operand(&l.address)?;
@@ -19861,6 +19987,13 @@ fn lower_invoke(
     aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     use std::collections::hash_map::Entry;
+    // A function with a dynamic `alloca` computes its callee SP from the runtime `DYN_TOP`, but this
+    // synthetic EH-invoke call block builds `sp + frame_size` with raw block-local indices. The
+    // combination (C++ exceptions + a variable-length `alloca` in the same function) is astronomically
+    // rare and unneeded by any current target — fail closed rather than pass the wrong callee frame.
+    if ctx.frame.contains_key(&DYN_TOP) {
+        return unsup("invoke (C++ EH) in a function with a dynamic alloca");
+    }
     let base = ctx.eh_base()?;
 
     // Resolve the callee — a direct call to a defined function only.

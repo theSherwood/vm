@@ -58,11 +58,19 @@ runtime-`va_list` family), the guest `strtod`, and the small `libc_shim.c`
 The mem/string + alloc + non-varargs stdio names (`memcpy`/`fwrite`/`puts`/
 `malloc`/…) are on-ramp-synthesized (slices N/O/X), not gaps.
 
-**NEXT (blocking) — dynamic `alloca`.** `JS_CallInternal` (the bytecode
-interpreter core) allocates its operand stack with a **runtime-sized `alloca`**
-(`alloca(alloc_size)`); the on-ramp lowers only constant-size `alloca` (→ window
-frame slots). A variable-length `alloca` needs a runtime data-SP bump + restore
-— a translator slice of its own (cf. the §3d data-stack), the current wall.
+**DONE — dynamic `alloca`.** `JS_CallInternal` allocates its operand stack with
+a **runtime-sized `alloca`** (`alloca i8, i64 %n`); the on-ramp now lowers it via
+a per-frame `DYN_TOP` running top (bumped by `align16(count·elem)`), and a call in
+such a function hands the callee that top so its frame sits above the
+variable-length region. Test `dynamic_alloca_runtime_count` (interp == JIT).
+
+**NEXT (blocking) — `llvm.frameaddress`.** With alloca cleared, `JS_CallInternal`
+reaches `js_check_stack_overflow`, which reads the stack pointer via
+`__builtin_frame_address(0)`. QuickJS assumes a *downward* native stack
+(`stack_limit = stack_top - stack_size`), but the SVM data-stack grows *up*, so a
+naive `sp` return fires the check on every call — needs a stack-direction-aware
+lowering (a downward-mapped `C − sp` proxy, or wiring `JS_UpdateStackTop` to the
+window bounds). Its own slice.
 
 **NEXT (semantic) — directed-rounding dtoa.** QuickJS's shortest Number→string
 (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` to find the shortest round-trip

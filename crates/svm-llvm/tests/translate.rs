@@ -5823,6 +5823,54 @@ fn struct_constant_return() {
 }
 
 #[test]
+fn dynamic_alloca_runtime_count() {
+    // A **dynamic `alloca`** — `alloca i32, i64 %n` with a *runtime* element count — is how QuickJS's
+    // `JS_CallInternal` sizes its operand stack. The on-ramp lays static allocas at fixed frame
+    // offsets; a dynamic one bumps a per-frame `DYN_TOP` running top at runtime, and a call in the
+    // same function hands the callee that top so its frame sits *above* the variable-length region.
+    // `@consume` writes its own local `alloca` (999) before reading the caller's dynamic buffer — if
+    // the callee frame overlapped the dynamic allocation the store would clobber it and the result
+    // would be wrong. clang folds a constant-sized VLA back to a static alloca, so this is a
+    // hand-written `.ll`; `%n` comes from a call so it stays runtime. Checked interp == JIT.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %n = call i64 @five()\n  \
+        %p = alloca i32, i64 %n\n  \
+        store i32 10, ptr %p\n  \
+        %p1 = getelementptr i32, ptr %p, i64 1\n  \
+        store i32 20, ptr %p1\n  \
+        %s = call i32 @consume(ptr %p)\n  \
+        ret i32 %s\n}\n\
+        define i64 @five() {\n\
+        entry:\n  \
+        ret i64 5\n}\n\
+        define i32 @consume(ptr %q) {\n\
+        entry:\n  \
+        %scratch = alloca i32\n  \
+        store i32 999, ptr %scratch\n  \
+        %a = load i32, ptr %q\n  \
+        %q1 = getelementptr i32, ptr %q, i64 1\n  \
+        %b = load i32, ptr %q1\n  \
+        %r = add i32 %a, %b\n  \
+        ret i32 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate dynamic-alloca .ll");
+    svm_verify::verify_module(&t.module).expect("verify dynamic-alloca");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run dynamic-alloca");
+    assert_eq!(
+        r,
+        vec![Value::I32(30)],
+        "p[0]+p[1] = 10+20 = 30 (callee frame sits above the dynamic region)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 30, "JIT dynamic-alloca = 30"),
+        other => panic!("JIT dynamic-alloca: unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn vector_shift_per_lane_amount() {
     // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
     // Postgres' `simd.h`). svm-ir's `VShift` takes one scalar count for all lanes, so the on-ramp

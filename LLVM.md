@@ -631,20 +631,34 @@ aggregate field-wise (test `struct_constant_return`; helps any by-value-aggregat
 correctly-rounded guest `strtod` + a small `demos/quickjs/libc_shim.c` (`fesetround`/`strtol`/`lrint`/
 `abort`/`malloc_usable_size`); the mem/alloc/non-varargs-stdio names are on-ramp-synthesized, not gaps.
 
-**Blocking gaps now (the two walls the spike reached).** (1) **Dynamic `alloca`** — `JS_CallInternal`
-(the bytecode interpreter core) allocates its operand stack with a *runtime-sized* `alloca`; the on-ramp
-lowers only constant-size `alloca` (→ window frame slots). A variable-length `alloca` is a translator
-slice of its own — a runtime data-SP bump + restore on the §3d data-stack. (2) **Directed-rounding dtoa**
-— QuickJS's shortest Number→string (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are
-round-to-nearest only (no rounding-mode op); `toFixed`/`toPrecision` use `FE_TONEAREST` (honored), so the
-current driver is unaffected, but general `String(0.1)` needs a rounding-mode primitive or a
-directed-rounding-free guest dtoa.
+**Dynamic `alloca` — DONE.** `JS_CallInternal` (the bytecode interpreter core) allocates its operand
+stack with a *runtime-sized* `alloca` (`alloca i8, i64 %n`); the on-ramp lowered only constant-size
+`alloca` (→ fixed frame slots). Now a function with a dynamic alloca reserves an 8-byte `DYN_TOP`
+running-top slot (seeded at entry to `sp + frame_size`); each dynamic `alloca` bumps it by
+`align16(count·elem)` and returns the old top, and a **call** in that function hands the callee `DYN_TOP`
+(not `sp + frame_size`) so its frame sits above the variable-length region. Function-lifetime only (no
+`llvm.stacksave`/`stackrestore` in QuickJS — fail-closed if seen); C++ `invoke` + dynamic alloca in one
+function is fail-closed (astronomically rare). Test `dynamic_alloca_runtime_count` (interp == JIT).
 
-**Remaining slice sequence.** (a) **dynamic `alloca`** (the current wall) → the interpreter core
-translates; (b) widen the JS program past `toFixed` + the directed-rounding dtoa follow-up; (c) regex /
-BigInt / `try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH
-dependency); (d) the `run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's
-analog of SQLite's sqllogictest. Harness: `demo_quickjs_eval_vs_native` (`#[ignore]`d at the alloca wall).
+**Blocking gap now — `llvm.frameaddress`.** With alloca cleared, `JS_CallInternal` reaches
+`js_check_stack_overflow`, which reads the stack pointer via `__builtin_frame_address(0)`
+(`llvm.frameaddress`). **Non-trivial:** QuickJS assumes a *downward* native stack
+(`stack_limit = stack_top - stack_size`; overflow when `sp < stack_limit`), but the SVM data-stack grows
+*up* — so returning `sp` directly makes the check fire on every call. Needs a stack-direction-aware
+lowering (a downward-mapped `C − sp` proxy, or wiring QuickJS's `JS_UpdateStackTop` to the window
+bounds). Its own slice.
+
+**Semantic follow-up — directed-rounding dtoa.** QuickJS's shortest Number→string (`js_ecvt1`) toggles
+`FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are round-to-nearest only (no rounding-mode op);
+`toFixed`/`toPrecision` use `FE_TONEAREST` (honored), so the current driver is unaffected, but general
+`String(0.1)` needs a rounding-mode primitive or a directed-rounding-free guest dtoa.
+
+**Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) **`llvm.frameaddress`** (the current
+wall) → the interpreter core translates + runs; (c) widen the JS program past `toFixed` + the
+directed-rounding dtoa follow-up; (d) regex / BigInt / `try`/`catch` (JS exceptions ride QuickJS's own
+bytecode, not host unwinding, so likely no EH dependency); (e) the `run-test262.c` harness over an
+embedded slice — the self-validating suite, QuickJS's analog of SQLite's sqllogictest. Harness:
+`demo_quickjs_eval_vs_native` (`#[ignore]`d, now at the `frameaddress` wall).
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
