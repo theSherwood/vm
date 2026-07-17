@@ -284,16 +284,23 @@ tracked enhancement, not a blocker.
     established, with **no memory write on any path between**, is removed and its result forwarded —
     threaded across blocks by `crate::thread::Threader`, exactly as GVN threads a congruent dominating
     value. "Same location" is `(address value-number, offset, op)` — the address by `crate::vn`
-    congruence (block-local SSA never shares an operand id). Alias model is conservative across blocks:
-    **any** write / side effect (store / atomic / `mem.copy`/`fill` / call) on a between-path clobbers,
-    and the between region must be **acyclic** (loop-carried loads deferred) so the source runs once
-    before the load and the partial-block clobber checks (after the source, before the load) are valid.
+    congruence (block-local SSA never shares an operand id). Alias model across blocks is **precise for
+    stores**: a between-path store does *not* clobber when it is provably disjoint — the same base
+    value-number with a non-overlapping byte range — reusing `mem_forward`'s intra-block reasoning
+    (sound under trap-confinement: two admitted accesses off one base differ by their offset gap, an
+    out-of-range address traps rather than wrapping to alias). A store off a *different* base
+    value-number, or any other write / side effect with unknown reach (atomic / `mem.copy`/`fill` /
+    call), still clobbers. The between region must be **acyclic** (loop-carried loads deferred) so the
+    source runs once before the load and the partial-block clobber checks (after the source, before the
+    load) are valid.
     Sound on value *and* traps (the dominating same-width access proved the address in-bounds). The load
     is removed with a block-local rebuild (general DCE keeps loads as possible traps). Runs per-function
     after GVN (addresses already congruent); `OptConfig.load_elim` toggle (default on). Tests
     (`tests/load_elim.rs`): sequential + diamond-join forwarding, a between-store that must block it
-    (checked at `addr==other` where a missed clobber would miscompile), and an adversarial loop with a
-    per-iteration store that must **not** be eliminated; the whole pipeline (18-case randomized
+    (checked at `addr==other` where a missed clobber would miscompile), an adversarial loop with a
+    per-iteration store that must **not** be eliminated, and the alias-precision boundary — a
+    disjoint-offset store in an arm still forwards, an overlapping-offset store blocks it; the whole
+    pipeline (18-case randomized
     differential, 46 peval differentials, `opt_sccp` fuzz) exercises it. **Next:** loop-invariant load
     hoisting and an opt-in scratch-region contract for dead-store elimination (DSE needs a
     private-region guarantee to stay sound under shared-memory threads).
@@ -319,9 +326,12 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   size **and** make the interpreter slightly slower (removing them was 0.94–0.97×). Gate hoisting on a
   cheap benefit estimate (invariant op count / loop-body share) so a pass only fires when it pays.
   Until then the passes are a net loss on hoist-free loops.
-- [ ] **Broaden the ablation corpus.** SCCP and jump-threading barely move on the current corpus
-  (their speed effect is ~0 there). Add branch-heavy / constant-propagation-heavy shapes and more
-  realistic residuals so each pass has a case that actually exercises its run-time win.
+- [x] **Broaden the ablation corpus + measure the full pass set.** The harness now leaves out **all
+  eleven** togglable passes (was six) and adds two cases so the Phase-3/4 passes have a shape that
+  exercises them: a **memory** case (a redundant same-address load for `mem`, a diamond-join reload
+  for `load_elim`) and an **interproc** case (a constant `call_indirect` → `devirt` → `inline` → `dfe`,
+  nearly halving the module). `OPT_BENCH.md` regenerated; the interprocedural passes turn out to be the
+  biggest *size* wins in the corpus. (Still open: more branch/const-prop-heavy shapes to sharpen SCCP.)
 - [ ] **Multi-run statistics in the harness.** Single-run numbers show visible variance (one JIT row
   read 2× its neighbors). Report medians + spread over several runs before treating any delta as load-
   bearing.

@@ -1849,7 +1849,7 @@ pub(crate) fn store_forward_load_op(op: StoreOp) -> Option<LoadOp> {
 }
 
 /// The number of bytes a store op writes (the low bytes of the value).
-fn store_width(op: StoreOp) -> u64 {
+pub(crate) fn store_width(op: StoreOp) -> u64 {
     match op {
         StoreOp::I32 | StoreOp::F32 | StoreOp::I64_32 => 4,
         StoreOp::I64 | StoreOp::F64 => 8,
@@ -1877,7 +1877,7 @@ fn key_width(op_key: u8) -> u64 {
 
 /// Whether two byte ranges `[o1, o1+w1)` and `[o2, o2+w2)` are disjoint. Saturating arithmetic makes a
 /// (pathological, giant-offset) overflow read as *not disjoint* — the conservative, sound direction.
-fn ranges_disjoint(o1: u64, w1: u64, o2: u64, w2: u64) -> bool {
+pub(crate) fn ranges_disjoint(o1: u64, w1: u64, o2: u64, w2: u64) -> bool {
     o1.saturating_add(w1) <= o2 || o2.saturating_add(w2) <= o1
 }
 

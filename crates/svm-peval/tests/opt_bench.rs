@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use svm_interp::Value;
 use svm_ir::{
-    BinOp, Block, CmpOp, Data, Func, Inst, IntTy, LoadOp, Memory, Module, Terminator, ValType,
-    DEFAULT_RESERVED_LOG2,
+    BinOp, Block, CmpOp, Data, Func, FuncType, Inst, IntTy, LoadOp, Memory, Module, Terminator,
+    ValType, DEFAULT_RESERVED_LOG2,
 };
 use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
 use svm_peval::{optimize_module_with, specialize, OptConfig, SpecArg};
@@ -88,6 +88,17 @@ fn leave_one_out() -> Vec<(&'static str, OptConfig)> {
                 ..a
             },
         ),
+        ("devirt", OptConfig { devirt: false, ..a }),
+        ("inline", OptConfig { inline: false, ..a }),
+        ("dfe", OptConfig { dfe: false, ..a }),
+        ("mem", OptConfig { mem: false, ..a }),
+        (
+            "load_elim",
+            OptConfig {
+                load_elim: false,
+                ..a
+            },
+        ),
     ]
 }
 
@@ -110,6 +121,9 @@ struct Case {
 
 fn i32s(xs: &[i32]) -> Vec<Value> {
     xs.iter().map(|&x| Value::I32(x)).collect()
+}
+fn i64s(xs: &[i64]) -> Vec<Value> {
+    xs.iter().map(|&x| Value::I64(x)).collect()
 }
 
 fn bin32(op: BinOp, a: u32, b: u32) -> Inst {
@@ -476,6 +490,147 @@ fn module1(f: Func, memory: Option<Memory>) -> Module {
     }
 }
 
+/// A memory-access shape that exercises the Phase-4 passes: a redundant same-address load
+/// (intra-block `mem`) in the head, and a **join reload** across a diamond that only `load_elim` can
+/// remove (a multi-predecessor block cannot be merged, so intra-block forwarding never sees it).
+///   b0(p,sel): a = mem[p+0]; b = mem[p+0]; br_if sel -> b1(p, a+b) else b2(p, a+b)   // b redundant → mem
+///   b1/b2: pass (p, s) through to b3
+///   b3(p3, s): d = mem[p3+0]; return s + d                                            // d → load_elim
+fn mem_case() -> Module {
+    let ld = |addr: u32, off: u64| Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset: off,
+        align: 0,
+    };
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let thru = |t: u32| Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![],
+        term: Terminator::Br {
+            target: t,
+            args: vec![0, 1],
+        },
+    };
+    let f = Func {
+        params: vec![ValType::I64, ValType::I32], // p, sel
+        results: vec![ValType::I64],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I64, ValType::I32], // v0=p, v1=sel
+                insts: vec![
+                    ld(0, 0),  // v2 = mem[p+0]
+                    ld(0, 0),  // v3 = mem[p+0]  (redundant → mem)
+                    add(2, 3), // v4 = a + b
+                ],
+                term: Terminator::BrIf {
+                    cond: 1,
+                    then_blk: 1,
+                    then_args: vec![0, 4],
+                    else_blk: 2,
+                    else_args: vec![0, 4],
+                },
+            },
+            thru(3), // b1 -> b3
+            thru(3), // b2 -> b3
+            Block {
+                params: vec![ValType::I64, ValType::I64], // p3, s
+                insts: vec![
+                    ld(0, 0),  // v2 = mem[p3+0]  (join reload → load_elim)
+                    add(1, 2), // v3 = s + d
+                ],
+                term: Terminator::Return(vec![3]),
+            },
+        ],
+    };
+    Module {
+        funcs: vec![f],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: false,
+            bytes: 5i64.to_le_bytes().to_vec(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// An interprocedural shape: the entry `call_indirect`s a constant funcref, so **devirt** turns it
+/// into a direct call, **inline** splices the small leaf in, and **dfe** then removes both the leaf
+/// and an unused third function.
+///   f0(a,b): call_indirect(ref.func(1), [a,b])       // -> devirt -> inline
+///   f1(a,b): a*3 + b*5 + 7                            // leaf (inlined, then dead)
+///   f2(a,b): dead (uncalled)
+fn interproc_case() -> Module {
+    let mul = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a,
+        b,
+    };
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let sig = FuncType {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+    };
+    let entry = Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64, ValType::I64],
+            insts: vec![
+                Inst::RefFunc { func: 1 }, // v2 = funcref(1)
+                Inst::CallIndirect {
+                    ty: sig,
+                    idx: 2,
+                    args: vec![0, 1],
+                }, // v3
+            ],
+            term: Terminator::Return(vec![3]),
+        }],
+    };
+    let leaf = Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64, ValType::I64],
+            insts: vec![
+                Inst::ConstI64(3),
+                mul(0, 2), // a*3
+                Inst::ConstI64(5),
+                mul(1, 4), // b*5
+                add(3, 5),
+                Inst::ConstI64(7),
+                add(6, 7), // a*3 + b*5 + 7
+            ],
+            term: Terminator::Return(vec![8]),
+        }],
+    };
+    let dead = Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64, ValType::I64],
+            insts: vec![add(0, 1)],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    Module {
+        funcs: vec![entry, leaf, dead],
+        ..Default::default()
+    }
+}
+
 fn corpus() -> Vec<Case> {
     vec![
         Case {
@@ -506,6 +661,19 @@ fn corpus() -> Vec<Case> {
             name: "correlated branch",
             module: correlated_branch(),
             args: vec![i32s(&[-3]), i32s(&[4]), i32s(&[5]), i32s(&[100])],
+        },
+        Case {
+            name: "memory (mem + load_elim)",
+            module: mem_case(),
+            args: vec![
+                vec![Value::I64(0), Value::I32(1)],
+                vec![Value::I64(0), Value::I32(0)],
+            ],
+        },
+        Case {
+            name: "interproc (devirt+inline+dfe)",
+            module: interproc_case(),
+            args: vec![i64s(&[3, 4]), i64s(&[-2, 7]), i64s(&[10, 10])],
         },
     ]
 }
