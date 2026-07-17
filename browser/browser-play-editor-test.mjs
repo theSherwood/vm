@@ -130,6 +130,18 @@ try {
     ? ok(`wasm-JIT toggle on ${jitCards.length} demos (reactors + hello/Lua/SQLite modules)`)
     : fail(`jit cards: ${JSON.stringify(jitCards)}`);
 
+  // The hello module card runs end-to-end via runModule (JIT toggle default-on): this exercises the
+  // streamed module fetch (download-progress path) and the single-shot module JIT in CI, since
+  // hello_c.svmb is committed. Runs before the module parity check so the asset streams fresh (uncached).
+  await runCard(page, 'hello (C → SVM)');
+  const helloMod = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    stdout: document.querySelector(`${sel} .stdout`).textContent,
+  }), card('hello (C → SVM)'));
+  helloMod.state === 'done' && helloMod.stdout.length > 0
+    ? ok(`hello module ran end-to-end (${JSON.stringify(helloMod.stdout.trim().slice(0, 20))})`)
+    : fail(`hello module run: ${JSON.stringify(helloMod)}`);
+
   // Prove interp ≡ JIT on the bounce reactor (committed asset, fast) — framebuffer byte-identical.
   await page.click(`${card('bounce (interactive — arrow keys)')} .prove`);
   await page.waitForFunction(
@@ -153,6 +165,16 @@ try {
     ? ok(`module parity proven in-page: ${modParity}`)
     : fail(`module parity: ${modParity}`);
 
+  // Touch dpad: every reactor card carries an on-screen dpad (4 arrows + fire/use/enter/esc) so the
+  // interactive guests are playable without a physical keyboard. Structural check (CSS gates visibility
+  // to touch/narrow screens); pressing a key while no reactor runs is a guarded no-op.
+  const dpad = await page.evaluate((sel) => {
+    const d = document.querySelector(`${sel} .dpad`);
+    return { present: !!d, keys: d ? d.querySelectorAll('.dkey').length : 0 };
+  }, card('bounce (interactive — arrow keys)'));
+  dpad.present && dpad.keys === 8
+    ? ok(`touch dpad on reactor cards (${dpad.keys} keys)`) : fail(`dpad: ${JSON.stringify(dpad)}`);
+
   // The Vim toggle engages the Vim keymap on the editors (registered + editor holds vim state).
   await page.check('#vim');
   const vim = await page.evaluate((sel) => {
@@ -160,6 +182,66 @@ try {
     return { opt: cm?.getOption('keyMap'), state: !!cm?.state?.vim };
   }, card('hello'));
   vim.opt === 'vim' && vim.state ? ok('vim mode engaged') : fail(`vim: ${JSON.stringify(vim)}`);
+
+  // Phase 4: an edit persists under the card slug and survives a reload; Reset restores the default and
+  // clears storage; a Share permalink round-trips the editor contents through the URL hash.
+  const sel = card('hello');
+  const setCM = (s, v) => page.evaluate(([s, v]) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue(v), [s, v]);
+  const getCM = (s) => page.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.getValue(), s);
+  const waitReady = () => page.waitForFunction(
+    () => document.getElementById('engine-state').dataset.state === 'ready', { timeout: 30_000 });
+
+  await setCM(sel, 'PERSIST_SENTINEL');
+  const saved = await page.evaluate(() => localStorage.getItem('svm-play:src:hello'));
+  saved === 'PERSIST_SENTINEL' ? ok('edit persisted to localStorage') : fail(`persist: ${saved}`);
+  await page.reload({ waitUntil: 'load' });
+  await waitReady();
+  (await getCM(sel)) === 'PERSIST_SENTINEL'
+    ? ok('editor restored from localStorage after reload') : fail('editor not restored after reload');
+  await page.click(`${sel} .reset`);
+  const afterReset = await page.evaluate((s) => ({
+    val: document.querySelector(`${s} .CodeMirror`).CodeMirror.getValue(),
+    stored: localStorage.getItem('svm-play:src:hello'),
+  }), sel);
+  (afterReset.val !== 'PERSIST_SENTINEL' && afterReset.val.includes('cap.call') && afterReset.stored === null)
+    ? ok('Reset restores the default source and clears storage')
+    : fail(`reset: ${JSON.stringify({ v: afterReset.val.slice(0, 30), s: afterReset.stored })}`);
+
+  // Share: the button emits a permalink; navigating to it (with storage cleared) restores the source
+  // purely from the `#demo=…&src=…` hash.
+  await setCM(sel, 'SHARED_ROUNDTRIP_42');
+  await page.click(`${sel} .share`);
+  await page.waitForFunction((s) => /#demo=/.test(document.querySelector(`${s} .log`).textContent), sel, { timeout: 5_000 });
+  const shareURL = await page.evaluate((s) => {
+    const m = document.querySelector(`${s} .log`).textContent.match(/https?:\/\/\S+#demo=\S+/);
+    return m ? m[0] : null;
+  }, sel);
+  if (shareURL && shareURL.includes('demo=hello')) {
+    await page.evaluate(() => localStorage.removeItem('svm-play:src:hello')); // prove the hash, not storage
+    await page.goto(shareURL, { waitUntil: 'load' });
+    await waitReady();
+    (await getCM(sel)) === 'SHARED_ROUNDTRIP_42'
+      ? ok('share permalink round-trips the editor via the URL hash') : fail('share permalink did not restore');
+  } else {
+    fail(`share URL not emitted: ${shareURL}`);
+  }
+
+  // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.
+  await page.selectOption('#theme', 'dark');
+  const themed = await page.evaluate(() => ({
+    attr: document.documentElement.dataset.theme,
+    stored: localStorage.getItem('svm-play:theme'),
+  }));
+  themed.attr === 'dark' && themed.stored === 'dark'
+    ? ok('theme picker forces + persists dark') : fail(`theme: ${JSON.stringify(themed)}`);
+  await page.reload({ waitUntil: 'load' });
+  await waitReady();
+  const themeAfter = await page.evaluate(() => ({
+    attr: document.documentElement.dataset.theme,
+    sel: document.getElementById('theme').value,
+  }));
+  themeAfter.attr === 'dark' && themeAfter.sel === 'dark'
+    ? ok('theme preference survives a reload (no flash — set in <head>)') : fail(`theme reload: ${JSON.stringify(themeAfter)}`);
 } finally {
   await browser.close();
   server.close();

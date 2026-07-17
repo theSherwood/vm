@@ -2,6 +2,22 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!-- Resolve the theme before first paint (no flash): the stored preference is auto|light|dark;
+         `auto` follows the OS. Everything downstream keys off the resolved `data-theme` on <html>, so
+         the CSS needs only a single dark override (no media-query duplication). play.js reads the same
+         preference to seed the sidebar's theme picker and re-resolves `auto` on OS changes. -->
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem('svm-play:theme') || 'auto';
+          var dark = pref === 'dark' || (pref === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (e) {
+          document.documentElement.dataset.theme =
+            matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+      })();
+    </script>
     <!-- Re-adds COOP/COEP on static hosts (GitHub Pages) so the page is cross-origin isolated and
          SharedArrayBuffer is available. Must run before the module scripts. No-op locally (serve.mjs
          already sets the headers). Sibling to this file, so its SW scope covers everything under web/;
@@ -14,12 +30,12 @@
         --border: #e2e6ec; --surface: #f7f8fa; --accent: #2f57d6; --accent-soft: #eef1fb;
         --good: #1a7f37; --bad: #b00020;
       }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #111417; --fg: #dfe3e8; --muted: #9aa4b2; --faint: #6f7a89;
-          --border: #262c34; --surface: #1a1e23; --accent: #7c8cff; --accent-soft: #1b2340;
-          --good: #4cc585; --bad: #ff6b81;
-        }
+      /* Dark palette — applied whenever <html data-theme="dark"> (the head script resolves `auto`
+         against the OS, and the sidebar picker can force it either way). */
+      :root[data-theme="dark"] {
+        --bg: #111417; --fg: #dfe3e8; --muted: #9aa4b2; --faint: #6f7a89;
+        --border: #262c34; --surface: #1a1e23; --accent: #7c8cff; --accent-soft: #1b2340;
+        --good: #4cc585; --bad: #ff6b81;
       }
       * { box-sizing: border-box; }
       body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -79,6 +95,12 @@
                       background: #000; border: 1px solid var(--border); border-radius: 6px; }
       canvas.gpucanvas { image-rendering: auto; width: 100%; max-width: 40rem; height: auto;
                          background: #000; border: 1px solid var(--border); border-radius: 6px; }
+      /* On-screen dpad for the interactive reactors — shown on touch / narrow screens (where there's no
+         physical keyboard); the same key events the physical arrows dispatch through the keyboard cap. */
+      .dpad { display: none; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.6rem; }
+      .dpad .dkey { min-width: 2.6rem; padding: 0.5rem 0.55rem; touch-action: none; user-select: none;
+                    font-variant-numeric: tabular-nums; }
+      @media (hover: none), (max-width: 48rem) { .dpad { display: flex; } }
       @media (max-width: 48rem) {
         .layout { flex-direction: column; }
         .sidebar { position: static; max-height: none; flex-basis: auto; width: 100%; }
@@ -116,28 +138,25 @@
       .cm-s-default .cm-variable-2 { color: #0550ae; }
       .cm-s-default .cm-number { color: #1a7f37; }
       .cm-s-default .cm-operator { color: #6a737d; }
-      @media (prefers-color-scheme: dark) {
-        .CodeMirror {
-          border-color: #333; background: #1d1d1d; color: #ddd;
-        }
-        .CodeMirror-gutters { background: #1a1a1a; border-color: #333; }
-        .CodeMirror-linenumber { color: #666; }
-        .CodeMirror-cursor { border-left-color: #ddd; }
-        .CodeMirror-selected { background: #33415580 !important; }
-        .cm-s-default .cm-comment { color: #8b949e; }
-        .cm-s-default .cm-string { color: #ff7b72; }
-        .cm-s-default .cm-keyword { color: #79c0ff; }
-        .cm-s-default .cm-builtin { color: #d2a8ff; }
-        .cm-s-default .cm-type { color: #56d4c4; }
-        .cm-s-default .cm-def { color: #ffa657; }
-        .cm-s-default .cm-variable-2 { color: #a5d6ff; }
-        .cm-s-default .cm-number { color: #7ee787; }
-        .cm-s-default .cm-operator { color: #8b949e; }
-        .CodeMirror-dialog { background: #1d1d1d; color: #ddd; }
-        .cm-error-line { background: #3a1d20; }
-        .cm-error-marker { color: #ff7b72; }
-        .cm-error-widget { background: #2d1417; color: #ffb4ac; border-left-color: #f85149; }
-      }
+      /* CodeMirror dark theme — gated on the resolved data-theme (same rules, attribute-prefixed). */
+      :root[data-theme="dark"] .CodeMirror { border-color: #333; background: #1d1d1d; color: #ddd; }
+      :root[data-theme="dark"] .CodeMirror-gutters { background: #1a1a1a; border-color: #333; }
+      :root[data-theme="dark"] .CodeMirror-linenumber { color: #666; }
+      :root[data-theme="dark"] .CodeMirror-cursor { border-left-color: #ddd; }
+      :root[data-theme="dark"] .CodeMirror-selected { background: #33415580 !important; }
+      :root[data-theme="dark"] .cm-s-default .cm-comment { color: #8b949e; }
+      :root[data-theme="dark"] .cm-s-default .cm-string { color: #ff7b72; }
+      :root[data-theme="dark"] .cm-s-default .cm-keyword { color: #79c0ff; }
+      :root[data-theme="dark"] .cm-s-default .cm-builtin { color: #d2a8ff; }
+      :root[data-theme="dark"] .cm-s-default .cm-type { color: #56d4c4; }
+      :root[data-theme="dark"] .cm-s-default .cm-def { color: #ffa657; }
+      :root[data-theme="dark"] .cm-s-default .cm-variable-2 { color: #a5d6ff; }
+      :root[data-theme="dark"] .cm-s-default .cm-number { color: #7ee787; }
+      :root[data-theme="dark"] .cm-s-default .cm-operator { color: #8b949e; }
+      :root[data-theme="dark"] .CodeMirror-dialog { background: #1d1d1d; color: #ddd; }
+      :root[data-theme="dark"] .cm-error-line { background: #3a1d20; }
+      :root[data-theme="dark"] .cm-error-marker { color: #ff7b72; }
+      :root[data-theme="dark"] .cm-error-widget { background: #2d1417; color: #ffb4ac; border-left-color: #f85149; }
     </style>
   </head>
   <body>
@@ -151,6 +170,14 @@
         <div id="nav-list"></div>
         <label class="vim-toggle" title="Vim keybindings in every editor">
           <input type="checkbox" id="vim"> vim mode
+        </label>
+        <label class="vim-toggle" title="Page theme (auto follows your OS)">
+          theme
+          <select id="theme">
+            <option value="auto">auto</option>
+            <option value="light">light</option>
+            <option value="dark">dark</option>
+          </select>
         </label>
       </nav>
       <!-- One <section class="demo"> per example is built here by play.js; each carries its own editor,

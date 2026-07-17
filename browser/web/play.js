@@ -499,17 +499,48 @@ const setEngineState = (state, text) => { const e = $('engine-state'); e.dataset
 
 // Fetched `.svmb` bytes, cached (a 6 MB SQLite module is worth not re-downloading on every Run).
 const moduleCache = new Map();
-async function fetchModule(url) {
+async function fetchModule(url, onProgress) {
   if (moduleCache.has(url)) return moduleCache.get(url);
   // Resolve module URLs relative to this script (not the document), so they work under any base path
   // (origin root locally, `/<repo>/` on GitHub Pages).
   const resolved = new URL(url, import.meta.url);
   const r = await fetch(resolved);
   if (!r.ok) throw new Error(`fetch ${url}: ${r.status}`);
+  // Stream the body so the big downloads (SQLite ~6 MB, Postgres ~20 MB module + ~40 MB image) show
+  // progress instead of a silent stall. Falls back to a one-shot read when there's no reader (or no
+  // caller watching): Content-Length gives the percent, absent ⇒ a running byte count.
+  if (onProgress && r.body && r.body.getReader) {
+    const total = Number(r.headers.get('content-length')) || 0;
+    const reader = r.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      onProgress(received, total);
+    }
+    const bytes = new Uint8Array(received);
+    let off = 0;
+    for (const ch of chunks) { bytes.set(ch, off); off += ch.length; }
+    moduleCache.set(url, bytes);
+    return bytes;
+  }
   const bytes = new Uint8Array(await r.arrayBuffer());
   moduleCache.set(url, bytes);
   return bytes;
 }
+
+// A download-progress callback that reports into a card's status line. `label` is the file being
+// fetched; `total` of 0 (no Content-Length) shows a running byte count instead of a percentage.
+const fmtMB = (n) => (n / (1 << 20)).toFixed(1);
+const onFetchProgress = (c, label) => (received, total) => {
+  const pct = total ? ` ${Math.floor((received / total) * 100)}%` : '';
+  const of = total ? ` (${fmtMB(received)}/${fmtMB(total)} MB)` : ` (${fmtMB(received)} MB)`;
+  setState(c, 'running', `downloading ${label}…${pct}${of}`);
+};
+const baseName = (url) => url.split('/').pop();
 
 // Blit the framebuffer the last run presented (via the `display` capability) to this card's canvas.
 // w/h of 0 ⇒ no frame: hide the canvas. Copies the RGBA out of wasm memory into a fresh
@@ -568,7 +599,7 @@ async function runModule(c) {
   const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
   let bytes;
   try {
-    bytes = await fetchModule(ex.url);
+    bytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     logTo(c, `fetch failed: ${e.message}`);
@@ -628,7 +659,10 @@ async function runPg(c) {
   c.el.canvas.hidden = true;
   let modBytes, imgBytes;
   try {
-    [modBytes, imgBytes] = await Promise.all([fetchModule(ex.url), fetchModule(ex.image)]);
+    // Sequential (not Promise.all) so the two large downloads report progress one at a time into the
+    // shared status line instead of racing over it.
+    modBytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+    imgBytes = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
     logTo(c, `fetch failed: ${e.message}`);
@@ -683,6 +717,15 @@ let reactorRAF = null; // the pending requestAnimationFrame id while a reactor l
 let jitReactor = null; // the wasm-JIT reactor driver while a JIT loop runs (else null → interpreter)
 let activeReactorCard = null;
 
+// Feed one key event to the running reactor guest through the `keyboard` capability (JS keyCode +
+// pressed flag). Shared by the physical-keyboard handler and the on-screen touch dpad; a no-op when no
+// reactor loop is running, and routed to whichever tier (interpreter / wasm-JIT) is live.
+function sendReactorKey(keyCode, pressed) {
+  if (reactorRAF === null) return;
+  if (jitReactor) eng.ex.svm_onramp_jit_key(keyCode, pressed);
+  else eng.ex.svm_onramp_key(keyCode, pressed);
+}
+
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
 function stopReactor() {
   teardownWebGPU(); // drop any GPU device + the servicer (no-op for non-webgpu reactors)
@@ -712,7 +755,7 @@ async function runReactor(c) {
   const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
   let bytes;
   try {
-    bytes = await fetchModule(ex.url);
+    bytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     return;
@@ -740,7 +783,7 @@ async function runReactor(c) {
   let wad = null;
   if (ex.wad) {
     try {
-      wad = await fetchModule(ex.wad);
+      wad = await fetchModule(ex.wad, onFetchProgress(c, baseName(ex.wad)));
     } catch (e) {
       setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the WAD`);
       return;
@@ -1090,6 +1133,70 @@ function stopDemo(c) {
 const slug = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 
+// ---- editor state: persistence + shareable permalinks --------------------------------------------
+// Each editable card's source is persisted under its slug so edits survive a reload; "Reset" restores
+// the demo's default and drops the saved copy. localStorage is best-effort — a private-mode/quota
+// error must never break the page, so every access is guarded.
+const STORE_PREFIX = 'svm-play:src:';
+const loadSaved = (id) => { try { return localStorage.getItem(STORE_PREFIX + id); } catch { return null; } };
+const saveSrc = (id, value, dflt) => {
+  try {
+    if (value === dflt) localStorage.removeItem(STORE_PREFIX + id); // back to default ⇒ forget it
+    else localStorage.setItem(STORE_PREFIX + id, value);
+  } catch { /* private mode / quota — persistence is best-effort */ }
+};
+const clearSaved = (id) => { try { localStorage.removeItem(STORE_PREFIX + id); } catch { /* ignore */ } };
+
+// URL-safe base64 of a UTF-8 string (for the `#src=` permalink payload). Byte-by-byte, not a spread,
+// so a large source can't blow the call stack.
+function toB64Url(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function fromB64Url(b64) {
+  const bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+// Build a link that reproduces a card's current editor contents: `…/play.html#demo=<slug>&src=<b64url>`.
+const buildShareURL = (id, src) =>
+  `${location.origin}${location.pathname}#${new URLSearchParams({ demo: id, src: toB64Url(src) }).toString()}`;
+
+// Copy a permalink for this card to the clipboard (falling back to the address bar if the clipboard is
+// blocked — e.g. an insecure context or a denied permission).
+async function shareCard(c) {
+  const url = buildShareURL(c.id, c.editor.getValue());
+  try {
+    await navigator.clipboard.writeText(url);
+    setState(c, 'done', 'link copied to clipboard');
+  } catch {
+    location.hash = url.slice(url.indexOf('#') + 1);
+    setState(c, 'done', 'link in the address bar — copy it');
+  }
+  logTo(c, url);
+}
+
+// Apply a shared editor state from the URL hash (`#demo=<slug>&src=<b64url>`) once at startup: seed the
+// target card's editor and scroll it into view. A bare `#demo=<slug>` (no src) just scrolls to it.
+function applyHash() {
+  if (!location.hash) return;
+  let params;
+  try { params = new URLSearchParams(location.hash.slice(1)); } catch { return; }
+  const id = params.get('demo');
+  if (!id) return;
+  const c = cards.find((card) => card.id === id);
+  if (!c) return;
+  const src = params.get('src');
+  if (src != null && c.editor) {
+    try { c.editor.setValue(fromB64Url(src)); } catch { /* malformed payload — leave the default */ }
+  }
+  c.el.section.scrollIntoView({ block: 'start' });
+}
+
 const POWERBOX_MODES = [
   ['plain', 'none (compute only)'],
   ['io', 'host I/O (stdout)'],
@@ -1098,8 +1205,9 @@ const POWERBOX_MODES = [
 ];
 
 function buildCard(name, ex) {
+  const id = slug(name);
   const section = el('section', 'demo');
-  section.id = 'demo-' + slug(name);
+  section.id = 'demo-' + id;
   section.dataset.demo = name; // stable hook for tests
   section.append(el('h2', 'demo-title', name));
   section.append(el('p', 'desc', ex.desc || ''));
@@ -1107,14 +1215,19 @@ function buildCard(name, ex) {
   // SVM text (no `kind`) and editable modules (Lua/SQL/Postgres) get an editor; a fixed C guest or a
   // reactor gets a lightweight read-only note (its "source" is a pre-built binary).
   const editable = !ex.kind || !!ex.editable;
+  const dflt = ex.src || '';
   let editor = null;
   if (editable) {
     const ta = el('textarea');
-    ta.value = ex.src || '';
+    ta.value = dflt;
     const wrap = el('div', 'editor');
     wrap.appendChild(ta);
     section.appendChild(wrap);
     editor = createEditor(ta, ex.lang || 'svm');
+    // Restore a previously edited source, then persist every edit under this card's slug.
+    const saved = loadSaved(id);
+    if (saved != null && saved !== dflt) editor.setValue(saved);
+    editor.onChange(() => saveSrc(id, editor.getValue(), dflt));
   } else {
     section.appendChild(el('pre', 'note',
       ex.kind === 'reactor'
@@ -1141,6 +1254,16 @@ function buildCard(name, ex) {
   const stopBtn = el('button', 'stop', 'Stop');
   stopBtn.disabled = true;
   controls.append(runBtn, stopBtn);
+  // Editable cards get Reset (restore the demo's default source) + Share (copy a permalink of the
+  // current editor contents). A fixed/reactor card has no editable source, so neither applies.
+  let resetBtn = null, shareBtn = null;
+  if (editable) {
+    resetBtn = el('button', 'reset', 'Reset');
+    resetBtn.title = 'Restore this demo’s original source';
+    shareBtn = el('button', 'share', 'Share');
+    shareBtn.title = 'Copy a link that reproduces the current editor contents';
+    controls.append(resetBtn, shareBtn);
+  }
   let jit = null;
   let proveBtn = null;
   if (ex.jit) {
@@ -1181,13 +1304,40 @@ function buildCard(name, ex) {
     el('strong', null, 'stdout'), stdout, el('strong', null, 'log'), logEl);
   section.appendChild(out);
 
+  // On-screen dpad for the interactive reactors: arrows steer, plus the action keys Doom's menus/play
+  // use. Only rendered for reactor cards; CSS shows it on touch / narrow screens. Each button dispatches
+  // the same keyboard-cap event as the physical key (pressed on pointerdown, released on up/leave).
+  if (ex.kind === 'reactor') {
+    const pad = el('div', 'dpad');
+    // [label, JS keyCode] — arrows (37/38/40/39), fire (Ctrl 17), use (Space 32), enter (13), esc (27).
+    for (const [label, code] of [['←', 37], ['↑', 38], ['↓', 40], ['→', 39], ['fire', 17], ['use', 32], ['↵', 13], ['esc', 27]]) {
+      const b = el('button', 'dkey', label);
+      b.type = 'button';
+      b.dataset.key = String(code);
+      const press = (down) => (ev) => { ev.preventDefault(); sendReactorKey(code, down ? 1 : 0); };
+      b.addEventListener('pointerdown', press(true));
+      b.addEventListener('pointerup', press(false));
+      b.addEventListener('pointerleave', press(false));
+      b.addEventListener('pointercancel', press(false));
+      pad.appendChild(b);
+    }
+    section.appendChild(pad);
+  }
+
   const c = {
-    name, ex, editor,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, prove: proveBtn },
+    name, ex, editor, id,
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, prove: proveBtn, reset: resetBtn, share: shareBtn },
   };
   runBtn.addEventListener('click', () => runDemo(c));
   stopBtn.addEventListener('click', () => stopDemo(c));
   if (proveBtn) proveBtn.addEventListener('click', () => (c.ex.kind === 'module' ? proveModuleParity : proveParity)(c));
+  if (resetBtn) resetBtn.addEventListener('click', () => {
+    editor.setValue(dflt);
+    clearSaved(id);
+    editor.clearError();
+    setState(c, 'ready', 'reset to the original source');
+  });
+  if (shareBtn) shareBtn.addEventListener('click', () => shareCard(c));
   return c;
 }
 
@@ -1212,6 +1362,26 @@ function buildSidebar() {
   for (const c of cards) observer.observe(c.el.section);
 }
 
+// Theme picker: the head script already resolved the initial `data-theme` from the stored preference;
+// here we seed the sidebar select and keep it live — persisting the choice and re-resolving `auto`
+// against the OS as it changes.
+function setupTheme() {
+  const sel = $('theme');
+  let stored = 'auto';
+  try { stored = localStorage.getItem('svm-play:theme') || 'auto'; } catch { /* private mode */ }
+  sel.value = stored;
+  const mq = matchMedia('(prefers-color-scheme: dark)');
+  const apply = (pref) => {
+    const dark = pref === 'dark' || (pref === 'auto' && mq.matches);
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  };
+  sel.addEventListener('change', () => {
+    try { localStorage.setItem('svm-play:theme', sel.value); } catch { /* best-effort */ }
+    apply(sel.value);
+  });
+  mq.addEventListener('change', () => { if (sel.value === 'auto') apply('auto'); }); // follow the OS live
+}
+
 async function main() {
   const demosEl = $('demos');
   for (const [name, ex] of Object.entries(EXAMPLES)) {
@@ -1221,6 +1391,8 @@ async function main() {
   }
   buildSidebar();
   refreshAll(); // lay the editors out now they're in the DOM
+  applyHash();  // seed a card's editor from a shared #demo=…&src=… permalink, if present
+  setupTheme();
   $('vim').addEventListener('change', (e) => setVimAll(e.target.checked));
 
   // Forward keys to the running reactor guest through the `keyboard` capability (as JS keyCodes — the
@@ -1233,8 +1405,7 @@ async function main() {
   const SWALLOW = new Set([37, 38, 39, 40, 32, 9]);
   const forward = (pressed) => (e) => {
     if (reactorRAF === null || !REACTOR_KEYS.has(e.keyCode)) return;
-    if (jitReactor) eng.ex.svm_onramp_jit_key(e.keyCode, pressed);
-    else eng.ex.svm_onramp_key(e.keyCode, pressed);
+    sendReactorKey(e.keyCode, pressed);
     const shortcut = (e.ctrlKey || e.metaKey) && e.keyCode !== 17;
     if (SWALLOW.has(e.keyCode) && !shortcut) e.preventDefault();
   };
