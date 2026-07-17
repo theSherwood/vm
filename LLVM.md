@@ -590,6 +590,62 @@ Notes:
   `sin`/`cos`/… are the remaining additions. See the "Transcendentals → a guest `libm`" bullet above.
 - **`argc`/`argv`**: **DONE** — see *Slice BE* below. `envp`/`getenv`: **DONE** — see *Slice BF*.
 
+### ▶ Active target — QuickJS (a full JS engine; the densest breadth proof)
+
+**Status: SPIKE — promoted from the candidate list (§7) to active work.** Bellard's **QuickJS**
+(2024-01-13, MIT) is the strongest self-validating interpreter on the list: NaN-boxing, a bytecode VM
+with **computed-goto** dispatch (`indirectbr`/`blockaddress` — DONE, slices AV+AW), **BigInt** (`libbf`),
+regex (`libregexp`), Unicode tables, and a **test262** runner. "Little is left unproven if it passes."
+It is a **big lift**, tracked as in-progress — the QuickJS analog of the Postgres capstone, not a
+one-slice demo. Reproduction + the full gap inventory live in `crates/svm-run/demos/quickjs/`
+(`qjs_eval.c` + `build_bitcode.sh` + README).
+
+**Spike findings (this session).** A minimal embedding — `JS_NewRuntime`/`JS_NewContext`/`JS_Eval` of a
+fixed JS program (recursion, a `sort` closure, `JSON.stringify`, string methods, `toFixed`), no
+`quickjs-libc` so **zero ambient OS surface** — compiles to a **~1.9 MB linked bitcode** module
+(`quickjs.c` ~55k lines + `libregexp`/`libunicode`/`cutils`/`libbf`). Native oracle output:
+`1,2,3,5,7,8,9 | sumfib=17710 | {"a":1,"b":[true,null,"x"]} | abc | 0.3000`. Pushing the module through
+`cargo run --example try_translate` walks the fail-closed chokepoint; both gap classes are the **same
+shape SQLite/Postgres already solved**:
+1. **Address-taken libm (`js_math_funcs`).** The `Math` object stores raw C funcptrs in a *constant*
+   table (`JS_CFUNC_SPECIAL_DEF("sin", 1, f_f, sin)`), so `&sin`/`&fabs`/`&pow`/… appear in a global
+   initializer. The on-ramp lowers these inline for *direct* calls but has no funcref for an
+   address-taken one → first stop: `Unsupported("constexpr reference to `@fabs`")`. **Fix:** `llvm-link`
+   guest **openlibm** (the existing slice BQ/CO mechanism — a guest def gives each name a funcref). Set:
+   `fabs floor ceil trunc sqrt sin cos tan asin acos atan atan2 exp log log2 log10 expm1 log1p sinh cosh
+   tanh asinh acosh atanh cbrt hypot pow`.
+2. **The libc waist** (after `-DNDEBUG` clears `__assert_fail`) — almost all on-ramp-synthesized or
+   Postgres-shimmed: mem/string (`memchr`/`memcmp`/`strlen`/`strcpy`/…), alloc (`malloc`/`realloc`/`free`/
+   `malloc_usable_size`), the printf family (`printf`/`snprintf`/`vsnprintf`/`fwrite`/…), number
+   parse/format (`__isoc23_strtol`/`strtod`/`lrint`). **New / worth attention:** `fesetround` (FP
+   rounding-mode control — SVM float ops are round-to-nearest; QuickJS toggles it around some
+   conversions), time (`clock_gettime`/`gettimeofday`/`localtime_r`), and `pthread_cond_*`/`pthread_mutex_*`
+   (unused on a single-threaded eval → stubbable), `abort`.
+
+**Progress (this session).** **DONE:** (1) the address-taken-libm link (openlibm + 5 QuickJS extras
+`asinh`/`acosh`/`atanh`/`log1p`/`hypot`); (2) a **translator fix — struct-constant operands**: QuickJS
+returns `JS_EXCEPTION` as a 16-byte `JSValue` struct constant (`ret {i64,i64} {0,6}`), which the `ret`
+path dropped to the scalar operand path and rejected — `agg_fields` now materializes a constant
+aggregate field-wise (test `struct_constant_return`; helps any by-value-aggregate frontend); (3) the
+**libc/stdio waist** — the reused Postgres printf engine (runtime-`va_list` `vsnprintf` family) + the
+correctly-rounded guest `strtod` + a small `demos/quickjs/libc_shim.c` (`fesetround`/`strtol`/`lrint`/
+`abort`/`malloc_usable_size`); the mem/alloc/non-varargs-stdio names are on-ramp-synthesized, not gaps.
+
+**Blocking gaps now (the two walls the spike reached).** (1) **Dynamic `alloca`** — `JS_CallInternal`
+(the bytecode interpreter core) allocates its operand stack with a *runtime-sized* `alloca`; the on-ramp
+lowers only constant-size `alloca` (→ window frame slots). A variable-length `alloca` is a translator
+slice of its own — a runtime data-SP bump + restore on the §3d data-stack. (2) **Directed-rounding dtoa**
+— QuickJS's shortest Number→string (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are
+round-to-nearest only (no rounding-mode op); `toFixed`/`toPrecision` use `FE_TONEAREST` (honored), so the
+current driver is unaffected, but general `String(0.1)` needs a rounding-mode primitive or a
+directed-rounding-free guest dtoa.
+
+**Remaining slice sequence.** (a) **dynamic `alloca`** (the current wall) → the interpreter core
+translates; (b) widen the JS program past `toFixed` + the directed-rounding dtoa follow-up; (c) regex /
+BigInt / `try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH
+dependency); (d) the `run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's
+analog of SQLite's sqllogictest. Harness: `demo_quickjs_eval_vs_native` (`#[ignore]`d at the alloca wall).
+
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
 literal runs are written straight from the format global; each conversion lowers to the synthesized
@@ -2374,7 +2430,9 @@ phases, both worth doing:
   - **Lua** (reference impl) — runs the *official* `testes/` suite; forces **`setjmp`/`longjmp`** +
     computed goto. The cleanest "second SQLite."
   - **QuickJS** (Bellard) — full JS engine with a **test262** runner; extreme density (NaN-boxing,
-    bigint, regex, computed goto). Big lift; little is left unproven if it passes.
+    bigint, regex, computed goto). Big lift; little is left unproven if it passes. **▶ PROMOTED to
+    active work — see "Active target — QuickJS" in the Pending-work section above** (spike done: ~1.9 MB
+    linked bitcode, gap list quantified — address-taken libm + the libc waist, both SQLite/Postgres-shaped).
   - **mal / chibi-scheme / a tiny Forth** — cheap stepping stones to the same control-flow features.
 - **Byte-exact, zero-OS-surface known-answer suites (cheapest high-confidence wins — start here):**
   - **Monocypher** or **fiat-crypto** — modern crypto (ChaCha20/Blake2/X25519/Ed25519) with built-in

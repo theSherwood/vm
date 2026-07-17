@@ -1773,6 +1773,212 @@ fn libm_bundled_vs_native() {
     );
 }
 
+/// Fetch (and cache) Bellard's QuickJS (2024-01-13, MIT) — the full-JS-engine breadth target
+/// (LLVM.md "Active target — QuickJS"). Fetched-not-vendored from the upstream mirror; returns the
+/// extracted dir or `None` (skip) offline. Core set: `quickjs.c` + `libregexp`/`libunicode`/`cutils`/
+/// `libbf`; no inline asm, no generated-at-build headers beyond what ships in the tarball.
+fn fetch_quickjs() -> Option<PathBuf> {
+    const VER: &str = "2024-01-13";
+    let cache = std::env::temp_dir().join("svm_quickjs_cache");
+    let dir = cache.join(format!("quickjs-{VER}"));
+    if dir.join("quickjs.c").exists() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    let txz = cache.join(format!("quickjs-{VER}.tar.xz"));
+    let url = format!("https://bellard.org/quickjs/quickjs-{VER}.tar.xz");
+    let ok = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(&txz)
+        .arg(&url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("note: skipping quickjs (fetch failed — offline?)");
+        return None;
+    }
+    let ok = Command::new("tar")
+        .arg("xf")
+        .arg(&txz)
+        .arg("-C")
+        .arg(&cache)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !dir.join("quickjs.c").exists() {
+        eprintln!("note: skipping quickjs (untar failed)");
+        return None;
+    }
+    Some(dir)
+}
+
+/// The openlibm sources QuickJS's `Math` object takes the address of beyond [`OPENLIBM_SRCS`]
+/// (the Postgres set) — inverse hyperbolics, `log1p`, `hypot`.
+const QUICKJS_OPENLIBM_EXTRA: &[&str] = &["s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot"];
+
+/// **▶ QuickJS eval — the full-JS-engine breadth target (SPIKE, in progress).** Wires the whole
+/// differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the
+/// `demos/quickjs/qjs_eval.c` driver + the guest libm + the libc/stdio shims to bitcode,
+/// `llvm-link` into one module, then translate → verify → run vs a native `cc` oracle. The libc
+/// waist is now shimmed (printf engine + `strtod` + `libc_shim.c`); it is **ignored** because the
+/// interpreter core (`JS_CallInternal`) uses a **dynamic `alloca`** (runtime-sized operand stack)
+/// the on-ramp doesn't yet lower, and general Number→string needs directed-rounding dtoa — see
+/// LLVM.md "Active target — QuickJS" for the live gap list. Run by hand:
+/// `cargo test --test translate demo_quickjs_eval_vs_native -- --ignored --nocapture`.
+#[test]
+#[ignore = "QuickJS spike: blocked on dynamic alloca in JS_CallInternal (translator gap, LLVM.md)"]
+fn demo_quickjs_eval_vs_native() {
+    let (Some(qjs), Some(ol)) = (fetch_quickjs(), fetch_openlibm()) else {
+        return;
+    };
+    let pid = std::process::id();
+    let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/quickjs/qjs_eval.c");
+    let incs = [
+        format!("-I{}", qjs.display()),
+        format!("-I{}", ol.display()),
+        format!("-I{}/include", ol.display()),
+        format!("-I{}/src", ol.display()),
+        format!("-I{}/amd64", ol.display()),
+    ];
+    // On-ramp compile flags: no vectorization (capstone convention), NDEBUG drops `__assert_fail`.
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-c",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-DNDEBUG",
+        "-D_GNU_SOURCE",
+        "-DCONFIG_VERSION=\"2024-01-13\"",
+        "-DASSEMBLER=0",
+    ];
+    // Compile QuickJS TUs + driver + the guest-libm set, each → bitcode.
+    let qjs_tus = ["quickjs", "libregexp", "libunicode", "cutils", "libbf"];
+    let mut bcs: Vec<PathBuf> = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{tag}.bc"));
+        let mut cmd = Command::new("clang");
+        cmd.args(cflags);
+        for i in &incs {
+            cmd.arg(i);
+        }
+        cmd.arg(&src).arg("-o").arg(&out);
+        match cmd.status() {
+            Ok(s) if s.success() => Some(out),
+            _ => None,
+        }
+    };
+    for tu in qjs_tus {
+        match compile(qjs.join(format!("{tu}.c")), tu) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping quickjs (clang failed on {tu})");
+                return;
+            }
+        }
+    }
+    match compile(driver.clone(), "driver") {
+        Some(bc) => bcs.push(bc),
+        None => {
+            eprintln!("note: skipping quickjs (clang failed on driver)");
+            return;
+        }
+    }
+    for name in OPENLIBM_SRCS.iter().chain(QUICKJS_OPENLIBM_EXTRA) {
+        match compile(ol.join("src").join(format!("{name}.c")), name) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping quickjs (clang failed on libm {name})");
+                return;
+            }
+        }
+    }
+    // The guest libc/stdio waist the on-ramp doesn't synthesize: the reused Postgres printf engine
+    // (the runtime-va_list `vsnprintf` family), the correctly-rounded guest `strtod`, and the
+    // QuickJS misc shim (`fesetround`/`strtol`/`abort`/…). The native oracle keeps real libc — the
+    // shims match it byte-for-byte — so they go into the guest link only.
+    let demos = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos");
+    let shims = [
+        (demos.join("postgres/printf_shim.c"), "printf_shim"),
+        (demos.join("strtod/strtod.c"), "strtod"),
+        (demos.join("quickjs/libc_shim.c"), "libc_shim"),
+    ];
+    for (src, tag) in &shims {
+        match compile(src.clone(), tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping quickjs (clang failed on shim {tag})");
+                return;
+            }
+        }
+    }
+    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_linked.bc"));
+    let link_ok = Command::new("llvm-link-18")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .or_else(|_| {
+            Command::new("llvm-link")
+                .args(&bcs)
+                .arg("-o")
+                .arg(&linked)
+                .status()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !link_ok {
+        eprintln!("note: skipping quickjs (llvm-link unavailable)");
+        return;
+    }
+    // Native oracle: the same driver + engine + guest libm, no system `-lm`.
+    let exe = std::env::temp_dir().join(format!("qjsbc_{pid}_native"));
+    let mut cc = Command::new("cc");
+    cc.args([
+        "-O2",
+        "-D_GNU_SOURCE",
+        "-DCONFIG_VERSION=\"2024-01-13\"",
+        "-DASSEMBLER=0",
+    ]);
+    for i in &incs {
+        cc.arg(i);
+    }
+    cc.arg(&driver);
+    for tu in qjs_tus {
+        cc.arg(qjs.join(format!("{tu}.c")));
+    }
+    for name in OPENLIBM_SRCS.iter().chain(QUICKJS_OPENLIBM_EXTRA) {
+        cc.arg(ol.join("src").join(format!("{name}.c")));
+    }
+    cc.arg("-o").arg(&exe);
+    match cc.status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping quickjs (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe).output().expect("run native quickjs");
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native quickjs oracle produced no output"
+    );
+    // Guest: translate → resolve caps → verify → run under the powerbox, diff stdout vs the oracle.
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate quickjs");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify quickjs module");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run quickjs");
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "quickjs: guest {:?} vs native {:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
 /// Like [`check_demo_vs_native`] but threads `extra` clang flags into the **bitcode** compile only
 /// — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
 /// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
@@ -5626,6 +5832,36 @@ fn freeze_of_aggregate() {
         r,
         vec![Value::I32(35)],
         "freeze of {{7,35}} then extractvalue 1 = 35"
+    );
+}
+
+#[test]
+fn struct_constant_return() {
+    // A **struct-constant** return — `ret {i64,i64} {i64 0, i64 6}` — is how QuickJS returns its
+    // `JS_EXCEPTION` sentinel (a 16-byte `JSValue` `{value, tag}` passed by value; tag 6 =
+    // exception). `agg_of` tracks only *local* aggregates, so a constant one dropped to the scalar
+    // `operand` path and was rejected; `agg_fields` now materializes it field-wise, like a struct φ
+    // incoming. A hand-written `.ll` (clang folds the simple C shapes to a `select`) exercises the
+    // constant return, the multi-result `call`, and the caller-side `extractvalue`.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %v = call {i64, i64} @exc()\n  \
+        %t = extractvalue {i64, i64} %v, 1\n  \
+        %r = trunc i64 %t to i32\n  \
+        ret i32 %r\n}\n\
+        define {i64, i64} @exc() {\n\
+        entry:\n  \
+        ret {i64, i64} {i64 0, i64 6}\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate struct-const-return .ll");
+    svm_verify::verify_module(&t.module).expect("verify struct-const-return");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r =
+        svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run struct-const-return");
+    assert_eq!(
+        r,
+        vec![Value::I32(6)],
+        "JS_EXCEPTION-shaped {{0,6}}, field 1 = 6"
     );
 }
 
