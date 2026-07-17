@@ -3237,6 +3237,50 @@ pub struct DebugRun {
     /// Number of ops executed so far — the **logical clock** for reverse debugging (DEBUGGING.md W1).
     /// `seek(t)` reaches a state by replaying a fresh run to this count; `step_back` = `seek(clock-1)`.
     op_clock: u64,
+    /// The IR functions (for looking up the op about to execute, to compute its memory access when a
+    /// watchpoint is armed). `Arc` so `seek`'s replay-rebuild is cheap.
+    funcs: std::sync::Arc<[Func]>,
+    /// Armed window watchpoints (DEBUGGING.md W2): `(addr, len, kind)`. Empty in the common case, so
+    /// the per-op `access_of` computation is skipped entirely. Ids are owned by the caller (the DAP
+    /// backend), which re-applies the set after a `seek` rebuild.
+    watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// Set when [`run_to`](DebugRun::run_to) stopped *before* an op that hits a watchpoint (the access
+    /// hasn't applied yet); taken by the caller to report `StopReason::Watchpoint`.
+    last_watch: Option<(u64, bool)>,
+}
+
+/// The watched range the op at module-0 `(func, block, inst)` would hit, from the live block-local
+/// values — the bytecode counterpart of the tree-walker's `access_of` + `watch_hit`. `None` if the op
+/// accesses no watched range (or its address can't be resolved). A free fn (not a method) so it borrows
+/// only the pieces `run_to` has already split out of `&mut self`.
+#[allow(clippy::too_many_arguments)]
+fn watch_hit_before(
+    vm: &Vm,
+    mem: &Option<Mem>,
+    funcs: &[Func],
+    fn_block_base: &[Vec<u32>],
+    watchpoints: &[(u64, u64, super::WatchKind)],
+    func: FuncIdx,
+    block: usize,
+    inst: usize,
+) -> Option<(u64, bool)> {
+    let ir_inst = funcs
+        .get(func as usize)?
+        .blocks
+        .get(block)?
+        .insts
+        .get(inst)?;
+    let base_off = *fn_block_base.get(func as usize)?.get(block)? as usize;
+    let vals = vm.regs.get(vm.base + base_off..)?;
+    let super::MemAccess::Range { base, width, write } = super::access_of(ir_inst, vals, mem)
+    else {
+        return None;
+    };
+    let end = base.saturating_add(width as u64);
+    watchpoints.iter().find_map(|(addr, len, kind)| {
+        let w_end = addr.saturating_add(*len);
+        (base < w_end && *addr < end && kind.fires_on(write)).then_some((base, write))
+    })
 }
 
 impl DebugRun {
@@ -3282,7 +3326,24 @@ impl DebugRun {
             at_bp: false,
             done: None,
             op_clock: 0,
+            funcs: std::sync::Arc::from(m.funcs.clone()),
+            watchpoints: Vec::new(),
+            last_watch: None,
         })
+    }
+
+    /// Replace the armed **window watchpoints** (DEBUGGING.md W2) — each `(addr, len, kind)` makes
+    /// `run_to` stop *before* any op that accesses `[addr, addr+len)` with a matching read/write kind.
+    /// Caller-owned ids; re-applied by the DAP backend after a `seek` rebuild.
+    pub fn set_watchpoints(&mut self, ranges: Vec<(u64, u64, super::WatchKind)>) {
+        self.watchpoints = ranges;
+    }
+
+    /// Take the `(addr, write)` of the watchpoint the last `run_to` stopped before (cleared by the
+    /// read), so the caller can report `StopReason::Watchpoint`. `None` if the last stop was a plain
+    /// breakpoint / step.
+    pub fn take_watch_hit(&mut self) -> Option<(u64, bool)> {
+        self.last_watch.take()
     }
 
     /// Ops executed so far — the reverse-debugging clock ([`DebugRun::op_clock`]).
@@ -3351,6 +3412,10 @@ impl DebugRun {
             at_bp,
             done,
             op_clock,
+            fn_block_base,
+            funcs,
+            watchpoints,
+            last_watch,
             ..
         } = self;
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
@@ -3378,6 +3443,24 @@ impl DebugRun {
                 if bps.contains(&pc) {
                     *at_bp = true;
                     return Some(pc);
+                }
+                // Watchpoint: stop *before* an op that touches a watched window range (the access
+                // hasn't applied — step once to observe the new bytes). Skipped when none are armed.
+                if !watchpoints.is_empty() && pc.module == 0 {
+                    if let Some(hit) = watch_hit_before(
+                        vm,
+                        &*mem,
+                        funcs,
+                        fn_block_base,
+                        watchpoints,
+                        pc.func,
+                        pc.block,
+                        pc.inst,
+                    ) {
+                        *last_watch = Some(hit);
+                        *at_bp = true;
+                        return Some(pc);
+                    }
                 }
             }
             match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {

@@ -3,17 +3,18 @@
 //! (the reference oracle, full feature set) or the **bytecode VM** the browser playground actually
 //! runs, over `svm_interp::bytecode::DebugRun`.
 //!
-//! The bytecode engine covers breakpoints, stepping, backtrace, scalar/aggregate inspection, and now
-//! **reverse debugging** (`seek`/`step_back`/`reverseContinue`) by deterministic replay: the debug run
-//! is pure compute (single-vCPU, no capabilities), so seeking to an earlier op clock rebuilds a fresh
-//! `DebugRun` and replays to that many ops. Data breakpoints (`set_watchpoint`) and multithreading are
-//! **not yet built on it** — gated off by `supports_watch` so `DapServer` refuses them cleanly rather
-//! than returning a wrong answer. They are *not* delegated to the tree-walker: it is the differential
-//! oracle only (and far too slow to sit on any user-facing path). The direction is to build both
-//! remaining pieces **on the bytecode engine** — watchpoints via a per-op watched-range check in the
-//! debug-stepping loop, multithreading via a deterministic cooperative multi-vCPU *debug scheduler*
-//! (see DEBUGGING.md G3). Correctness is guaranteed by `crates/svm/tests/debug_parity.rs` (engine
-//! level) and `dap_over_bytecode_*` (server level, incl. reverse-vs-tree-walker parity).
+//! The bytecode engine covers breakpoints, stepping, backtrace, scalar/aggregate inspection,
+//! **reverse debugging** (`seek`/`step_back`/`reverseContinue`, by deterministic replay — the debug
+//! run is pure compute, so seeking to an earlier op clock rebuilds a fresh `DebugRun` and replays to
+//! that many ops), and **data breakpoints** (`set_watchpoint` — a per-op check of the effective
+//! address, computed like the interpreter's `access_of`, against the watched ranges; the run stops
+//! *before* an op that touches one). `supports_reverse`/`supports_watch` are both `true`. Only
+//! **multithreading** is not yet built on it (`threads`/`select_task` are single-vCPU stubs) — and it
+//! is *not* delegated to the tree-walker (the differential oracle only, far too slow for any
+//! user-facing path): the direction is a deterministic cooperative multi-vCPU *debug scheduler* on the
+//! bytecode engine (DEBUGGING.md G3). Correctness is guaranteed by `crates/svm/tests/debug_parity.rs`
+//! (engine level) and `dap_over_bytecode_*` (server level, incl. reverse- and watchpoint-vs-tree-walker
+//! parity).
 
 use svm_interp::bytecode::DebugRun;
 use svm_interp::{
@@ -147,6 +148,9 @@ pub struct BytecodeBackend {
     func: FuncIdx,
     args: Vec<Value>,
     breakpoints: Vec<IrPc>,
+    /// Armed watchpoints with backend-owned stable ids (re-applied to the run after a `seek` rebuild).
+    watch_specs: Vec<(WatchId, u64, u64, WatchKind)>,
+    next_watch: u32,
     fuel: u64,
 }
 
@@ -166,8 +170,21 @@ impl BytecodeBackend {
             func,
             args: args.to_vec(),
             breakpoints: Vec::new(),
+            watch_specs: Vec::new(),
+            next_watch: 0,
             fuel,
         })
+    }
+
+    /// Push the current watchpoint ranges into the live `DebugRun` (after arming/clearing one, or
+    /// re-arming a fresh run built by `seek`).
+    fn apply_watches(&mut self) {
+        self.run.set_watchpoints(
+            self.watch_specs
+                .iter()
+                .map(|(_, a, l, k)| (*a, *l, *k))
+                .collect(),
+        );
     }
 
     /// Map a `DebugRun` completion (`run_to`/`step` returned `None`) to a `Stop`: the finished result
@@ -199,10 +216,14 @@ impl Debuggee for BytecodeBackend {
         // seek, so a shared decrementing counter would be inconsistent).
         let mut fuel = self.fuel;
         match self.run.run_to(&self.breakpoints, &mut fuel) {
-            Some(pc) => Stop::Break {
-                reason: StopReason::Breakpoint,
-                pc,
-            },
+            // A stop is a watchpoint hit if the run flagged one before this op, else a breakpoint.
+            Some(pc) => {
+                let reason = match self.run.take_watch_hit() {
+                    Some((addr, write)) => StopReason::Watchpoint { addr, write },
+                    None => StopReason::Breakpoint,
+                };
+                Stop::Break { reason, pc }
+            }
             None => self.finish_stop(),
         }
     }
@@ -271,8 +292,9 @@ impl Debuggee for BytecodeBackend {
         let mut fuel = self.fuel;
         while run.op_clock() < t && run.tick(&mut fuel) {}
         self.run = run;
-        // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
-        // here makes progress instead of immediately re-reporting this stop.
+        self.apply_watches(); // re-arm the watchpoints on the fresh (replayed) run
+                              // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
+                              // here makes progress instead of immediately re-reporting this stop.
         if let Some(pc) = self.run.frame_pc(0) {
             if self.breakpoints.contains(&pc) {
                 self.run.arm_breakpoint_skip();
@@ -290,12 +312,22 @@ impl Debuggee for BytecodeBackend {
         self.breakpoints.retain(|&b| b != pc);
         self.breakpoints.len() != before
     }
-    // No watchpoints on the bytecode engine (gated off) — `None` ⇒ the server reports unverified.
-    fn set_watchpoint(&mut self, _addr: u64, _len: u64, _kind: WatchKind) -> Option<WatchId> {
-        None
+    // Data breakpoints: arm a window watchpoint (a backend-owned stable id, so it survives a `seek`).
+    fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Option<WatchId> {
+        let id = WatchId::from_raw(self.next_watch);
+        self.next_watch += 1;
+        self.watch_specs.push((id, addr, len, kind));
+        self.apply_watches();
+        Some(id)
     }
-    fn clear_watchpoint(&mut self, _id: WatchId) -> bool {
-        false
+    fn clear_watchpoint(&mut self, id: WatchId) -> bool {
+        let before = self.watch_specs.len();
+        self.watch_specs.retain(|(w, ..)| *w != id);
+        let removed = self.watch_specs.len() != before;
+        if removed {
+            self.apply_watches();
+        }
+        removed
     }
     fn backtrace(&self) -> Vec<FrameInfo> {
         let mut out = Vec::new();
@@ -346,6 +378,6 @@ impl Debuggee for BytecodeBackend {
         true
     }
     fn supports_watch(&self) -> bool {
-        false
+        true
     }
 }

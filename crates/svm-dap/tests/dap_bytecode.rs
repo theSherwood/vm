@@ -447,6 +447,110 @@ fn dap_over_bytecode_reverse_matches_the_tree_walker() {
     );
 }
 
+// A program that stores 8 bytes to window address 0 (line 6), for the watchpoint test. Auto debug
+// info makes line 5 (before the store) breakpointable.
+const MEM_STORE: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  a = i64.const 0
+  v = i64.const 42
+  i64.store a v
+  r = i64.load a
+  return r
+}
+"#;
+
+#[test]
+fn dap_over_bytecode_watchpoint_matches_the_tree_walker() {
+    // Arm a write data breakpoint on window [0, 8) and Continue: the debugger stops *before* the store
+    // that touches it (line 6) with reason "data breakpoint" — identically on both engines.
+    fn script(engine: Option<&str>) -> (bool, String, i64) {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut la = vec![
+            ("programText", Json::s(MEM_STORE)),
+            ("function", Json::i(0)),
+        ];
+        if let Some(e) = engine {
+            la.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(la)));
+        // Break on line 5 (the const just before the store), so we're stopped when we arm the watch.
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(6))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+        // Arm a write watchpoint on window [0, 8) directly (dataId = "addr:len").
+        let arm = s.handle(&req(
+            5,
+            "setDataBreakpoints",
+            Json::obj(vec![(
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![
+                    ("dataId", Json::s("0:8")),
+                    ("accessType", Json::s("write")),
+                ])]),
+            )]),
+        ));
+        let verified = arm
+            .iter()
+            .find(|m| m.get("command").and_then(|c| c.as_str()) == Some("setDataBreakpoints"))
+            .and_then(|m| {
+                m.get("body")?
+                    .get("breakpoints")?
+                    .as_array()?
+                    .first()?
+                    .get("verified")
+                    .cloned()
+            })
+            == Some(Json::Bool(true));
+        // Continue → stop before the store's write to [0, 8).
+        let cont = s.handle(&req(6, "continue", Json::obj(vec![])));
+        let reason = event(&cont, "stopped")
+            .and_then(|e| e.get("body")?.get("reason")?.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let out = s.handle(&req(
+            7,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        let line = response(&out)
+            .get("body")
+            .unwrap()
+            .get("stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("line")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        (verified, reason, line)
+    }
+
+    let bytecode = script(Some("bytecode"));
+    assert!(bytecode.0, "the data breakpoint verifies");
+    assert_eq!(bytecode.1, "data breakpoint", "stops for the watchpoint");
+    assert_eq!(
+        bytecode.2, 7,
+        "stops at the store's line (before it writes)"
+    );
+    assert_eq!(
+        bytecode,
+        script(None),
+        "bytecode watchpoint ≡ tree-walker watchpoint"
+    );
+}
+
 #[test]
 fn dap_over_bytecode_step_back_rewinds_one_op() {
     // stepBack re-executes to one op earlier: after two forward steps the op clock advances, and a

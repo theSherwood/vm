@@ -313,6 +313,15 @@ impl WatchKind {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct WatchId(u32);
 
+impl WatchId {
+    /// Mint a `WatchId` from a raw handle — for a backend that owns its own stable ids (the
+    /// DAP-over-bytecode backend, whose watch set is re-applied across `seek` rebuilds, so the ids
+    /// can't come from a per-run counter).
+    pub fn from_raw(n: u32) -> WatchId {
+        WatchId(n)
+    }
+}
+
 /// The outcome of resuming an [`Inspector`] ([`Inspector::run_until_stop`] / [`Inspector::step`]).
 #[derive(Clone, Debug)]
 pub enum Stop {
