@@ -272,13 +272,15 @@ tracked enhancement, not a blocker.
     disjoint offsets** — sound under `svm_mask`'s trap-confinement, where two admitted accesses off one
     base differ by exactly their offset gap (an out-of-range address traps, never wraps to alias), so
     disjoint offset ranges are disjoint bytes (the common struct-field pattern). An atomic / `mem.copy`
-    / call still clobbers the whole map. `OptConfig.mem` toggle (default on). Tests in
+    / call still clobbers the whole map. **`v128` load/store** participate too (keyed by a distinct
+    16-byte discriminator; a `v128.store` forwards to a `v128.load`), with cross-width overlap against
+    scalar cells handled by the same byte-range check. `OptConfig.mem` toggle (default on). Tests in
     `tests/memopt.rs` (forwarded store; redundant load across a pure op; the aliasing `a==b` may-alias
     store that must block forwarding; a disjoint-offset store that must *not*; an overlapping-offset
-    store that must); the peval differential suite + `opt_sccp` fuzz cover the pipeline. **Next:** cross-
-    block load elimination (GVN-style, threading the available value through block params) and an opt-in
-    scratch-region contract for dead-store elimination (DSE needs a private-region guarantee to stay
-    sound under shared-memory threads).
+    store that must; `v128` store→load forwarding); the peval differential suite + `opt_sccp` fuzz
+    cover the pipeline. **Next:** cross-block load elimination (GVN-style, threading the available value
+    through block params) and an opt-in scratch-region contract for dead-store elimination (DSE needs a
+    private-region guarantee to stay sound under shared-memory threads).
 - [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `svm-opt` on a module and JITs the
   result, peval-demo shape); PEVAL_BENCH + Wasmtime-relative numbers with the optimizer on;
   fold the settled design into `DESIGN.md` §20 and retire this doc to a tracker stub.

@@ -7,7 +7,8 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{
-    BinOp, Block, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
+    BinOp, Block, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp,
+    ValType,
 };
 use svm_opt::optimize_module;
 use svm_verify::verify_module;
@@ -261,4 +262,55 @@ fn overlapping_offset_store_blocks_forwarding() {
         2,
         "a store overlapping the loaded bytes must block forwarding"
     );
+}
+
+#[test]
+fn v128_store_forwards_to_loads() {
+    // f(base): mem128[base] = C; x = mem128[base]; y = mem128[base]; return x | y.  Both v128 loads
+    // forward to the stored constant (x|y = C|C = C), so no v128.load survives.
+    let c = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let f = Func {
+        params: vec![ValType::I64], // base = v0
+        results: vec![ValType::V128],
+        blocks: vec![Block {
+            params: vec![ValType::I64],
+            insts: vec![
+                Inst::ConstV128(c), // v1
+                Inst::V128Store {
+                    addr: 0,
+                    value: 1,
+                    offset: 0,
+                    align: 0,
+                },
+                Inst::V128Load {
+                    addr: 0,
+                    offset: 0,
+                    align: 0,
+                }, // v2 → forwards to v1
+                Inst::V128Load {
+                    addr: 0,
+                    offset: 0,
+                    align: 0,
+                }, // v3 → forwards to v1
+                Inst::VBitBin {
+                    op: VBitBinOp::Or,
+                    a: 2,
+                    b: 3,
+                }, // v4 = x | y
+            ],
+            term: Terminator::Return(vec![4]),
+        }],
+    };
+    let m = module(f);
+    let args: Vec<Vec<Value>> = [0i64, 64, 4096]
+        .iter()
+        .map(|&b| vec![Value::I64(b)])
+        .collect();
+    let opt = check(&m, &args);
+    assert_eq!(
+        count(&opt, |i| matches!(i, Inst::V128Load { .. })),
+        0,
+        "both v128 loads forward to the stored value"
+    );
+    assert_eq!(run(&opt, &[Value::I64(0)]), Ok(vec![Value::V128(c)]));
 }

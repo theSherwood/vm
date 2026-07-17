@@ -1844,6 +1844,23 @@ fn store_width(op: StoreOp) -> u64 {
     }
 }
 
+/// Availability-key discriminator for a `v128` access (its 16-byte load/store). Distinct from every
+/// [`LoadOp::index`] (which are `0..14`), so a `v128` cell never collides with a scalar one.
+const V128_KEY: u8 = u8::MAX;
+
+/// The access width in bytes of an availability-key op discriminator (a [`LoadOp::index`], or
+/// [`V128_KEY`] for a `v128`).
+fn key_width(op_key: u8) -> u64 {
+    if op_key == V128_KEY {
+        16
+    } else {
+        LoadOp::from_index(op_key)
+            .expect("cached op index is valid")
+            .info()
+            .2 as u64
+    }
+}
+
 /// Whether two byte ranges `[o1, o1+w1)` and `[o2, o2+w2)` are disjoint. Saturating arithmetic makes a
 /// (pathological, giant-offset) overflow read as *not disjoint* — the conservative, sound direction.
 fn ranges_disjoint(o1: u64, w1: u64, o2: u64, w2: u64) -> bool {
@@ -1926,21 +1943,43 @@ fn mem_forward(b: &Block, fn_results: &[usize]) -> Block {
                 // same base address differ by exactly their offset gap (no wrap-aliasing), so disjoint
                 // offset ranges are disjoint bytes. A different base value could alias, so it is dropped.
                 avail.retain(|&(base_c, offset_c, op_c), _| {
-                    base_c == na
-                        && ranges_disjoint(
-                            offset_c,
-                            LoadOp::from_index(op_c)
-                                .expect("cached op index is valid")
-                                .info()
-                                .2 as u64,
-                            *offset,
-                            ws,
-                        )
+                    base_c == na && ranges_disjoint(offset_c, key_width(op_c), *offset, ws)
                 });
                 // Record the cell this store wrote (when a same-type load reads it back exactly).
                 if let Some(lop) = store_forward_load_op(*op) {
                     avail.insert((na, *offset, lop.index()), nv);
                 }
+            }
+            // `v128` load/store mirror the scalar cases, keyed by [`V128_KEY`] (16-byte width). A
+            // `v128.store` reads back exactly as a `v128.load` (same type), so it always forwards.
+            Inst::V128Load { addr, offset, .. } => {
+                let key = (map[*addr as usize], *offset, V128_KEY);
+                if let Some(&v) = avail.get(&key) {
+                    map[result_start[i] as usize] = v;
+                } else {
+                    let mut ni = inst.clone();
+                    map_operands(&mut ni, &mut |o| map[o as usize]);
+                    insts.push(ni);
+                    map[result_start[i] as usize] = next;
+                    avail.insert(key, next);
+                    next += 1;
+                }
+            }
+            Inst::V128Store {
+                addr,
+                value,
+                offset,
+                ..
+            } => {
+                let na = map[*addr as usize];
+                let nv = map[*value as usize];
+                let mut ni = inst.clone();
+                map_operands(&mut ni, &mut |o| map[o as usize]);
+                insts.push(ni);
+                avail.retain(|&(base_c, offset_c, op_c), _| {
+                    base_c == na && ranges_disjoint(offset_c, key_width(op_c), *offset, 16)
+                });
+                avail.insert((na, *offset, V128_KEY), nv);
             }
             other => {
                 let e = other.effects();
