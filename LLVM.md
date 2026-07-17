@@ -1624,6 +1624,24 @@ rows. openlibm is fetched-not-vendored (BSD); `link_shims.sh` takes a pre-staged
 `/tmp/openlibm`) when github egress is blocked. **svm-llvm lane green (fmt + clippy `-D warnings`; 13
 `demo_pg_*`).** Next: still *boot speed* (snapshot/restore), and wider SQL (joins, indexes, subqueries).
 
+**Follow-on (landed) — Postgres in the browser: a persistent session that survives page reloads; boot
+speed measured (`BOOTSPEED.md`).** The "eventual browser demo" is real. The playground boots the whole
+backend **in wasm** (`browser/build-pg-assets.mjs`; the one-shot `svm_run_pg`) and now runs it as a
+**live interactive session** — the first Run boots to `backend>`, every Run after feeds the editor's
+SQL to the *same* backend (~30–120 ms vs the ~9–13 s in-browser boot) and state persists across
+queries, psql-style. The enabler was a **blocking-stdin park** in the interpreter
+(`Host::set_stdin_blocking` → `Outcome::StdinPark`/`VcpuEvent::StdinPark`, `svm-interp`; session
+exports `svm_pg_open`/`svm_pg_query`/`svm_pg_close`, `browser/src/lib.rs` + `browser/web/play.js`).
+The session also **survives page reloads**: the live data dir serializes out through `svm-fs`'s shared
+in-memory mount (`mem_fs_seeded_shared` + `MemFsHandle::image` → the `svm_pg_snapshot` export →
+IndexedDB), and a reboot from the saved image runs Postgres's own crash recovery over it — proven
+native (`browser/tests/pg_snapshot_roundtrip.rs`) and through the shipping wasm artifact
+(`browser/pg_snapshot_test.mjs`). And *boot speed* got a measured decomposition, **`BOOTSPEED.md`**:
+the "~100 s" above was a *debug* build paying WAL recovery — shipped pre-translated with a
+cleanly-shut-down data image, cold start is ~2.6 s native / ~6–8 s in-browser (`browser/bench_pg.mjs`),
+no snapshot/restore machinery required (freeze/thaw stays an optional lever). The open Postgres item
+is **wider SQL** (joins, indexes, subqueries).
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
@@ -3057,8 +3075,10 @@ dependency entirely** (the reason `svm-llvm` is excluded from the workspace).
   ongoing** for version bumps. By horizon: stay on LLVM 18 → forking is cheaper; track current Rust/clang
   long-term → the textual reader wins (and `llvm-ir` may not even support the version you need).
 
-**Status: IN PROGRESS** (decided to build it now — `llvm-ir` kept biting, both on constants and the
-version ceiling). See the handoff block below for the plan + current state.
+**Status: DONE — the flip landed; `svm-llvm` links no libLLVM** (decided to build it after `llvm-ir`
+kept biting, both on constants and the version ceiling; the textual reader now feeds the translator on
+every path, and `llvm-ir`/`llvm-sys` are dropped from `crates/svm-llvm/Cargo.toml`). The handoff block
+below is kept as the implementation record.
 
 **Q1b — Textual `.ll` reader: migration plan & handoff.** Replacing the `llvm-ir`/libLLVM binding
 with a dependency-free textual-`.ll` reader. Approach, validation, and the staged sequence:
@@ -3367,8 +3387,9 @@ the peval probe running (not skipping); embench + cross-engine verified green on
   (block-local SSA numbering, §3a), and the `unsup(...)` fail-closed chokepoint.
 - First-light differential: `crates/svm-llvm/tests/translate.rs` — `compile_to_bc` runs the
   pinned `clang -O2 -emit-llvm` pipeline; `run` does translate→verify→interp.
-- Crate config + build prereqs: `crates/svm-llvm/Cargo.toml` (the `llvm-ir`/`llvm-sys`
-  `prefer-dynamic` deps); workspace exclusion in the root `Cargo.toml`.
+- Crate config + build prereqs: `crates/svm-llvm/Cargo.toml` (no libLLVM deps since the
+  textual-reader flip — the in-house `.ll` reader lives in `crates/svm-llvm/src/ll/`; see §8
+  Q1b/Q4); workspace exclusion in the root `Cargo.toml`.
 - The oracle to diff against (Lane B): chibicc `frontend/chibicc/codegen_ir.c` + the running
   demos in `demos/` — wired in at Milestone 1.
 
