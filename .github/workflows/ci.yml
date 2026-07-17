@@ -312,14 +312,49 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
+      # Three workspaces: `browser` (the wasm engine), the root (svm-run's `prep_svmb`/`build_image`),
+      # and the workspace-excluded `crates/svm-llvm` (`svm-llvm-translate`). The latter two are the
+      # Postgres regenerate half below — uncached, they cold-build in release on every run.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with: { workspaces: browser }
+        with:
+          workspaces: |
+            browser
+            .
+            crates/svm-llvm
       # Playwright + Chromium aren't preinstalled on the runner (unlike Node); install both.
       - name: Install Playwright + Chromium
         working-directory: browser
         run: |
           npm install playwright@1.56.1
           npx playwright install --with-deps chromium
+
+      # LLVM is needed on EVERY run, not just a cold one: build-pg-assets.mjs hands the translator
+      # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (svm-llvm links no
+      # libLLVM). clang/flex/bison are Postgres's own build deps — used only on a cold input cache.
+      - name: install LLVM/clang 18 (+ Postgres build deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18 flex bison
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+
+      # Regenerate the Postgres artifacts from current code and stage them into web/assets/, so the
+      # `browser-test.mjs` Postgres check BOOTS instead of SKIPping (it skips when unstaged). That boot
+      # is the drift guard: a translator/encoder change that breaks the database fails the PR that
+      # introduces it rather than the next deploy. The cached inputs (whole-program bitcode + initdb'd
+      # cluster) are code-independent, so keying them on the Postgres version + shim sources is sound.
+      - name: cache Postgres build inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/svm_pg_cache/postgres_shimmed.bc
+            /tmp/svm_pg_cache/pgdata
+          key: pg-inputs-v1-17.5-${{ hashFiles('crates/svm-run/demos/postgres/**') }}
+      - name: build + stage Postgres artifacts
+        working-directory: browser
+        env:
+          SVM_PG_VER: "17.5"
+          SVM_PG_CACHE: /tmp/svm_pg_cache
+        run: node build-pg-assets.mjs
       # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
       # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
       - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)
