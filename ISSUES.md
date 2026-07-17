@@ -13,6 +13,32 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — found by the QuickJS breadth harness (2026-07-17)
+
+**Where:** the LLVM on-ramp on Bellard's QuickJS 2024-01-13, the `libbf` bignum path (BigInt).
+`crates/svm-run/demos/quickjs/` — the engine otherwise runs a wide slice of JS byte-identical to
+native (`demo_quickjs_breadth_vs_native`: regex, generators, `try`/`catch`, `Map`/`Set`, closures,
+destructuring, `JSON`, `Object`/`Array` methods, `Date`, integer `Math`). **BigInt is the one known
+JS-surface gap** and is deliberately excluded from the breadth demo.
+
+**Symptom.** Even a trivial BigInt is wrong, so this is a fundamental `libbf` op, not a complex one:
+- `(7n).toString()` → `"128000000000000000008"` (should be `"7"`); `(2n+3n).toString()` →
+  `"96000000000000000008"` (should be `"5"`) — the `~2^value`-scale garbage smells like a mantissa/
+  exponent normalization gone wrong (libbf stores value as mantissa × 2^exp).
+- `(6n*7n)` **hangs** (a non-terminating loop, presumably a normalization/carry loop fed a wrong
+  limb count).
+
+**Ruled out.** The primitives libbf leans on are individually **correct** on the on-ramp (verified
+guest == native over a focused probe): `__builtin_clzll`/`ctzll`, 64-bit variable shifts, and the
+128-bit multiply (`(__int128)a*b` → lo/hi). So the bug is a subtler libbf-specific pattern (candidate
+suspects: `bf_set_si`/`bf_normalize` bit-length + shift, `bf_ftoa` base conversion, a struct-layout /
+`memcpy` of the `bf_t` limb array, or an `add/sub_overflow` carry idiom), not one of those ops.
+
+**Fix sketch.** Reproduce headlessly by linking `libbf.c` alone with a tiny driver that calls
+`bf_set_si` + `bf_ftoa` (base 10) and diffing guest vs native — that isolates set/normalize/format
+from the JS layer. Then bisect the first miscompiling `bf_*` primitive. Not blocking the QuickJS
+playground demo (which doesn't use BigInt); a dedicated slice.
+
 ### I23 — svm-jit miscompiles some rustc-emitted bitcode: an in-bounds heap `Vec` access faults / returns garbage (S2) — found by the `bench/rustbench` real-program harness (2026-07-14)
 
 **Where:** the LLVM on-ramp + `svm-jit` on **rustc**-produced bitcode (rustc 1.81, LLVM 18 — the

@@ -2000,6 +2000,18 @@ fn demo_quickjs_repl_stdin() {
     );
 }
 
+/// **▶ QuickJS breadth — a wide slice of the JS language runs byte-identical to native.** The
+/// `qjs_breadth.c` program exercises regex (`libregexp`), `try`/`catch`, generators, `Map`/`Set`,
+/// closures, destructuring + spread, string methods, `JSON` round-trip, `Object`/`Array` higher-order
+/// methods, `Date`, and integer `Math` — proving the on-ramp runs far more than the eval smoke test.
+/// (BigInt is deliberately omitted — miscompiled through `libbf`, the one known JS-surface gap; see
+/// ISSUES.md.)
+#[test]
+#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
+fn demo_quickjs_breadth_vs_native() {
+    quickjs_diff("qjs_breadth.c", b"");
+}
+
 /// Like [`check_demo_vs_native`] but threads `extra` clang flags into the on-ramp's **`.ll`** compile
 /// only — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
 /// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:

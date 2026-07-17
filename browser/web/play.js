@@ -486,6 +486,10 @@ SELECT n, a AS fib FROM fib;
   },
   'JavaScript (QuickJS — write & run JS)': {
     kind: 'module',
+    // Interp tier only: the wasm-JIT emitter can't yet emit QuickJS's `_start` (`status 2 = not
+    // emittable` — an op the emitter lacks, unlike Lua/SQLite which emit but wasmi-reject the giant
+    // function). Browser-verified on the interpreter tier (real Chromium/V8). Enabling the JIT tier is
+    // a follow-up on the `svm-wasmjit` emitter. See LLVM.md "Active target — QuickJS".
     editable: true,
     lang: 'js',
     url: './assets/qjs_repl.svmb',
