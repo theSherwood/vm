@@ -114,20 +114,46 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    op 5 + op 1). Empirically found: an unmodified powerbox `_start` (`() -> i32`)
    ThreadFaults under `instantiate_module` — the child-entry signature is the fix.
 
-### Known gap — stdout-inheriting commands need a module+grant primitive
+4b. **exec a compiled-C command with inherited stdout** *(done —
+   `stage1_exec_stdout.rs`)* — the full external `echo`. This closes slice 4's
+   gap with a new substrate op, **`instantiate_module_named` (Instantiator
+   op 13)**: the union of `instantiate_module` (op 5 — resolve + compile a
+   host-granted `Module`, materialize its data into the carve) and
+   `instantiate_named` (op 11 — re-grant caps into the child's powerbox by name).
+   It is the only op that runs a foreign program **and** hands it capabilities,
+   so a compiled command resolves an inherited `stdout` by name and `write(1, …)`
+   lands in the shell's sink. The shell parent re-grants its own `stdout` under
+   the name `"stdout"`; the command's `--child-entry` `_start` resolves it. Built
+   on **both backends** (interp dispatch decode + JIT `instantiate_module_named`
+   thunk, the JIT given both the module resolver and the named-grant hooks),
+   differential interp==JIT, output tracking argv. **Authority-TCB, not
+   escape-TCB (§2a): the D63/D38 carve masking is untouched** — op 13 is literally
+   the union of two existing, fuzzed decode paths through the same confined-child
+   spawn. Existing instantiate suites unchanged.
 
-Slice 4 handles **no-capability** commands (their `_start` resolves nothing).
-A command that writes to `stdout` needs its `stdout` cap **re-granted into the
-child**, but the grant ops (`instantiate_granted`/`_named`, ops 8/11) are
-**same-module** only — there is no `instantiate_module`+grant op, and a raw
-handle can't be seeded into a child's cap table (re-granting must insert it).
-So a stdout-inheriting compiled-C command is blocked on a new substrate
-primitive: **spawn a verified `Module` as a confined powerbox child** (re-grant
-named caps + seed the args buffer + invoke its entry). That op — authority-TCB,
-not escape-TCB (§2a); the carve masking is untouched — is the next real
-substrate slice. Until it lands, output can only be forwarded parent-as-pager
-(the `stage1_foreign_command.rs` model, which needs the command to write to its
-carve rather than an ambient fd).
+### Power 2 — the endpoint direction (deferred, S9)
+
+Op 13 is **forwarding** (capability model "Power 1"): a parent hands a child a
+capability it already holds. That covers `cmd` writing straight to the terminal.
+It does **not** cover the shell *intercepting* a command's output — `cmd > file`,
+`cmd | other`, capturing into a shell buffer — because there the shell must not
+forward the real `stdout` but **serve** the child's stdout with its own code
+(capturing bytes, feeding a pipe). That is capability-model **Power 2**: a guest
+minting a capability whose implementation *is* its own code, so a child's
+`cap.call` on it parks and wakes the parent (§14 "the parent's own handler /
+pay-for-what-you-virtualize"). The primitive is the **`Endpoint`** (PROCESS.md
+§4, `[PROPOSED]`; S9 on the roadmap): `mint(sig) -> (serve_end, client_template)`,
+`serve`/`reply`. A guest-served endpoint is what makes a parent a **personality /
+kernel for its children** (parent-as-POSIX-kernel, parent-as-pager) — the
+keystone of self-similarity. It is **not built**. Until it lands:
+
+- **`cmd` → terminal**: op 13, forwarding the real stdout. **Done.**
+- **`cmd > file`, `cmd | cmd2`** (shell-side interception): needs `Endpoint`
+  (Power 2). The stopgap is the parent-as-pager model (`stage1_foreign_command.rs`
+  — the command writes to its carve, the parent forwards), which requires a
+  command written to output to memory rather than an ambient fd, so it is **not**
+  a drop-in for unmodified compiled commands. Real redirection/pipelines of
+  external commands wait on the endpoint work.
 
 5. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of command
    `Module`s and the `Instantiator` handle, so the Stage-0 shell dispatches an

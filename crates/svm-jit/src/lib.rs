@@ -2468,6 +2468,8 @@ impl CompiledModule {
                 kill_thunk: instantiator_rt::kill as *const () as i64,
                 instantiate_granted_thunk: instantiator_rt::instantiate_granted as *const () as i64,
                 instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
+                instantiate_module_named_thunk: instantiator_rt::instantiate_module_named
+                    as *const () as i64,
             }
         } else {
             InstEnv::null()
@@ -3842,6 +3844,8 @@ pub(crate) unsafe fn compile_child_and_run(
             // closed anyway — wired only so the `InstEnv` is fully populated (ops 8/11 → EINVAL/CapFault).
             instantiate_granted_thunk: instantiator_rt::instantiate_granted as *const () as i64,
             instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
+            instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
+                as i64,
         },
         None => InstEnv::null(),
     };
@@ -4620,6 +4624,9 @@ struct InstEnv {
     // multi-cap by name).
     instantiate_granted_thunk: i64,
     instantiate_named_thunk: i64,
+    // STAGE1.md — op 13 (`instantiate_module_named`): run a separate `Module` *and* re-grant caps by
+    // name (the shell "exec" primitive — union of op 5 + op 11).
+    instantiate_module_named_thunk: i64,
 }
 
 impl InstEnv {
@@ -4635,6 +4642,7 @@ impl InstEnv {
             kill_thunk: 0,
             instantiate_granted_thunk: 0,
             instantiate_named_thunk: 0,
+            instantiate_module_named_thunk: 0,
         }
     }
     /// True when this compilation may lower `Instantiator` cap.calls to the nesting runtime (the
@@ -6993,6 +7001,9 @@ fn lower_instantiator(
         8 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
         // S2 instantiate_named: (grants_ptr, grants_n, entry, off, size_log2, quota) -> child handle
         11 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
+        // STAGE1 instantiate_module_named: (module, grants_ptr, grants_n, entry, off, size_log2,
+        // quota) -> child handle — op 5's leading `Module` handle then op 11's grant list + carve args.
+        13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
         _ => None,
     };
     let shape_ok = contract.is_some_and(|(need, res)| {
@@ -7207,6 +7218,40 @@ fn lower_instantiator(
                 &[
                     nursery, mem_base, mem_size, h, grants_ptr, grants_n, entry, off, size_log2,
                     fuel, trap_out,
+                ],
+            );
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+        }
+        13 => {
+            // STAGE1 instantiate_module_named(nursery, mem_base, mem_size, handle:i32, module:i64,
+            //   grants_ptr:i64, grants_n:i64, entry:i64, off:i64, size_log2:i64, fuel:i64,
+            //   trap_out:i64) -> handle:i32. Op 5's leading `Module` handle then op 11's grant-list
+            // args — runs a foreign module with a by-name granted powerbox (the shell "exec").
+            let h = get(vals, handle)?;
+            let mem_size = b.ins().iconst(I64, lower.mapped as i64);
+            let modh = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let grants_ptr = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
+            let grants_n = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
+            let entry = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
+            let off = get(vals, *args.get(4).ok_or(JitError::Malformed)?)?;
+            let size_log2 = get(vals, *args.get(5).ok_or(JitError::Malformed)?)?;
+            let fuel = get(vals, *args.get(6).ok_or(JitError::Malformed)?)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b
+                .ins()
+                .iconst(I64, lower.inst.instantiate_module_named_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[
+                    nursery, mem_base, mem_size, h, modh, grants_ptr, grants_n, entry, off,
+                    size_log2, fuel, trap_out,
                 ],
             );
             emit_trap_propagate(b, lower);
