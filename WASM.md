@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (125 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (127 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`/`reftypes.rs`/`debug_line.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -149,9 +149,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   on both backends: every arithmetic/lane/convert/shuffle op, the **float rounding** lanes
   (`f32x4`/`f64x2` `.ceil/.floor/.trunc/.nearest`), the **memory variants** (splat-load, load-extend,
   load-zero, load/store-lane), and the **relaxed-SIMD** extension. Built over the proven 5-step pattern
-  (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops bail on
-  the JIT where Cranelift can't legalize them (`i8x16.mul`, `i64x2` min/max — the interp still covers
-  them and wasm never emits them). **Validated against the official spec corpus** (see *spec
+  (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); one op family bails
+  on the JIT where Cranelift can't legalize it (`i64x2` min/max — the interp still covers it and wasm
+  never emits it; the former `i8x16.mul` bail now lowers on the JIT via widen → `i16x8` mul →
+  low-byte pack, `diff_i8x16_mul` interp==JIT). **Validated against the official spec corpus** (see *spec
   conformance* below): every numeric + SIMD value vector matches, **0 failures across 36.7k
   assertions**.
   - [x] **SIMD memory variants — DONE.** `v128.load{8,16,32,64}_splat`, `load{8x8,16x4,32x2}_{s,u}`,
@@ -164,7 +165,8 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     `svm-wasm/tests/simd.rs` (the wasm bridge + a real `bitselect`-max idiom).
   - [x] **Integer min/max — DONE.** `i8x16`/`i16x8`/`i32x4` `{min,max}_{s,u}` (extends `VIntBinOp` →
     one Cranelift `smin`/`umin`/`smax`/`umax`; `i64x2` has no min/max op, and would not legalize so it
-    bails on the JIT alongside `i8x16.mul`). Tests incl. a real lane-wise `clamp` kernel.
+    bails on the JIT — the one remaining bail, now that `i8x16.mul` lowers via widen → `i16x8` mul →
+    low-byte pack). Tests incl. a real lane-wise `clamp` kernel.
   - [x] **Float lane compares — DONE.** `f32x4`/`f64x2` `{eq,ne,lt,gt,le,ge}` → mask (`Inst::VFloatCmp`,
     one Cranelift `fcmp`; ordered, `ne` unordered — matches Rust's float operators, the test oracle,
     incl. NaN). `crates/svm/tests/simd.rs` + `svm-wasm/tests/simd.rs`.
