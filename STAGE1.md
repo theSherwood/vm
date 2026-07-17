@@ -101,21 +101,46 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
      argument at runtime* (`codegen_ir.c` §7) and cannot emit `cap.self.resolve`,
      so `applet(inst, addrspace, stdout_h)` writing through `stdout_h` is the
      natural form. Proven with a seeded-argv echo, differential interp==JIT.
-4. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of applet
-   entries and the `Instantiator`/`stdout` handles, so the Stage-0 shell
-   dispatches an unknown command to a spawned child instead of
-   `<cmd>: not found`, threading the child's status into `$?`. This is the
-   chibicc-integration slice: the compiled shell drives `instantiate_granted`/
-   `join` through generic capability imports, applets are C funcs taking
-   `(inst, addrspace, stdout_h)` (the ABI pinned in slice 3), and the parent
-   seeds the argv[] block (the layout pinned in slice 1). The remaining frontend
-   piece is exposing an `instantiate_granted`/`join` import binding and reaching
-   an applet's function index from the shell.
-5. **Pipelines across real children** — replace the memfs-temp pipeline staging
+4. **exec a compiled-C command (pure status)** *(done —
+   `stage1_exec_command.rs`)* — a "shell" parent spawns a *separate*, unmodified
+   `int main(int argc, char **argv)` C program via `instantiate_module` (op 5),
+   delivers `argv` through the §3e args buffer seeded into the child's carve, and
+   `join`s for `main`'s return — the value a shell records in `$?`. The one
+   enabler was a chibicc **`--child-entry`** flag: it emits function 0 with the
+   §14 child ABI (`(i64 starter) -> (i64 status)`, `main`'s int widened) instead
+   of the paramless top-level powerbox entry, so the program is spawnable while
+   still parsing the args buffer into `main(argc, argv)`. Status tracks argv
+   (real delivery), differential interp==JIT; **no new substrate op** (rides
+   op 5 + op 1). Empirically found: an unmodified powerbox `_start` (`() -> i32`)
+   ThreadFaults under `instantiate_module` — the child-entry signature is the fix.
+
+### Known gap — stdout-inheriting commands need a module+grant primitive
+
+Slice 4 handles **no-capability** commands (their `_start` resolves nothing).
+A command that writes to `stdout` needs its `stdout` cap **re-granted into the
+child**, but the grant ops (`instantiate_granted`/`_named`, ops 8/11) are
+**same-module** only — there is no `instantiate_module`+grant op, and a raw
+handle can't be seeded into a child's cap table (re-granting must insert it).
+So a stdout-inheriting compiled-C command is blocked on a new substrate
+primitive: **spawn a verified `Module` as a confined powerbox child** (re-grant
+named caps + seed the args buffer + invoke its entry). That op — authority-TCB,
+not escape-TCB (§2a); the carve masking is untouched — is the next real
+substrate slice. Until it lands, output can only be forwarded parent-as-pager
+(the `stage1_foreign_command.rs` model, which needs the command to write to its
+carve rather than an ambient fd).
+
+5. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of command
+   `Module`s and the `Instantiator` handle, so the Stage-0 shell dispatches an
+   unknown command to a spawned child instead of `<cmd>: not found`, threading
+   the child's status into `$?`. The compiled shell drives `instantiate_module`/
+   `join` through generic capability imports (the handle-as-first-arg convention,
+   `codegen_ir.c` §7); commands are `--child-entry` modules the embedder mounts.
+   Full stdout inheritance rides the module+grant primitive above.
+6. **Pipelines across real children** — replace the memfs-temp pipeline staging
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
    plan"). This is the jump from sequential spawn/wait to true concurrency.
-6. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
+7. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
    piece for shells that fork *themselves*.
 
 Security posture is unchanged: children keep their **own guarded windows**; the

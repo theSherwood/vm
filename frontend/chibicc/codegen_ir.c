@@ -70,6 +70,7 @@
 #include "chibicc.h"
 
 extern bool opt_g; // -g: emit the debug-info section (DEBUGGING.md §6 waist)
+extern bool opt_child_entry; // --child-entry: emit function 0 with the §14 child ABI (spawnable)
 
 static FILE *o;
 
@@ -2581,9 +2582,20 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,     MEMORY_SLOT,
                          ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT, JIT_SLOT};
   cg("export \"_start\" 0\n");
-  cg("func () -> (%s) {\n", is_void ? "" : irty(mret));
-  cg("block0():\n");
-  nv = 0;
+  // A `--child-entry` module is spawned via `instantiate_module`, whose child ABI is
+  // `(i64 starter) -> (i64 status)`; the top-level powerbox entry is paramless `() -> (main's ret)`.
+  // The starter is ignored here (a no-capability command); `main`'s result is widened to the i64 the
+  // parent reads via `join`. `cap_mask` should be 0 for such a command (it holds no powerbox), so the
+  // resolve loop below is a no-op — `cap.self.resolve` would fail in a destitute child.
+  if (opt_child_entry) {
+    cg("func (i64) -> (i64) {\n");
+    cg("block0(v0: i64):\n");
+    nv = 1; // v0 is the (ignored) starter param
+  } else {
+    cg("func () -> (%s) {\n", is_void ? "" : irty(mret));
+    cg("block0():\n");
+    nv = 0;
+  }
   // Resolve each *used* powerbox cap by name into its stash slot. Each name's bytes are written to a
   // scratch cell at the data-stack base (`data_end`), reused per name — transient, since `main`
   // (called below with the data-SP = `data_end`) overwrites it as it grows its frame.
@@ -2672,7 +2684,12 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v13 = i64.and v11 v12\n");
     cg("  v14 = i32.wrap_i64 v0\n");
     if (is_void) {
-      cg("  call %d (v13, v14, v1)\n  return\n", mi);
+      // A child entry returns an i64 status even for a void main (0); a powerbox entry returns ().
+      cg("  call %d (v13, v14, v1)\n", mi);
+      cg(opt_child_entry ? "  v15 = i64.const 0\n  return v15\n" : "  return\n");
+    } else if (opt_child_entry) {
+      cg("  v15 = call %d (v13, v14, v1)\n", mi);
+      cg("  v16 = i64.extend_i32_u v15\n  return v16\n"); // widen main's int to the i64 status
     } else {
       cg("  v15 = call %d (v13, v14, v1)\n  return v15\n", mi);
     }
@@ -2687,11 +2704,21 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   char va[24] = "";
   if (main_fn->ty->is_variadic)
     snprintf(va, sizeof va, ", v%d", sp);
-  if (is_void) {
+  if (is_void && !opt_child_entry) {
     cg("  call %d (v%d%s)\n  return\n", func_index(main_fn), sp, va);
+  } else if (is_void) {
+    cg("  call %d (v%d%s)\n", func_index(main_fn), sp, va);
+    int r = nv++;
+    cg("  v%d = i64.const 0\n  return v%d\n", r, r); // child entry: i64 status (0) for a void main
   } else {
     int r = nv++;
-    cg("  v%d = call %d (v%d%s)\n  return v%d\n", r, func_index(main_fn), sp, va, r);
+    cg("  v%d = call %d (v%d%s)\n", r, func_index(main_fn), sp, va);
+    if (opt_child_entry) {
+      int w = nv++;
+      cg("  v%d = i64.extend_i32_u v%d\n  return v%d\n", w, r, w);
+    } else {
+      cg("  return v%d\n", r);
+    }
   }
   cg("}\n\n");
 }
