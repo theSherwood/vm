@@ -311,25 +311,8 @@ exit:\n\
   %r = add i64 %ra, %rb\n\
   ret i64 %r\n\
 }\n";
-    let dir = std::env::temp_dir();
-    let ll = dir.join(format!("svm_structphi_{}.ll", std::process::id()));
-    let bc = dir.join(format!("svm_structphi_{}.bc", std::process::id()));
-    std::fs::write(&ll, ir).expect("write IR");
-    // Assemble the textual IR with clang (no extra tool dependency beyond the one tests already need).
-    match Command::new("clang")
-        .args(["-x", "ir", "-c", "-emit-llvm"])
-        .arg(&ll)
-        .arg("-o")
-        .arg(&bc)
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("note: skipping struct_phi_cross_block (clang unavailable)");
-            return;
-        }
-    }
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate struct-φ IR");
+    // Textual LLVM IR — feed it straight to the in-house reader (no clang/`llvm-as` round-trip).
+    let t = svm_llvm::translate_ll_str(ir).expect("translate struct-φ IR");
     svm_verify::verify_module(&t.module).expect("verify");
     let run = t
         .exports
@@ -2693,23 +2676,8 @@ done:\n\
   %r = phi i32 [ %rt, %then ], [ %re, %else ]\n\
   ret i32 %r\n\
 }\n";
-    let dir = std::env::temp_dir();
-    let llf = dir.join(format!("svm_mask_{}.ll", std::process::id()));
-    let bcf = dir.join(format!("svm_mask_{}.bc", std::process::id()));
-    std::fs::write(&llf, ll).unwrap();
-    match Command::new("llvm-as")
-        .arg(&llf)
-        .arg("-o")
-        .arg(&bcf)
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("note: skipping cross_block_i1_mask (llvm-as unavailable)");
-            return;
-        }
-    }
-    let t = svm_llvm::translate_bc_path(&bcf).expect("translate mask bitcode");
+    // Textual LLVM IR — feed it straight to the in-house reader (no `llvm-as` round-trip).
+    let t = svm_llvm::translate_ll_str(ll).expect("translate mask IR");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     for (seed, expect) in [(0i32, 1i32), (1, 4), (2, 2), (3, 8)] {
