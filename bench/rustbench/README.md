@@ -17,17 +17,18 @@ context only.
 
 ## Toolchain
 
-The version match matters: rustc must emit **LLVM-18** bitcode (svm-llvm's on-ramp disassembles with
-LLVM 18); rustc **1.81** is the last LLVM-18 release. wasm64 is a tier-3 target, so its lane needs
-nightly `build-std`.
+The svm-jit lane emits **textual** LLVM IR (`--emit=llvm-ir`) and reads it with svm-llvm's
+version-tolerant `.ll` reader — no `llvm-dis`, **no LLVM-version pin** (I24), so the **system default**
+rustc drives the native/svm/wasm32 lanes (validated on rustc 1.94 / LLVM 21). wasm64 is a tier-3
+target, so its lane needs nightly `build-std`.
 
 ```
-rustup toolchain install 1.81.0                       # LLVM 18 — svm-jit LP64 bitcode + native + wasm32
-rustup +1.81.0 target add wasm32-unknown-unknown
-rustup toolchain install nightly --component rust-src  # wasm64 via -Z build-std
+rustup target add wasm32-unknown-unknown               # wasm32 lane (default toolchain)
+rustup toolchain install nightly --component rust-src   # wasm64 via -Z build-std
 ```
 
-Any missing piece just blanks that column; svm-jit + native need only `1.81.0`.
+Any missing piece just blanks that column; svm-jit + native need only a working `rustc`. Set
+`SVM_RUSTBENCH_RUSTC` to pick a specific toolchain (e.g. `+1.81.0` to reproduce the old LLVM-18 build).
 
 ## Run (from `bench/`)
 

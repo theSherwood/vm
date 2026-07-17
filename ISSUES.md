@@ -66,9 +66,24 @@ opaque-pointer / auto-vectorizer patterns that clang happened not to emit but ru
 workload now cross-checks byte-identical to native (`881260`) on all three backends and is **re-enabled**
 in the driver's `WORKLOADS`.
 
-### I24 — the LLVM on-ramp is pinned to LLVM 18, so it cannot read bitcode from current rustc/clang (LLVM 19–21) (S3) — surfaced building `bench/rustbench` (2026-07-15)
+### I24 — the LLVM on-ramp was effectively pinned to LLVM 18 — **RESOLVED** (2026-07-17): the textual reader is version-tolerant; consumers feed `.ll` text and skip `llvm-dis`
 
-**Where:** `svm_llvm::translate_bc_path` reads a module by shelling `llvm-dis` (LLVM **18** — the CI
+**Resolution.** The pin was never in the reader — it was the **`llvm-dis` bitcode step**. Our in-house
+`.ll` reader already parses modern textual IR: validated by translating the five `bench/rustbench`
+workloads emitted by **rustc 1.94 (LLVM 21)** — all parse, verify, and run **byte-identical to native**
+on all three backends (e.g. `bfs` = 881260). So the fix is to route around `llvm-dis`:
+- **`svm-llvm`** — `translate_ll_path` (already public) reads `.ll` text with no `llvm-dis` and no
+  version coupling; `translate_bc_path` now shells the **newest** `llvm-dis` on `PATH` (`best_llvm_dis`,
+  newest-first probe; a newer tool reads older bitcode too; `SVM_LLVM_DIS` overrides) instead of a
+  hardcoded one, so a `.bc` from a newer producer works wherever a matching `llvm-dis` is installed.
+- **`bench/rustbench`** — the svm-jit lane now emits `--emit=llvm-ir` (textual) and reads it via
+  `translate_ll_path`; the `+1.81.0` pin is gone (all lanes use the **system default** rustc;
+  `SVM_RUSTBENCH_RUSTC` overrides). Confirmed running under rustc 1.94/LLVM 21 with correctness green.
+
+The `ast.rs` "pin is LLVM 18" note is corrected to "version-tolerant (validated LLVM 18–22)". Original
+report below.
+
+**Where (orig):** `svm_llvm::translate_bc_path` reads a module by shelling `llvm-dis` (LLVM **18** — the CI
 `svm-llvm` job installs `llvm-18`/`clang-18`) to disassemble `.bc` → textual `.ll`, then parses the
 `.ll` with the in-house reader.
 

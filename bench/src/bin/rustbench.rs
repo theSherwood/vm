@@ -10,16 +10,17 @@
 //! `run(n) -> i64` logic).
 //!
 //! Lanes (each gracefully skipped if its toolchain is absent):
-//!   native   `rustc +1.81 -O` → object, linked with the confine self-timer. The ×native baseline.
-//!   svm-jit  `rustc +1.81 --emit=llvm-bc` (LLVM 18, matching the on-ramp's `llvm-dis`) → `svm_llvm`
-//!            → `svm_jit`, in-process. LP64.
+//!   native   `rustc -O` → object, linked with the confine self-timer. The ×native baseline.
+//!   svm-jit  `rustc --emit=llvm-ir` → textual IR → the version-tolerant `svm_llvm` reader → `svm_jit`,
+//!            in-process. LP64. **No `llvm-dis`, no LLVM-version pin (I24) — any modern rustc works.**
 //!   wt/w64   `cargo +nightly build -Z build-std … --target wasm64-unknown-unknown` → Wasmtime
 //!            (memory64). **LP64 — the honest same-widths comparison; `svm÷wt64` is the headline.**
-//!   wt/w32   `rustc +1.81 --target wasm32-unknown-unknown` → Wasmtime. ILP32 — the *flattered*
+//!   wt/w32   `rustc --target wasm32-unknown-unknown` → Wasmtime. ILP32 — the *flattered*
 //!            comparison (32-bit addressing + free 4 GiB guards), shown for context only.
 //!
-//! Toolchain: `rustc +1.81.0` (LLVM 18) for the LP64 bitcode + native + wasm32 lanes; `+nightly` with
-//! the `rust-src` component and the `wasm32`/`wasm64` targets for the wasm lanes. Missing pieces just
+//! Toolchain: the **system default** `rustc` drives the native/svm/wasm32 lanes (set
+//! `SVM_RUSTBENCH_RUSTC` to pick another, e.g. `+1.81.0`); the wasm64 lane needs `+nightly` with the
+//! `rust-src` component. Add the `wasm32`/`wasm64` targets for the wasm lanes. Missing pieces just
 //! blank the column. Run from `bench/`:  cargo run --release --bin rustbench
 
 use std::path::{Path, PathBuf};
@@ -29,7 +30,17 @@ use std::time::Instant;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
 const REPS: u32 = 15;
-const RUSTC: &str = "+1.81.0"; // LLVM 18 — matches the svm-llvm on-ramp's llvm-dis
+/// The rustc for the guest lanes. `SVM_RUSTBENCH_RUSTC` overrides the toolchain (e.g. `+1.81.0` to
+/// reproduce the old LLVM-18 build, or `+nightly`); the default is the **system default** toolchain.
+/// The svm-jit lane feeds *textual* LLVM IR to the version-tolerant on-ramp (I24), so it no longer
+/// needs an LLVM-18 rustc — any modern rustc works, the same one the native/wasm lanes use.
+fn rustc() -> Command {
+    let mut c = Command::new("rustc");
+    if let Ok(tc) = std::env::var("SVM_RUSTBENCH_RUSTC") {
+        c.arg(tc);
+    }
+    c
+}
 
 /// (workload, small-n, large-n). `large` sized so the large run is tens of ms.
 const WORKLOADS: &[(&str, i64, i64)] = &[
@@ -38,8 +49,8 @@ const WORKLOADS: &[(&str, i64, i64)] = &[
     ("sort", 100, 400_000),
     ("parse", 1_000, 2_000_000),
     ("base64", 1_000, 1_000_000),
-    ("bfs", 10, 5_000),  // grid BFS: traversal, queue, pointer-chasing. Once miscompiled (ISSUES.md
-    // I23) — a real bug this harness caught; two svm-llvm translation bugs, now fixed.
+    ("bfs", 10, 5_000), // grid BFS: traversal, queue, pointer-chasing. Once miscompiled (ISSUES.md
+                        // I23) — a real bug this harness caught; two svm-llvm translation bugs, now fixed.
 ];
 
 fn rb_dir() -> PathBuf {
@@ -57,8 +68,8 @@ fn compose(name: &str) -> Option<String> {
 }
 
 fn rustc_ok() -> bool {
-    Command::new("rustc")
-        .args([RUSTC, "--edition", "2021", "--version"])
+    rustc()
+        .args(["--edition", "2021", "--version"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -89,14 +100,13 @@ fn parse_ns_chk(out: &[u8]) -> Option<(f64, i64)> {
     ))
 }
 
-/// Native `rustc +1.81 -O` **staticlib** (bundles the core/alloc runtime — a bare object would leave
+/// Native `rustc -O` **staticlib** (bundles the core/alloc runtime — a bare object would leave
 /// `unwrap_failed`/`panic_bounds_check`/… undefined) linked with the confine self-timer → `(per_iter_ns,
 /// run(small))`.
 fn native_lane(src: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
     let lib = tmp("native.a");
-    let ok = Command::new("rustc")
+    let ok = rustc()
         .args([
-            RUSTC,
             "--edition",
             "2021",
             "-O",
@@ -133,30 +143,34 @@ fn native_lane(src: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
     parse_ns_chk(&out.stdout)
 }
 
-/// `rustc +1.81 --emit=llvm-bc` → svm_llvm → svm_jit (compiled once). Returns a runner + `run(small)`.
+/// `rustc --emit=llvm-ir` → svm_llvm → svm_jit (compiled once). Returns a runner + `run(small)`.
+///
+/// Emits **textual** LLVM IR and feeds it to the version-tolerant `.ll` reader
+/// ([`svm_llvm::translate_ll_path`]) — no `llvm-dis`, so **any** rustc works (I24): the on-ramp is no
+/// longer coupled to the producer's LLVM version, so this lane rides the same modern rustc as the
+/// native/wasm lanes instead of a pinned LLVM-18 toolchain.
 fn svmjit_runner(src: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)> {
-    let bc = tmp("svm.bc");
-    let ok = Command::new("rustc")
+    let ll = tmp("svm.ll");
+    let ok = rustc()
         .args([
-            RUSTC,
             "--edition",
             "2021",
             "-O",
             "-Cpanic=abort",
-            "--emit=llvm-bc",
+            "--emit=llvm-ir",
             "--crate-type=cdylib",
             "--target=x86_64-unknown-linux-gnu",
         ])
         .arg(src)
         .arg("-o")
-        .arg(&bc)
+        .arg(&ll)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
         return None;
     }
-    let t = svm_llvm::translate_bc_path(&bc).ok()?;
+    let t = svm_llvm::translate_ll_path(&ll).ok()?;
     let sp = t.entry_sp as i64;
     let e = t.exports.iter().find(|(n, _)| n == "run")?.1;
     let mut cm = svm_jit::compile(&t.module, e).ok()?;
@@ -194,12 +208,11 @@ fn wt_runner(wasm: &Path, w64: bool, small: i64) -> Option<(impl FnMut(i64) -> i
     Some((runner, want))
 }
 
-/// `rustc +1.81 --target wasm32-unknown-unknown` → module path (ILP32, the flattered lane).
+/// `rustc --target wasm32-unknown-unknown` → module path (ILP32, the flattered lane).
 fn build_wasm32(src: &Path) -> Option<PathBuf> {
     let wasm = tmp("w32.wasm");
-    Command::new("rustc")
+    rustc()
         .args([
-            RUSTC,
             "--edition",
             "2021",
             "-O",
@@ -242,9 +255,7 @@ fn build_wasm64(src_text: &str) -> Option<PathBuf> {
 
 fn main() {
     if !rustc_ok() {
-        eprintln!(
-            "rustbench: `rustc {RUSTC}` unavailable — install it (LLVM 18 toolchain). Skipping."
-        );
+        eprintln!("rustbench: `rustc` unavailable (set SVM_RUSTBENCH_RUSTC to pick a toolchain). Skipping.");
         return;
     }
     let have_nightly = Command::new("rustc")
