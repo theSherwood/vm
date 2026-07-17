@@ -3,16 +3,17 @@
 //! (the reference oracle, full feature set) or the **bytecode VM** the browser playground actually
 //! runs, over `svm_interp::bytecode::DebugRun`.
 //!
-//! The bytecode engine covers the **forward-debug subset today** (breakpoints, stepping, backtrace,
-//! scalar/aggregate inspection). Reverse debugging (`seek`/`step_back`), data breakpoints
-//! (`set_watchpoint`), and multithreading are **not yet built on it** — gated off by `supports_*` so
-//! `DapServer` refuses them cleanly rather than returning a wrong answer. They are *not* delegated to
-//! the tree-walker: it is the differential oracle only (and far too slow to sit on any user-facing
-//! path). The direction is to build all three **on the bytecode engine** — reverse via deterministic
-//! replay (+ checkpoints), watchpoints via a per-op watched-range check in the debug-stepping loop,
-//! and multithreading via a deterministic cooperative multi-vCPU *debug scheduler* (see DEBUGGING.md
-//! G3). Correctness of the shared subset is guaranteed by `crates/svm/tests/debug_parity.rs`, which
-//! proves the two engines report identical stop locations, per-frame locals, and results.
+//! The bytecode engine covers breakpoints, stepping, backtrace, scalar/aggregate inspection, and now
+//! **reverse debugging** (`seek`/`step_back`/`reverseContinue`) by deterministic replay: the debug run
+//! is pure compute (single-vCPU, no capabilities), so seeking to an earlier op clock rebuilds a fresh
+//! `DebugRun` and replays to that many ops. Data breakpoints (`set_watchpoint`) and multithreading are
+//! **not yet built on it** — gated off by `supports_watch` so `DapServer` refuses them cleanly rather
+//! than returning a wrong answer. They are *not* delegated to the tree-walker: it is the differential
+//! oracle only (and far too slow to sit on any user-facing path). The direction is to build both
+//! remaining pieces **on the bytecode engine** — watchpoints via a per-op watched-range check in the
+//! debug-stepping loop, multithreading via a deterministic cooperative multi-vCPU *debug scheduler*
+//! (see DEBUGGING.md G3). Correctness is guaranteed by `crates/svm/tests/debug_parity.rs` (engine
+//! level) and `dap_over_bytecode_*` (server level, incl. reverse-vs-tree-walker parity).
 
 use svm_interp::bytecode::DebugRun;
 use svm_interp::{
@@ -137,11 +138,14 @@ impl Debuggee for Inspector {
 }
 
 /// The **bytecode backend** — a `DebugRun` (the resumable bytecode debug session) plus the persistent
-/// breakpoint set and fuel `DapServer` expects, and the module (for `source_loc`/`func_name`, which
-/// are engine-neutral free functions keyed on the `IrPc`). Forward-debug only.
+/// breakpoint set `DapServer` expects, the module (for `source_loc`/`func_name`, which are
+/// engine-neutral free functions keyed on the `IrPc`), and the launch `func`/`args` so reverse
+/// debugging can rebuild a fresh run and replay to an earlier op clock. Forward **and** reverse.
 pub struct BytecodeBackend {
     run: DebugRun,
     module: Module,
+    func: FuncIdx,
+    args: Vec<Value>,
     breakpoints: Vec<IrPc>,
     fuel: u64,
 }
@@ -159,6 +163,8 @@ impl BytecodeBackend {
         Some(BytecodeBackend {
             run,
             module,
+            func,
+            args: args.to_vec(),
             breakpoints: Vec::new(),
             fuel,
         })
@@ -173,11 +179,26 @@ impl BytecodeBackend {
             None => Stop::Blocked,
         }
     }
+
+    /// A `Step` stop at the current pc (or the finished result), for a resume/seek that didn't hit a
+    /// breakpoint.
+    fn step_stop(&self) -> Stop {
+        match self.run.frame_pc(0) {
+            Some(pc) => Stop::Break {
+                reason: StopReason::Step,
+                pc,
+            },
+            None => self.finish_stop(),
+        }
+    }
 }
 
 impl Debuggee for BytecodeBackend {
     fn run_until_stop(&mut self) -> Stop {
-        match self.run.run_to(&self.breakpoints, &mut self.fuel) {
+        // A fresh fuel budget per resume (debugging is interactive; the run replays from scratch on a
+        // seek, so a shared decrementing counter would be inconsistent).
+        let mut fuel = self.fuel;
+        match self.run.run_to(&self.breakpoints, &mut fuel) {
             Some(pc) => Stop::Break {
                 reason: StopReason::Breakpoint,
                 pc,
@@ -186,7 +207,8 @@ impl Debuggee for BytecodeBackend {
         }
     }
     fn step(&mut self) -> Stop {
-        match self.run.step(&mut self.fuel) {
+        let mut fuel = self.fuel;
+        match self.run.step(&mut fuel) {
             Some(pc) => Stop::Break {
                 reason: StopReason::Step,
                 pc,
@@ -195,7 +217,8 @@ impl Debuggee for BytecodeBackend {
         }
     }
     fn step_over(&mut self) -> Stop {
-        match self.run.step_over(&mut self.fuel) {
+        let mut fuel = self.fuel;
+        match self.run.step_over(&mut fuel) {
             Some(pc) => Stop::Break {
                 reason: StopReason::Step,
                 pc,
@@ -204,7 +227,8 @@ impl Debuggee for BytecodeBackend {
         }
     }
     fn step_out(&mut self) -> Stop {
-        match self.run.step_out(&mut self.fuel) {
+        let mut fuel = self.fuel;
+        match self.run.step_out(&mut fuel) {
             Some(pc) => Stop::Break {
                 reason: StopReason::Step,
                 pc,
@@ -212,12 +236,49 @@ impl Debuggee for BytecodeBackend {
             None => self.finish_stop(),
         }
     }
-    // Reverse debugging is out of the bytecode engine's single-vCPU scope (gated off — never called).
+    // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
+    // (single-vCPU, no capabilities), so seeking to an earlier op clock = rebuild a fresh run and
+    // replay to that many ops. `step_back` = one op earlier. (A checkpoint ladder to bound the replay
+    // cost is a future optimization; the debugged programs here are small.)
     fn step_back(&mut self) -> Stop {
-        Stop::Blocked
+        // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
+        // terminator slot, where there's nothing to inspect). One replay pass records the latest such
+        // op clock strictly before now; then seek there.
+        let now = self.run.op_clock();
+        let Some(mut probe) = DebugRun::new(&self.module, self.func, &self.args) else {
+            return Stop::Blocked;
+        };
+        let mut fuel = self.fuel;
+        let mut target = 0;
+        loop {
+            let c = probe.op_clock();
+            if c >= now {
+                break;
+            }
+            if probe.frame_pc(0).is_some() {
+                target = c;
+            }
+            if !probe.tick(&mut fuel) {
+                break;
+            }
+        }
+        self.seek(target)
     }
-    fn seek(&mut self, _t: u64) -> Stop {
-        Stop::Blocked
+    fn seek(&mut self, t: u64) -> Stop {
+        let Some(mut run) = DebugRun::new(&self.module, self.func, &self.args) else {
+            return Stop::Blocked;
+        };
+        let mut fuel = self.fuel;
+        while run.op_clock() < t && run.tick(&mut fuel) {}
+        self.run = run;
+        // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
+        // here makes progress instead of immediately re-reporting this stop.
+        if let Some(pc) = self.run.frame_pc(0) {
+            if self.breakpoints.contains(&pc) {
+                self.run.arm_breakpoint_skip();
+            }
+        }
+        self.step_stop()
     }
     fn set_breakpoint(&mut self, pc: IrPc) {
         if !self.breakpoints.contains(&pc) {
@@ -276,13 +337,13 @@ impl Debuggee for BytecodeBackend {
         Some(0)
     }
     fn turn(&self) -> u64 {
-        0
+        0 // single-vCPU: no scheduler turns; the op `clock` is the time coordinate
     }
     fn clock(&self) -> u64 {
-        0
+        self.run.op_clock()
     }
     fn supports_reverse(&self) -> bool {
-        false
+        true
     }
     fn supports_watch(&self) -> bool {
         false

@@ -168,12 +168,18 @@ different things depending on which pair you compare:
   `browser-dap-test.mjs` drives a full initialize→launch→breakpoint→variables→terminate conversation
   in real Chromium on the bytecode engine.
 
-  **Direction — the forward-only gaps are all bytecode-engine work, never tree-walker delegation.** The
+  **Reverse debugging landed on the bytecode engine (slice 4).** `DebugRun` gained an **op clock**
+  (`op_clock`) and a raw one-op `tick`; `BytecodeBackend` implements `seek(t)` by rebuilding a fresh
+  `DebugRun` and replaying `t` ops (the run is pure compute, so replay is deterministic), `step_back`
+  by rewinding to the previous real-instruction op, and `clock`, with `supports_reverse` now `true`.
+  `dap_over_bytecode_reverse_matches_the_tree_walker` proves a forward-then-`reverseContinue` script
+  yields **identical** observations on both engines; the browser debug panel gained Step Back / Reverse
+  controls (Chromium-verified: run forward to i=4, reverse back to i=5). A checkpoint ladder to bound
+  the replay cost is a future optimization — the debugged programs here are small.
+
+  **Direction — the remaining gaps are all bytecode-engine work, never tree-walker delegation.** The
   tree-walker is the differential oracle only; it is far too slow to sit on any user-facing path, so
-  reverse/watch/multithread must each be built *on the bytecode engine*:
-  - **Reverse** (`seek`/`step_back`/`reverseContinue`) — deterministic replay: `seek(t)` rebuilds a
-    `DebugRun` and steps to `t` (cheap on the fast engine), with periodic state checkpoints to bound
-    the replay. Parity-test against the tree-walker's replay-based reverse.
+  watch/multithread must each be built *on the bytecode engine*:
   - **Watchpoints** (`set_watchpoint`) — a per-op watched-range check in `DebugRun`'s single-op loop,
     using the effective address the confinement-masking already computes; kept off the `run_fast`
     hot path.

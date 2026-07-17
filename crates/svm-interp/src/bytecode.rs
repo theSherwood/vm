@@ -3234,6 +3234,9 @@ pub struct DebugRun {
     /// Paused on a reported breakpoint — step past it before the next `run_to` so we make progress.
     at_bp: bool,
     done: Option<Result<Vec<Value>, Trap>>,
+    /// Number of ops executed so far — the **logical clock** for reverse debugging (DEBUGGING.md W1).
+    /// `seek(t)` reaches a state by replaying a fresh run to this count; `step_back` = `seek(clock-1)`.
+    op_clock: u64,
 }
 
 impl DebugRun {
@@ -3278,7 +3281,59 @@ impl DebugRun {
             debug: m.debug_info.clone(),
             at_bp: false,
             done: None,
+            op_clock: 0,
         })
+    }
+
+    /// Ops executed so far — the reverse-debugging clock ([`DebugRun::op_clock`]).
+    pub fn op_clock(&self) -> u64 {
+        self.op_clock
+    }
+
+    /// Arm the "paused on a breakpoint" state so the next [`run_to`](DebugRun::run_to) steps past the
+    /// current op before scanning — used after a `seek`/replay lands exactly on a breakpoint, so a
+    /// forward resume makes progress instead of re-reporting the same stop.
+    pub fn arm_breakpoint_skip(&mut self) {
+        self.at_bp = true;
+    }
+
+    /// Execute **exactly one op** (advancing the clock), for replay-based `seek`. Returns `false` once
+    /// the run has finished (its result is then available via [`result`](DebugRun::result)). Unlike the
+    /// stepping verbs it does not skip unmapped ops or honor breakpoints — it is the raw time quantum.
+    pub fn tick(&mut self, fuel: &mut u64) -> bool {
+        if self.done.is_some() {
+            return false;
+        }
+        self.at_bp = false;
+        let Self {
+            source,
+            table,
+            mem,
+            host,
+            vm,
+            done,
+            op_clock,
+            ..
+        } = self;
+        match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
+            Ok(Outcome::Suspended) => {
+                *op_clock += 1;
+                true
+            }
+            Ok(Outcome::Done(vals)) => {
+                *op_clock += 1;
+                *done = Some(Ok(vals));
+                false
+            }
+            Ok(_) => {
+                *done = Some(Err(Trap::Malformed));
+                false
+            }
+            Err(t) => {
+                *done = Some(Err(t));
+                false
+            }
+        }
     }
 
     /// Run until the current op's `IrPc` is in `bps` (stopping *before* it) or the run finishes; returns
@@ -3295,14 +3350,16 @@ impl DebugRun {
             vm,
             at_bp,
             done,
+            op_clock,
             ..
         } = self;
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
             match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
-                Ok(Outcome::Suspended) => {}
+                Ok(Outcome::Suspended) => *op_clock += 1,
                 Ok(Outcome::Done(vals)) => {
+                    *op_clock += 1;
                     *done = Some(Ok(vals));
                     return None;
                 }
@@ -3324,8 +3381,12 @@ impl DebugRun {
                 }
             }
             match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
-                Ok(Outcome::Suspended) => continue,
+                Ok(Outcome::Suspended) => {
+                    *op_clock += 1;
+                    continue;
+                }
                 Ok(Outcome::Done(vals)) => {
+                    *op_clock += 1;
                     *done = Some(Ok(vals));
                     return None;
                 }
@@ -3356,13 +3417,15 @@ impl DebugRun {
             vm,
             at_bp,
             done,
+            op_clock,
             ..
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
             match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
-                Ok(Outcome::Suspended) => {}
+                Ok(Outcome::Suspended) => *op_clock += 1,
                 Ok(Outcome::Done(vals)) => {
+                    *op_clock += 1;
                     *done = Some(Ok(vals));
                     return None;
                 }
