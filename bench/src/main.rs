@@ -1547,18 +1547,33 @@ struct Ratios {
     jit_vs_native: Option<f64>,
 }
 
-/// Run the svm-opt AOT optimizer over `m`, re-verifying the result. A verify failure (a pass the
-/// optimizer mishandled on this kernel) falls back to the unoptimized module with a note, so a kernel
-/// is never silently miscompiled — the cross-check below would also catch a wrong result.
-fn optimize_ir(m: &svm_ir::Module, name: &str) -> svm_ir::Module {
-    let opt = svm_opt::optimize_module(m);
+/// Run the svm-opt AOT optimizer over `m`, re-verifying the result, and return the optimized module
+/// **and the entry function's new index**. The optimizer runs dead-function elimination, which can drop
+/// (e.g. an unused `main`) and renumber functions, so the caller's original `entry` index would be
+/// stale afterward. To keep it findable we tag the entry as an export before optimizing (a root DFE
+/// must preserve) and resolve its new index by that tag. A verify failure falls back to the unoptimized
+/// module with a note (and the original entry), so a kernel is never silently miscompiled — the
+/// cross-check below would also catch a wrong result.
+fn optimize_ir(m: &svm_ir::Module, entry: u32, name: &str) -> (svm_ir::Module, u32) {
+    const TAG: &str = "__bench_entry";
+    let mut tagged = m.clone();
+    tagged.exports.push(svm_ir::Export {
+        name: TAG.into(),
+        func: entry,
+    });
+    let opt = svm_opt::optimize_module(&tagged);
     match svm_verify::verify_module(&opt) {
-        Ok(()) => opt,
+        Ok(()) => {
+            let e = opt
+                .resolve_export(TAG)
+                .expect("entry export survives optimization");
+            (opt, e)
+        }
         Err(e) => {
             eprintln!(
                 "note: --optimize keeps `{name}` unoptimized (svm-opt output failed verify: {e:?})"
             );
-            m.clone()
+            (m.clone(), entry)
         }
     }
 }
@@ -1567,10 +1582,10 @@ fn optimize_ir(m: &svm_ir::Module, name: &str) -> svm_ir::Module {
 /// engine agrees on the result first, so we never benchmark a miscompile.
 fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     let m = svm_text::parse_module(&k.ir).expect("parse our IR text");
-    let m = if optimize {
-        optimize_ir(&m, &k.name)
+    let (m, entry) = if optimize {
+        optimize_ir(&m, k.entry, &k.name)
     } else {
-        m
+        (m, k.entry)
     };
     // wasm32 bytes come either pre-compiled (the `irreducible` kernel's clang output) or by
     // assembling the hand-written WAT.
@@ -1591,8 +1606,8 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
     });
     let svm = |n: i64| match k.mode {
-        Mode::Compute => svm_call(&m, k.entry, &k.lead_args, n),
-        Mode::HostCall => svm_call_host(&m, k.entry, &k.lead_args, n),
+        Mode::Compute => svm_call(&m, entry, &k.lead_args, n),
+        Mode::HostCall => svm_call_host(&m, entry, &k.lead_args, n),
     };
     let inst = |wasm: &[u8]| match k.mode {
         Mode::Compute => wasm_entry(engine, wasm),
@@ -1634,7 +1649,7 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     if interp.is_some() {
         assert_eq!(
             ours,
-            interp_call(&m, k.entry, &k.lead_args, n_small),
+            interp_call(&m, entry, &k.lead_args, n_small),
             "kernel `{}`: svm vs interp disagree",
             k.name
         );
@@ -1684,10 +1699,10 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         // span, since it is ~100–1000× slower; per-iteration cost is span-independent). ---
         if raw.interp_ns.is_some() {
             let ib = per_call(pc_interp, || {
-                black_box(interp_call(&m, k.entry, &k.lead_args, N_INTERP_BIG));
+                black_box(interp_call(&m, entry, &k.lead_args, N_INTERP_BIG));
             });
             let is = per_call(pc_interp, || {
-                black_box(interp_call(&m, k.entry, &k.lead_args, N_INTERP_SMALL));
+                black_box(interp_call(&m, entry, &k.lead_args, N_INTERP_SMALL));
             });
             let v = (ib - is) * 1e9 / (N_INTERP_BIG - N_INTERP_SMALL) as f64;
             raw.interp_ns = Some(raw.interp_ns.unwrap().min(v));

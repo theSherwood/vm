@@ -158,41 +158,50 @@ cargo run --release -- --from-wasm --csv --reps 5             # baseline (no svm
 cargo run --release -- --from-wasm --optimize --csv --reps 5  # with svm-opt in front of the JIT
 ```
 
-Back-to-back best-of-5, same session (ratios only — absolute ns drift with host load):
+Four SVM configurations, each `compute32 = svm-jit ÷ Wasmtime` (best-of-5, back-to-back; ratios only,
+absolute ns drift with host load): the SVM lane fed by **native IR** (hand-written / `chibicc`) vs
+**from-wasm** (the same wasm bytes transpiled), each with svm-opt off/on. `nat/wmt` is the Rust `native`
+lane ÷ Wasmtime — the ceiling svm-opt can't move (it's the Rust twin, not our IR).
 
-| kernel | svm/Wasmtime, no opt | svm/Wasmtime, +svm-opt |
-|---|---|---|
-| **irreducible** (clang relooper output) | **1.17×** | **0.40×** |
-| memsum | 1.23× | 0.96× |
-| locals_c | 1.16× | 0.96× |
-| hostcall | 1.17× | 1.10× |
-| alu | 1.03× | 1.04× |
-| alu_c | 1.03× | 1.04× |
-| float | 1.02× | 1.03× |
-| simd | 1.06× | 1.10× |
-| scatter | 1.10× | 1.11× |
-| calli | 1.26× | 1.28× |
-| hostbuf | 0.49× | 0.49× |
+| kernel | nat/wmt | svm-IR off | svm-IR on | from-wasm off | from-wasm on |
+|---|---|---|---|---|---|
+| **calli** | 0.68× | 1.40× | **0.18×** | 1.23× | 1.25× |
+| **irreducible** | n/a | 0.32× | 0.42× | 1.15× | **0.35×** |
+| locals_c | 1.34× | 2.32× | 1.76× | 1.40× | 0.94× |
+| memsum | 1.34× | 0.98× | 0.99× | 1.20× | 0.92× |
+| alu | 0.20× | 1.02× | 1.02× | 1.03× | 1.03× |
+| alu_c | 0.20× | 1.03× | 1.03× | 1.02× | 1.04× |
+| float | 1.00× | 1.02× | 1.01× | 1.02× | 1.02× |
+| simd | n/a | 1.02× | 1.06× | 1.06× | 1.07× |
+| scatter | 0.72× | 0.96× | 0.94× | 1.12× | 1.11× |
+| hostcall | n/a | 1.05× | 1.05× | 1.13× | 1.18× |
+| hostbuf | n/a | 0.49× | 0.49× | 0.49× | 0.50× |
 
 _(`cache` is DRAM-latency-bound — the harness gives it a custom, low-repeat span — so its ratio is
 memory-stall noise, not IR quality; elided.)_
 
-**The headline is `irreducible`: 1.17× → 0.40×** — svm-opt makes the SVM JIT **2.5× faster than
-Wasmtime** on it. This is the §1a differentiator made real. That kernel is a C `goto` into a loop —
-genuinely irreducible control flow. Wasmtime *must* reloop it (wasm can't express irreducible CFG), so
-even from the same source it pays a per-iteration dispatch. Under `--from-wasm` the SVM lane starts from
-clang's *already-relooped* wasm and inherits that dispatch; svm-opt then **de-reloops** it — GVN keeps
-the relooper's dispatch selectors as local constants (its new constant cost model), and `jump_thread`
-resolves the dispatch `br_table` per edge until it dies, recovering the irreducible CFG that **SVM IR
-runs natively but wasm cannot represent**. (Running the *native* SVM IR directly — no reloop ever — is
-0.29×; de-relooping the transpiled form recovers most of that edge.)
+**Two big structural wins, each where the input carries the structure to transform:**
 
-**The loop kernels also improve** — `memsum` 1.23→0.96, `locals_c` 1.16→0.96 — because the same GVN
-constant cost model stops threading loop constants into block params, tightening the loop bodies (the
-GVN analogue of the LICM win). **The rest is flat** (within run-to-run noise), which *confirms* the
-ablation's thesis: on straight-line compute the JIT re-derives svm-opt's scalar passes, so the optimizer
-is native-speed-neutral there — its JIT-path value is code size / compile time, plus the structural wins
-(de-relooping, un-threading) that the backend inherits and can't reconstruct itself.
+- **`calli`, native IR: 1.40× → 0.18×** (svm-jit ~5× faster than Wasmtime). A constant-funcref
+  `call_indirect`; svm-opt **devirtualizes** it to a direct call and **inlines** it, deleting the
+  per-call table-lookup + signature-check dispatch that Wasmtime keeps. It fires on native IR (the
+  constant funcref is visible) but **not** from-wasm (1.23→1.25 — the wasm lowering hides it), the exact
+  mirror of…
+- **`irreducible`, from-wasm: 1.15× → 0.35×** (svm-jit ~2.9× faster). A C `goto` into a loop; Wasmtime
+  *must* reloop it (wasm can't express irreducible CFG), so it pays a per-iteration dispatch. svm-opt
+  **de-reloops** the transpiled form — GVN keeps the relooper's dispatch selectors as local constants
+  (its constant cost model), `jump_thread` resolves the dispatch per edge until it dies — recovering the
+  irreducible CFG that **SVM IR runs natively and wasm cannot represent**. It fires from-wasm (the reloop
+  tax is there to remove) but is ~neutral on native IR (0.32→0.42), which is *already* the clean
+  irreducible loop (0.29–0.32× — svm 3× faster with no opt needed).
+
+**The loop kernels improve under `--from-wasm`** — `memsum` 1.20→0.92, `locals_c` 1.40→0.94 — from the
+GVN constant cost model no longer threading loop constants into block params (the GVN analogue of the
+LICM win). **Everything else is flat** across all four configs, which *confirms* the ablation thesis: on
+straight-line compute the JIT re-derives svm-opt's scalar passes, so the optimizer is native-speed-
+neutral — its JIT-path value is the structural transforms Cranelift can't reconstruct (**devirt+inline,
+de-reloop**), which surface wherever the IR carries them: constant indirect calls on the native path,
+relooped control flow on the wasm path. svm-opt **never meaningfully regresses** any lane.
 
 _The corpus is small and hand-built to isolate each pass. Remaining follow-up (OPT.md): multi-run
 medians + variance._
