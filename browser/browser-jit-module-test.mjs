@@ -28,6 +28,7 @@ const CASES = [
   { name: 'hello_c', stdin: '' },
   { name: 'lua_eval', stdin: 'local s=0; for i=1,2000000 do s=s+i end; print(s)\n' },
   { name: 'sqlite_repl', stdin: "CREATE TABLE t(x);\nWITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<50000) INSERT INTO t SELECT i FROM c;\nSELECT sum(x), count(*) FROM t;\n" },
+  { name: 'qjs_repl', stdin: "function fib(n){return n<2?n:fib(n-1)+fib(n-2);}\nconsole.log('fib', Array.from({length:25},(_,i)=>fib(i)).join(' '));\nconst xs=[5,3,8,1,9,2,7]; console.log('sorted', xs.slice().sort((a,b)=>a-b).join(','));\nlet s=0; for(let i=0;i<500000;i++) s+=i; console.log('sum', s);\nconsole.log('re', 'a1b2c3'.replace(/[0-9]/g,'#'));\n" },
 ].filter((c) => existsSync(`${ROOT}/web/assets/${c.name}.svmb`));
 
 const res = await page.evaluate(async (cases) => {
