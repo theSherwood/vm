@@ -21,8 +21,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_with_host, Host, Trap};
-use svm_jit::{compile_and_run_with_host, JitOutcome};
+use svm_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap};
+use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 use svm_run::cap_thunk;
 use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
@@ -75,11 +75,61 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
+/// Compile a C source string to text IR with the `--child-entry` spawnable §14 child ABI — how an
+/// external command the shell `exec`s (STAGE1.md §5) is built.
+fn c_to_ir_child(src: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("svm_cshcmd_{}_{id}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let irfile = base.with_extension("svm");
+    std::fs::write(&cfile, src).unwrap();
+    let status = Command::new(chibicc())
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "--child-entry",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run chibicc");
+    assert!(status.success(), "chibicc --child-entry failed on:\n{src}");
+    std::fs::read_to_string(&irfile).unwrap()
+}
+
+/// The op-13 named-grant hooks the JIT needs to spawn a separate-module child with a by-name powerbox.
+fn grant_hooks() -> GrantChildHooks {
+    GrantChildHooks {
+        build: svm_run::grant_child_build,
+        build_named: svm_run::grant_named_child_build,
+        release: svm_run::grant_child_release,
+    }
+}
+
 /// Bind the shim's `__px_`-prefixed import names to the personality (strip the prefix, resolve the
-/// bare libc name to `(HOST_FN, op)` + the granted handle).
-fn resolver(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
-    let bound = svm_posix::resolve_bound(handle);
-    move |name| bound(name.strip_prefix("__px_")?)
+/// bare libc name to `(HOST_FN, op)` + the granted handle). `__spawn`/`__join` are the shell's own
+/// `Instantiator` `cap.call`s (op 13 / op 1) — bound to the granted `Instantiator` handle, not the
+/// personality (STAGE1.md §5).
+fn resolver(px_h: i32, inst_h: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
+    let bound = svm_posix::resolve_bound(px_h);
+    move |name| match name {
+        "__spawn" => Some(svm_ir::Resolved::CapBound {
+            type_id: 6,
+            op: 13,
+            handle: inst_h,
+        }),
+        "__join" => Some(svm_ir::Resolved::CapBound {
+            type_id: 6,
+            op: 1,
+            handle: inst_h,
+        }),
+        _ => bound(name.strip_prefix("__px_")?),
+    }
 }
 
 /// The guest libc shim (guest code): standard libc names, adapting C's NUL-terminated `char*` calls
@@ -101,6 +151,13 @@ long __px_readdir(int cap, long dir, long namebuf, long namecap);
 long __px_closedir(int cap, long dir);
 long __px_argc(int cap);
 long __px_argv(int cap, long i, long buf, long cap2);
+/* Personality `exec` surface (STAGE1.md §5): PATH lookup + the forwardable stdout handle. The spawn
+   itself is the shell's own `Instantiator` cap.call — `__spawn` (op 13) / `__join` (op 1), bound to the
+   granted `Instantiator` handle (not the personality), so they carry a baked handle like every import. */
+long __px_exec_lookup(int cap, long name, long len);
+long __px_exec_stdout(int cap);
+long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
+long __join(int inst, long child);
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
@@ -345,6 +402,35 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
 /* Execute one command after redirection has been stripped. `line` is tokenized into argv; builtins
    read their input from a path argument or, absent one, the (possibly redirected) in_fd. Returns the
    command's exit status (0 = success). */
+/* Spawn an external command (STAGE1.md §5). `pool` (a big writable global) forces a window large
+   enough to hold a 128 KiB-aligned 128 KiB command carve below the stack, and holds the grant record.
+   The command's stdout is the personality's forwardable `Stream` (`exec_stdout`), re-granted by name so
+   its `write(1, …)` reaches the shell's sink — a `>`/`|` redirect on an external command is not honored
+   (that needs the Power-2 `Endpoint`, STAGE1.md); the command always writes to the terminal sink. */
+static char pool[393216];
+static int spawn_cmd(long mod, int argc, char **argv) {
+  long out = __px_exec_stdout(0);
+  long base = (long)pool;
+  long carve = (base + 131071) & ~131071;
+  /* grant record at base: {name_off, name_len, out, flags}; "stdout" name follows at base+16 */
+  int *rec = (int *)base;
+  rec[0] = (int)(base + 16); rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
+  char *nm = (char *)(base + 16);
+  nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
+  /* the command's args buffer at carve+128 (POWERBOX_ARGS_BASE): {argc, envc=0} then packed argv */
+  char *ab = (char *)(carve + 128);
+  int *hdr = (int *)ab;
+  hdr[0] = argc; hdr[1] = 0;
+  char *p = ab + 8;
+  for (int i = 0; i < argc; i++) {
+    char *s = argv[i]; long L = slen(s);
+    for (long k = 0; k < L; k++) *p++ = s[k];
+    *p++ = 0;
+  }
+  long child = __spawn(0, mod, base, 1, 0, carve, 17, 0);
+  return (int)__join(0, child);
+}
+
 static int exec_line(char *line) {
   char *argv[MAXARGS];
   int argc = tokenize(line, argv);
@@ -522,7 +608,11 @@ static int exec_line(char *line) {
   } else if (streq(cmd, "exit")) {
     exit(argc > 1 ? (int)atoi_(argv[1]) : last_status);
   } else {
-    puts_(cmd); puts_(": not found\n"); st = 127;
+    /* Not a builtin: look the command up in the personality's PATH registry and, if found, spawn it as
+       an external child (STAGE1.md §5); otherwise the classic `<cmd>: not found`. */
+    long mod = __px_exec_lookup(0, (long)cmd, slen(cmd));
+    if (mod < 0) { puts_(cmd); puts_(": not found\n"); st = 127; }
+    else st = spawn_cmd(mod, argc, argv);
   }
   return st;
 }
@@ -719,44 +809,107 @@ fn run_shell(
     files: &[&str],
     args: &[&str],
 ) -> (Vec<u8>, Vec<u8>) {
+    run_shell_ex(stdin, env, files, args, &[])
+}
+
+/// As [`run_shell`], plus a **PATH registry** of external commands `(name, C source)`: each is compiled
+/// `--child-entry`, granted as a `Module`, and registered so an unknown command name in the script is
+/// `exec`'d as an external child (STAGE1.md §5) instead of `<cmd>: not found`. With no `cmds` (the
+/// [`run_shell`] case) `exec_lookup` always misses, so the `not found` path is unchanged.
+fn run_shell_ex(
+    stdin: &[u8],
+    env: &[(&str, &str)],
+    files: &[&str],
+    args: &[&str],
+    cmds: &[(&str, &str)],
+) -> (Vec<u8>, Vec<u8>) {
     let src = format!("{SHIM}\n{SHELL_MAIN}");
     let ir = c_to_ir(&src);
     let raw = parse_module_raw(&ir)
         .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
-    let win = 1u64 << raw.memory.expect("frontend declares a window").size_log2;
+    let win = 1usize << raw.memory.expect("frontend declares a window").size_log2;
+
+    // The external command `Module`s (shared by both hosts), compiled with the spawnable child ABI.
+    let cmd_mods: Vec<(&str, svm_ir::Module)> = cmds
+        .iter()
+        .map(|&(name, csrc)| {
+            let m = svm_run::resolve_capability_imports(
+                parse_module_raw(&c_to_ir_child(csrc)).expect("parse cmd"),
+            )
+            .expect("resolve cmd");
+            verify_module(&m).expect("verify cmd");
+            (name, m)
+        })
+        .collect();
+
+    // Grant a personality + the spawn caps on one host; identical grant order across the two hosts keeps
+    // the handles equal (so one resolver binds both). The `Instantiator` (over the whole window) and a
+    // forwardable stdout `Stream` back the shell's `__spawn`/`exec_stdout`; the personality's fd-1 writes
+    // route to the same shared sink as the child's re-granted `Stream`, unifying their output.
+    let setup = |host: &mut Host| -> (svm_posix::Posix, i32, i32) {
+        let sink = host.shared_stdout();
+        let out_h = host.grant_stream(StreamRole::Out);
+        let inst_h = host.grant_instantiator(0, win as u64);
+        let cmd_handles: Vec<(&str, i32)> = cmd_mods
+            .iter()
+            .map(|(n, m)| (*n, host.grant_module(m)))
+            .collect();
+        // The shell never `malloc`s, so the personality heap (top 64 KiB) is never touched — it just
+        // stays clear of the command carve (inside `pool`, low) and the shell's stack.
+        let (px_h, posix) =
+            svm_posix::grant(host, (win - (64 << 10)) as u64, win as u64, stdin.to_vec());
+        posix.set_stdout_sink(sink);
+        posix.set_exec_stdout(out_h);
+        for (n, h) in &cmd_handles {
+            posix.register_command(n, *h);
+        }
+        for (k, v) in env {
+            posix.set_env(k, v);
+        }
+        for path in files {
+            posix.write_file(path, b"");
+        }
+        if !args.is_empty() {
+            posix.set_args(args);
+        }
+        (posix, px_h, inst_h)
+    };
 
     let mut ih = Host::new();
-    let (ipx, iposix) = svm_posix::grant(&mut ih, win / 2, win, stdin.to_vec());
+    let (iposix, ipx, iinst) = setup(&mut ih);
     let mut jh = Host::new();
-    let (jpx, jposix) = svm_posix::grant(&mut jh, win / 2, win, stdin.to_vec());
-    assert_eq!(ipx, jpx, "identical grant order → identical handle");
-    for (k, v) in env {
-        iposix.set_env(k, v);
-        jposix.set_env(k, v);
-    }
-    for path in files {
-        iposix.write_file(path, b"");
-        jposix.write_file(path, b"");
-    }
-    if !args.is_empty() {
-        iposix.set_args(args);
-        jposix.set_args(args);
-    }
+    let (jposix, jpx, jinst) = setup(&mut jh);
+    assert_eq!(
+        (ipx, iinst),
+        (jpx, jinst),
+        "identical grant order → identical handles"
+    );
 
-    let m = svm_ir::resolve_imports_with(&raw, resolver(ipx))
+    let m = svm_ir::resolve_imports_with(&raw, resolver(ipx, iinst))
         .unwrap_or_else(|e| panic!("resolve imports: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    let init = vec![0u8; win];
 
-    // Interpreter: the shell loops to EOF and returns 0 (or `exit`s, a `Trap::Exit`).
-    let mut fuel = 50_000_000u64;
-    match run_with_host(&m, 0, &[], &mut fuel, &mut ih) {
+    // Interpreter: the shell loops to EOF and returns 0 (or `exit`s, a `Trap::Exit`). The reserved
+    // window backs the command carve op 13 spawns into.
+    let mut fuel = 200_000_000u64;
+    match run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &init, 0, &mut ih).0 {
         Ok(_) | Err(Trap::Exit(_)) => {}
         Err(e) => panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"),
     }
-    // JIT.
-    let jout =
-        compile_and_run_with_host(&m, 0, &[], cap_thunk, &mut jh as *mut Host as *mut c_void)
-            .expect("jit compiles");
+    // JIT — given the module resolver + named-grant hooks op 13 needs.
+    let (jout, _) = compile_and_run_capture_reserved_with_host_ex(
+        &m,
+        0,
+        &[],
+        &init,
+        0,
+        cap_thunk,
+        &mut jh as *mut Host as *mut c_void,
+        Some(svm_run::module_resolver),
+        Some(grant_hooks()),
+    )
+    .expect("jit compiles");
     assert!(
         matches!(jout, JitOutcome::Returned(_) | JitOutcome::Exited(_)),
         "jit ended abnormally: {jout:?}\n--- IR ---\n{ir}"
@@ -779,6 +932,61 @@ fn stage0_shell_runs_a_script() {
     assert_eq!(
         iout, b"hello, shell\n/root\n/tmp\nfrobnicate: not found\n",
         "interp: the shell ran the script (echo, $VAR, cd+pwd, unknown cmd)"
+    );
+    assert_eq!(jout, iout, "jit: shell output must match interp");
+}
+
+/// An external command: echo every `argv[i]` on its own line, return `argc` (a non-zero status that
+/// tracks the argument count, so `$?` is observable).
+const CMD_ECHO: &str = r#"
+long write(long fd, void *buf, long n);
+static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
+int main(int argc, char **argv){
+  for (int i = 0; i < argc; i++){ write(1, argv[i], slen(argv[i])); write(1, "\n", 1); }
+  return argc;
+}
+"#;
+
+/// An external command that succeeds: print `ok\n`, return `0` — so `&&`/`||` see a success status.
+const CMD_OK: &str = r#"
+long write(long fd, void *buf, long n);
+int main(int argc, char **argv){ write(1, "ok\n", 3); return 0; }
+"#;
+
+/// STAGE1.md §5 — the real Stage-0 shell **spawns an external command**. A command name that is not a
+/// builtin is looked up in the personality's PATH registry and, if found, run as a separate compiled-C
+/// child via `Instantiator` op 13 + `join`: its `argv` is delivered, its stdout interleaves with the
+/// shell's own output in the one shared sink, and its status threads into `$?`. An unregistered name is
+/// still `<cmd>: not found` (status 127). Differential interp==JIT.
+#[test]
+fn stage0_shell_spawns_external_command() {
+    let script = b"echo start\n\
+                   say hi there\n\
+                   echo rc $?\n\
+                   bogus\n\
+                   echo rc $?\n";
+    let (iout, jout) = run_shell_ex(script, &[], &[], &[], &[("say", CMD_ECHO)]);
+    assert_eq!(
+        iout,
+        b"start\nsay\nhi\nthere\nrc 3\nbogus: not found\nrc 127\n".as_slice(),
+        "interp: builtin + spawned external (argv echoed, status = argc) + not-found, all in one sink"
+    );
+    assert_eq!(jout, iout, "jit: shell output must match interp");
+}
+
+/// A spawned command's status participates in `&&`/`||` short-circuiting exactly like a builtin's, and
+/// the PATH registry holds more than one command. `ok` returns 0 (success); `say` returns its argc
+/// (non-zero, a failure). Differential interp==JIT.
+#[test]
+fn stage0_shell_external_command_status_in_control_flow() {
+    let script = b"ok && echo yes\n\
+                   say a || echo fallback\n\
+                   ok || echo skipped\n";
+    let (iout, jout) = run_shell_ex(script, &[], &[], &[], &[("say", CMD_ECHO), ("ok", CMD_OK)]);
+    assert_eq!(
+        iout,
+        b"ok\nyes\nsay\na\nfallback\nok\n".as_slice(),
+        "interp: `ok`(0)&&echo → yes; `say a`(2, fail)||echo → fallback; `ok`(0)||echo → skipped"
     );
     assert_eq!(jout, iout, "jit: shell output must match interp");
 }
