@@ -11,6 +11,7 @@ import { runJitModule } from './wasmjit-module.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
+import { formatPgOutput } from './pg-format.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -775,6 +776,12 @@ function readEngineStdout() {
   return new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + l));
 }
 
+// The Postgres session's stdout, with `postgres --single`'s raw debug-tuple result blocks reformatted
+// into psql-style aligned tables (`pg-format.js`). Prompts/banner/notices pass through untouched.
+function readPgStdout() {
+  return formatPgOutput(readEngineStdout());
+}
+
 // ---- persistent Postgres storage (IndexedDB) -----------------------------------------------------
 // The live backend's data dir is an in-memory `mem_fs`; on its own it evaporates when the page unloads.
 // After each query we snapshot that fs (`svm_pg_snapshot` → an `svm_fs` data image) and stash the image
@@ -920,7 +927,7 @@ async function runPg(c) {
       const ms = (performance.now() - t0).toFixed(0);
       eng.ex.svm_dealloc(modP, modBytes.length);
       eng.ex.svm_dealloc(imgP, imgBytes.length);
-      c.el.stdout.textContent += readEngineStdout(); // the banner + first prompt
+      c.el.stdout.textContent += readPgStdout(); // the banner + first prompt
       if (rc !== 0) {
         // A saved image that won't boot is likely corrupt — drop it so the next Run starts clean.
         if (restored) {
@@ -956,8 +963,8 @@ async function runPg(c) {
     const rc = eng.ex.svm_pg_query(p, b.length);
     const ms = (performance.now() - t0).toFixed(0);
     eng.ex.svm_dealloc(p, b.length);
-    // Append this query's output delta to the running transcript.
-    c.el.stdout.textContent += readEngineStdout();
+    // Append this query's output delta to the running transcript (result blocks → psql-style tables).
+    c.el.stdout.textContent += readPgStdout();
     c.el.stdout.scrollTop = c.el.stdout.scrollHeight;
     const status = eng.ex.svm_status();
     if (rc === 0) {
