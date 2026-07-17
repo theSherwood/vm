@@ -57,9 +57,14 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 2. **stdio-inherited child** *(done — `stage1_stdio_child.rs`)* — a same-module
    BusyBox-applet child inherits a granted `stdout` (`instantiate_named`, op 11)
    and echoes its parent-seeded `argv` to it: a real external `echo` — argv in,
-   bytes out through inherited stdio, status back — differential interp==JIT. (A
-   *separate*-module child with granted stdio is a later variant; the
-   same-module applet shape is what the shell actually wants.)
+   bytes out through inherited stdio, status back — differential interp==JIT.
+   - **Foreign-program variant** *(done — `stage1_foreign_command.rs`)* — the
+     general `exec` case: the command is a *separate* verified `Module` (a
+     distinct binary), spawned via `instantiate_module` (op 5). Separate-module
+     children have no stdio-grant op, so the shell uses the **parent-as-pager**
+     model — the child writes output into its carve and the parent forwards
+     those bytes (length = the child's `join` return) to its own stdout.
+     Differential interp==JIT.
 3. **multi-applet dispatch guarantee** *(done — `stage1_applet_dispatch.rs`)* —
    one binary carries several applets (`true`→0, `false`→1, `echo`→writes+3),
    and spawning a chosen entry yields that applet's own `(stdout, status)`. This
