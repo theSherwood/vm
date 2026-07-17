@@ -186,8 +186,10 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
 Decision #3 settled: keep `HOST_FN` + handle as the mechanism. The handle is already an unforgeable,
 more-expressive disambiguator than a nominal type_id, and an open host-assignable type_id range would
 weaken the §3c type-check's closed-enum audit surface for only a diagnostics gain.
-- [ ] (Optional, cosmetic) carry an optional human-readable **interface label** alongside a `HostFn`
+- [x] (Optional, cosmetic) carry an optional human-readable **interface label** alongside a `HostFn`
       grant — untrusted, verifier-ignored, for diagnostics / `cap.self.*` only. Not a type_id.
+      *Landed as F9* (below): the label is the F7 registered name, surfaced host-side via
+      `Host::cap_label(handle)` and guest-side via `cap.self.label` (opcode `0x7F`).
 
 ### Phase 5 — C bindings — done
 - [x] `svm-capi` crate (`rlib` + `cdylib` + `staticlib`) + hand-written `include/svm.h` over the whole
@@ -433,7 +435,13 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   ungranted name is `-EINVAL`), fail-closed on the untrusted name (`-EFAULT` out of bounds, `-EINVAL`
   bad UTF-8 / unknown). Tests: `powerbox_imports.rs` (runtime resolve + use on all three backends;
   unknown-name `-EINVAL`; canonical names match the stashed handles) and `cap_self.rs` (text + binary
-  round-trip).
+  round-trip). *Update (PROCESS.md S15, c1–c4):* the resolve path is now the powerbox's **only**
+  bootstrap — every synthesized `_start` is paramless and stashes its handles via `cap.self.resolve`
+  over a name list (`svm_ir::POWERBOX_CAP_NAMES[..n]` for the fixed set;
+  `synth_powerbox_start_with_names` / `_for_imports` for a module's own import names), with the
+  runner binding name → implementation **+ handle** (`Resolved::CapBound`, `svm_run::powerbox_resolver`,
+  `powerbox_named.rs`). The positional handle-parameter `_start` is retired at every frontend; the
+  runner keeps positional entry only as a low-level primitive for hand-written IR kernels.
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic capability labels.** *Landed.* The reverse of F7: a human-readable **label** for a
@@ -471,7 +479,11 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   without aliasing. Because the F7 directory is **live** (`cap.self.resolve` reads it at call time),
   anything minted + named mid-run becomes guest-resolvable immediately — dynamic *discovery* of new
   capabilities falls out for free. Keeps the object-capability idiom: authority appears because a held
-  capability minted it, never by ambient mutation.
+  capability minted it, never by ambient mutation. *First slice landed:*
+  `Host::grant_host_fn_region` (`HostFnRegion`) hands the handler a narrow `RegionMinter` alongside
+  `(op, args, mem)`, so an mmap-capable fs capability can mint a file-backed `SharedRegion` mid-run
+  (the MMAP_CAPABILITY.md §4b zero-copy bridge) — the general `mint(HostFn)` / mid-run name
+  registration remains open.
 - **F13 — general capability revocation.** The handle table is structurally ready — every slot is
   `{generation, entry: Option<Binding>, type_id}`, handles pack `(generation, slot)`, and
   `Trap::CapFault` already documents "closed/revoked (dead generation)"; `Jit.release` does per-slot
@@ -496,8 +508,9 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   one more reflection op (`cap.self.ops(handle)` populated at grant time like F7/F9) — logged here so
   the choice is deliberate; the default is to keep op vocabularies wholly between embedder and guest
   (§2a: the VM stays mechanism, never semantics).
-- **F15 — a process substrate (the execution half; svm as a base for shells and OSes).** *Vision,
-  not yet scheduled — logged so the design intent is captured.* The long-term aim is for svm to be a
+- **F15 — a process substrate (the execution half; svm as a base for shells and OSes).** *Now
+  designed and in flight — the design lives in `PROCESS.md` and the spawn/wait/exec epic is tracked
+  in `STAGE1.md`; landed-slice status at the end of this entry.* The long-term aim is for svm to be a
   substrate a **shell or OS personality** runs on. Two halves: a *filesystem* (the **Fs capability**,
   `svm_run::fs` — the VFS `open`/`read`/…, plus the file-backed `mmap`/`msync` storage shape) and a
   *process model*. The filesystem half exists; this is the process half.
@@ -524,6 +537,20 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   a real OS-personality substrate. The building blocks (§14 child domains, Fs, `Exit`, F13) mean this
   is composition of existing mechanism, not new VM semantics — consistent with keeping the VM pure
   mechanism (§2a).
+
+  *Status (Stage 1, landed):* the `posix_spawn`+`wait` core is proven differentially
+  (`stage1_spawn_wait.rs`: a parent seeds argv into a child's carve, spawns a separate host-verified
+  `Module` via `Instantiator.instantiate_module` (op 5), and `join`s (op 1) for the child's exit
+  status — need (1)'s spawn-with-argv + wait). Stdio inheritance landed as capability forwarding:
+  `instantiate_named` (op 11, a named grant list — a parent re-grants its `stdout` by name,
+  `stage1_stdio_child.rs`) and **`instantiate_module_named` (op 13 = op 5 + op 11)**, under which an
+  *unmodified* compiled-C `main(argc, argv)` runs as a spawned child with inherited stdout and seeded
+  argv (`stage1_exec_stdout.rs`), interp == JIT; multi-applet dispatch threads each command's
+  exit status into `$?` (`stage1_applet_dispatch.rs`); the argv vector ABI is pinned
+  (`stage1_argv_vector.rs`). The §15 quota side gained the **`Budget` capability** (iface 14,
+  `Host::grant_budget`; op 0 `split` attenuates, op 1 `read` reports). Still open: need (2)'s pipe
+  between children — shell-side *interception* (`cmd > file`, `cmd | cmd2`) needs the guest-served
+  `Endpoint` (PROCESS.md §4, still [PROPOSED]) — and need (3)'s signal surface.
 
 ---
 
