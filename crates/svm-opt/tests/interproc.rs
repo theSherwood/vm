@@ -879,32 +879,31 @@ fn an_exported_function_is_not_specialized() {
 }
 
 #[test]
-fn const_prop_bails_when_indirect_dispatch_is_present() {
-    // A funcref value equals its funcidx, so a surviving `call_indirect` could reach any function with
-    // arguments const_prop can't see. The pass must then leave every function alone — here `sel`, whose
-    // one direct caller passes flag=1, keeps its branch because an indirect call could pass flag=0.
+fn const_prop_bails_on_an_unresolvable_indirect_index() {
+    // A `call_indirect` on a **runtime** funcref (here the entry's own parameter `fp`) could reach any
+    // function with arguments const_prop can't see, so the whole pass must bail — `sel`, whose one
+    // direct caller passes flag=1, keeps its branch (an indirect call could pass flag=0).
     let sig = FuncType {
         params: vec![ValType::I32, ValType::I32],
         results: vec![ValType::I32],
     };
     let entry = Func {
-        params: vec![ValType::I32],
+        params: vec![ValType::I32, ValType::I32], // fp (runtime funcref), x
         results: vec![ValType::I32],
         blocks: vec![Block {
-            params: vec![ValType::I32], // x
+            params: vec![ValType::I32, ValType::I32],
             insts: vec![
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![1, 0],
+                    args: vec![2, 1],
                 }, // sel(1, x) — a direct call passing a constant flag
-                Inst::ConstI32(1), // a runtime-looking funcref for the indirect call
                 Inst::CallIndirect {
                     ty: sig,
-                    idx: 3,
-                    args: vec![1, 0],
-                }, // (*fp)(1, x) — keeps the whole module in the conservative regime
-                add(2, 4),
+                    idx: 0,
+                    args: vec![2, 1],
+                }, // (*fp)(1, x) — fp is unknown, so the pass can't see who this calls
+                add(3, 4),
             ],
             term: Terminator::Return(vec![5]),
         }],
@@ -919,7 +918,347 @@ fn const_prop_bails_when_indirect_dispatch_is_present() {
     assert_eq!(
         n_brif(&cp),
         1,
-        "const_prop must not specialize any function while indirect dispatch is present"
+        "an unresolvable indirect index forces const_prop to leave every function alone"
     );
     assert_eq!(cp, m, "const_prop is the identity here");
+}
+
+#[test]
+fn const_funcref_argument_devirtualizes_through_the_callee() {
+    // entry(x): apply(g, x)  where `apply(fp, a) = call_indirect fp (a)` and `g` (func 2) is `a+1`.
+    // The funcref is a constant `ConstI32(2)` (funcref == funcidx), so const_prop's fixpoint resolves
+    // `apply`'s dispatch to `g`: it propagates the constant into `fp`, the re-run of devirt turns the
+    // now-constant `call_indirect` into a direct call to `g`, which inlines — leaving the entry
+    // computing a+1 with no indirect (and ultimately no) call.
+    let sig = FuncType {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+    };
+    let entry = Func {
+        params: vec![ValType::I32], // x
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::ConstI32(2), // funcref g (== funcidx 2)
+                Inst::Call {
+                    func: 1,
+                    args: vec![1, 0],
+                }, // apply(g, x)
+            ],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let apply = Func {
+        params: vec![ValType::I32, ValType::I32], // fp=v0, a=v1
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32, ValType::I32],
+            insts: vec![Inst::CallIndirect {
+                ty: sig,
+                idx: 0,
+                args: vec![1],
+            }], // (*fp)(a)
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let g = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![Inst::ConstI32(1), add(0, 1)], // a + 1
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, apply, g],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    assert_eq!(
+        n_call_indirect(&m),
+        1,
+        "precondition: apply dispatches indirectly"
+    );
+
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("re-verifies");
+    assert_eq!(
+        n_call_indirect(&opt),
+        0,
+        "const_prop resolves the funcref so devirt turns the indirect call direct"
+    );
+    assert_eq!(n_calls(&opt), 0, "the resolved call then inlines");
+    for x in [0i32, 5, -3, 41] {
+        assert_eq!(run(&m, 0, &[Value::I32(x)]), run(&opt, 0, &[Value::I32(x)]));
+        assert_eq!(run(&opt, 0, &[Value::I32(x)]), Ok(vec![Value::I32(x + 1)]));
+    }
+}
+
+#[test]
+fn a_non_uniform_funcref_argument_is_not_devirtualized() {
+    // `apply` is called with two *different* constant funcrefs (g at one site, h at another), so its
+    // `fp` is not a single constant — the dispatch must stay indirect, and behavior must be preserved.
+    let sig = FuncType {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+    };
+    let apply = Func {
+        params: vec![ValType::I32, ValType::I32], // fp, a
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32, ValType::I32],
+            insts: vec![Inst::CallIndirect {
+                ty: sig.clone(),
+                idx: 0,
+                args: vec![1],
+            }],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let plus1 = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![Inst::ConstI32(1), add(0, 1)],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let times2 = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![add(0, 0)],
+            term: Terminator::Return(vec![1]),
+        }],
+    };
+    // entry(sel, x): if sel { apply(plus1, x) } else { apply(times2, x) }
+    let entry = Func {
+        params: vec![ValType::I32, ValType::I32], // sel, x
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32, ValType::I32],
+                insts: vec![],
+                term: Terminator::BrIf {
+                    cond: 0,
+                    then_blk: 1,
+                    then_args: vec![1],
+                    else_blk: 2,
+                    else_args: vec![1],
+                },
+            },
+            Block {
+                params: vec![ValType::I32], // x
+                insts: vec![
+                    Inst::ConstI32(2), // funcref plus1 (funcidx 2)
+                    Inst::Call {
+                        func: 1,
+                        args: vec![1, 0],
+                    },
+                ],
+                term: Terminator::Return(vec![2]),
+            },
+            Block {
+                params: vec![ValType::I32], // x
+                insts: vec![
+                    Inst::ConstI32(3), // funcref times2 (funcidx 3)
+                    Inst::Call {
+                        func: 1,
+                        args: vec![1, 0],
+                    },
+                ],
+                term: Terminator::Return(vec![2]),
+            },
+        ],
+    };
+    let m = Module {
+        funcs: vec![entry, apply, plus1, times2],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("re-verifies");
+    assert!(
+        n_call_indirect(&opt) >= 1,
+        "a callee dispatched on two different funcrefs must keep its indirect call"
+    );
+    for sel in [0i32, 1] {
+        for x in [0i32, 5, -4] {
+            assert_eq!(
+                run(&m, 0, &[Value::I32(sel), Value::I32(x)]),
+                run(&opt, 0, &[Value::I32(sel), Value::I32(x)]),
+            );
+        }
+    }
+}
+
+#[test]
+fn an_indirect_call_with_a_runtime_arg_blocks_specialization() {
+    // Soundness guard for the fixpoint: `g` is called *directly* with flag=1 and *indirectly* (through a
+    // constant funcref) with a runtime flag. If const_prop counted only the direct call it would wrongly
+    // fix flag=1; it must join in the indirect call's runtime argument, leaving `g`'s branch intact.
+    // g(flag) = flag ? 10 : 20   (func 1)
+    let g = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32],
+                insts: vec![Inst::ConstI32(0), cmp(CmpOp::Ne, 0, 1)], // flag != 0
+                term: Terminator::BrIf {
+                    cond: 2,
+                    then_blk: 1,
+                    then_args: vec![],
+                    else_blk: 2,
+                    else_args: vec![],
+                },
+            },
+            Block {
+                params: vec![],
+                insts: vec![Inst::ConstI32(10)],
+                term: Terminator::Return(vec![0]),
+            },
+            Block {
+                params: vec![],
+                insts: vec![Inst::ConstI32(20)],
+                term: Terminator::Return(vec![0]),
+            },
+        ],
+    };
+    let sig = FuncType {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+    };
+    // entry(r): t1 = g(1); t2 = call_indirect(funcref g, r); return t1 + t2
+    let entry = Func {
+        params: vec![ValType::I32], // r (runtime)
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![1],
+                }, // g(1) -> v2
+                Inst::ConstI32(1), // funcref g (funcidx 1)
+                Inst::CallIndirect {
+                    ty: sig,
+                    idx: 3,
+                    args: vec![0],
+                }, // g(r) -> v4
+                add(2, 4),
+            ],
+            term: Terminator::Return(vec![5]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, g],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("re-verifies");
+    for r in [0i32, 1, 2, -5] {
+        let want = 10 + if r != 0 { 10 } else { 20 };
+        assert_eq!(run(&m, 0, &[Value::I32(r)]), run(&opt, 0, &[Value::I32(r)]));
+        assert_eq!(
+            run(&opt, 0, &[Value::I32(r)]),
+            Ok(vec![Value::I32(want)]),
+            "g must stay branch-sensitive at r={r}"
+        );
+    }
+}
+
+#[test]
+fn a_block_parameter_is_not_read_as_a_function_parameter() {
+    // Regression: the fixpoint must not confuse a *block* parameter (a phi in a non-entry block) with a
+    // *function* parameter. `h(p)` is always called with p=1, so h.p is constant — but in a non-entry
+    // block h calls `k(q)` where `q` is a runtime phi (5 or 7). If the analysis read q as h's param it
+    // would fix k's argument to 1 and mis-specialize k. k must stay branch-sensitive.
+    let entry = Func {
+        params: vec![],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![],
+            insts: vec![
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![0],
+                }, // h(1)
+            ],
+            term: Terminator::Return(vec![1]),
+        }],
+    };
+    let h = Func {
+        params: vec![ValType::I32], // p
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32], // p = v0
+                insts: vec![Inst::ConstI32(5), Inst::ConstI32(7)],
+                term: Terminator::BrIf {
+                    cond: 0,
+                    then_blk: 1,
+                    then_args: vec![1], // q = 5
+                    else_blk: 1,
+                    else_args: vec![2], // q = 7
+                },
+            },
+            Block {
+                params: vec![ValType::I32], // q = v0 (a phi: 5 or 7)
+                insts: vec![Inst::Call {
+                    func: 2,
+                    args: vec![0],
+                }], // k(q)
+                term: Terminator::Return(vec![1]),
+            },
+        ],
+    };
+    let k = Func {
+        params: vec![ValType::I32], // v
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32],
+                insts: vec![Inst::ConstI32(5), cmp(CmpOp::Eq, 0, 1)], // v == 5
+                term: Terminator::BrIf {
+                    cond: 2,
+                    then_blk: 1,
+                    then_args: vec![],
+                    else_blk: 2,
+                    else_args: vec![],
+                },
+            },
+            Block {
+                params: vec![],
+                insts: vec![Inst::ConstI32(100)],
+                term: Terminator::Return(vec![0]),
+            },
+            Block {
+                params: vec![],
+                insts: vec![Inst::ConstI32(200)],
+                term: Terminator::Return(vec![0]),
+            },
+        ],
+    };
+    let m = Module {
+        funcs: vec![entry, h, k],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    // h(1): p=1 -> q=5 -> k(5) -> 100.
+    assert_eq!(run(&m, 0, &[]), Ok(vec![Value::I32(100)]));
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("re-verifies");
+    assert_eq!(
+        run(&opt, 0, &[]),
+        Ok(vec![Value::I32(100)]),
+        "k must not be mis-specialized from a block parameter read as a function parameter"
+    );
 }
