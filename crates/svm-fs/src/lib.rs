@@ -281,6 +281,28 @@ impl MemFsState {
 }
 
 impl MemFsState {
+    /// Current contents as a `(files, dirs)` seed — the exact shape [`encode_image`] serializes and
+    /// [`mem_fs_seeded_handler`]/[`mem_fs_seeded_shared`] mount. A file's bytes are its live committed
+    /// buffer (an open `fd` shares the same `Arc`, so bytes already `write`n are included); purely
+    /// transient state that is not part of a filesystem *image* — open-fd cursors, `opendir` handles,
+    /// live mmaps — is dropped. Entries are sorted for a byte-deterministic image (so re-snapshotting an
+    /// unchanged store yields identical bytes).
+    fn snapshot(&self) -> FsSeed {
+        let mut files: Vec<(String, Vec<u8>)> = self
+            .files
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                )
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let dirs: Vec<String> = self.dirs.iter().cloned().collect(); // BTreeSet ⇒ already sorted
+        (files, dirs)
+    }
+
     /// A durability barrier (`msync`/`sync`): `true` ⇒ drop this write (crashed or crashing now).
     fn crash_barrier(&mut self) -> bool {
         self.crash.as_mut().is_some_and(CrashCtl::barrier)
@@ -760,6 +782,59 @@ pub fn mem_fs_seeded_handler(
     }
 }
 
+/// A live handle onto a store mounted by [`mem_fs_seeded_shared`], letting the caller serialize the
+/// **current** filesystem back out — e.g. to persist a browser Postgres session across page reloads
+/// (snapshot the data dir, stash the image, reboot from it next visit). Cloneable; every clone observes
+/// the same live store. The guest that owns the mount runs single-threaded, so a snapshot taken while it
+/// is suspended (parked at a stdin read, between queries) is a quiescent, crash-consistent point-in-time
+/// image — exactly the state Postgres' startup recovery expects to replay.
+#[derive(Clone)]
+pub struct MemFsHandle(Arc<Mutex<MemFsState>>);
+
+impl MemFsHandle {
+    /// The current filesystem as a `(files, dirs)` seed (see [`MemFsState::snapshot`]).
+    pub fn seed(&self) -> FsSeed {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
+    }
+
+    /// The current filesystem serialized straight to a shippable [`encode_image`] blob — the bytes a
+    /// caller persists and later re-mounts via [`decode_image`] + [`mem_fs_seeded_shared`].
+    pub fn image(&self) -> Vec<u8> {
+        let (files, dirs) = self.seed();
+        encode_image(&files, &dirs)
+    }
+}
+
+/// Like [`mem_fs_seeded_handler`] but returns the `HostFn` **and** a [`MemFsHandle`] onto its state, so
+/// the mount can be snapshotted back out later (the persistent-session persistence path). Unlike the
+/// `make: impl Fn() -> HostFn` builders — which re-seed a fresh store on every grant — this grants
+/// **one** live store shared between the handler and the handle through an `Arc<Mutex<..>>`, locked per
+/// op (uncontended in the single-threaded browser). The deterministic, snapshot-free one-shot path keeps
+/// [`mem_fs_seeded_handler`].
+pub fn mem_fs_seeded_shared(
+    files: Vec<(String, Vec<u8>)>,
+    dirs: Vec<String>,
+) -> (HostFn, MemFsHandle) {
+    let mut st = MemFsState::default();
+    for (p, data) in &files {
+        st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
+    }
+    for d in &dirs {
+        st.dirs.insert(norm(d));
+    }
+    let shared = Arc::new(Mutex::new(st));
+    let handle = MemFsHandle(shared.clone());
+    let hostfn: HostFn = Box::new(
+        move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+            Ok(vec![shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .handle(op, args, mem)])
+        },
+    );
+    (hostfn, handle)
+}
+
 /// A filesystem seed: `(files as (relative-path, bytes), directory relative-paths)`. The material both
 /// [`mem_fs_seeded`] mounts and [`encode_image`] serializes.
 pub type FsSeed = (Vec<(String, Vec<u8>)>, Vec<String>);
@@ -858,4 +933,72 @@ pub fn decode_image(bytes: &[u8]) -> Result<FsSeed, String> {
         files.push((s.to_string(), take(&mut p, dlen)?.to_vec()));
     }
     Ok((files, dirs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flat `GuestMem` over a `Vec<u8>` — enough to drive the fs ops (they only read paths / read
+    /// write-payloads / write read-results within `[0, len)`).
+    struct VecMem(Vec<u8>);
+    impl GuestMem for VecMem {
+        fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+            let end = (ptr as usize).checked_add(len as usize)?;
+            self.0.get(ptr as usize..end).map(<[u8]>::to_vec)
+        }
+        fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+            let end = (ptr as usize).checked_add(data.len())?;
+            self.0.get_mut(ptr as usize..end)?.copy_from_slice(data);
+            Some(())
+        }
+    }
+
+    /// `mem_fs_seeded_shared` snapshots the **live** store — writes and removes made through the granted
+    /// `HostFn` after the mount show up in `MemFsHandle::image`, and the image round-trips through
+    /// `decode_image` back to a mountable seed. This is the persistence hinge: a Postgres session's data
+    /// dir, mutated by DDL/DML, must serialize back out exactly.
+    #[test]
+    fn shared_handle_snapshots_live_writes() {
+        // Seed: one existing file + one empty dir (the shapes an initdb tree has).
+        let seed_files = vec![("base/1".to_string(), b"seed".to_vec())];
+        let seed_dirs = vec!["pg_wal".to_string()];
+        let (mut fs, handle) = mem_fs_seeded_shared(seed_files, seed_dirs);
+
+        // The seed is visible immediately, before any op.
+        let (f0, d0) = handle.seed();
+        assert_eq!(f0, vec![("base/1".to_string(), b"seed".to_vec())]);
+        assert_eq!(d0, vec!["pg_wal".to_string()]);
+
+        // Lay out guest memory: path "base/2" at 0, payload "hello" at 16.
+        let mut mem = VecMem(vec![0u8; 32]);
+        mem.0[..6].copy_from_slice(b"base/2");
+        mem.0[16..21].copy_from_slice(b"hello");
+        let call = |fs: &mut HostFn, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
+            fs(op, args, Some(mem)).expect("host fn")[0]
+        };
+
+        // Create + write a new file through the granted handler (O_CREATE|O_WRITE).
+        let fd = call(&mut fs, FS_OPEN, &[0, 6, O_CREATE | O_WRITE], &mut mem);
+        assert!(fd >= 3, "fd = {fd}");
+        assert_eq!(call(&mut fs, FS_WRITE, &[fd, 16, 5], &mut mem), 5);
+        assert_eq!(call(&mut fs, FS_CLOSE, &[fd], &mut mem), 0);
+
+        // Remove the seeded file (path "base/1" reuses the same 6-byte slot layout).
+        mem.0[..6].copy_from_slice(b"base/1");
+        assert_eq!(call(&mut fs, FS_REMOVE, &[0, 6], &mut mem), 0);
+
+        // Snapshot → the write is captured and the removal propagated.
+        let image = handle.image();
+        let (files, dirs) = decode_image(&image).expect("round-trips");
+        assert_eq!(files, vec![("base/2".to_string(), b"hello".to_vec())]);
+        assert_eq!(dirs, vec!["pg_wal".to_string()]);
+
+        // Re-mounting the image reproduces the same live state (the persistence loop closes).
+        let (_fs2, handle2) = mem_fs_seeded_shared(files, dirs);
+        assert_eq!(handle2.seed(), handle.seed());
+
+        // Snapshotting an unchanged store is byte-identical (deterministic, sorted output).
+        assert_eq!(handle.image(), handle.image());
+    }
 }

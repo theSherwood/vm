@@ -1856,7 +1856,11 @@ fn grant_onramp_caps(
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     // A paramless (by-name) entry resolves the whole prefix by name, so grant+register all of it; a
     // positional entry gets exactly its `arity` handles as args (the old, slot-order grant).
-    let n = if arity == 0 { ONRAMP_CAP_NAMES.len() } else { arity };
+    let n = if arity == 0 {
+        ONRAMP_CAP_NAMES.len()
+    } else {
+        arity
+    };
     let mut handles: Vec<i32> = Vec::new();
     if n >= 1 {
         handles.push(host.grant_stream(StreamRole::Out));
@@ -2106,9 +2110,19 @@ fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
 fn pg_setup(
     m: &svm_ir::Module,
     image: &[u8],
-) -> Result<(svm_ir::Module, Host, Vec<Value>, Vec<u8>), i32> {
+) -> Result<
+    (
+        svm_ir::Module,
+        Host,
+        Vec<Value>,
+        Vec<u8>,
+        svm_fs::MemFsHandle,
+    ),
+    i32,
+> {
     // Idempotent on the already-resolved `.svmb` (imports = 0); resolves a raw on-ramp module too.
-    let resolved = svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+    let resolved =
+        svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
     // Postgres' `_start` arity depends on the on-ramp entry convention: the current `synth_start_argv`
     // (slice S15c) emits a **paramless** `_start` that resolves its caps **by name**, while an older
     // pre-S15c artifact takes the 4-cap prefix (`stdout, stdin, exit, memory`) **positionally**. Accept
@@ -2139,10 +2153,13 @@ fn pg_setup(
         Value::I32(exit),
         Value::I32(memory),
     ][..arity]
-    .to_vec();
-    // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed).
+        .to_vec();
+    // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed). The **shared**
+    // mount hands back a `MemFsHandle`, so a persistent session can snapshot the live data dir back out
+    // later ([`svm_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
     let (files, dirs) = svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
-    let fsh = host.grant_host_fn(svm_fs::mem_fs_seeded_handler(files, dirs)());
+    let (fs_hostfn, fs_handle) = svm_fs::mem_fs_seeded_shared(files, dirs);
+    let fsh = host.grant_host_fn(fs_hostfn);
     host.register_cap_name("fs", fsh);
     // Seed `argv` at the powerbox args base: a slashed argv[0] so `find_my_exec` resolves.
     let argv: [&[u8]; 5] = [b"./postgres", b"--single", b"-D", b".", b"postgres"];
@@ -2150,7 +2167,7 @@ fn pg_setup(
     let base = svm_ir::POWERBOX_ARGS_BASE as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
-    Ok((resolved, host, slots, init_mem))
+    Ok((resolved, host, slots, init_mem, fs_handle))
 }
 
 /// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
@@ -2170,7 +2187,7 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
         stderr: Vec::new(),
         framebuffer: None,
     };
-    let (m, mut host, slots, init_mem) = match pg_setup(m, image) {
+    let (m, mut host, slots, init_mem, _fs) = match pg_setup(m, image) {
         Ok(setup) => setup,
         Err(status) => return unsupported(status),
     };
@@ -2270,6 +2287,9 @@ struct PgSession {
     stdout_pos: usize,
     /// The backend exited or trapped — no further queries are possible.
     ended: bool,
+    /// Live handle onto the session's `mem_fs` data dir, so [`svm_pg_snapshot`] can serialize the
+    /// current database (tables, WAL, catalogs) back out for the host to persist across reloads.
+    fs_snap: svm_fs::MemFsHandle,
 }
 
 /// The one live session (single-threaded wasm ⇒ a plain static). `None` until [`svm_pg_open`].
@@ -2349,7 +2369,7 @@ pub extern "C" fn svm_pg_open(
         set(STATUS_VERIFY_ERR);
         return -STATUS_VERIFY_ERR;
     }
-    let (m, mut host, slots, init_mem) = match pg_setup(&m, image) {
+    let (m, mut host, slots, init_mem, fs_snap) = match pg_setup(&m, image) {
         Ok(setup) => setup,
         Err(status) => {
             set(status);
@@ -2382,7 +2402,13 @@ pub extern "C" fn svm_pg_open(
             return -STATUS_TRAP;
         }
     };
-    let mut session = PgSession { prog, vcpu, stdout_pos: 0, ended: false };
+    let mut session = PgSession {
+        prog,
+        vcpu,
+        stdout_pos: 0,
+        ended: false,
+        fs_snap,
+    };
     let status = pg_pump(&mut session); // run boot to the first stdin park (the prompt)
     pg_flush_stdout(&mut session); // hand back the banner + prompt
     set(status);
@@ -2430,6 +2456,32 @@ pub extern "C" fn svm_pg_query(sql_ptr: *const u8, sql_len: usize) -> i32 {
     } else {
         -status
     }
+}
+
+/// **Snapshot the open session's database** to a shippable data image. Serializes the live `mem_fs`
+/// data dir — every file the backend has written (heap tables, indexes, WAL, catalogs) — into the same
+/// [`svm_fs::encode_image`] blob [`svm_pg_open`] mounts, so the host can persist it (e.g. IndexedDB) and
+/// reopen from it on the next visit: Postgres runs its normal startup recovery over the snapshot and all
+/// committed state comes back. Best taken while the backend is parked at its prompt (between queries),
+/// when the fs is quiescent — the natural resting state of an idle session. The bytes land in a
+/// cdylib-managed allocation exposed by `svm_pg_snapshot_ptr`/`_len`, valid until the next snapshot (do
+/// **not** `svm_dealloc` it). Sets [`svm_status`]; returns `0` on success, `-STATUS_UNSUPPORTED` if no
+/// session is open.
+#[no_mangle]
+pub extern "C" fn svm_pg_snapshot() -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: single-threaded wasm; exclusive access to the session static. A snapshot only reads the
+    // fs handle, so an `ended` (exited/trapped) session is still serializable — its data dir holds the
+    // final committed state, which recovery replays like any crash-consistent image.
+    let Some(session) = (unsafe { (*core::ptr::addr_of!(PG_SESSION)).as_ref() }) else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    let image = session.fs_snap.image();
+    // SAFETY: single-threaded wasm; read back only via the `svm_pg_snapshot_*` accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(PG_SNAP), image) };
+    set(STATUS_OK);
+    0
 }
 
 /// Close the open Postgres session (drop the backend + reclaim its program). Idempotent; a no-op when
@@ -3238,6 +3290,9 @@ pub fn instantiate_exec(m: &svm_ir::Module) -> (i32, i64) {
 static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
+/// Captured data image of the most recent [`svm_pg_snapshot`] (same cdylib-managed lifetime as `OUT`:
+/// a leaked boxed slice, valid until the next snapshot; read via `svm_pg_snapshot_ptr`/`_len`).
+static mut PG_SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 /// Captured final window image of the most recent [`svm_run_capture`] (same cdylib-managed lifetime
 /// as `OUT`/`ERR`: valid until the next `svm_run_capture`).
 static mut SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
@@ -3953,6 +4008,16 @@ pub extern "C" fn svm_stdout_ptr() -> *const u8 {
 pub extern "C" fn svm_stdout_len() -> usize {
     unsafe { (*core::ptr::addr_of!(OUT)).1 }
 }
+/// Pointer / length of the data image from the most recent [`svm_pg_snapshot`] (valid until the next
+/// snapshot; do not `svm_dealloc` it).
+#[no_mangle]
+pub extern "C" fn svm_pg_snapshot_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(PG_SNAP)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_pg_snapshot_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(PG_SNAP)).1 }
+}
 /// Pointer / length of the captured stderr from the most recent [`svm_run_pb`] (same lifetime rule).
 #[no_mangle]
 pub extern "C" fn svm_stderr_ptr() -> *const u8 {
@@ -4121,7 +4186,9 @@ pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
         }
         slot.as_mut().unwrap()
     };
-    let reply = svm_dap::Json::Arr(server.handle(&req)).to_string().into_bytes();
+    let reply = svm_dap::Json::Arr(server.handle(&req))
+        .to_string()
+        .into_bytes();
     put(reply);
     0
 }
