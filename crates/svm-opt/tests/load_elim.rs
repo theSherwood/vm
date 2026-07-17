@@ -49,6 +49,15 @@ fn storei(addr: u32, value: u32) -> Inst {
         align: 0,
     }
 }
+fn store_off(op: StoreOp, addr: u32, value: u32, offset: u64) -> Inst {
+    Inst::Store {
+        op,
+        addr,
+        value,
+        offset,
+        align: 0,
+    }
+}
 fn addi(a: u32, b: u32) -> Inst {
     Inst::IntBin {
         ty: IntTy::I64,
@@ -298,5 +307,96 @@ fn load_in_a_loop_with_a_store_is_not_forwarded() {
         n_loads(&iso),
         2,
         "a load carried around a loop with a store must not be eliminated"
+    );
+}
+
+/// A diamond whose one arm stores to `p + offset` (width from `op`); the join reloads `mem[p+0]`.
+/// Used to pin the cross-block alias-precision boundary: a disjoint store (i64 at offset 8) leaves the
+/// reload eliminable (1 load); an overlapping store (i32 at offset 4 → bytes [4,8) overlap the i64
+/// [0,8)) blocks it (2 loads). The store's value is a const typed to match the op (i64 stores need an
+/// i64 value), materialized at v2 before the store.
+fn diamond_with_arm_store(op: StoreOp, offset: u64) -> Module {
+    let thru = |t: u32| Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![],
+        term: Terminator::Br {
+            target: t,
+            args: vec![0, 1],
+        },
+    };
+    let konst = if matches!(op, StoreOp::I64) {
+        Inst::ConstI64(0x1234)
+    } else {
+        Inst::ConstI32(0x1234)
+    };
+    let f = Func {
+        params: vec![ValType::I64, ValType::I32], // p, sel
+        results: vec![ValType::I64],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I64, ValType::I32],
+                insts: vec![loadi(0)], // v2 = a = mem[p+0]
+                term: Terminator::BrIf {
+                    cond: 1,
+                    then_blk: 1,
+                    then_args: vec![0, 2],
+                    else_blk: 2,
+                    else_args: vec![0, 2],
+                },
+            },
+            // b1: the arm carrying the store.
+            Block {
+                params: vec![ValType::I64, ValType::I64],        // p, a
+                insts: vec![konst, store_off(op, 0, 2, offset)], // value v2, store addr = p = v0
+                term: Terminator::Br {
+                    target: 3,
+                    args: vec![0, 1],
+                },
+            },
+            thru(3), // b2: no store
+            Block {
+                params: vec![ValType::I64, ValType::I64], // p3, a3
+                insts: vec![loadi(0), addi(1, 2)],        // v2 = d = mem[p3+0], v3 = a3 + d
+                term: Terminator::Return(vec![3]),
+            },
+        ],
+    };
+    module(f, 5)
+}
+
+#[test]
+fn disjoint_offset_store_in_an_arm_does_not_block_forwarding() {
+    // The arm stores to mem[p+8] (i64) — disjoint from the reloaded mem[p+0] off the same base — so
+    // cross-block forwarding still fires: the join reload is eliminated.
+    let m = diamond_with_arm_store(StoreOp::I64, 8);
+    let args: Vec<Vec<Value>> = [0i32, 1]
+        .iter()
+        .map(|&s| vec![Value::I64(0), Value::I32(s)])
+        .collect();
+    check(&m, &args);
+    let iso = optimize_module_with(&m, &only_load_elim());
+    assert_eq!(
+        n_loads(&iso),
+        1,
+        "a disjoint-offset store off the same base must not block cross-block forwarding"
+    );
+}
+
+#[test]
+fn overlapping_store_in_an_arm_blocks_forwarding() {
+    // The arm stores 4 bytes at mem[p+4] — overlapping the reloaded i64 mem[p+0] ([4,8) ∩ [0,8)) — so
+    // the join reload must NOT be forwarded. Checked at sel taking the storing arm, where the store
+    // changes the high word of mem[p+0], so a wrong forward would diverge.
+    let m = diamond_with_arm_store(StoreOp::I32, 4);
+    let args: Vec<Vec<Value>> = [0i32, 1]
+        .iter()
+        .map(|&s| vec![Value::I64(0), Value::I32(s)])
+        .collect();
+    check(&m, &args);
+    let iso = optimize_module_with(&m, &only_load_elim());
+    assert_eq!(
+        n_loads(&iso),
+        2,
+        "a store overlapping the reloaded bytes must block cross-block forwarding"
     );
 }

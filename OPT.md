@@ -284,16 +284,23 @@ tracked enhancement, not a blocker.
     established, with **no memory write on any path between**, is removed and its result forwarded —
     threaded across blocks by `crate::thread::Threader`, exactly as GVN threads a congruent dominating
     value. "Same location" is `(address value-number, offset, op)` — the address by `crate::vn`
-    congruence (block-local SSA never shares an operand id). Alias model is conservative across blocks:
-    **any** write / side effect (store / atomic / `mem.copy`/`fill` / call) on a between-path clobbers,
-    and the between region must be **acyclic** (loop-carried loads deferred) so the source runs once
-    before the load and the partial-block clobber checks (after the source, before the load) are valid.
+    congruence (block-local SSA never shares an operand id). Alias model across blocks is **precise for
+    stores**: a between-path store does *not* clobber when it is provably disjoint — the same base
+    value-number with a non-overlapping byte range — reusing `mem_forward`'s intra-block reasoning
+    (sound under trap-confinement: two admitted accesses off one base differ by their offset gap, an
+    out-of-range address traps rather than wrapping to alias). A store off a *different* base
+    value-number, or any other write / side effect with unknown reach (atomic / `mem.copy`/`fill` /
+    call), still clobbers. The between region must be **acyclic** (loop-carried loads deferred) so the
+    source runs once before the load and the partial-block clobber checks (after the source, before the
+    load) are valid.
     Sound on value *and* traps (the dominating same-width access proved the address in-bounds). The load
     is removed with a block-local rebuild (general DCE keeps loads as possible traps). Runs per-function
     after GVN (addresses already congruent); `OptConfig.load_elim` toggle (default on). Tests
     (`tests/load_elim.rs`): sequential + diamond-join forwarding, a between-store that must block it
-    (checked at `addr==other` where a missed clobber would miscompile), and an adversarial loop with a
-    per-iteration store that must **not** be eliminated; the whole pipeline (18-case randomized
+    (checked at `addr==other` where a missed clobber would miscompile), an adversarial loop with a
+    per-iteration store that must **not** be eliminated, and the alias-precision boundary — a
+    disjoint-offset store in an arm still forwards, an overlapping-offset store blocks it; the whole
+    pipeline (18-case randomized
     differential, 46 peval differentials, `opt_sccp` fuzz) exercises it. **Next:** loop-invariant load
     hoisting and an opt-in scratch-region contract for dead-store elimination (DSE needs a
     private-region guarantee to stay sound under shared-memory threads).

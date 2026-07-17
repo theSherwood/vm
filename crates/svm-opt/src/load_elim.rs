@@ -27,7 +27,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
-use svm_ir::{Block, Func, Inst, ValType};
+use svm_ir::{Block, Func, Inst, LoadOp, ValType};
 use svm_verify::func_value_types;
 
 use crate::cfg::Cfg;
@@ -100,17 +100,40 @@ fn induced_acyclic(succs: &[Vec<u32>], between: &[bool]) -> bool {
     true
 }
 
-/// Whether no instruction writes memory / has a side effect on any path from the source (block `sb`,
-/// after instruction `si`) to the load (block `tb`, before instruction `ti`). `between` is the acyclic
-/// region between them; endpoints check only the relevant partial body, interior blocks check in full.
+/// The location a load reads: the value-number of its base address, its offset, and its access width
+/// in bytes.
+struct LoadLoc {
+    base_vn: u32,
+    offset: u64,
+    width: u64,
+}
+
+/// Whether nothing on any path from the source `src` (block, after instruction) to the load `tgt`
+/// (block, before instruction) can have written the load's `loc`. `between` is the acyclic region
+/// between them; endpoints check only the relevant partial body, interior blocks in full.
+///
+/// A **store** is precise: it does not clobber when its location is provably disjoint from the load's —
+/// the same base **value-number** (congruent address) with a disjoint byte range, sound under
+/// trap-confinement exactly as [`crate::mem_forward`]'s intra-block reasoning (two admitted accesses off
+/// one base differ by their offset gap; an out-of-range address traps rather than wrapping to alias). A
+/// store off a *different* base value-number may alias, so it clobbers; and any other memory write or
+/// side effect with unknown reach (atomic, `mem.copy`/`fill`, call) always clobbers.
 fn clobber_free(
     s: &crate::ssa::SsaFunc,
+    vn: &[u32],
+    loc: &LoadLoc,
     between: &[bool],
-    sb: u32,
-    si: u32,
-    tb: u32,
-    ti: u32,
+    src: (u32, u32),
+    tgt: (u32, u32),
 ) -> bool {
+    let (sb, si) = src;
+    let (tb, ti) = tgt;
+    // A store to `(addr, offset, width)` cannot touch the load unless it aliases: different base
+    // value-number (unprovable), or the same base with an overlapping byte range.
+    let store_may_alias = |addr: Value, offset: u64, width: u64| -> bool {
+        vn[addr as usize] != loc.base_vn
+            || !crate::ranges_disjoint(offset, width, loc.offset, loc.width)
+    };
     for (b, present) in between.iter().enumerate() {
         if !present {
             continue;
@@ -124,9 +147,25 @@ fn clobber_free(
             (0, blk.insts.len())
         };
         for inst in &blk.insts[lo..hi] {
-            let e = inst.effects();
-            if e.writes_mem || e.side_effect {
-                return false;
+            match inst {
+                Inst::Store {
+                    op, addr, offset, ..
+                } => {
+                    if store_may_alias(*addr, *offset, crate::store_width(*op)) {
+                        return false;
+                    }
+                }
+                Inst::V128Store { addr, offset, .. } => {
+                    if store_may_alias(*addr, *offset, 16) {
+                        return false;
+                    }
+                }
+                other => {
+                    let e = other.effects();
+                    if e.writes_mem || e.side_effect {
+                        return false; // atomic / mem.copy/fill / call — unknown reach
+                    }
+                }
             }
         }
     }
@@ -257,6 +296,14 @@ pub fn load_elim(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
             let t = &accesses[ti];
             (t.loc, t.value, t.block, t.inst)
         };
+        let loc = LoadLoc {
+            base_vn: t_loc.0,
+            offset: t_loc.1,
+            width: LoadOp::from_index(t_loc.2)
+                .expect("valid load op index")
+                .info()
+                .2 as u64,
+        };
         for src in &accesses {
             if src.loc != t_loc || src.block == t_block || src.value == t_value {
                 continue; // must be a different cross-block access to the same location
@@ -275,7 +322,14 @@ pub fn load_elim(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
             if !induced_acyclic(&cfg.succs, &between) {
                 continue; // a loop between them — partial-block reasoning would be unsound
             }
-            if !clobber_free(&s, &between, src.block, src.inst, t_block, t_inst) {
+            if !clobber_free(
+                &s,
+                &vn,
+                &loc,
+                &between,
+                (src.block, src.inst),
+                (t_block, t_inst),
+            ) {
                 continue;
             }
             eliminated.insert(t_value);
