@@ -280,6 +280,35 @@ try {
     ? ok('Stop ended the debug session (panel hidden, editor writable)')
     : fail(`debug stop: ${JSON.stringify(ended)}`);
 
+  // The watchpoint card: a counter at a fixed window address, named `count` by its `debug` section, so
+  // the Variables pane can arm a data breakpoint on it. Debug pauses at the pre-placed loop-body
+  // breakpoint; clicking `count`'s ● toggle arms the watch; Continue then stops for the data breakpoint.
+  const wpCard = card('Debugger (SVM — watchpoints / data breakpoints)');
+  await page.click(`${wpCard} .debug`);
+  await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
+    wpCard, { timeout: 20_000 });
+  const wpPaused = await page.evaluate((sel) => ({
+    vars: document.querySelector(`${sel} .dbg-vars`).textContent,
+    // `count` is memory-located ⇒ its ● toggle is enabled (a watchable data breakpoint target).
+    toggleEnabled: !!document.querySelector(`${sel} .dbg-vars button[data-watch="count"]:not([disabled])`),
+  }), wpCard);
+  wpPaused.toggleEnabled && /count\s*=\s*0/.test(wpPaused.vars)
+    ? ok('watchpoint card paused — count=0, ● toggle armable')
+    : fail(`watchpoint paused: ${JSON.stringify(wpPaused)}`);
+
+  // Arm the data breakpoint on `count`, then Continue → the loop-body store trips it (reason "data
+  // breakpoint"), and the ● shows armed (.on).
+  await page.click(`${wpCard} .dbg-vars button[data-watch="count"]`);
+  const armed = await page.evaluate((sel) =>
+    !!document.querySelector(`${sel} .dbg-vars button[data-watch="count"].on`), wpCard);
+  armed ? ok('clicking ● armed the data breakpoint on count') : fail('watch toggle did not arm (.on)');
+  await page.click(`${wpCard} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => /data breakpoint/.test(document.querySelector(`${sel} .state`).textContent),
+    wpCard, { timeout: 10_000 });
+  const tripped = await page.evaluate((sel) => document.querySelector(`${sel} .state`).textContent, wpCard);
+  ok(`watchpoint tripped — ${tripped.replace(/\s+/g, ' ').trim()}`);
+  await page.click(`${wpCard} .dbg-controls button[data-cmd="stop"]`);
+
   // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.
   await page.selectOption('#theme', 'dark');
   const themed = await page.evaluate(() => ({

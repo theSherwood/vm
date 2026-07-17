@@ -90,6 +90,13 @@
                   padding: 0.45rem 0.6rem; margin: 0; min-height: 1.2rem; max-height: 12rem; overflow: auto;
                   font: 0.8rem/1.5 ui-monospace, monospace; }
       .dbg-vars .bpname { color: var(--accent); }
+      /* Per-variable watchpoint (data breakpoint) toggle: a hollow ● that fills when armed; dimmed and
+         non-interactive for a variable with no watchable window address (an SSA-promoted scalar). */
+      .dbg-vars .wp { border: 0; background: none; cursor: pointer; padding: 0 0.3rem 0 0;
+                      font-size: 0.8rem; line-height: 1; color: var(--border); vertical-align: baseline; }
+      .dbg-vars .wp:hover { color: var(--muted); }
+      .dbg-vars .wp.on { color: var(--bad); }
+      .dbg-vars .wp.off { color: var(--faint); opacity: 0.4; cursor: default; }
       .dbg-vars:empty { display: none; }
       .state { font-size: 0.82rem; color: var(--muted); font-variant-numeric: tabular-nums; }
       .state[data-state="error"], .state[data-state="stopped"] { color: var(--bad); }
