@@ -9808,6 +9808,15 @@ pub struct Host {
     /// Bytes a `Stream{In}` handle's `read` draws from.
     pub stdin: Vec<u8>,
     stdin_pos: usize,
+    /// **Opt-in blocking stdin** (a persistent interactive session, e.g. the browser Postgres console).
+    /// When `true`, a `Stream{In}` `read` that finds the buffer exhausted does **not** return `0`
+    /// (EOF — which makes a REPL-style guest shut down); instead it sets [`Self::stdin_parked`] so the
+    /// driver can suspend the vCPU at that read and resume it once more bytes are pushed. Default
+    /// `false`: the one-shot runs (`svm_run_pg`, the corpus/oracle) keep plain EOF-at-end semantics.
+    pub stdin_block: bool,
+    /// Transient: the last `Stream{In}` `read` parked (buffer empty under [`Self::stdin_block`]). The
+    /// bytecode `CapCall` arm takes this to yield [`Outcome::StdinPark`] instead of completing the read.
+    stdin_parked: bool,
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -10045,6 +10054,8 @@ impl Host {
             table: vec![Slot::default(); CAP],
             stdin: Vec::new(),
             stdin_pos: 0,
+            stdin_block: false,
+            stdin_parked: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
             out_sink: None,
@@ -10084,6 +10095,25 @@ impl Host {
     /// [`run_capture_reserved_with_host`]. A non-durable run leaves the reserve untouched.
     pub fn set_durable(&mut self, durable: bool) {
         self.durable = durable;
+    }
+
+    /// Enable **blocking stdin** (a persistent interactive session — see [`Self::stdin_block`]). With it
+    /// on, a `read` on an exhausted stdin buffer parks the vCPU (surfacing [`VcpuEvent::StdinPark`]) so
+    /// the driver can push more input and resume, rather than returning EOF and letting the guest exit.
+    pub fn set_stdin_blocking(&mut self, on: bool) {
+        self.stdin_block = on;
+    }
+
+    /// Append bytes to the stdin buffer (a resumed [`VcpuEvent::StdinPark`] then reads them). The
+    /// consumed prefix is not reclaimed — fine for the interactive session's modest per-query input.
+    pub fn push_stdin(&mut self, bytes: &[u8]) {
+        self.stdin.extend_from_slice(bytes);
+    }
+
+    /// Take the transient "the last stdin read parked" flag (the `CapCall` arm uses it to yield
+    /// [`Outcome::StdinPark`]). Crate-internal: the bytecode engine lives in a sibling module.
+    pub(crate) fn take_stdin_parked(&mut self) -> bool {
+        core::mem::take(&mut self.stdin_parked)
     }
 
     /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
@@ -12207,6 +12237,13 @@ impl Host {
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
                 let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
+                // Blocking stdin (opt-in, e.g. a persistent REPL session): an exhausted buffer parks
+                // the vCPU at this read rather than returning EOF. Signal the driver (which re-issues
+                // the read after pushing more input) and return a placeholder the driver discards.
+                if avail.is_empty() && self.stdin_block {
+                    self.stdin_parked = true;
+                    return ret(0);
+                }
                 let n = (len as usize).min(avail.len());
                 let chunk = avail[..n].to_vec();
                 let Some(m) = mem else {

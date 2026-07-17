@@ -121,8 +121,17 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
   output back onto the page. `browser/browser-test.mjs` drives it in real Chromium via Playwright —
   selects the example, clicks Run, asserts the query result — alongside every other playground example
   (the check skips when the artifacts aren't staged). **The demo is done: a real PostgreSQL, in the
-  browser, in the playground next to Lua and SQLite, sandboxed.** Remaining polish is boot speed
-  (snapshot/restore).
+  browser, in the playground next to Lua and SQLite, sandboxed.**
+- **✅ Persistent interactive session — per-query boot eliminated.** The playground now runs Postgres as
+  a *live* backend (`svm_pg_open`/`_query`/`_close`), not a fresh boot per query. The enabling mechanism
+  is a **blocking-stdin park** in the interpreter: with `Host::set_stdin_blocking`, a `read` on an
+  exhausted stdin buffer suspends the resumable `bytecode::Vcpu` (`VcpuEvent::StdinPark`) instead of
+  returning EOF (which makes `--single` exit), so the backend parks at its `backend>` prompt; the host
+  pushes the next query and resumes. Measured in Chromium: the **first** query pays the ~9–13 s boot, but
+  every query after runs in **~30–120 ms** and **state persists** across them (a `CREATE TABLE` is still
+  there for the next `SELECT`) — a real `psql`-style session. This closes the *per-query* boot cost; the
+  **one** remaining latency is the first boot, whose lever is snapshot/restore of the post-boot state
+  (freeze/thaw — deferred; the session makes it much less pressing, since you pay it once per page).
 
 ## Reproducing the measurements
 

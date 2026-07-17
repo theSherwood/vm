@@ -1524,6 +1524,9 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 v.d = fuel as i64;
                 return PAR_INSTANTIATE;
             }
+            // Blocking stdin is a single-threaded interactive-session feature (the Postgres console
+            // runs on its own owned-host `Vcpu`, not the parallel driver); a worker vCPU never sets it.
+            bytecode::VcpuEvent::StdinPark => return PAR_TRAP,
         }
     }
 }
@@ -2095,39 +2098,26 @@ fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
     blob
 }
 
-/// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
-/// (`svm_fs::mem_fs_seeded_handler` — a real in-memory filesystem, no host fs), seed the `--single`
-/// argv, and run the module's `_start` on the **reserved-window** bytecode engine (Postgres grows its
-/// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
-/// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
-/// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). The `stdout, stdin,
-/// exit, memory, fs` caps are all resolved by name (the current paramless `_start`); a pre-S15c
-/// artifact whose `_start` takes the 4-cap prefix positionally is also accepted.
-pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
-    let unsupported = |status: i32| PbOutcome {
-        status,
-        value: 0,
-        exit_code: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        framebuffer: None,
-    };
+/// Shared Postgres powerbox setup (used by the one-shot [`pg_exec`] and the persistent [`PgSession`]):
+/// resolve the module, grant `stdout/stdin/exit/memory` (registered by name — the paramless `_start`
+/// resolves them) + the in-memory `fs` cap over the data `image`, and build the `--single` argv image.
+/// Returns `(resolved module, host, positional slots, init_mem)` or a `STATUS_*` on failure. `host`'s
+/// stdin is left empty and non-blocking; the caller sets those per run mode.
+fn pg_setup(
+    m: &svm_ir::Module,
+    image: &[u8],
+) -> Result<(svm_ir::Module, Host, Vec<Value>, Vec<u8>), i32> {
     // Idempotent on the already-resolved `.svmb` (imports = 0); resolves a raw on-ramp module too.
-    let resolved = match svm_ir::resolve_imports(m, onramp_cap_resolver) {
-        Ok(r) => r,
-        Err(_) => return unsupported(STATUS_UNSUPPORTED),
-    };
-    let m = &resolved;
+    let resolved = svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
     // Postgres' `_start` arity depends on the on-ramp entry convention: the current `synth_start_argv`
     // (slice S15c) emits a **paramless** `_start` that resolves its caps **by name**, while an older
     // pre-S15c artifact takes the 4-cap prefix (`stdout, stdin, exit, memory`) **positionally**. Accept
     // both — anything past the 4-cap prefix is not a shape Postgres' entry uses.
-    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    let arity = resolved.funcs.first().map_or(0, |f| f.params.len());
     if arity > 4 {
-        return unsupported(STATUS_UNSUPPORTED);
+        return Err(STATUS_UNSUPPORTED);
     }
     let mut host = Host::new();
-    host.stdin = stdin.to_vec();
     // Grant the on-ramp powerbox prefix — stdout, stdin, exit, memory (the heap-growth cap `malloc`
     // uses) — and register each **by name** (`cap.self.resolve`), which the paramless `_start` needs;
     // a positional `_start` additionally receives the first `arity` of them as its params. Granted
@@ -2151,10 +2141,7 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
     ][..arity]
     .to_vec();
     // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed).
-    let (files, dirs) = match svm_fs::decode_image(image) {
-        Ok(seed) => seed,
-        Err(_) => return unsupported(STATUS_DECODE_ERR),
-    };
+    let (files, dirs) = svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
     let fsh = host.grant_host_fn(svm_fs::mem_fs_seeded_handler(files, dirs)());
     host.register_cap_name("fs", fsh);
     // Seed `argv` at the powerbox args base: a slashed argv[0] so `find_my_exec` resolves.
@@ -2163,6 +2150,32 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
     let base = svm_ir::POWERBOX_ARGS_BASE as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
+    Ok((resolved, host, slots, init_mem))
+}
+
+/// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
+/// (`svm_fs::mem_fs_seeded_handler` — a real in-memory filesystem, no host fs), seed the `--single`
+/// argv, and run the module's `_start` on the **reserved-window** bytecode engine (Postgres grows its
+/// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
+/// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
+/// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). The `stdout, stdin,
+/// exit, memory, fs` caps are all resolved by name (the current paramless `_start`); a pre-S15c
+/// artifact whose `_start` takes the 4-cap prefix positionally is also accepted.
+pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
+    let unsupported = |status: i32| PbOutcome {
+        status,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    let (m, mut host, slots, init_mem) = match pg_setup(m, image) {
+        Ok(setup) => setup,
+        Err(status) => return unsupported(status),
+    };
+    let m = &m;
+    host.stdin = stdin.to_vec();
     let mut fuel = u64::MAX;
     let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
         m,
@@ -2234,6 +2247,196 @@ pub extern "C" fn svm_run_pg(
         EXIT_CODE = out.exit_code;
     }
     out.value
+}
+
+// ==== persistent interactive Postgres session (the browser console) ===============================
+// `svm_run_pg` boots a *fresh* backend per call, runs the SQL to EOF, and lets it exit — every query
+// pays the multi-second boot and loses all state. A `PgSession` keeps ONE backend alive: boot to the
+// `backend>` prompt once, then each query pushes SQL onto the (now **blocking**) stdin and resumes the
+// vCPU until it parks at the next read — so queries after the first are sub-second and DDL/DML persist
+// across them, exactly like a real `psql` session. This rides the [`bytecode::Vcpu::set_stdin_blocking`]
+// park (a `read` on an exhausted buffer suspends instead of returning EOF) over the same reserved
+// window `svm_run_pg` uses; Postgres `--single` is single-threaded, so the only events are the stdin
+// park, a clean exit, or a trap.
+
+/// A live single-user Postgres backend suspended at a stdin read. Owns its leaked [`bytecode::VcpuProgram`]
+/// (the vCPU borrows it `'static`; reclaimed when the session is replaced/closed) and tracks how much of
+/// the backend's cumulative stdout has already been handed back, so each query returns only its delta.
+struct PgSession {
+    /// The compiled program, leaked so `vcpu` can borrow it `'static`; reclaimed in [`pg_close_session`].
+    prog: *mut bytecode::VcpuProgram,
+    vcpu: bytecode::Vcpu<'static>,
+    /// Bytes of `vcpu`'s cumulative stdout already returned (delta cursor).
+    stdout_pos: usize,
+    /// The backend exited or trapped — no further queries are possible.
+    ended: bool,
+}
+
+/// The one live session (single-threaded wasm ⇒ a plain static). `None` until [`svm_pg_open`].
+static mut PG_SESSION: Option<PgSession> = None;
+
+/// Drop the live session (if any) and **reclaim** its leaked program. Order matters: the vCPU (which
+/// borrows the program `'static`) must drop before the program box is reclaimed.
+fn pg_close_session() {
+    // SAFETY: single-threaded wasm; exclusive access to the session static.
+    unsafe {
+        if let Some(s) = (*core::ptr::addr_of_mut!(PG_SESSION)).take() {
+            let prog = s.prog;
+            drop(s); // drops `vcpu` (releasing the `'static` borrow); the raw `prog` ptr is a no-op drop
+            drop(Box::from_raw(prog)); // reclaim the leaked VcpuProgram
+        }
+    }
+}
+
+/// Advance the session's vCPU to its next stop. Returns [`STATUS_OK`] when it parks at a stdin read
+/// (ready for the next query), [`STATUS_EXIT`] on a clean guest exit, [`STATUS_TRAP`] on a trap, and
+/// [`STATUS_UNSUPPORTED`] for any other event (a `--single` backend spawns/JITs nothing). Marks the
+/// session `ended` on anything but a park.
+fn pg_pump(s: &mut PgSession) -> i32 {
+    match s.vcpu.run() {
+        bytecode::VcpuEvent::StdinPark => STATUS_OK,
+        bytecode::VcpuEvent::Done(_) => {
+            s.ended = true;
+            STATUS_EXIT
+        }
+        bytecode::VcpuEvent::Trapped(_) => {
+            s.ended = true;
+            STATUS_TRAP
+        }
+        _ => {
+            s.ended = true;
+            STATUS_UNSUPPORTED
+        }
+    }
+}
+
+/// Stash the session's stdout **delta** (bytes since the last hand-back) into the `OUT` buffer the
+/// `svm_stdout_ptr`/`_len` accessors expose, advancing the cursor.
+fn pg_flush_stdout(s: &mut PgSession) {
+    let out = &s.vcpu.host_mut().stdout;
+    let delta = out.get(s.stdout_pos..).unwrap_or(&[]).to_vec();
+    s.stdout_pos = out.len();
+    // SAFETY: single-threaded wasm; read back only via the export accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), delta) };
+}
+
+/// **Open a persistent Postgres session.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the
+/// data image at `[img_ptr, img_len)` on the `fs` cap, and boot `postgres --single` to its `backend>`
+/// prompt — leaving it **suspended at the first stdin read** (blocking stdin) rather than running to
+/// exit. Replaces any prior session. Sets [`svm_status`]; the banner + prompt land in `svm_stdout_*`.
+/// Returns `0` on a ready backend, else the negative `STATUS_*`. Drive with [`svm_pg_query`], end with
+/// [`svm_pg_close`].
+#[no_mangle]
+pub extern "C" fn svm_pg_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    pg_close_session(); // a fresh open supersedes any live session
+                        // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return -STATUS_VERIFY_ERR;
+    }
+    let (m, mut host, slots, init_mem) = match pg_setup(&m, image) {
+        Ok(setup) => setup,
+        Err(status) => {
+            set(status);
+            return -status;
+        }
+    };
+    host.set_stdin_blocking(true); // the read at the prompt parks instead of returning EOF
+    let prog = match bytecode::VcpuProgram::compile(&m) {
+        Some(p) => Box::into_raw(Box::new(p)),
+        None => {
+            set(STATUS_UNSUPPORTED);
+            return -STATUS_UNSUPPORTED;
+        }
+    };
+    // SAFETY: `prog` is leaked here and only reclaimed by `pg_close_session` after its vCPU drops, so the
+    // `&'static` borrow is valid for the session's whole life.
+    let vcpu = match bytecode::Vcpu::new_root_reserved_with_powerbox(
+        unsafe { &*prog },
+        0,
+        &slots,
+        &init_mem,
+        host,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            // SAFETY: nothing borrows `prog` yet — the vCPU build failed — so reclaim it directly.
+            unsafe { drop(Box::from_raw(prog)) };
+            set(STATUS_TRAP);
+            return -STATUS_TRAP;
+        }
+    };
+    let mut session = PgSession { prog, vcpu, stdout_pos: 0, ended: false };
+    let status = pg_pump(&mut session); // run boot to the first stdin park (the prompt)
+    pg_flush_stdout(&mut session); // hand back the banner + prompt
+    set(status);
+    // SAFETY: single-threaded wasm; exclusive access to the session static.
+    unsafe { *core::ptr::addr_of_mut!(PG_SESSION) = Some(session) };
+    if status == STATUS_OK {
+        0
+    } else {
+        -status
+    }
+}
+
+/// **Run one query on the open session.** Push the SQL at `[sql_ptr, sql_len)` (a trailing newline is
+/// added if absent, so `--single` executes it) onto the backend's stdin and resume until it parks at the
+/// next prompt. Sets [`svm_status`]; the query's output (result rows + the next `backend>`) lands in
+/// `svm_stdout_*` as a **delta** (just this query's bytes). Returns `0` on a ready backend, else the
+/// negative `STATUS_*` (incl. [`STATUS_UNSUPPORTED`] if no session is open or it already ended).
+#[no_mangle]
+pub extern "C" fn svm_pg_query(sql_ptr: *const u8, sql_len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: single-threaded wasm; exclusive access to the session static.
+    let Some(session) = (unsafe { (*core::ptr::addr_of_mut!(PG_SESSION)).as_mut() }) else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    if session.ended {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    }
+    // SAFETY: the host guarantees `[sql_ptr, sql_len)` is a live `svm_alloc`ation it just filled.
+    let sql: &[u8] = if sql_ptr.is_null() || sql_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) }
+    };
+    session.vcpu.push_stdin(sql);
+    if sql.last() != Some(&b'\n') {
+        session.vcpu.push_stdin(b"\n"); // flush the statement to `--single`'s line reader
+    }
+    let status = pg_pump(session);
+    pg_flush_stdout(session);
+    set(status);
+    if status == STATUS_OK {
+        0
+    } else {
+        -status
+    }
+}
+
+/// Close the open Postgres session (drop the backend + reclaim its program). Idempotent; a no-op when
+/// none is open. The next [`svm_pg_open`] starts a fresh backend.
+#[no_mangle]
+pub extern "C" fn svm_pg_close() {
+    pg_close_session();
 }
 
 /// A live per-frame **reactor** over an on-ramp guest — the interactive/graphical run model (the path
