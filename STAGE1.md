@@ -60,15 +60,23 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    bytes out through inherited stdio, status back — differential interp==JIT. (A
    *separate*-module child with granted stdio is a later variant; the
    same-module applet shape is what the shell actually wants.)
-3. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of child
-   `Module`s and the `Instantiator`/`Module` handles, so the Stage-0 shell
+3. **multi-applet dispatch guarantee** *(done — `stage1_applet_dispatch.rs`)* —
+   one binary carries several applets (`true`→0, `false`→1, `echo`→writes+3),
+   and spawning a chosen entry yields that applet's own `(stdout, status)`. This
+   is the substrate guarantee the shell's command dispatch rests on: look a
+   command up, spawn its entry, thread its exit code into `$?`. Differential
+   interp==JIT. The name→entry map itself is trivial glue and lands in slice 4.
+4. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of applet
+   entries and the `Instantiator`/`stdout` handles, so the Stage-0 shell
    dispatches an unknown command to a spawned child instead of
-   `<cmd>: not found`, threading the child's status into `$?`.
-4. **Pipelines across real children** — replace the memfs-temp pipeline staging
+   `<cmd>: not found`, threading the child's status into `$?`. This is the
+   chibicc-integration slice: the compiled shell drives `instantiate_named`/
+   `join` through generic capability imports.
+5. **Pipelines across real children** — replace the memfs-temp pipeline staging
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
    plan"). This is the jump from sequential spawn/wait to true concurrency.
-5. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
+6. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
    piece for shells that fork *themselves*.
 
 Security posture is unchanged: children keep their **own guarded windows**; the
