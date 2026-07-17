@@ -213,9 +213,9 @@ if (ensureQuickJS() && ensureOpenlibm()) {
 //    snprintf, with a harness that reads a Lua chunk from **stdin** and runs it. The page pipes the
 //    editor's text in as stdin, so the user writes and runs their own Lua. io.write/os.date/coroutine
 //    all work; file I/O (io.open) degrades to nil (no fs cap granted). Committed golden fixture
-//    (`lua_eval.bc`; no Lua source needed).
+//    (`lua_eval.ll` — the textual `.ll` the reader ingests directly; no Lua source needed).
 try {
-  buildBc('lua_eval', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_eval.bc'));
+  buildBc('lua_eval', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_eval.ll'));
 } catch (e) {
   console.log(`  ✗ lua_eval: ${e.message}`);
 }
