@@ -24,9 +24,9 @@ fn main() {
     let syms = args
         .next()
         .expect("usage: spectre_bench <kernels.c> <sym,sym,...>");
-    let bc = std::env::temp_dir().join(format!("svm_spectre_bench_{}.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("svm_spectre_bench_{}.ll", std::process::id()));
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&src)
         .arg("-o")
         .arg(&bc)
@@ -34,7 +34,7 @@ fn main() {
         .map(|s| s.success())
         .unwrap_or(false);
     assert!(ok, "clang failed on {src}");
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate");
     let sp = t.entry_sp as i64;
     for spec in syms.split(',') {
         let (sym, large) = match spec.split_once(':') {

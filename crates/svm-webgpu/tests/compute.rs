@@ -9,12 +9,12 @@ use std::process::Command;
 fn build_guest_bc() -> Option<std::path::PathBuf> {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/webgpu/wgpu_demo.c");
-    let bc = std::env::temp_dir().join(format!("svm_webgpu_demo_{}.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("svm_webgpu_demo_{}.ll", std::process::id()));
     let ok = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -39,7 +39,7 @@ fn demo_webgpu_compute() {
         return;
     };
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate webgpu demo bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate webgpu demo bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {

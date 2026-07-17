@@ -290,7 +290,7 @@ fn main() {
         };
 
         // SVM: compile the wrapper to bitcode (no main), translate.
-        let bc = dir.join(format!("emb_{name}.bc"));
+        let bc = dir.join(format!("emb_{name}.ll"));
         let mut sc = Command::new("clang");
         common(&mut sc);
         // On-ramp SIMD target (D64): svm-jit consumes *host* bitcode, so unlike wasm (capped at the
@@ -303,7 +303,7 @@ fn main() {
             "-march=x86-64-v3",
             "-mprefer-vector-width=128",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_BUILD",
             "-fno-builtin-memcmp",
             "-fno-builtin-bcmp",
@@ -319,7 +319,7 @@ fn main() {
             }
             continue;
         }
-        let t = match svm_llvm::translate_bc_path(&bc) {
+        let t = match svm_llvm::translate_ll_path(&bc) {
             Ok(t) => t,
             Err(e) => {
                 println!("{name:<16} (skipped: translate failed: {e:?})");
