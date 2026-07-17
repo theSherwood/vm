@@ -312,6 +312,7 @@ block0(v0: i64):
   },
   'bounce (interactive — arrow keys)': {
     kind: 'reactor',
+    jit: true, // tick() is wasm-JIT-emittable (proven byte-identical by browser-jit-reactor-test)
     url: './assets/bounce.svmb',
     jit: true, // tick() emits after cap-call outlining — toggle "wasm-JIT" to run it near-natively
     mode: 'io',
@@ -324,6 +325,7 @@ block0(v0: i64):
   },
   'life (Conway — heap persistence)': {
     kind: 'reactor',
+    jit: true, // tick() is wasm-JIT-emittable (proven byte-identical by browser-jit-reactor-test)
     url: './assets/life.svmb',
     jit: true, // tick() emits after cap-call outlining — toggle "wasm-JIT" to run it near-natively
     mode: 'io',
@@ -336,6 +338,7 @@ block0(v0: i64):
   },
   'Mandelbrot zoom (interactive — arrow keys)': {
     kind: 'reactor',
+    jit: true, // tick() is wasm-JIT-emittable (proven byte-identical by browser-jit-reactor-test)
     url: './assets/mandelzoom.svmb',
     jit: true, // f64 tick() emits after cap-call outlining — toggle "wasm-JIT" for a ~24× speedup
     mode: 'io',
@@ -796,6 +799,105 @@ async function runReactor(c) {
   reactorRAF = requestAnimationFrame(loop);
 }
 
+// ---- "prove it": the interpreter ≡ wasm-JIT differential, in the page --------------------------------
+// The project's core claim is "verified ⇒ the same result on both tiers." For a JIT-emittable reactor,
+// prove it live: open the SAME guest on the interpreter and on the wasm-JIT tier, run N frames on each,
+// and compare the presented framebuffer byte-for-byte. (This is exactly what browser-jit-reactor-test.mjs
+// asserts in CI — surfaced here as a button.)
+
+// FNV-1a over the presented framebuffer, tagged with its dimensions (so a size divergence also shows).
+// Copied out of shared memory — a plain view would be a live alias.
+function hashFB() {
+  const w = eng.ex.svm_framebuffer_width();
+  const h = eng.ex.svm_framebuffer_height();
+  const p = Number(eng.ex.svm_framebuffer_ptr());
+  const px = new Uint8Array(eng.memory.buffer).slice(p, p + w * h * 4);
+  let hsh = 0x811c9dc5;
+  for (let i = 0; i < px.length; i++) { hsh ^= px[i]; hsh = Math.imul(hsh, 0x01000193) >>> 0; }
+  return `${w}x${h}:${(hsh >>> 0).toString(16)}`;
+}
+
+// Open the interpreter reactor, run up to `n` frames, hashing each presented frame; close. Synchronous.
+function framesInterp(bytes, wad, n) {
+  let opened;
+  if (wad) {
+    const nameBytes = new TextEncoder().encode('doom1.wad');
+    const modP = eng.ex.svm_alloc(bytes.length);
+    const nameP = eng.ex.svm_alloc(nameBytes.length);
+    const wadP = eng.ex.svm_alloc(wad.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(bytes, modP);
+    view.set(nameBytes, nameP);
+    view.set(wad, wadP);
+    opened = eng.ex.svm_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
+    eng.ex.svm_dealloc(modP, bytes.length);
+    eng.ex.svm_dealloc(nameP, nameBytes.length);
+    eng.ex.svm_dealloc(wadP, wad.length);
+  } else {
+    const p = eng.ex.svm_alloc(bytes.length);
+    new Uint8Array(eng.memory.buffer).set(bytes, p);
+    opened = eng.ex.svm_onramp_open(p, bytes.length);
+    eng.ex.svm_dealloc(p, bytes.length);
+  }
+  if (opened !== 0) throw new Error(`interpreter open failed: status ${eng.ex.svm_status()}`);
+  const hs = [];
+  for (let i = 0; i < n; i++) { if (eng.ex.svm_onramp_frame() !== 0) break; hs.push(hashFB()); }
+  eng.ex.svm_onramp_close();
+  return hs;
+}
+
+// Open the wasm-JIT reactor (throws if the tick isn't emittable), run up to `n` frames, hashing each.
+async function framesJit(bytes, wad, n) {
+  const r = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad);
+  const hs = [];
+  for (let i = 0; i < n; i++) { if (r.frame() !== 0) break; hs.push(hashFB()); }
+  r.close();
+  return hs;
+}
+
+async function proveParity(c) {
+  if (broken) return;
+  stopReactor(); // a parity run supersedes any running reactor loop
+  const ex = c.ex;
+  setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
+  c.el.run.disabled = true;
+  c.el.prove.disabled = true;
+  let bytes, wad = null;
+  try {
+    bytes = await fetchModule(ex.url);
+    if (ex.wad) wad = await fetchModule(ex.wad);
+  } catch (e) {
+    setState(c, 'error', `${e.message}`);
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  const N = 30;
+  try {
+    // Yield a paint so "proving…" lands before the synchronous interpreter frames block the thread.
+    await new Promise((r) => setTimeout(r, 30));
+    const interpH = framesInterp(bytes, wad, N);
+    const jitH = await framesJit(bytes, wad, N);
+    const n = Math.min(interpH.length, jitH.length);
+    let mismatch = -1;
+    for (let i = 0; i < n; i++) if (interpH[i] !== jitH[i]) { mismatch = i; break; }
+    const identical = mismatch === -1 && interpH.length === jitH.length && n > 0;
+    if (identical) {
+      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical framebuffer across ${n} frames`);
+      logTo(c, `parity: ${n} frames byte-identical on both tiers`);
+    } else {
+      setState(c, 'error', `✗ tiers diverged at frame ${mismatch} (interp ${interpH.length} / jit ${jitH.length} frames)`);
+      logTo(c, `parity: diverged at frame ${mismatch}`);
+    }
+  } catch (e) {
+    setState(c, 'error', `parity run failed: ${e.message}`);
+    logTo(c, `parity run failed: ${e.message}`);
+  } finally {
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+  }
+}
+
 // SVM **text** guests: parse+verify inside the sandbox (`svm_parse`), then run across Workers under the
 // card's selected powerbox recipe.
 async function runText(c) {
@@ -854,7 +956,7 @@ async function runText(c) {
       broken = true;
       setState(c, 'stopped', 'stopped — reload the page to run again');
       logTo(c, 'stopped by user');
-      for (const card of cards) card.el.run.disabled = true;
+      for (const card of cards) { card.el.run.disabled = true; if (card.el.prove) card.el.prove.disabled = true; }
     } else {
       setState(c, 'error', `run error: ${e.message}`);
       logTo(c, `run error: ${e.message}`);
@@ -946,6 +1048,7 @@ function buildCard(name, ex) {
   stopBtn.disabled = true;
   controls.append(runBtn, stopBtn);
   let jit = null;
+  let proveBtn = null;
   if (ex.jit) {
     const l = el('label', 'jit-label');
     l.title = 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
@@ -954,6 +1057,11 @@ function buildCard(name, ex) {
     jit.checked = true;
     l.append(jit, ' wasm-JIT');
     controls.appendChild(l);
+    // "Prove it": run the guest on both tiers and assert the framebuffer is byte-identical.
+    proveBtn = el('button', 'prove', 'Prove interp ≡ JIT');
+    proveBtn.title = 'Run 30 frames on the interpreter and the wasm-JIT tier and check the framebuffer is byte-identical';
+    proveBtn.disabled = true;
+    controls.appendChild(proveBtn);
   }
   const state = el('span', 'state', 'ready');
   state.dataset.state = 'ready';
@@ -974,10 +1082,11 @@ function buildCard(name, ex) {
 
   const c = {
     name, ex, editor,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, prove: proveBtn },
   };
   runBtn.addEventListener('click', () => runDemo(c));
   stopBtn.addEventListener('click', () => stopDemo(c));
+  if (proveBtn) proveBtn.addEventListener('click', () => proveParity(c));
   return c;
 }
 
@@ -1042,7 +1151,10 @@ async function main() {
     setEngineState('error', `engine load failed: ${e.message}`);
     return;
   }
-  for (const c of cards) c.el.run.disabled = false;
+  for (const c of cards) {
+    c.el.run.disabled = false;
+    if (c.el.prove) c.el.prove.disabled = false;
+  }
   setEngineState('ready', 'engine ready');
 }
 
