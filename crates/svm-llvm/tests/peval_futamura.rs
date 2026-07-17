@@ -18,7 +18,7 @@ fn peval_guest_specializes_interpreter_and_jits_in_sandbox() {
     let Some(bc) = common::build_fixture_bc("peval_futamura") else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate the peval-futamura guest to svm-IR");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate the peval-futamura guest to svm-IR");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "the guest must produce a powerbox entry"

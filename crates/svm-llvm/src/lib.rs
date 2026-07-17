@@ -415,6 +415,16 @@ pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     translate_ll_str(&src)
 }
 
+/// [`translate_ll_path`] with explicit [`TranslateOptions`] — the `.ll` counterpart of
+/// [`translate_bc_path_with_options`] (e.g. `stub_unresolved_externs` for a large-program bring-up).
+pub fn translate_ll_path_with_options(
+    path: impl AsRef<Path>,
+    opts: TranslateOptions,
+) -> Result<Translated, Error> {
+    let src = std::fs::read_to_string(path).map_err(|e| Error::Parse(e.to_string()))?;
+    translate_ll_str_with_options(&src, opts)
+}
+
 /// Translate textual LLVM IR from a string (the textual-reader entry; see [`translate_ll_path`]).
 ///
 /// The §6 source-line half rides each instruction's `!DILocation` (parsed onto its `debugloc`); the

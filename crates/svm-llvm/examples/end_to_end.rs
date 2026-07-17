@@ -200,10 +200,10 @@ fn main() {
     let mut jit_ratios = Vec::new();
     for &(name, large_fast, large_bc, large_tw, src) in PROGRAMS {
         let kf = dir.join(format!("e2e_{name}.c"));
-        let bc = dir.join(format!("e2e_{name}.bc"));
+        let bc = dir.join(format!("e2e_{name}.ll"));
         std::fs::write(&kf, format!("#include <stdint.h>\n{src}\n")).unwrap();
         let ok = Command::new("clang")
-            .args(["-O2", "-emit-llvm", "-c"])
+            .args(["-O2", "-emit-llvm", "-S"])
             .arg(&kf)
             .arg("-o")
             .arg(&bc)
@@ -218,7 +218,7 @@ fn main() {
             println!("{name:<6}  (skipped: native compile/run failed)");
             continue;
         };
-        let t = match svm_llvm::translate_bc_path(&bc) {
+        let t = match svm_llvm::translate_ll_path(&bc) {
             Ok(t) => t,
             Err(e) => {
                 println!("{name:<6}  (skipped: translate failed: {e:?})");

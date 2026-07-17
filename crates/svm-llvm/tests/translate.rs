@@ -1,4 +1,4 @@
-//! Translator tests: compile C through *stock clang* to legalized bitcode, translate it to SVM
+//! Translator tests: compile C through *stock clang* to legalized textual `.ll`, translate it to SVM
 //! IR, **verify** it (the untrusted-frontend re-check, §2a), and run it on **both** the reference
 //! interpreter and the Cranelift JIT — asserting they agree with each other and with the
 //! hand-computed result. This is the chibicc-as-oracle differential (LLVM.md §5) plus the §18
@@ -11,10 +11,11 @@ use svm_interp::Value;
 use svm_ir::ValType;
 use svm_jit::JitOutcome;
 
-/// Compile a C snippet to legalized LLVM bitcode with the pinned pipeline (LLVM.md §4): `-O2` runs
-/// `mem2reg`/SROA (the §3a two-stack split for free) **and auto-vectorization** — the on-ramp now
-/// ingests the full SIMD output (slices AN–AT: i32x4 → legalization → conversions/rotate/shuffle/
-/// `<N x i1>` masks). Returns `None` (skip, don't fail) when `clang` is unavailable.
+/// Compile a C snippet to legalized LLVM **bitcode** (`.bc`) — retained only for the `.bc`↔`.ll`
+/// reader **parity** tests ([`assert_ll_parity`]), which need a genuine bitcode input to compare the
+/// `llvm-dis` shim against the in-house textual reader. Every other test compiles to textual `.ll`
+/// via [`compile_to_ll`] and translates through [`svm_llvm::translate_ll_path`] (the direction the
+/// on-ramp is developed on). `None` (skip, don't fail) when `clang` is unavailable.
 fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
@@ -35,29 +36,29 @@ fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     }
 }
 
-/// Compile a C snippet to legalized bitcode **with debug info** (`-g`). Uses `-Og` (optimize for
+/// Compile a C snippet to legalized textual `.ll` **with debug info** (`-g`). Uses `-Og` (optimize for
 /// debugging): mem2reg/SROA still run — so scalars arrive promoted, the legalized shape the on-ramp
 /// needs — while the per-statement line table is preserved (`-O2` collapses a tiny function's lines
 /// onto one). So the §6 source-line ingest can be exercised against real, multi-line clang debug
 /// metadata. `None` (skip) if clang is unavailable.
-fn compile_to_bc_g(name: &str, src: &str) -> Option<PathBuf> {
+fn compile_to_ll_g(name: &str, src: &str) -> Option<PathBuf> {
     compile_g(name, src, "-Og")
 }
 
 /// Compile at `-O0 -g`: every C local stays an `alloca` + `llvm.dbg.declare`, the shape the §6
 /// **variable** ingest reads (a `dbg.declare` → a `Window` frame slot). `None` (skip) if clang is
 /// unavailable.
-fn compile_to_bc_o0g(name: &str, src: &str) -> Option<PathBuf> {
+fn compile_to_ll_o0g(name: &str, src: &str) -> Option<PathBuf> {
     compile_g(name, src, "-O0")
 }
 
 fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_g_{}_{}.c", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_g_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_g_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args([opt, "-g", "-emit-llvm", "-c"])
+        .args([opt, "-g", "-emit-llvm", "-S"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -95,10 +96,10 @@ fn from_slot(t: ValType, s: i64) -> Value {
 /// **both** backends with `args`; assert they agree and equal `expect`. Returns silently if clang
 /// is unavailable.
 fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
-    let Some(bc) = compile_to_bc(name, src) else {
+    let Some(bc) = compile_to_ll(name, src) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let results = module.funcs[0].results.clone();
@@ -129,7 +130,7 @@ fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
 /// code on **both** backends. The native compiler is the strongest oracle (the chibicc Tier-2
 /// pattern); `run` returns a byte so the full result survives the 8-bit Unix exit code.
 fn check_vs_native(name: &str, src: &str, seed: i32) {
-    let Some(bc) = compile_to_bc(name, src) else {
+    let Some(bc) = compile_to_ll(name, src) else {
         return;
     };
     let exe = std::env::temp_dir().join(format!("svm_llvm_native_{}_{}", std::process::id(), name));
@@ -154,7 +155,7 @@ fn check_vs_native(name: &str, src: &str, seed: i32) {
         .code()
         .unwrap() as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
@@ -177,10 +178,10 @@ fn check_vs_native(name: &str, src: &str, seed: i32) {
 /// Used for the data-stack guard: a deep recursion with a real frame must fault past the window's
 /// mapped region, not corrupt globals or return garbage.
 fn check_traps(name: &str, src: &str, args: &[Value]) {
-    let Some(bc) = compile_to_bc(name, src) else {
+    let Some(bc) = compile_to_ll(name, src) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let mut full: Vec<Value> = vec![Value::I64(t.entry_sp as i64)];
@@ -205,10 +206,10 @@ fn check_traps(name: &str, src: &str, args: &[Value]) {
 /// bench relies on for honest JIT timing (its loop must carry no per-call Cranelift codegen).
 #[test]
 fn jit_compile_once_run_many() {
-    let Some(bc) = compile_to_bc("compile_once", "int run(int x){ return x * x + 1; }") else {
+    let Some(bc) = compile_to_ll("compile_once", "int run(int x){ return x * x + 1; }") else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate");
     svm_verify::verify_module(&t.module).expect("verify");
     let e = t
         .exports
@@ -310,25 +311,8 @@ exit:\n\
   %r = add i64 %ra, %rb\n\
   ret i64 %r\n\
 }\n";
-    let dir = std::env::temp_dir();
-    let ll = dir.join(format!("svm_structphi_{}.ll", std::process::id()));
-    let bc = dir.join(format!("svm_structphi_{}.bc", std::process::id()));
-    std::fs::write(&ll, ir).expect("write IR");
-    // Assemble the textual IR with clang (no extra tool dependency beyond the one tests already need).
-    match Command::new("clang")
-        .args(["-x", "ir", "-c", "-emit-llvm"])
-        .arg(&ll)
-        .arg("-o")
-        .arg(&bc)
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("note: skipping struct_phi_cross_block (clang unavailable)");
-            return;
-        }
-    }
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate struct-φ IR");
+    // Textual LLVM IR — feed it straight to the in-house reader (no clang/`llvm-as` round-trip).
+    let t = svm_llvm::translate_ll_str(ir).expect("translate struct-φ IR");
     svm_verify::verify_module(&t.module).expect("verify");
     let run = t
         .exports
@@ -1416,7 +1400,7 @@ fn powerbox_diff_cc_flags(
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
     // The on-ramp: translate → resolve §7 imports to concrete capabilities → verify → run.
-    let t = svm_llvm::translate_bc_path(bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate bitcode");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc program must produce a named-export powerbox entry (paramless _start, S15 c)"
@@ -1446,7 +1430,7 @@ fn powerbox_diff_cc_flags(
 /// Compile a **powerbox program** (real I/O via libc) from an inline source string and run the
 /// differential ([`powerbox_diff`]).
 fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
-    let Some(bc) = compile_to_bc(name, src) else {
+    let Some(bc) = compile_to_ll(name, src) else {
         return;
     };
     let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
@@ -1460,7 +1444,7 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
 /// `argv[0]` is otherwise the temp path, which the guest can't (and shouldn't) reproduce.
 fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&str]) {
     use std::os::unix::process::CommandExt;
-    let Some(bc) = compile_to_bc(name, src) else {
+    let Some(bc) = compile_to_ll(name, src) else {
         return;
     };
     let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
@@ -1482,7 +1466,7 @@ fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&s
     let native = cmd.output().expect("run native");
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
     svm_verify::verify_module(&module).expect("verify translated IR");
     let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
@@ -1689,7 +1673,7 @@ fn libm_bundled_vs_native() {
         "-DASSEMBLER=0",
     ];
 
-    // Guest: each openlibm source + the driver → bitcode, then `llvm-link` into one module.
+    // Guest: each openlibm source + the driver → `.ll`, then `llvm-link -S` into one module.
     let mut bcs: Vec<PathBuf> = Vec::new();
     for name in OPENLIBM_SRCS
         .iter()
@@ -1699,16 +1683,16 @@ fn libm_bundled_vs_native() {
         let (src, out) = if name == "__driver" {
             (
                 driver.clone(),
-                std::env::temp_dir().join(format!("olbc_{pid}_driver.bc")),
+                std::env::temp_dir().join(format!("olbc_{pid}_driver.ll")),
             )
         } else {
             (
                 ol.join("src").join(format!("{name}.c")),
-                std::env::temp_dir().join(format!("olbc_{pid}_{name}.bc")),
+                std::env::temp_dir().join(format!("olbc_{pid}_{name}.ll")),
             )
         };
         let mut cmd = Command::new("clang");
-        cmd.args(cflags).args(["-emit-llvm", "-c"]);
+        cmd.args(cflags).args(["-emit-llvm", "-S"]);
         for i in &incs {
             cmd.arg(i);
         }
@@ -1721,8 +1705,9 @@ fn libm_bundled_vs_native() {
             }
         }
     }
-    let linked = std::env::temp_dir().join(format!("olbc_{pid}_libm.bc"));
+    let linked = std::env::temp_dir().join(format!("olbc_{pid}_libm.ll"));
     if !Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
@@ -1756,7 +1741,7 @@ fn libm_bundled_vs_native() {
     let native = Command::new(&exe).output().expect("run native libm");
 
     // Guest: translate → resolve caps → verify → run (JIT via the powerbox).
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate bundled libm");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate bundled libm");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify libm module");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run libm");
@@ -1820,7 +1805,7 @@ const QUICKJS_OPENLIBM_EXTRA: &[&str] = &["s_asinh", "e_acosh", "e_atanh", "s_lo
 /// **▶ QuickJS eval — the full-JS-engine breadth target (SPIKE, in progress).** Wires the whole
 /// differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the
 /// `demos/quickjs/qjs_eval.c` driver + the guest libm + the libc/stdio shims to bitcode,
-/// `llvm-link` into one module, then translate → verify → run vs a native `cc` oracle. The libc
+/// `llvm-link -S` into one `.ll` module, then translate → verify → run vs a native `cc` oracle. The libc
 /// waist is now shimmed (printf engine + `strtod` + `libc_shim.c`); it is **ignored** because the
 /// interpreter core (`JS_CallInternal`) uses a **dynamic `alloca`** (runtime-sized operand stack)
 /// the on-ramp doesn't yet lower, and general Number→string needs directed-rounding dtoa — see
@@ -1846,7 +1831,7 @@ fn demo_quickjs_eval_vs_native() {
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-fno-vectorize",
         "-fno-slp-vectorize",
         "-DNDEBUG",
@@ -1854,11 +1839,11 @@ fn demo_quickjs_eval_vs_native() {
         "-DCONFIG_VERSION=\"2024-01-13\"",
         "-DASSEMBLER=0",
     ];
-    // Compile QuickJS TUs + driver + the guest-libm set, each → bitcode.
+    // Compile QuickJS TUs + driver + the guest-libm set, each → textual `.ll`.
     let qjs_tus = ["quickjs", "libregexp", "libunicode", "cutils", "libbf"];
     let mut bcs: Vec<PathBuf> = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{tag}.bc"));
+        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{tag}.ll"));
         let mut cmd = Command::new("clang");
         cmd.args(cflags);
         for i in &incs {
@@ -1914,19 +1899,15 @@ fn demo_quickjs_eval_vs_native() {
             }
         }
     }
-    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_linked.bc"));
-    let link_ok = Command::new("llvm-link-18")
+    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_linked.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests it.
+    let link_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !link_ok {
@@ -1966,7 +1947,7 @@ fn demo_quickjs_eval_vs_native() {
         "native quickjs oracle produced no output"
     );
     // Guest: translate → resolve caps → verify → run under the powerbox, diff stdout vs the oracle.
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate quickjs");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate quickjs");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify quickjs module");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run quickjs");
@@ -1979,19 +1960,19 @@ fn demo_quickjs_eval_vs_native() {
     );
 }
 
-/// Like [`check_demo_vs_native`] but threads `extra` clang flags into the **bitcode** compile only
-/// — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
+/// Like [`check_demo_vs_native`] but threads `extra` clang flags into the on-ramp's **`.ll`** compile
+/// only — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
 /// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
 /// the vector lane (§17/D58) is outside the scalar on-ramp's scope, and exact integer code gives
-/// the identical bytes scalar-vs-vectorized, so the on-ramp consumes scalar bitcode while the
+/// the identical bytes scalar-vs-vectorized, so the on-ramp consumes scalar `.ll` while the
 /// oracle keeps vectorizing — the same split the Rust lane uses (`rust_*` helper, LLVM.md).
 fn check_demo_vs_native_flags(name: &str, rel: &str, stdin: &[u8], extra: &[&str]) {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos")
         .join(rel);
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.bc", std::process::id(), name));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.ll", std::process::id(), name));
     let status = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .args(extra)
         .arg(&path)
         .arg("-o")
@@ -2103,7 +2084,7 @@ fn inline_asm_unrecognized_is_fail_closed() {
     // The asm allowlist is **closed**: a template that is not a recognized barrier/`popcnt`/… must be
     // a clean `Unsupported`, never silently dropped or mis-lowered. This is the §2a chokepoint —
     // executing opaque machine code would defeat the sandbox, so an unknown template fails closed.
-    let Some(bc) = compile_to_bc(
+    let Some(bc) = compile_to_ll(
         "asm_unknown",
         "int f(int x){ int r; __asm__(\"movl %1,%0; incl %0\" : \"=r\"(r) : \"r\"(x) : \"cc\"); \
            return r; } \
@@ -2111,7 +2092,7 @@ fn inline_asm_unrecognized_is_fail_closed() {
     ) else {
         return;
     };
-    match svm_llvm::translate_bc_path(&bc) {
+    match svm_llvm::translate_ll_path(&bc) {
         Err(svm_llvm::Error::Unsupported(_)) => {}
         other => panic!("expected Unsupported for unrecognized inline asm, got {other:?}"),
     }
@@ -2308,12 +2289,12 @@ fn computed_goto_threaded_interpreter() {
 /// the text parse recovered them, and the `indirectbr` lowered to a `br_table`.
 #[test]
 fn computed_goto_lowers_indirectbr_to_br_table() {
-    let Some(bc) = compile_to_bc("computed_goto_struct", COMPUTED_GOTO_SRC) else {
+    let Some(bc) = compile_to_ll("computed_goto_struct", COMPUTED_GOTO_SRC) else {
         return;
     };
     // The reader recovered the dispatch table's `blockaddress` labels (internally, via `ll::parse`),
     // so the `indirectbr` lowered to a `br_table` terminator.
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
     let has_br_table = t
         .module
@@ -2353,13 +2334,13 @@ fn computed_goto_phi_threaded_blockaddress() {
 /// operand-position recovery path — not just the global-table path — is exercised).
 #[test]
 fn computed_goto_phi_recovery_finds_operand_blockaddress() {
-    let Some(bc) = compile_to_bc("computed_goto_phi_struct", COMPUTED_GOTO_PHI_SRC) else {
+    let Some(bc) = compile_to_ll("computed_goto_phi_struct", COMPUTED_GOTO_PHI_SRC) else {
         return;
     };
     // The φ-threaded (operand-position) `blockaddress` recovery path resolves internally, so the
     // module translates + verifies (no fail-closed). Its runtime correctness is covered by
     // `computed_goto_phi_threaded_blockaddress` (a native differential).
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
 }
 
@@ -2370,7 +2351,7 @@ fn computed_goto_phi_recovery_finds_operand_blockaddress() {
 /// `longjmp`"); on a target without that runtime it declines cleanly and the interpreters cover it.
 /// `run` returns a byte so the result survives the Unix exit code.
 fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
-    let Some(bc) = compile_to_bc(name, src) else {
+    let Some(bc) = compile_to_ll(name, src) else {
         return;
     };
     let exe = std::env::temp_dir().join(format!("svm_llvm_sj_{}_{}", std::process::id(), name));
@@ -2388,7 +2369,7 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
         .code()
         .unwrap() as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
@@ -2445,7 +2426,7 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
 /// reads must match native. Unlike setjmp, the JIT must *run* varargs (it lowers to ordinary
 /// loads/stores/calls), so a JIT decline is a failure here.
 fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
-    let Some(bc) = compile_to_bc(name, src) else {
+    let Some(bc) = compile_to_ll(name, src) else {
         return;
     };
     let exe = std::env::temp_dir().join(format!("svm_llvm_va_{}_{}", std::process::id(), name));
@@ -2470,7 +2451,7 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
         .code()
         .unwrap() as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
@@ -2692,23 +2673,8 @@ done:\n\
   %r = phi i32 [ %rt, %then ], [ %re, %else ]\n\
   ret i32 %r\n\
 }\n";
-    let dir = std::env::temp_dir();
-    let llf = dir.join(format!("svm_mask_{}.ll", std::process::id()));
-    let bcf = dir.join(format!("svm_mask_{}.bc", std::process::id()));
-    std::fs::write(&llf, ll).unwrap();
-    match Command::new("llvm-as")
-        .arg(&llf)
-        .arg("-o")
-        .arg(&bcf)
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("note: skipping cross_block_i1_mask (llvm-as unavailable)");
-            return;
-        }
-    }
-    let t = svm_llvm::translate_bc_path(&bcf).expect("translate mask bitcode");
+    // Textual LLVM IR — feed it straight to the in-house reader (no `llvm-as` round-trip).
+    let t = svm_llvm::translate_ll_str(ll).expect("translate mask IR");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     for (seed, expect) in [(0i32, 1i32), (1, 4), (2, 2), (3, 8)] {
@@ -3224,13 +3190,13 @@ fn demo_sqlite_vs_native() {
     };
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/sqlite/sqlite_demo.c");
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_sqlite.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_sqlite.ll", std::process::id()));
     let inc = format!("-I{}", amalg.display());
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-fno-vectorize",
             "-fno-slp-vectorize",
         ])
@@ -3262,7 +3228,7 @@ fn demo_sqlite_repl_stdin() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/sqlite/sqlite_repl.c");
     let bc = std::env::temp_dir().join(format!(
-        "svm_llvm_demo_{}_sqlite_repl.bc",
+        "svm_llvm_demo_{}_sqlite_repl.ll",
         std::process::id()
     ));
     let inc = format!("-I{}", amalg.display());
@@ -3270,7 +3236,7 @@ fn demo_sqlite_repl_stdin() {
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-fno-vectorize",
             "-fno-slp-vectorize",
         ])
@@ -3374,12 +3340,12 @@ fn run_sqllogictest(max_scripts: usize) {
     let inc = format!("-I{}", amalg.display());
     let pid = std::process::id();
 
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_slt.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_slt.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-fno-vectorize",
             "-fno-slp-vectorize",
         ])
@@ -3410,7 +3376,7 @@ fn run_sqllogictest(max_scripts: usize) {
         }
     }
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate sqllogictest runner");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate sqllogictest runner");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
     svm_verify::verify_module(&module).expect("verify");
 
@@ -3483,18 +3449,18 @@ fn demo_lmdb_mmap_cap_vs_native() {
     let pid = std::process::id();
     let tmp = std::env::temp_dir();
 
-    // Guest bitcode: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one .bc.
+    // Guest `.ll`: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one module.
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-DSVM_GUEST",
         "-fno-vectorize",
         "-fno-slp-vectorize",
     ];
     let mut bcs = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = tmp.join(format!("svm_llvm_lmdb_{pid}_{tag}.bc"));
+        let out = tmp.join(format!("svm_llvm_lmdb_{pid}_{tag}.ll"));
         let ok = Command::new("clang")
             .args(cflags)
             .arg(&inc)
@@ -3520,19 +3486,16 @@ fn demo_lmdb_mmap_cap_vs_native() {
             }
         }
     }
-    let linked = tmp.join(format!("svm_llvm_lmdb_{pid}.bc"));
-    let linked_ok = Command::new("llvm-link-18")
+    let linked = tmp.join(format!("svm_llvm_lmdb_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !linked_ok {
@@ -3558,7 +3521,7 @@ fn demo_lmdb_mmap_cap_vs_native() {
         return;
     }
 
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -3680,19 +3643,19 @@ fn demo_lmdb_crash_recovery() {
     let pid = std::process::id();
     let tmp = std::env::temp_dir();
 
-    // Guest bitcode: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one .bc.
+    // Guest `.ll`: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one module.
     // (Distinct tag from demo_lmdb_mmap_cap_vs_native so the two tests can run in parallel.)
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-DSVM_GUEST",
         "-fno-vectorize",
         "-fno-slp-vectorize",
     ];
     let mut bcs = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = tmp.join(format!("svm_llvm_lmdbcrash_{pid}_{tag}.bc"));
+        let out = tmp.join(format!("svm_llvm_lmdbcrash_{pid}_{tag}.ll"));
         let ok = Command::new("clang")
             .args(cflags)
             .arg(&inc)
@@ -3718,19 +3681,16 @@ fn demo_lmdb_crash_recovery() {
             }
         }
     }
-    let linked = tmp.join(format!("svm_llvm_lmdbcrash_{pid}.bc"));
-    let linked_ok = Command::new("llvm-link-18")
+    let linked = tmp.join(format!("svm_llvm_lmdbcrash_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !linked_ok {
@@ -3738,7 +3698,7 @@ fn demo_lmdb_crash_recovery() {
         return;
     }
 
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -3848,14 +3808,14 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-DSVM_GUEST",
         "-fno-vectorize",
         "-fno-slp-vectorize",
     ];
     let mut bcs = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = tmp.join(format!("svm_llvm_lmdbzc_{pid}_{tag}.bc"));
+        let out = tmp.join(format!("svm_llvm_lmdbzc_{pid}_{tag}.ll"));
         let ok = Command::new("clang")
             .args(cflags)
             .arg(&inc)
@@ -3881,19 +3841,16 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
             }
         }
     }
-    let linked = tmp.join(format!("svm_llvm_lmdbzc_{pid}.bc"));
-    let linked_ok = Command::new("llvm-link-18")
+    let linked = tmp.join(format!("svm_llvm_lmdbzc_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !linked_ok {
@@ -3919,7 +3876,7 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
         return;
     }
 
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4020,12 +3977,12 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
     let tmp = std::env::temp_dir();
 
     // Guest bitcode (single translation unit — no llvm-link; the on-ramp synthesizes libc).
-    let bc = tmp.join(format!("svm_ring_{pid}.bc"));
+    let bc = tmp.join(format!("svm_ring_{pid}.ll"));
     let bc_ok = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4058,7 +4015,7 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
     let native = Command::new(&exe).output().expect("native ring run");
     assert!(native.status.success(), "native ring run failed");
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate ring guest");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate ring guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4135,12 +4092,12 @@ fn demo_sqlite_fs_cap_vs_native() {
     let pid = std::process::id();
 
     // Guest bitcode (-DSVM_GUEST → SQLITE_OS_OTHER + the capability VFS).
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_sqlite_fs.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_sqlite_fs.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4189,7 +4146,7 @@ fn demo_sqlite_fs_cap_vs_native() {
         .expect("native verify");
     assert!(oracle_verify.status.success(), "native verify failed");
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate sqlite_fs bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate sqlite_fs bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4285,12 +4242,12 @@ fn demo_pg_oscap_vs_native() {
     let pid = std::process::id();
 
     // Guest bitcode: os_probe.c `#include`s os_shim.c under -DSVM_GUEST (single TU, no llvm-link).
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_oscap.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_oscap.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4325,7 +4282,7 @@ fn demo_pg_oscap_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_oscap bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_oscap bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4406,14 +4363,14 @@ fn trap_error_surfaces_guest_output() {
     let src = "#include <unistd.h>\n\
                extern void svm_no_such_extern(void);\n\
                int main(void){ write(1, \"BOOT-MARKER\\n\", 11); svm_no_such_extern(); return 0; }";
-    let Some(bc) = compile_to_bc("trap_output", src) else {
+    let Some(bc) = compile_to_ll("trap_output", src) else {
         return;
     };
     let opts = svm_llvm::TranslateOptions {
         stub_unresolved_externs: true,
         ..Default::default()
     };
-    let t = svm_llvm::translate_bc_path_with_options(&bc, opts).expect("translate");
+    let t = svm_llvm::translate_ll_path_with_options(&bc, opts).expect("translate");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4530,12 +4487,12 @@ fn demo_pg_procstub() {
     // fixed expected report. Pure — runs on the bare powerbox.
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/proc_probe.c");
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_pg_proc.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_pg_proc.ll", std::process::id()));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4551,7 +4508,7 @@ fn demo_pg_procstub() {
             return;
         }
     }
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_proc bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_proc bitcode");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
     svm_verify::verify_module(&module).expect("verify");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
@@ -4598,12 +4555,12 @@ fn demo_pg_stdio_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/stdio_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stdio.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stdio.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4637,7 +4594,7 @@ fn demo_pg_stdio_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_stdio bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_stdio bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4683,12 +4640,12 @@ fn demo_pg_stream_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/stream_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stream.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stream.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4722,7 +4679,7 @@ fn demo_pg_stream_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_stream bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_stream bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4770,12 +4727,12 @@ fn demo_pg_fprintf_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/fprintf_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_fprintf.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_fprintf.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4809,7 +4766,7 @@ fn demo_pg_fprintf_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_fprintf bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_fprintf bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4870,12 +4827,12 @@ fn demo_pg_sscanf_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/sscanf_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_sscanf.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_sscanf.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4911,7 +4868,7 @@ fn demo_pg_sscanf_vs_native() {
     let oracle = child.wait_with_output().expect("native pg_sscanf run");
     assert!(oracle.status.success(), "native oracle failed");
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_sscanf bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_sscanf bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -5054,14 +5011,14 @@ fn demo_rational_vs_native() {
 /// native oracle; the assertion is the **interleaving-invariant total** (the chibicc `c_guest_*`
 /// contract, now via the LLVM frontend). `None` (skip) if clang is unavailable.
 #[cfg(all(unix, target_arch = "x86_64"))]
-fn compile_demo_libc_to_bc(name: &str, rel: &str) -> Option<PathBuf> {
+fn compile_demo_libc_to_ll(name: &str, rel: &str) -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos")
         .join(rel);
     let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
-    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.bc", std::process::id(), name));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.ll", std::process::id(), name));
     let status = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg("-I")
         .arg(&inc)
         .arg(&path)
@@ -5078,17 +5035,17 @@ fn compile_demo_libc_to_bc(name: &str, rel: &str) -> Option<PathBuf> {
 }
 
 /// Compile an inline C **source string** with chibicc's guest-libc include dir on the path (the
-/// `<pthread.h>`/`<svm.h>` shims) → bitcode. The text variant of [`compile_demo_libc_to_bc`], for a
+/// `<pthread.h>`/`<svm.h>` shims) → textual `.ll`. The text variant of [`compile_demo_libc_to_ll`], for a
 /// demo that must be *patched* before compiling (the guest-JIT blob descriptor). `None` if clang is
 /// unavailable.
 #[cfg(all(unix, target_arch = "x86_64"))]
-fn compile_libc_src_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+fn compile_libc_src_to_ll(name: &str, src: &str) -> Option<PathBuf> {
     let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
     let c = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.c", std::process::id(), name));
-    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.bc", std::process::id(), name));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg("-I")
         .arg(&inc)
         .arg(&c)
@@ -5112,10 +5069,10 @@ fn compile_libc_src_to_bc(name: &str, src: &str) -> Option<PathBuf> {
 /// failure, not an infinite test). Skips silently if clang is unavailable.
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
-    let Some(bc) = compile_demo_libc_to_bc(name, rel) else {
+    let Some(bc) = compile_demo_libc_to_ll(name, rel) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a threads/libc program must produce a powerbox entry"
@@ -5367,10 +5324,10 @@ fn atomics_narrow() {
 fn atomics_narrow_lowers_and_runs() {
     // Local validation (no native cc). c: 0→200→44(wrap)→172→160→175; oc=175, store 99, cas(99→123)
     // ok, cas(7) fail, c=123. s: 1000+70000 ≡ 5464 (mod 2^16).
-    let Some(bc) = compile_to_bc("atomics_n", ATOMICS_NARROW_SRC) else {
+    let Some(bc) = compile_to_ll("atomics_n", ATOMICS_NARROW_SRC) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     // The narrow CAS-loop helpers were synthesized (each contains an AtomicCmpxchg).
     let cas_loops = t
         .module
@@ -5422,10 +5379,10 @@ fn atomics_wide_lowers_and_runs() {
     // Local validation (no native cc): the native atomics lower, verify, and run to the
     // hand-computed result. a: 0→5→3→11→11→10; old=10, store 42, cas(42→99) ok, cas(7) fail, a=99;
     // b: 1e12 + 1.
-    let Some(bc) = compile_to_bc("atomics_w", ATOMICS_WIDE_SRC) else {
+    let Some(bc) = compile_to_ll("atomics_w", ATOMICS_WIDE_SRC) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let has_atomic = t.module.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
         b.insts.iter().any(|i| {
             matches!(
@@ -5463,7 +5420,7 @@ fn unresolved_extern_stub_opt_in() {
 
     // (1) A dead undefined extern behind an opaque gate (`gate` is `volatile 0`, so clang can't prove
     // the branch dead and keeps the `call @mystery` in the IR — yet it is never taken at runtime).
-    let Some(bc) = compile_to_bc(
+    let Some(bc) = compile_to_ll(
         "extern_stub_dead",
         "#include <stdio.h>\n\
          extern int mystery(int);\n\
@@ -5473,12 +5430,12 @@ fn unresolved_extern_stub_opt_in() {
         return;
     };
     // Strict default: a clean, fail-closed translate-time error.
-    match svm_llvm::translate_bc_path(&bc) {
+    match svm_llvm::translate_ll_path(&bc) {
         Err(svm_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
         other => panic!("strict default should fail closed on `mystery`, got {other:?}"),
     }
     // Opt-in: translates + verifies, and runs to a clean exit — the dead stub never executes.
-    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let t = svm_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify stubbed module");
     let run = svm_run::run_powerbox(&module, b"").expect("run (dead stub inert)");
@@ -5489,7 +5446,7 @@ fn unresolved_extern_stub_opt_in() {
 
     // (2) The same extern, now on the *taken* path: the called stub must trap (run errors), never
     // silently return or escape.
-    let Some(bc2) = compile_to_bc(
+    let Some(bc2) = compile_to_ll(
         "extern_stub_called",
         "#include <stdio.h>\n\
          extern int mystery(int);\n\
@@ -5497,7 +5454,7 @@ fn unresolved_extern_stub_opt_in() {
     ) else {
         return;
     };
-    let t2 = svm_llvm::translate_bc_path_with_options(&bc2, stub).expect("stub translate 2");
+    let t2 = svm_llvm::translate_ll_path_with_options(&bc2, stub).expect("stub translate 2");
     let module2 = svm_run::resolve_capability_imports(t2.module).expect("resolve caps 2");
     svm_verify::verify_module(&module2).expect("verify stubbed module 2");
     assert!(
@@ -5519,14 +5476,14 @@ fn stub_trap_names_the_extern() {
         stub_unresolved_externs: true,
         ..TranslateOptions::default()
     };
-    let Some(bc) = compile_to_bc(
+    let Some(bc) = compile_to_ll(
         "stub_named",
         "extern int frobnicate_widget(int);\n\
          int run(int x){ return frobnicate_widget(x); }",
     ) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let t = svm_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
     let entry_sp = t.entry_sp as i64;
     assert!(
         t.module
@@ -5602,7 +5559,7 @@ fn unresolved_extern_funcptr_stub() {
     // `gate ? mystery : other` takes the address of the undefined `mystery`; with `gate` a volatile 0
     // the live target is `other`, so the run is clean and the `mystery` funcref (a stub) is never
     // selected — proving an address-taken stub is inert until actually invoked.
-    let Some(bc) = compile_to_bc(
+    let Some(bc) = compile_to_ll(
         "extern_funcptr",
         "#include <stdio.h>\n\
          extern int mystery(int, int);\n\
@@ -5613,13 +5570,13 @@ fn unresolved_extern_funcptr_stub() {
     ) else {
         return;
     };
-    match svm_llvm::translate_bc_path(&bc) {
+    match svm_llvm::translate_ll_path(&bc) {
         Err(svm_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
         other => {
             panic!("strict default should fail closed on address-taken `mystery`, got {other:?}")
         }
     }
-    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let t = svm_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify funcptr-stub module");
     let run = svm_run::run_powerbox(&module, b"").expect("run (funcref stub inert)");
@@ -5917,10 +5874,10 @@ fn tail_call_lowers_and_runs() {
                    printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
                    return 0;\n\
                }";
-    let Some(bc) = compile_to_bc("tail_lower", src) else {
+    let Some(bc) = compile_to_ll("tail_lower", src) else {
         return; // clang unavailable
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let n_tail = t
         .module
         .funcs
@@ -6298,13 +6255,13 @@ fn unsupported_is_fail_closed() {
     // only `FPType::{Single,Double}`). It must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint). (i128 div/rem, the prior subject
     // here, is now supported via the `__svm_udivmod128` helper — see the `i128_*` tests.)
-    let Some(bc) = compile_to_bc(
+    let Some(bc) = compile_to_ll(
         "fp80add",
         "long double f(long double a, long double b){ return a + b; }",
     ) else {
         return;
     };
-    match svm_llvm::translate_bc_path(&bc) {
+    match svm_llvm::translate_ll_path(&bc) {
         Err(svm_llvm::Error::Unsupported(_)) => {}
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -6320,8 +6277,8 @@ fn unsupported_is_fail_closed() {
 
 /// Translate `src` and return its verified module + entry-SP, or `None` if clang is unavailable.
 fn translate_verified(name: &str, src: &str) -> Option<(svm_ir::Module, u64)> {
-    let bc = compile_to_bc(name, src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let bc = compile_to_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify translated IR");
     Some((t.module, t.entry_sp))
 }
@@ -6375,10 +6332,10 @@ int main(void) {
   return 0;
 }
 "#;
-    let Some(bc) = compile_to_bc("vm_mem", src) else {
+    let Some(bc) = compile_to_ll("vm_mem", src) else {
         return;
     };
-    let m = svm_llvm::translate_bc_path(&bc)
+    let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
     // Structural: the Memory ops became `CallImport`s (resolved to the Memory cap at load). The raw
@@ -6655,10 +6612,10 @@ fn exports_feed_a_link_unit() {
 long twice(long x) { return x + x; }
 long inc(long x) { return x + 1; }
 "#;
-    let Some(bc) = compile_to_bc("exports", src) else {
+    let Some(bc) = compile_to_ll("exports", src) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     // Every export indexes a real function, and both library functions are present.
     for (name, idx) in &t.exports {
         assert!(
@@ -6684,7 +6641,7 @@ fn translate_cli_emits_module_and_syms() {
     let src = r#"
 long twice(long x) { return x + x; }
 "#;
-    let Some(bc) = compile_to_bc("cli", src) else {
+    let Some(bc) = compile_to_ll("cli", src) else {
         return;
     };
     let dir = std::env::temp_dir();
@@ -6847,10 +6804,10 @@ fn async_mix(arg: i64) -> i64 {
 #[cfg(unix)]
 fn vm_async_io_runtime() {
     let src = include_str!("../../svm-run/demos/async_io/async_io.c");
-    let Some(bc) = compile_to_bc("async_io", src) else {
+    let Some(bc) = compile_to_ll("async_io", src) else {
         return;
     };
-    let m = svm_llvm::translate_bc_path(&bc)
+    let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
     // The async-ring imports are registered and the entry grants through Blocking (7 handles).
@@ -6901,13 +6858,13 @@ fn vm_async_io_runtime() {
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn vm_async_work_stealing_runtime() {
-    let Some(bc) = compile_demo_libc_to_bc(
+    let Some(bc) = compile_demo_libc_to_ll(
         "async_work_stealing",
         "async_work_stealing/async_work_stealing.c",
     ) else {
         return;
     };
-    let m = svm_llvm::translate_bc_path(&bc)
+    let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
     let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
@@ -7004,10 +6961,10 @@ int main(void) {
   return (int)(r + slot);
 }
 "#;
-    let Some(bc) = compile_to_bc("vm_jit_struct", src) else {
+    let Some(bc) = compile_to_ll("vm_jit_struct", src) else {
         return;
     };
-    let m = svm_llvm::translate_bc_path(&bc)
+    let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
     let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
@@ -7065,12 +7022,12 @@ long __vm_jit_install(long code);\n\
 long __vm_jit_uninstall(long slot);\n";
     let src0 =
         include_str!("../../svm-run/demos/jit/jit_demo.c").replace("#include <svm.h>", jit_decls);
-    let Some(bc0) = compile_to_bc("jit_probe", &src0) else {
+    let Some(bc0) = compile_to_ll("jit_probe", &src0) else {
         return;
     };
     // Probe svm-llvm's parent window size (translation does not check the memory-match — that is a
     // runtime precondition of `__vm_jit_compile`), then patch the blob's descriptor to it.
-    let s = svm_llvm::translate_bc_path(&bc0)
+    let s = svm_llvm::translate_ll_path(&bc0)
         .expect("translate probe")
         .module
         .memory
@@ -7082,10 +7039,10 @@ long __vm_jit_uninstall(long slot);\n";
         "expected to patch the blob memory descriptor `eb(buf, 16);`"
     );
 
-    let Some(bc) = compile_to_bc("jit_demo", &src) else {
+    let Some(bc) = compile_to_ll("jit_demo", &src) else {
         return;
     };
-    let m = svm_llvm::translate_bc_path(&bc)
+    let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
     let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
@@ -7114,12 +7071,12 @@ long __vm_jit_uninstall(long slot);\n";
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn vm_jit_threads_demo() {
     let src0 = include_str!("../../svm-run/demos/jit/jit_threads.c");
-    let Some(bc0) = compile_libc_src_to_bc("jit_threads_probe", src0) else {
+    let Some(bc0) = compile_libc_src_to_ll("jit_threads_probe", src0) else {
         return;
     };
     // Probe svm-llvm's parent window size, then patch the blob descriptor to it (no magic constant —
     // it tracks svm-llvm's sizing, exactly as `vm_jit_guest_self_jit_demo` does).
-    let s = svm_llvm::translate_bc_path(&bc0)
+    let s = svm_llvm::translate_ll_path(&bc0)
         .expect("translate probe")
         .module
         .memory
@@ -7131,10 +7088,10 @@ fn vm_jit_threads_demo() {
         "expected to patch the blob memory descriptor `eb(&e, 16);`"
     );
 
-    let Some(bc) = compile_libc_src_to_bc("jit_threads", &src) else {
+    let Some(bc) = compile_libc_src_to_ll("jit_threads", &src) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     assert_eq!(
         t.module.funcs[0].blocks[0]
             .insts
@@ -7194,10 +7151,10 @@ int main(void) {
   return 0;
 }
 "#;
-    let Some(bc) = compile_to_bc("vm_region", src) else {
+    let Some(bc) = compile_to_ll("vm_region", src) else {
         return;
     };
-    let m = svm_llvm::translate_bc_path(&bc)
+    let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
     // Structural: the SharedRegion ops became their `CallImport`s, and the entry grants through
@@ -7244,19 +7201,19 @@ int main(void) {
 /// Compile a freestanding C++ snippet to legalized LLVM-18 bitcode: `-fno-exceptions -fno-rtti`
 /// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA and auto-vectorization (the on-ramp
 /// ingests the SIMD output). Returns `None` (skip) if `clang++` is unavailable.
-fn compile_cpp_to_bc(name: &str, src: &str) -> Option<PathBuf> {
-    compile_cpp_to_bc_flags(name, src, &["-fno-exceptions", "-fno-rtti"])
+fn compile_cpp_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    compile_cpp_to_ll_flags(name, src, &["-fno-exceptions", "-fno-rtti"])
 }
 
-/// Like [`compile_cpp_to_bc`] but with caller-chosen flags — used by the EH tests, which keep
+/// Like [`compile_cpp_to_ll`] but with caller-chosen flags — used by the EH tests, which keep
 /// exceptions on (drop `-fno-exceptions`) so `invoke`/`landingpad`/`__cxa_*` reach the on-ramp.
-fn compile_cpp_to_bc_flags(name: &str, src: &str, extra: &[&str]) -> Option<PathBuf> {
+fn compile_cpp_to_ll_flags(name: &str, src: &str, extra: &[&str]) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let cc = dir.join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_cpp_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_cpp_{}_{}.ll", std::process::id(), name));
     std::fs::write(&cc, src).expect("write C++ source");
     let status = Command::new("clang++")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .args(extra)
         .arg(&cc)
         .arg("-o")
@@ -7275,7 +7232,7 @@ fn compile_cpp_to_bc_flags(name: &str, src: &str, extra: &[&str]) -> Option<Path
 /// assert identical stdout + exit. The program is a powerbox program (`extern "C" int main`, output
 /// via `extern "C" write`), exactly like the C corpus demos.
 fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
-    let Some(bc) = compile_cpp_to_bc(name, src) else {
+    let Some(bc) = compile_cpp_to_ll(name, src) else {
         return;
     };
     check_cpp_bc_vs_native(name, &bc, stdin);
@@ -7285,7 +7242,7 @@ fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
 /// exceptions *on* (only `-fno-rtti`), so `invoke`/`landingpad`/`resume` + the `__cxa_*` runtime
 /// reach the on-ramp. The native oracle links the default (exceptions-on) `clang++`.
 fn check_cpp_eh_vs_native(name: &str, src: &str, stdin: &[u8]) {
-    let Some(bc) = compile_cpp_to_bc_flags(name, src, &["-fno-rtti"]) else {
+    let Some(bc) = compile_cpp_to_ll_flags(name, src, &["-fno-rtti"]) else {
         return;
     };
     check_cpp_bc_vs_native(name, &bc, stdin);
@@ -7318,7 +7275,7 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
     };
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
-    let t = svm_llvm::translate_bc_path(bc).expect("translate C++ bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate C++ bitcode");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
@@ -7349,10 +7306,10 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
 /// a "terminate called…" stderr line, which is not byte-comparable to a guest trap, so this asserts the
 /// clean fault (a `Err` from the powerbox run) rather than diffing against native.
 fn check_cpp_eh_terminates(name: &str, src: &str) {
-    let Some(bc) = compile_cpp_to_bc_flags(name, src, &["-fno-rtti"]) else {
+    let Some(bc) = compile_cpp_to_ll_flags(name, src, &["-fno-rtti"]) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate C++ bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate C++ bitcode");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
@@ -8365,10 +8322,10 @@ int chain(int n) {
   return d + a;
 }
 ";
-    let Some(bc) = compile_to_bc_g("dilocation", src) else {
+    let Some(bc) = compile_to_ll_g("dilocation", src) else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     // The debug section is strippable / untrusted-for-escape — it must not affect verification.
     svm_verify::verify_module(&t.module).expect("verify");
 
@@ -8461,10 +8418,10 @@ int dist(int n) {
   return p.x + p.y + row[0] + pp->x;
 }
 ";
-    let Some(bc) = compile_to_bc_o0g("llvm_vars", src) else {
+    let Some(bc) = compile_to_ll_o0g("llvm_vars", src) else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify"); // debug info is escape-irrelevant
     let di = t.module.debug_info.as_ref().expect("debug info");
 
@@ -8549,10 +8506,10 @@ int dist(int n) {
   return p.x + p.y + row[0] + pp->x;
 }
 ";
-    let Some(bc) = compile_to_bc_o0g("llvm_vars_rt", src) else {
+    let Some(bc) = compile_to_ll_o0g("llvm_vars_rt", src) else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
 
     // Break at the last instruction of the last block — `dist` is branch-free at -O0, so by here
@@ -8607,10 +8564,10 @@ int scaled(int n) {
   return total;
 }
 ";
-    let Some(bc) = compile_to_bc_g("og_arg", src) else {
+    let Some(bc) = compile_to_ll_g("og_arg", src) else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
     let di = t.module.debug_info.as_ref().expect("debug info");
 
@@ -8677,10 +8634,10 @@ int counter = 7;
 struct P { int a; int b; } origin = { 3, 4 };
 int bump(int n) { counter = counter + n; return counter + origin.a; }
 ";
-    let Some(bc) = compile_to_bc_o0g("globals", src) else {
+    let Some(bc) = compile_to_ll_o0g("globals", src) else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
     let di = t.module.debug_info.as_ref().expect("debug info");
 
@@ -9239,15 +9196,15 @@ fn compute() -> i32 {
 // to a known value for non-vacuity.
 // ============================================================================================
 
-/// Like [`compile_to_bc`] (auto-vectorization is enabled in both now), kept as the explicit SIMD
+/// Like [`compile_to_ll`] (auto-vectorization is enabled in both now), kept as the explicit SIMD
 /// harness so a reduction loop's `<4 x i32>` + `llvm.vector.reduce.*` is pinned to a known value.
-fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
+fn compile_to_ll_vectorized(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_simd_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_simd_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -9261,17 +9218,17 @@ fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
     }
 }
 
-/// Like [`compile_to_bc_vectorized`] but targeting **AVX2** (`-mavx2`), so the auto-vectorizer emits
+/// Like [`compile_to_ll_vectorized`] but targeting **AVX2** (`-mavx2`), so the auto-vectorizer emits
 /// wider-than-128-bit vectors (`<8 x i32>`, and `<16 x i32>` under interleave) — the exact shapes
-/// the I2 legalization pass splits into `v128` chunks. The bitcode only *names* AVX vectors; the SVM
+/// the I2 legalization pass splits into `v128` chunks. The `.ll` only *names* AVX vectors; the SVM
 /// JIT still lowers each chunk to SSE2/NEON, so no AVX2 hardware is needed to run the result.
-fn compile_to_bc_avx(name: &str, src: &str) -> Option<PathBuf> {
+fn compile_to_ll_avx(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_simd_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_simd_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args(["-O2", "-mavx2", "-emit-llvm", "-c"])
+        .args(["-O2", "-mavx2", "-emit-llvm", "-S"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -9289,7 +9246,7 @@ fn compile_to_bc_avx(name: &str, src: &str) -> Option<PathBuf> {
 /// native `cc` build's exit code (the on-ramp's SIMD lowering vs the scalar native result — they
 /// compute the same value).
 fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
-    let Some(bc) = compile_to_bc_vectorized(name, src) else {
+    let Some(bc) = compile_to_ll_vectorized(name, src) else {
         return;
     };
     check_simd_bc_vs_native(name, &bc, seed);
@@ -9299,7 +9256,7 @@ fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
 /// shapes), which the I2 legalization pass splits into `v128` chunks. The native oracle is a plain
 /// scalar `cc` build of the same loop (gcc needs no `-mavx2`), so SVM-chunked == native-scalar.
 fn check_avx_vs_native(name: &str, src: &str, seed: i32) {
-    let Some(bc) = compile_to_bc_avx(name, src) else {
+    let Some(bc) = compile_to_ll_avx(name, src) else {
         return;
     };
     check_simd_bc_vs_native(name, &bc, seed);
@@ -9321,7 +9278,7 @@ fn check_simd_bc_vs_native(name: &str, bc: &Path, seed: i32) {
         .code()
         .unwrap() as u8;
 
-    let t = svm_llvm::translate_bc_path(bc).expect("translate vectorized bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate vectorized bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
@@ -9503,7 +9460,7 @@ fn simd_vec2_i32_carried_widening_mul_i13() {
         }\n";
     let main = "long run(long);\n#include <stdio.h>\n\
         int main(void){ printf(\"%ld %ld\\n\", run(1), run(7)); return 0; }\n";
-    let Some(bc) = compile_to_bc("i13_vec2_fir", kernel) else {
+    let Some(bc) = compile_to_ll("i13_vec2_fir", kernel) else {
         return; // clang unavailable
     };
     // Native oracle: full 64-bit results for n=1 and n=7 via stdout.
@@ -9527,7 +9484,7 @@ fn simd_vec2_i32_carried_widening_mul_i13() {
     assert_eq!(nat.len(), 2, "native printed two checksums");
 
     let t =
-        svm_llvm::translate_bc_path(&bc).expect("translate (I13 root fix: no longer fail-closed)");
+        svm_llvm::translate_ll_path(&bc).expect("translate (I13 root fix: no longer fail-closed)");
     let module = &t.module;
     svm_verify::verify_module(module).expect("verify");
     let e = t
@@ -10099,10 +10056,10 @@ int f(int n) {
   return x + n;
 }
 ";
-    let Some(bc) = compile_to_bc_o0g("shadow", src) else {
+    let Some(bc) = compile_to_ll_o0g("shadow", src) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate");
     svm_verify::verify_module(&t.module).expect("verify");
     let di = t.module.debug_info.as_ref().expect("debug info");
 
@@ -10582,10 +10539,10 @@ fn i128_wide_constant_now_translates() {
              return (long)((unsigned long)r) ^ (long)(r>>64);\n }\n",
         ),
     ] {
-        let Some(bc) = compile_to_bc(name, src) else {
+        let Some(bc) = compile_to_ll(name, src) else {
             return;
         };
-        svm_llvm::translate_bc_path(&bc).unwrap_or_else(|e| {
+        svm_llvm::translate_ll_path(&bc).unwrap_or_else(|e| {
             panic!("{name}: expected the wide i128 constant to translate, got {e:?}")
         });
     }

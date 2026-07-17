@@ -30,9 +30,9 @@ const EXPECT: i32 = 1506304;
 fn run(backend: Backend) -> Outcome {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_floats.bc"
+        "/tests/fixtures/lua/lua_floats.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua+floats bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua+floats bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

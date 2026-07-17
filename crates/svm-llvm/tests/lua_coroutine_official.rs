@@ -23,9 +23,9 @@ use svm_run::{Backend, Limits, Outcome, RunConfig, Value};
 fn run(backend: Backend) -> svm_run::Run {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_coroutine_official.bc"
+        "/tests/fixtures/lua/lua_coroutine_official.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua coroutine.lua bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua coroutine.lua bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

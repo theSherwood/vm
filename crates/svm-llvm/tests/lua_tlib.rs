@@ -25,7 +25,7 @@
 use svm_run::{fs, Backend, Limits, Outcome, RunConfig, Value};
 
 fn run(bc: &str, backend: Backend) -> svm_run::Run {
-    let t = svm_llvm::translate_bc_path(bc).expect("translate T-library bundle");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate T-library bundle");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {
@@ -57,11 +57,11 @@ fn check(bc: &str, backend: Backend) {
 
 const TLIB: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/lua/lua_tlib.bc"
+    "/tests/fixtures/lua/lua_tlib.ll"
 );
 const TAPI: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/lua/lua_tapi.bc"
+    "/tests/fixtures/lua/lua_tapi.ll"
 );
 
 #[test]

@@ -5,7 +5,7 @@
 //! text into, so a user can write and run their own Lua. Asserts the exact stdout bytes on the
 //! tree-walker, bytecode, and JIT — identical to a native build of the same sources.
 //!
-//! The fixture (`tests/fixtures/lua/lua_eval.bc`, harness `lua_eval_harness.c` alongside) opens the
+//! The fixture (`tests/fixtures/lua/lua_eval.ll`, harness `lua_eval_harness.c` alongside) opens the
 //! full editor lib set over the `lua_files` guest layers (stdio/time/shim + the `lua_fmt` snprintf).
 //! `io.write`/`os.date`/`coroutine` all work; file I/O (`io.open`) degrades gracefully to `nil` since
 //! this run grants no `fs` capability — see the `hc` guard in `lua_files_stdio.c`.
@@ -32,9 +32,9 @@ io yielded\n";
 fn stdout_of(backend: Backend) -> Vec<u8> {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_eval.bc"
+        "/tests/fixtures/lua/lua_eval.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua eval bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua eval bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

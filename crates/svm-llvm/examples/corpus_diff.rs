@@ -2,7 +2,7 @@
 //! compute kernels (not the synthetic micro-benchmarks)? For each kernel — real algorithms spanning
 //! crypto, hashing, sorting, search, matmul, and float — compile the SAME C two ways: native via
 //! `clang -O2` (an executable that self-times `run(n)` by large/small-n subtraction, min reps), and
-//! svm-jit via `clang -O2 -emit-llvm` → `svm_llvm::translate_bc_path` → `svm_jit::compile_and_run`,
+//! svm-jit via `clang -O2 -emit-llvm` → `svm_llvm::translate_ll_path` → `svm_jit::compile_and_run`,
 //! timed in-process the same way.
 //!
 //! It reports the per-kernel ratio (svm-jit / native) plus the distribution — quantifying "how many
@@ -152,10 +152,10 @@ fn native_ns(name: &str, src: &str, large: i64) -> Option<f64> {
 fn svmjit_ns(name: &str, src: &str, large: i64) -> Option<f64> {
     let dir = std::env::temp_dir();
     let kf = dir.join(format!("cd_{name}.c"));
-    let bc = dir.join(format!("cd_{name}.bc"));
+    let bc = dir.join(format!("cd_{name}.ll"));
     std::fs::write(&kf, format!("#include <stdint.h>\n#if defined(__clang__)\n#define NOVEC _Pragma(\"clang loop vectorize(disable)\")\n#else\n#define NOVEC\n#endif\n{src}\n")).unwrap();
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&kf)
         .arg("-o")
         .arg(&bc)
@@ -165,7 +165,7 @@ fn svmjit_ns(name: &str, src: &str, large: i64) -> Option<f64> {
     if !ok {
         return None;
     }
-    let t = svm_llvm::translate_bc_path(&bc).ok()?;
+    let t = svm_llvm::translate_ll_path(&bc).ok()?;
     let sp = t.entry_sp as i64;
     let e = t.exports.iter().find(|(n, _)| n == "run")?.1;
     // sanity: the module must actually run on the JIT (else skip)

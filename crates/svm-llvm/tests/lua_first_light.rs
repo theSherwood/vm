@@ -1,6 +1,6 @@
 //! Lua first light — the on-ramp translates and runs **real Lua 5.4.7** (its core: lexer, parser,
 //! code generator, GC, and the computed-`goto` bytecode VM with `setjmp` error handling) identically
-//! on all three engines. The committed bitcode fixture (`tests/fixtures/lua/lua_first_light.bc`, see
+//! on all three engines. The committed bitcode fixture (`tests/fixtures/lua/lua_first_light.ll`, see
 //! its README) embeds a script exercising recursion, tables, numeric `for`, closures with upvalues,
 //! and the `#` operator — all core VM features, no fail-closed libc stubs on the executed path — and
 //! returns 456. This guards the whole stack the milestone rests on: the varargs ABI, the synthesized
@@ -15,9 +15,9 @@ const EXPECT: i32 = 456;
 fn run(backend: Backend) -> Outcome {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_first_light.bc"
+        "/tests/fixtures/lua/lua_first_light.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua core bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua core bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

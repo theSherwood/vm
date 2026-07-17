@@ -117,13 +117,13 @@ fn node_bytes(tag: i32, a: i32, b: i32, c: i32) -> [u8; 16] {
 fn compile_c_to_svm(name: &str, src: &str) -> (Module, i64, Vec<(String, u32)>) {
     let base = std::env::temp_dir().join(format!("lisp_demo_{name}"));
     let cf = base.with_extension("c");
-    let bc = base.with_extension("bc");
+    let bc = base.with_extension("ll");
     std::fs::write(&cf, src).unwrap();
     let ok = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-fno-vectorize",
             "-fno-slp-vectorize",
             // Keep the evaluator's recursion as real recursive calls: without this, clang's
@@ -139,7 +139,7 @@ fn compile_c_to_svm(name: &str, src: &str) -> (Module, i64, Vec<(String, u32)>) 
         .unwrap()
         .success();
     assert!(ok, "clang failed");
-    let t = svm_llvm::translate_bc_path(&bc).expect("svm-llvm translate");
+    let t = svm_llvm::translate_ll_path(&bc).expect("svm-llvm translate");
     let _ = std::fs::remove_file(&cf);
     let _ = std::fs::remove_file(&bc);
     (t.module, t.entry_sp as i64, t.exports)

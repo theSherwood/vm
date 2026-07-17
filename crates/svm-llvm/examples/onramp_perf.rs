@@ -87,10 +87,10 @@ const WORKLOADS: &[(&str, &str, &str, bool)] = &[
 fn compile(name: &str, src: &str) -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("onramp_perf_{}_{}.c", std::process::id(), name));
-    let bc = dir.join(format!("onramp_perf_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("onramp_perf_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).ok()?;
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -158,7 +158,7 @@ fn main() {
             eprintln!("note: skipping {name} (clang unavailable)");
             continue;
         };
-        let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+        let t = svm_llvm::translate_ll_path(&bc).expect("translate");
         svm_verify::verify_module(&t.module).expect("verify");
         let m = &t.module;
         let sp = t.entry_sp;

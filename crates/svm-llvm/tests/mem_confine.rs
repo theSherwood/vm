@@ -37,13 +37,13 @@ fn build() -> Option<svm_llvm::Translated> {
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let c = dir.join(format!("svm_confine_{uniq}.c"));
-    let bc = dir.join(format!("svm_confine_{uniq}.bc"));
+    let ll = dir.join(format!("svm_confine_{uniq}.ll"));
     std::fs::write(&c, SRC).expect("write .c");
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&c)
         .arg("-o")
-        .arg(&bc)
+        .arg(&ll)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -51,9 +51,9 @@ fn build() -> Option<svm_llvm::Translated> {
         eprintln!("note: skipping mem_confine (clang unavailable)");
         return None;
     }
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate confinement probe");
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate confinement probe");
     let _ = std::fs::remove_file(&c);
-    let _ = std::fs::remove_file(&bc);
+    let _ = std::fs::remove_file(&ll);
     Some(t)
 }
 

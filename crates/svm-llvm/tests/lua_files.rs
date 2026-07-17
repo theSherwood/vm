@@ -21,9 +21,9 @@ use svm_run::{fs, Backend, Limits, Outcome, RunConfig, Value};
 fn instance() -> svm_run::Instance {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_files.bc"
+        "/tests/fixtures/lua/lua_files.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua files.lua bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua files.lua bitcode");
     svm_run::instantiate(t.module).expect("instantiate")
 }
 

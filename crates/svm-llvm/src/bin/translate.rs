@@ -1,7 +1,9 @@
-//! `svm-llvm-translate` — translate a legalized LLVM bitcode file (`*.bc`) to an SVM-IR module.
+//! `svm-llvm-translate` — translate legalized LLVM IR to an SVM-IR module. Input is textual `.ll`
+//! (the in-house version-tolerant reader — the preferred path) or bitcode `*.bc` (disassembled via
+//! `llvm-dis`); the reader is chosen by the input's file extension.
 //!
 //! ```text
-//! svm-llvm-translate <input.bc> -o <out> [--emit-syms <file>] [--binary]
+//! svm-llvm-translate <input.ll|input.bc> -o <out> [--emit-syms <file>] [--binary]
 //! ```
 //!
 //! This is the **separate-artifact** on-ramp (the scriptable companion to the [`svm_llvm`] library):
@@ -28,8 +30,8 @@ fn try_main() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: svm-llvm-translate <input.bc> -o <out> [--emit-syms <file>] [--binary] [--host-page <bytes>] [--stub-externs]\n\
-             \n  Translates legalized LLVM-18 bitcode to an SVM-IR module written to <out>:\n\
+            "usage: svm-llvm-translate <input.ll|input.bc> -o <out> [--emit-syms <file>] [--binary] [--host-page <bytes>] [--stub-externs]\n\
+             \n  Translates legalized LLVM IR (textual .ll, or .bc via llvm-dis) to an SVM-IR module written to <out>:\n\
              \n    text (.svm) by default, binary (.svmb) when -o ends in .svmb or --binary.\n\
              \n  --emit-syms <file> writes the export map (one `name idx` line per exported\n\
              \n  function) so a program can link against the module via svm_ir::link.\n\
@@ -84,13 +86,20 @@ fn try_main() -> Result<(), String> {
     // Binary if asked explicitly or the output names a `.svmb` file; text otherwise.
     let binary = binary || Path::new(&out).extension().is_some_and(|e| e == "svmb");
 
-    // Translate the bitcode. `Error` is `Debug`-only (no `Display`), so render it that way.
+    // Translate the input. A `.ll` extension takes the in-house **textual** reader (no `llvm-dis`,
+    // version-tolerant — the direction the on-ramp is developed on); anything else is treated as
+    // bitcode and disassembled via `llvm-dis`. `Error` is `Debug`-only (no `Display`), render it so.
     let opts = svm_llvm::TranslateOptions {
         stub_unresolved_externs: stub_externs,
         stack_page: host_page,
     };
-    let translated = svm_llvm::translate_bc_path_with_options(&input, opts)
-        .map_err(|e| format!("translate `{input}`: {e:?}"))?;
+    let is_ll = Path::new(&input).extension().is_some_and(|e| e == "ll");
+    let translated = if is_ll {
+        svm_llvm::translate_ll_path_with_options(&input, opts)
+    } else {
+        svm_llvm::translate_bc_path_with_options(&input, opts)
+    }
+    .map_err(|e| format!("translate `{input}`: {e:?}"))?;
 
     let module_bytes = if binary {
         svm_encode::encode_module(&translated.module)

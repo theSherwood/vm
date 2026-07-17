@@ -7,7 +7,16 @@ fn main() {
         .expect("usage: try_translate <bc> [native-exe]");
     let native = std::env::args().nth(2);
     let t0 = std::time::Instant::now();
-    let t = match svm_llvm::translate_bc_path(&p) {
+    // `.ll` → in-house textual reader; anything else → bitcode via `llvm-dis`.
+    let is_ll = std::path::Path::new(&p)
+        .extension()
+        .is_some_and(|e| e == "ll");
+    let translated = if is_ll {
+        svm_llvm::translate_ll_path(&p)
+    } else {
+        svm_llvm::translate_bc_path(&p)
+    };
+    let t = match translated {
         Ok(t) => t,
         Err(e) => {
             println!("TRANSLATE ERR: {e:?}");

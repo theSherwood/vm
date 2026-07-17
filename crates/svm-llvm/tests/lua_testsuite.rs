@@ -6,7 +6,7 @@
 //! (the suite's own pass/fail contract). Byte-for-byte the same outcome on the tree-walker, bytecode,
 //! and JIT.
 //!
-//! The fixture (`tests/fixtures/lua/lua_testsuite.bc`) links the Lua core + those five libraries with
+//! The fixture (`tests/fixtures/lua/lua_testsuite.ll`) links the Lua core + those five libraries with
 //! the guest libc shim, guest `libm`, guest `strtod` (incl. hex floats), the guest runtime `snprintf`,
 //! and fdlibm inverse-trig/`modf` (`lua_testsuite_trig.c`) — see the fixtures README. The three files
 //! were chosen because they are self-contained (no `require`/`os`/`io`/`debug`/`coroutine` and no
@@ -19,9 +19,9 @@ use svm_run::{Backend, Limits, Outcome, RunConfig, Value};
 fn run(backend: Backend) -> svm_run::Run {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_testsuite.bc"
+        "/tests/fixtures/lua/lua_testsuite.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua test-suite bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua test-suite bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

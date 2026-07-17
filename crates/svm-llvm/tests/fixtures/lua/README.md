@@ -1,7 +1,7 @@
 # Lua first-light fixture
 
-`lua_first_light.bc` is **Lua 5.4.7's core** (lexer, parser, code generator, GC, and the bytecode VM —
-no standard libraries) plus a tiny C-API harness, compiled to a single LLVM-18 bitcode module. It is a
+`lua_first_light.ll` is **Lua 5.4.7's core** (lexer, parser, code generator, GC, and the bytecode VM —
+no standard libraries) plus a tiny C-API harness, compiled to a single textual LLVM `.ll` module (version-tolerant reader). It is a
 committed golden input for the `lua_first_light` translate test: a regression guard that the on-ramp
 translates and runs real Lua identically on the tree-walker, bytecode, and JIT.
 
@@ -33,15 +33,15 @@ light"):
 ```sh
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"   # core only — not the lib*.c / lauxlib / lua.c
-for f in $CORE harness; do clang -O2 -emit-llvm -c -Ilua-5.4.7/src $f.c -o $f.bc; done
-llvm-link *.bc -o lua_first_light.bc
+for f in $CORE harness; do clang -O2 -emit-llvm -S -Ilua-5.4.7/src $f.c -o $f.ll; done
+llvm-link -S *.ll -o lua_first_light.ll
 ```
 
 where `harness.c` is the C-API driver above. Run it with `cargo run --example run_lua -- <bc> [backend]`.
 
 # Lua + floats fixture
 
-`lua_floats.bc` is the same Lua 5.4.7 core, **linked with the bundled guest `libm` and guest `strtod`**
+`lua_floats.ll` is the same Lua 5.4.7 core, **linked with the bundled guest `libm` and guest `strtod`**
 (`crates/svm-run/demos/libm/libm.c`, `crates/svm-run/demos/strtod/strtod.c`), running a float script
 (committed as `lua_floats_harness.c`). It is the payoff fixture for the `lua_floats` test: a single run
 exercises, end to end through the whole VM, the guest `strtod` (every numeric literal), the guest `pow`
@@ -61,11 +61,11 @@ they define):
 NV="-fno-vectorize -fno-slp-vectorize"
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"
-for f in $CORE; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
-clang -O2 $NV            -emit-llvm -c -Ilua-5.4.7/src lua_floats_harness.c -o harness.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c            -o guest_libm.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/strtod/strtod.c        -o guest_strtod.bc
-llvm-link $CORE.bc harness.bc guest_libm.bc guest_strtod.bc -o lua_floats.bc   # (expand $CORE.bc)
+for f in $CORE; do clang -O2 $NV -emit-llvm -S -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.ll; done
+clang -O2 $NV            -emit-llvm -S -Ilua-5.4.7/src lua_floats_harness.c -o harness.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/libm/libm.c            -o guest_libm.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/strtod/strtod.c        -o guest_strtod.ll
+llvm-link -S $CORE.ll harness.ll guest_libm.ll guest_strtod.ll -o lua_floats.ll   # (expand $CORE.ll)
 ```
 
 The guest `pow`/`exp`/`log`/`sin`/`cos`/`strtod` definitions **shadow** the on-ramp's would-be trap
@@ -75,7 +75,7 @@ the identical sources (`cc … -lm`, our strong defs shadowing libm).
 
 # Lua stdlib fixture
 
-`lua_stdlib.bc` is the Lua 5.4.7 core **plus the base/`string`/`table`/`math` libraries**
+`lua_stdlib.ll` is the Lua 5.4.7 core **plus the base/`string`/`table`/`math` libraries**
 (`lbaselib`/`lstrlib`/`ltablib`/`lmathlib` + `lauxlib`), linked with the guest libm and a small guest
 libc shim (`lua_stdlib_shim.c`: the transcendentals the guest libm lacks, `strstr`, and a
 no-filesystem `stdio` surface). The harness (`lua_stdlib_harness.c`) opens the four libraries via
@@ -101,16 +101,16 @@ NV="-fno-vectorize -fno-slp-vectorize"
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"
 LIBS="lbaselib lstrlib ltablib lmathlib lauxlib"
-for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
-clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_stdlib_harness.c -o harness.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_stdlib_shim.c   -o guest_shim.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c               -o guest_libm.bc
-llvm-link $CORE.bc $LIBS.bc harness.bc guest_shim.bc guest_libm.bc -o lua_stdlib.bc  # (expand globs)
+for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -S -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.ll; done
+clang -O2 $NV              -emit-llvm -S -Ilua-5.4.7/src lua_stdlib_harness.c -o harness.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src lua_stdlib_shim.c   -o guest_shim.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/libm/libm.c               -o guest_libm.ll
+llvm-link -S $CORE.ll $LIBS.ll harness.ll guest_shim.ll guest_libm.ll -o lua_stdlib.ll  # (expand globs)
 ```
 
 # Lua string.format fixture
 
-`lua_fmt.bc` is the same Lua 5.4.7 core + base/`string`/`table`/`math` libraries + guest libc shim +
+`lua_fmt.ll` is the same Lua 5.4.7 core + base/`string`/`table`/`math` libraries + guest libc shim +
 guest libm + guest `strtod`, **plus a guest runtime `snprintf`** (`lua_fmt_snprintf.c`), running a
 harness (`lua_fmt_harness.c`) whose script uses `string.format` heavily — width/precision/flags across
 `%d`/`%x`/`%X`/`%#x`/`%o`, `%5d`/`%-5d`/`%05d`/`%+d`, `%10s`/`%-10s`/`%.3s`, `%c`, `%.2f`/`%8.3f`/
@@ -137,14 +137,14 @@ NV="-fno-vectorize -fno-slp-vectorize"
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"
 LIBS="lbaselib lstrlib ltablib lmathlib lauxlib"
-for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
-clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_fmt_harness.c   -o harness.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_stdlib_shim.c   -o guest_shim.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c                 lua_fmt_snprintf.c  -o guest_snprintf.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c               -o guest_libm.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/strtod/strtod.c           -o guest_strtod.bc
-llvm-link $CORE.bc $LIBS.bc harness.bc guest_shim.bc guest_snprintf.bc guest_libm.bc \
-          guest_strtod.bc -o lua_fmt.bc   # (expand globs)
+for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -S -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.ll; done
+clang -O2 $NV              -emit-llvm -S -Ilua-5.4.7/src lua_fmt_harness.c   -o harness.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src lua_stdlib_shim.c   -o guest_shim.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S                 lua_fmt_snprintf.c  -o guest_snprintf.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/libm/libm.c               -o guest_libm.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/strtod/strtod.c           -o guest_strtod.ll
+llvm-link -S $CORE.ll $LIBS.ll harness.ll guest_shim.ll guest_snprintf.ll guest_libm.ll \
+          guest_strtod.ll -o lua_fmt.ll   # (expand globs)
 ```
 
 The guest `snprintf` **shadows** the on-ramp's `snprintf_rt` fail-closed trap; the `__vm_fmt_{fix,sci,
@@ -154,7 +154,7 @@ against a native build of the identical sources (guest `snprintf`/shim/strtod sh
 
 # Lua eval-from-stdin fixture (the interactive playground guest)
 
-`lua_eval.bc` opens the **full editor lib set** — base/`string`/`table`/`math`/`coroutine`/`io`/`os` —
+`lua_eval.ll` opens the **full editor lib set** — base/`string`/`table`/`math`/`coroutine`/`io`/`os` —
 over the `lua_files` guest layers (`lua_files_stdio.c` + `lua_files_time.c` + `lua_files_shim.c`) plus
 the `lua_fmt` guest `snprintf`/libm/`strtod`/trig. The harness (`lua_eval_harness.c`) **reads a Lua
 chunk from `stdin`** (`extern long read(int, void *, long)` — the `Stream.read` capability, like
@@ -171,29 +171,29 @@ by `browser/build-onramp-assets.mjs` at `--host-page 65536`.
 ## Regenerating (eval)
 
 The `files.lua` recipe minus `debug`, with `lua_eval_harness.c` (no embedded script). **Do not glob
-`*.bc`** for the link — it would re-link the output; list the components:
+`*.ll`** for the link — it would re-link the output; list the components:
 
 ```sh
 NV="-fno-vectorize -fno-slp-vectorize"
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"
 LIBS="lbaselib lstrlib ltablib lmathlib lauxlib lcorolib liolib loslib"
-for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
-clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_eval_harness.c   -o harness.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_files_stdio.c   -o guest_stdio.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_files_time.c    -o guest_time.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_files_shim.c    -o guest_shim.bc
-clang -O2 $NV -fno-builtin -fno-strict-aliasing -emit-llvm -c lua_testsuite_trig.c -o guest_trig.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c                 lua_fmt_snprintf.c   -o guest_snprintf.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c               -o guest_libm.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/strtod/strtod.c           -o guest_strtod.bc
-llvm-link $CORE.bc $LIBS.bc harness.bc guest_stdio.bc guest_time.bc guest_shim.bc guest_trig.bc \
-          guest_snprintf.bc guest_libm.bc guest_strtod.bc -o lua_eval.bc   # (expand globs)
+for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -S -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.ll; done
+clang -O2 $NV              -emit-llvm -S -Ilua-5.4.7/src lua_eval_harness.c   -o harness.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src lua_files_stdio.c   -o guest_stdio.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src lua_files_time.c    -o guest_time.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src lua_files_shim.c    -o guest_shim.ll
+clang -O2 $NV -fno-builtin -fno-strict-aliasing -emit-llvm -S lua_testsuite_trig.c -o guest_trig.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S                 lua_fmt_snprintf.c   -o guest_snprintf.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/libm/libm.c               -o guest_libm.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/strtod/strtod.c           -o guest_strtod.ll
+llvm-link -S $CORE.ll $LIBS.ll harness.ll guest_stdio.ll guest_time.ll guest_shim.ll guest_trig.ll \
+          guest_snprintf.ll guest_libm.ll guest_strtod.ll -o lua_eval.ll   # (expand globs)
 ```
 
 # Lua test-suite fixture
 
-`lua_testsuite.bc` runs **three unmodified files from the official Lua 5.4.7 distribution's own test
+`lua_testsuite.ll` runs **three unmodified files from the official Lua 5.4.7 distribution's own test
 suite** (`testes/vararg.lua`, `testes/bwcoercion.lua`, `testes/pm.lua`, embedded verbatim in
 `lua_testsuite_tests.c`) through the whole VM with the base/`string`/`table`/`math`/`utf8` libraries
 open. The harness (`lua_testsuite_harness.c`) loads each file as its own chunk under `pcall`, one fresh
@@ -217,7 +217,7 @@ configurable Fs capability). Only `main.lua` (tests the standalone `lua` binary 
 
 # Lua files.lua fixture (io/os over the configurable Fs capability)
 
-`lua_files.bc` runs the official **`testes/files.lua`** (embedded in `lua_files_tests.c`) with
+`lua_files.ll` runs the official **`testes/files.lua`** (embedded in `lua_files_tests.c`) with
 base/`string`/`table`/`math`/`coroutine`/`debug` + **`io`** + **`os`** open. The io library rides a
 real guest **stdio (FILE) layer** (`lua_files_stdio.c`) and the os library a guest **time/date
 layer** (`lua_files_time.c`); `lua_files_shim.c` carries the usual non-stdio odds and ends
@@ -261,7 +261,7 @@ trig/snprintf/libm/strtod). The native oracle builds the same core+harness again
 
 # Lua coroutine fixture
 
-`lua_coroutine.bc` runs an **in-house coroutine differential** (`lua_coroutine.lua`, kept readable in
+`lua_coroutine.ll` runs an **in-house coroutine differential** (`lua_coroutine.lua`, kept readable in
 this directory and embedded verbatim as bytes into `lua_coroutine_tests.c`) with
 base/`string`/`table`/`math`/`coroutine` open. It exercises the whole coroutine surface that does *not*
 need the `debug` library: `create`/`resume`/`yield` with multi-value transfer both directions, the
@@ -290,7 +290,7 @@ and `lua_coroutine_harness.c`. Validate the `.lua` against native Lua first (it 
 
 # Lua official coroutine.lua fixture
 
-`lua_coroutine_official.bc` runs the **unmodified official `testes/coroutine.lua`** (embedded in
+`lua_coroutine_official.ll` runs the **unmodified official `testes/coroutine.lua`** (embedded in
 `lua_coroutine_official_tests.c`) with base/`string`/`table`/`math`/`coroutine`/`debug` open. Standalone
 the internal `T` C-test library is absent, so the file's own `if not T`/`if T==nil` guards skip the
 C-API sections; what remains still drives the coroutine + **debug** libraries hard: yields inside every
@@ -319,7 +319,7 @@ Same as the test-suite fixture below, but with `lcorolib` **and** `ldblib` in `L
 
 # Lua utf8.lua fixture
 
-`lua_utf8.bc` runs the official **`testes/utf8.lua`** (embedded in `lua_utf8_tests.c`) through the whole
+`lua_utf8.ll` runs the official **`testes/utf8.lua`** (embedded in `lua_utf8_tests.c`) through the whole
 VM with base/`string`/`table`/`math`/`utf8` open. It is the full `utf8` library workout:
 `utf8.char`/`codepoint`/`len`/`offset`/`codes`/`charpattern`, strict vs. `nonstrict` decoding across
 every sequence size (1–6 bytes, up to the original-UTF-8 `0x7FFFFFFF`), surrogate and overlong
@@ -343,7 +343,7 @@ Same as the test-suite fixture below, but with `lua_utf8_harness.c` (adds the `r
 
 # Lua math.lua fixture
 
-`lua_math.bc` runs the official **`testes/math.lua`** (embedded in `lua_math_tests.c`) — the densest
+`lua_math.ll` runs the official **`testes/math.lua`** (embedded in `lua_math_tests.c`) — the densest
 single file in the suite — through the whole VM with base/`string`/`table`/`math` open, via the same
 harness. It exercises integer/float arithmetic and conversions, `//`/`%`, float↔integer order (every
 NaN corner), `math.type`/`tointeger`/`floor`/`ceil`/`fmod`/`ult`/`min`/`max`, the transcendentals,
@@ -379,16 +379,16 @@ NV="-fno-vectorize -fno-slp-vectorize"
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"
 LIBS="lbaselib lstrlib ltablib lmathlib lauxlib lutf8lib"
-for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
-clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_testsuite_harness.c -o harness.bc
-clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_testsuite_tests.c   -o tests.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_testsuite_shim.c    -o guest_shim.bc
-clang -O2 $NV -fno-builtin -fno-strict-aliasing -emit-llvm -c lua_testsuite_trig.c -o guest_trig.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c                 lua_fmt_snprintf.c      -o guest_snprintf.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c                   -o guest_libm.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/strtod/strtod.c              -o guest_strtod.bc
-llvm-link $CORE.bc $LIBS.bc harness.bc tests.bc guest_shim.bc guest_trig.bc guest_snprintf.bc \
-          guest_libm.bc guest_strtod.bc -o lua_testsuite.bc   # (expand globs)
+for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -S -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.ll; done
+clang -O2 $NV              -emit-llvm -S -Ilua-5.4.7/src lua_testsuite_harness.c -o harness.ll
+clang -O2 $NV              -emit-llvm -S -Ilua-5.4.7/src lua_testsuite_tests.c   -o tests.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src lua_testsuite_shim.c    -o guest_shim.ll
+clang -O2 $NV -fno-builtin -fno-strict-aliasing -emit-llvm -S lua_testsuite_trig.c -o guest_trig.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S                 lua_fmt_snprintf.c      -o guest_snprintf.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/libm/libm.c                   -o guest_libm.ll
+clang -O2 $NV -fno-builtin -emit-llvm -S .../demos/strtod/strtod.c              -o guest_strtod.ll
+llvm-link -S $CORE.ll $LIBS.ll harness.ll tests.ll guest_shim.ll guest_trig.ll guest_snprintf.ll \
+          guest_libm.ll guest_strtod.ll -o lua_testsuite.ll   # (expand globs)
 ```
 
 `lua_testsuite_shim.c` keeps a 48 MiB arena (the JIT window bound) and resets it between files. The
@@ -399,7 +399,7 @@ llvm-link $CORE.bc $LIBS.bc harness.bc tests.bc guest_shim.bc guest_trig.bc gues
 
 # Lua suite-sweep fixture (21 more official files)
 
-`lua_sweep.bc` runs **twenty-one more unmodified official test files** in one bundle — light-to-heavy:
+`lua_sweep.ll` runs **twenty-one more unmodified official test files** in one bundle — light-to-heavy:
 `tracegc`, `verybig`, `big`, `gengc`, `goto`, `events`, `code`, `bitwise`, `closure`, `tpack`,
 `literals`, `errors`, `nextvar`, `sort`, `db`, `constructs`, `locals`, `cstack`, `strings`, `gc`,
 `calls` — each as its own chunk in a fresh `lua_State` under `pcall`, with every guest-available
@@ -452,7 +452,7 @@ next to the `.c` files. Native oracle: same source copy against real libc.
 
 # Lua T-library fixtures (ltests.c: internal assertions + api.lua)
 
-`lua_tlib.bc` and `lua_tapi.bc` run the suite with **Lua's internal `T` C-test library** active: the
+`lua_tlib.ll` and `lua_tapi.ll` run the suite with **Lua's internal `T` C-test library** active: the
 whole core is compiled with `-DLUA_USER_H='"ltests.h"'` — internal assertions live (`LUAI_ASSERT`:
 every `lua_assert` in the VM runs, including `lua_checkmemory`'s full GC-structure walks), the
 tracking + failure-injecting `debug_realloc` allocator, debug sizes (`LUAL_BUFFERSIZE 23`, tiny
@@ -465,9 +465,9 @@ Two bundles, each **one shared `lua_State`** (the official `all.lua` execution m
 `warnf` keeps its warning mode in process statics, which must line up with the per-state `_WARN`
 global — and cumulative T-mode memory in one state must fit the reference JIT's 64 MiB window, so
 the load splits:
-- `lua_tlib.bc` — `cstack code events gengc errors nextvar locals coroutine` (the substantive `T`
+- `lua_tlib.ll` — `cstack code events gengc errors nextvar locals coroutine` (the substantive `T`
   sections: yields inside hooks, GC-age probes, C-stack limits, C-level locals/upvalues);
-- `lua_tapi.bc` — `gc` + `api` (the two `warn`-using files, together in a fresh state/arena).
+- `lua_tapi.ll` — `gc` + `api` (the two `warn`-using files, together in a fresh state/arena).
 
 `tests/lua_tlib.rs` asserts `Returned([I32(0)])`; the JIT runs gate CI, the interpreter runs are
 `#[ignore]`d full-depth gates (api.lua alone is ~7 min on the bytecode engine). Native oracle: same
@@ -499,7 +499,7 @@ layers + trig/snprintf/libm/strtod. `lua_tlib_tests.c` / `lua_tapi_tests.c` embe
 
 # Lua official suite under its own driver — `all.lua` (the capstone)
 
-`lua_all.bc` runs the **unmodified `testes/all.lua`** — the Lua distribution's own test *driver* —
+`lua_all.ll` runs the **unmodified `testes/all.lua`** — the Lua distribution's own test *driver* —
 on the on-ramp. The whole `testes/` tree is embedded (`lua_all_tests.c`) and **seeded onto the
 in-memory Fs** (`fopen`+`fwrite` at startup); `all.lua` then `dofile`s each file through its own
 `loadfile → string.dump → load` round-trip, `require`s sibling modules, tracks memory + timing,

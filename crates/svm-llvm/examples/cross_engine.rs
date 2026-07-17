@@ -1,6 +1,6 @@
 //! Cross-engine SVM benchmark driven by the **real LLVM frontend** (D54): compile the shared
 //! `bench/cross-engine/kernels.c` with `clang -O2 -emit-llvm` (vectorization on — the on-ramp
-//! legalizes `<N x T>` to v128), translate the bitcode to SVM IR via [`svm_llvm::translate_bc_path`],
+//! legalizes `<N x T>` to v128), translate the bitcode to SVM IR via [`svm_llvm::translate_ll_path`],
 //! and time
 //! each kernel on the three SVM engines — **tree-walker**, **bytecode**, **JIT**. So the SVM rows
 //! reflect IR the toolchain actually produces (not hand-written IR), from the *same* C source the
@@ -46,7 +46,7 @@ fn main() {
         .unwrap()
         .to_path_buf();
     let kernels_c = root.join("bench/cross-engine/kernels.c");
-    let bc = std::env::temp_dir().join(format!("svm_llvm_xe_{}.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_xe_{}.ll", std::process::id()));
 
     // Vectorization ON (plain -O2 → SSE-width <4 x i32> → one v128): the on-ramp legalizes to v128
     // (ISSUES.md I2) so `vadd` reaches svm-jit as real 128-bit SIMD. No -mavx2: a wider <8 x i32> *does*
@@ -55,7 +55,7 @@ fn main() {
     // determinism width anyway (ISSUES.md I8); host-native width would be an opt-in non-deterministic
     // mode (see DESIGN.md §17).
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&kernels_c)
         .arg("-o")
         .arg(&bc)
@@ -66,7 +66,7 @@ fn main() {
         eprintln!("note: clang unavailable or failed; skipping the LLVM-frontend SVM bench");
         return;
     }
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate kernels.c bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate kernels.c bitcode");
     let sp = t.entry_sp as i64;
     let idx = |sym: &str| -> u32 {
         t.exports

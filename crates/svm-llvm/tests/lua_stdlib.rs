@@ -3,7 +3,7 @@
 //! guest writes to **stdout through the `Stream.write` capability** — byte-identical on the
 //! tree-walker, bytecode, and JIT, and identical to a native build of the same sources.
 //!
-//! The fixture (`tests/fixtures/lua/lua_stdlib.bc`, harness + guest-libc shim alongside) opens the
+//! The fixture (`tests/fixtures/lua/lua_stdlib.ll`, harness + guest-libc shim alongside) opens the
 //! four libraries via `luaL_requiref` and runs a script exercising `print`, `string.upper`/`rep`/
 //! `sub`/`#`, `table.sort`/`concat`/`insert`/`remove`, `math.sqrt`/`pi`/`floor`/`max`/`abs`, `ipairs`,
 //! `pairs`, `type`, and `tostring`. `print` of numbers uses Lua's **constant** `%lld`/`%.14g` formats
@@ -31,9 +31,9 @@ pairs sum\t6\ttype\tnumber\ttostring\ttrue\n";
 fn stdout_of(backend: Backend) -> Vec<u8> {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_stdlib.bc"
+        "/tests/fixtures/lua/lua_stdlib.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua stdlib bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua stdlib bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

@@ -14,14 +14,14 @@ use svm_dap::{DapServer, Json};
 fn compile_o0g(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_dap_{}_{}.c", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_dap_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_dap_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let ok = Command::new("clang")
         .args([
             "-O0",
             "-g",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-fno-vectorize",
             "-fno-slp-vectorize",
         ])
@@ -75,7 +75,7 @@ int dist(int n) {
     let Some(bc) = compile_o0g("struct", src) else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
     let di = t.module.debug_info.as_ref().expect("debug info");
     let path = di.files[0].clone();
@@ -269,7 +269,7 @@ int add(int n) { total = total + n; return total; }
     let Some(bc) = compile_o0g("global", src) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate");
     svm_verify::verify_module(&t.module).expect("verify");
     let path = t.module.debug_info.as_ref().unwrap().files[0].clone();
     let text = svm_text::print_module(&t.module);

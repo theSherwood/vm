@@ -1,4 +1,4 @@
-//! Throwaway: translate a `.bc` and run it through the powerbox on the **tree-walker** (Memory
+//! Throwaway: translate a `.ll` and run it through the powerbox on the **tree-walker** (Memory
 //! granted), printing the outcome. Validates Lua first light — `main` runs a pure-compute script and
 //! returns the result. Pass `jit`/`bytecode` as a 2nd arg to pick another backend.
 use svm_run::{Backend, Limits, RunConfig};
@@ -6,13 +6,13 @@ use svm_run::{Backend, Limits, RunConfig};
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .expect("usage: run_lua <file.bc> [backend]");
+        .expect("usage: run_lua <file.ll> [backend]");
     let backend = match std::env::args().nth(2).as_deref() {
         Some("jit") => Backend::Jit,
         Some("bytecode") => Backend::Bytecode,
         _ => Backend::TreeWalk,
     };
-    let t = svm_llvm::translate_bc_path(&path).expect("translate");
+    let t = svm_llvm::translate_ll_path(&path).expect("translate");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

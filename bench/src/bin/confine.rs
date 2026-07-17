@@ -240,14 +240,14 @@ fn v8_lane(run_mjs: &Path, wasm: &Path, small: i64, large: i64) -> Option<(f64, 
 /// flips the vectorizable-kernel gap to parity-or-faster than Wasmtime-w64 (matmul 1.42x→0.89x), at
 /// +0 escape-TCB (more `v128` ops are value-only; the verifier re-checks). See DESIGN.md D64.
 fn translate(cfile: &Path) -> Option<(svm_ir::Module, i64, u32)> {
-    let bc = std::env::temp_dir().join(format!("confine_{}.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("confine_{}.ll", std::process::id()));
     let ok = Command::new("clang")
         .args([
             "-O2",
             "-march=x86-64-v3",
             "-mprefer-vector-width=128",
             "-emit-llvm",
-            "-c",
+            "-S",
         ])
         .arg(cfile)
         .arg("-o")
@@ -258,7 +258,7 @@ fn translate(cfile: &Path) -> Option<(svm_ir::Module, i64, u32)> {
     if !ok {
         return None;
     }
-    let t = svm_llvm::translate_bc_path(&bc).ok()?;
+    let t = svm_llvm::translate_ll_path(&bc).ok()?;
     let _ = std::fs::remove_file(&bc);
     let sp = t.entry_sp as i64;
     let e = t.exports.iter().find(|(n, _)| n == "run")?.1;

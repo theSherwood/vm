@@ -1,6 +1,6 @@
 //! Shared harness for the `peval_*` on-ramp tests (`peval_in_sandbox.rs`, `peval_jit.rs`,
-//! `peval_futamura.rs`). Each runs the manual probe — `rustc +1.81 --emit=llvm-bc` → `llvm-link-18`
-//! → `opt-18 internalize,globaldce` → translate → verify → run — on an in-repo fixture crate under
+//! `peval_futamura.rs`). Each runs the manual probe — `rustc +1.81 --emit=llvm-ir` → `llvm-link-18 -S`
+//! → `opt-18 -S internalize,globaldce` → translate → verify → run — on an in-repo fixture crate under
 //! `tests/fixtures/<name>`. The build half is identical across them, so it lives here.
 //!
 //! As a `tests/common/mod.rs` submodule it is **not** compiled as its own test binary; each test does
@@ -29,12 +29,12 @@ pub fn toolchain_present() -> bool {
         && tool_ok("opt-18", &["--version"])
 }
 
-/// Build the in-repo fixture crate `tests/fixtures/<fixture>` to a single legalized LLVM-18 bitcode
-/// blob, ready for [`svm_llvm::translate_bc_path`]. Returns `None` (skip) if the toolchain is absent
-/// or no bitcode is emitted.
+/// Build the in-repo fixture crate `tests/fixtures/<fixture>` to a single legalized textual LLVM `.ll`
+/// module, ready for [`svm_llvm::translate_ll_path`]. Returns `None` (skip) if the toolchain is absent
+/// or no IR is emitted.
 ///
-/// Mirrors the manual probe exactly: emit per-crate bitcode for the whole dependency closure
-/// (`RUSTFLAGS=--emit=llvm-bc cargo +1.81.0 build --release`), `llvm-link-18` them, then
+/// Mirrors the manual probe exactly: emit per-crate textual IR for the whole dependency closure
+/// (`RUSTFLAGS=--emit=llvm-ir cargo +1.81.0 build --release`), `llvm-link-18 -S` them, then
 /// `opt-18 internalize,globaldce` down to the closure reachable from the powerbox `main`/`malloc`/
 /// `free`. Building the fixture as a `lib` means no final executable link, so cargo exits cleanly even
 /// though `malloc`/`free`/`write`/`__vm_jit_*` are undefined (the on-ramp synthesizes/lowers them); we
@@ -55,31 +55,34 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
 
     let status = Command::new("cargo")
         .current_dir(&fixture_dir)
-        .env("RUSTFLAGS", "--emit=llvm-bc")
+        .env("RUSTFLAGS", "--emit=llvm-ir")
         .env("CARGO_TARGET_DIR", &target)
         .args(["+1.81.0", "build", "--release", "--ignore-rust-version"])
         .status()
         .unwrap_or_else(|e| panic!("run cargo build for the {fixture} fixture: {e}"));
     if !status.success() {
-        eprintln!("note: {fixture} `cargo build` returned {status} (tolerated if .bc emitted)");
+        eprintln!("note: {fixture} `cargo build` returned {status} (tolerated if .ll emitted)");
     }
 
     let deps = target.join("release/deps");
-    let mut bcs: Vec<PathBuf> = std::fs::read_dir(&deps)
+    let mut lls: Vec<PathBuf> = std::fs::read_dir(&deps)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "bc").unwrap_or(false))
+        .filter(|p| p.extension().map(|x| x == "ll").unwrap_or(false))
         .collect();
-    bcs.sort();
-    if bcs.is_empty() {
-        eprintln!("note: skipping {fixture} (no .bc emitted — build failed before codegen)");
+    lls.sort();
+    if lls.is_empty() {
+        eprintln!("note: skipping {fixture} (no .ll emitted — build failed before codegen)");
         return None;
     }
 
-    let linked = work.join("linked.bc");
+    // Merge + prune as textual `.ll` (`-S`), so translation goes through the version-tolerant textual
+    // reader (`translate_ll_path`) rather than the `llvm-dis` bitcode shim.
+    let linked = work.join("linked.ll");
     assert!(
         Command::new("llvm-link-18")
-            .args(&bcs)
+            .arg("-S")
+            .args(&lls)
             .arg("-o")
             .arg(&linked)
             .status()
@@ -88,10 +91,11 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
         "llvm-link-18 failed"
     );
 
-    let legalized = work.join("legalized.bc");
+    let legalized = work.join("legalized.ll");
     assert!(
         Command::new("opt-18")
             .args([
+                "-S",
                 "-passes=internalize,globaldce",
                 "-internalize-public-api-list=main,malloc,free",
             ])

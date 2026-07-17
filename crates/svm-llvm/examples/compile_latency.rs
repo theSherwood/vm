@@ -6,7 +6,7 @@
 //!
 //! This driver measures, per kernel from the shared `bench/cross-engine/kernels.c` (via the real
 //! LLVM frontend):
-//!   * **translate latency** — one-time `svm_llvm::translate_bc_path` (LLVM-bitcode → SVM IR), shared
+//!   * **translate latency** — one-time `svm_llvm::translate_ll_path` (LLVM-bitcode → SVM IR), shared
 //!     by all three engines.
 //!   * **cold cost** of each engine — the fixed per-`compile_and_run` cost (JIT codegen / bytecode
 //!     compile / tree-walk frame setup), recovered as the `n → 0` intercept of `T(n) = cold + n·iter`.
@@ -82,10 +82,10 @@ fn main() {
         .unwrap()
         .to_path_buf();
     let kernels_c = root.join("bench/cross-engine/kernels.c");
-    let bc = std::env::temp_dir().join(format!("svm_cl_{}.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("svm_cl_{}.ll", std::process::id()));
 
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&kernels_c)
         .arg("-o")
         .arg(&bc)
@@ -101,11 +101,11 @@ fn main() {
     let mut translate_ns = f64::MAX;
     for _ in 0..9 {
         let t = Instant::now();
-        let tr = svm_llvm::translate_bc_path(&bc).expect("translate");
+        let tr = svm_llvm::translate_ll_path(&bc).expect("translate");
         translate_ns = translate_ns.min(t.elapsed().as_nanos() as f64);
         black_box(&tr);
     }
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate kernels.c bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate kernels.c bitcode");
     let sp = t.entry_sp as i64;
     let idx = |sym: &str| -> u32 {
         t.exports
