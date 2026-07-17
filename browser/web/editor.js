@@ -94,6 +94,11 @@ export function createEditor(textarea, lang) {
   const api = {
     cm,
     getValue: () => cm.getValue(),
+    setValue: (v) => cm.setValue(v),
+    // Register a listener fired on every edit (used for localStorage persistence). CodeMirror also
+    // fires `change` for programmatic setValue, so a caller that sets the value inside its own handler
+    // must guard against re-entry (the playground does — see `restoreOrSeed`).
+    onChange: (fn) => cm.on('change', fn),
     markError,
     clearError,
     refresh: () => cm.refresh(),
