@@ -640,25 +640,32 @@ running-top slot (seeded at entry to `sp + frame_size`); each dynamic `alloca` b
 `llvm.stacksave`/`stackrestore` in QuickJS — fail-closed if seen); C++ `invoke` + dynamic alloca in one
 function is fail-closed (astronomically rare). Test `dynamic_alloca_runtime_count` (interp == JIT).
 
-**Blocking gap now — `llvm.frameaddress`.** With alloca cleared, `JS_CallInternal` reaches
-`js_check_stack_overflow`, which reads the stack pointer via `__builtin_frame_address(0)`
-(`llvm.frameaddress`). **Non-trivial:** QuickJS assumes a *downward* native stack
+**`llvm.frameaddress` — DONE.** With alloca cleared, `JS_CallInternal` reached `js_check_stack_overflow`,
+which reads the stack pointer via `__builtin_frame_address(0)`. QuickJS assumes a *downward* native stack
 (`stack_limit = stack_top - stack_size`; overflow when `sp < stack_limit`), but the SVM data-stack grows
-*up* — so returning `sp` directly makes the check fire on every call. Needs a stack-direction-aware
-lowering (a downward-mapped `C − sp` proxy, or wiring QuickJS's `JS_UpdateStackTop` to the window
-bounds). Its own slice.
+*up* — so `llvm.frameaddress(0)` lowers to the **downward proxy** `FRAME_ADDR_BASE - sp` (decreases with
+depth; the large base cancels out of the check's arithmetic, leaving "overflow when data-stack growth
+since `JS_UpdateStackTop` exceeds `stack_size`"). The result is only compared, never dereferenced; level
+> 0 (parent-frame unwinders) fails closed. Test `frameaddress_is_downward_stack_proxy` (interp == JIT).
+
+**Blocking gap now — SSA value liveness (`js_array_iterator_next`).** Past the whole stack-check surface,
+the translator fail-closes with `value … not available in block` — a value used in a block where the
+block-argument / liveness pass didn't thread it (a cross-block SSA case the on-ramp's block-local
+conversion doesn't yet cover). A translator slice on the liveness/`block_params` path, unrelated to the
+call ABI.
 
 **Semantic follow-up — directed-rounding dtoa.** QuickJS's shortest Number→string (`js_ecvt1`) toggles
 `FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are round-to-nearest only (no rounding-mode op);
 `toFixed`/`toPrecision` use `FE_TONEAREST` (honored), so the current driver is unaffected, but general
 `String(0.1)` needs a rounding-mode primitive or a directed-rounding-free guest dtoa.
 
-**Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) **`llvm.frameaddress`** (the current
-wall) → the interpreter core translates + runs; (c) widen the JS program past `toFixed` + the
-directed-rounding dtoa follow-up; (d) regex / BigInt / `try`/`catch` (JS exceptions ride QuickJS's own
-bytecode, not host unwinding, so likely no EH dependency); (e) the `run-test262.c` harness over an
-embedded slice — the self-validating suite, QuickJS's analog of SQLite's sqllogictest. Harness:
-`demo_quickjs_eval_vs_native` (`#[ignore]`d, now at the `frameaddress` wall).
+**Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
+(c) **SSA value-liveness** (the current wall — `value not available in block`) → the module translates;
+(d) widen the JS program past `toFixed` + the directed-rounding dtoa follow-up; (e) regex / BigInt /
+`try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH
+dependency); (f) the `run-test262.c` harness over an embedded slice — the self-validating suite,
+QuickJS's analog of SQLite's sqllogictest. Harness: `demo_quickjs_eval_vs_native` (`#[ignore]`d, now at
+the liveness wall).
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

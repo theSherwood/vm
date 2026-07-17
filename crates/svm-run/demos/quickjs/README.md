@@ -64,13 +64,17 @@ a per-frame `DYN_TOP` running top (bumped by `align16(count·elem)`), and a call
 such a function hands the callee that top so its frame sits above the
 variable-length region. Test `dynamic_alloca_runtime_count` (interp == JIT).
 
-**NEXT (blocking) — `llvm.frameaddress`.** With alloca cleared, `JS_CallInternal`
-reaches `js_check_stack_overflow`, which reads the stack pointer via
-`__builtin_frame_address(0)`. QuickJS assumes a *downward* native stack
-(`stack_limit = stack_top - stack_size`), but the SVM data-stack grows *up*, so a
-naive `sp` return fires the check on every call — needs a stack-direction-aware
-lowering (a downward-mapped `C − sp` proxy, or wiring `JS_UpdateStackTop` to the
-window bounds). Its own slice.
+**DONE — `llvm.frameaddress`.** `JS_CallInternal`'s `js_check_stack_overflow`
+reads the stack pointer via `__builtin_frame_address(0)`. QuickJS assumes a
+*downward* native stack, but the SVM data-stack grows *up*, so `frameaddress(0)`
+lowers to the downward proxy `FRAME_ADDR_BASE - sp` (decreases with depth; the
+base cancels out of the check's arithmetic). Test
+`frameaddress_is_downward_stack_proxy` (interp == JIT).
+
+**NEXT (blocking) — SSA value liveness.** Past the stack-check surface, the
+translator fail-closes in `js_array_iterator_next` with `value not available in
+block` — a value used in a block the block-argument/liveness pass didn't thread
+it into. A translator slice on the liveness / `block_params` path.
 
 **NEXT (semantic) — directed-rounding dtoa.** QuickJS's shortest Number→string
 (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` to find the shortest round-trip

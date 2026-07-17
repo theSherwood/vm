@@ -1215,6 +1215,12 @@ const VARARG_SCRATCH: ValueId = usize::MAX - 1;
 /// the top only grows within an activation and is discarded on return.
 const DYN_TOP: ValueId = usize::MAX - 2;
 
+/// Base for the **downward stack-pointer proxy** returned by `llvm.frameaddress(0)` (see
+/// [`lower_frameaddress`]): the value is `FRAME_ADDR_BASE - sp`, so it *decreases* with call depth
+/// like a native (downward-growing) stack pointer. A large constant, safely above any window offset,
+/// so the proxy never underflows and cancels out of the C stack-overflow arithmetic it feeds.
+const FRAME_ADDR_BASE: i64 = 1 << 40;
+
 /// Accumulates the §6 debug-info **neutral core** as functions are lowered — the LLVM on-ramp as a
 /// third independent producer feeding the frontend-neutral waist (DEBUGGING.md §6 / D-DBG-7).
 ///
@@ -14421,6 +14427,46 @@ fn lower_va_intrinsic(
     Ok(false)
 }
 
+/// `llvm.frameaddress(0)` (clang's `__builtin_frame_address(0)`) — used as an opaque **stack-pointer
+/// token** for software stack-overflow checks (e.g. QuickJS's `js_check_stack_overflow`, which the
+/// interpreter core `JS_CallInternal` hits per call). The C idiom assumes a *downward*-growing native
+/// stack (`stack_limit = stack_top - stack_size`; overflow when `frame_addr < stack_limit`), but the
+/// SVM §3d data-stack grows *up* (`sp` increases with depth). Returning raw `sp` would invert the check
+/// and fire on every call; instead return the **downward proxy** `FRAME_ADDR_BASE - sp`, which
+/// decreases with depth. The large base cancels out of the check's `stack_top - stack_size` and
+/// `frame_addr - alloca_size` arithmetic, leaving exactly "overflow when data-stack growth since
+/// `JS_UpdateStackTop` exceeds `stack_size`". The result is only ever compared / arithmetic'd, never
+/// dereferenced. Only frame level 0 is meaningful here — a parent-frame `frameaddress(k>0)` (unwinders)
+/// fails closed. Returns the result index, or `None` if `name` is not `llvm.frameaddress`.
+fn lower_frameaddress(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+    name: &str,
+) -> Result<Option<ValIdx>, Error> {
+    if !name.starts_with("llvm.frameaddress") {
+        return Ok(None);
+    }
+    // The single argument is the frame level; only the current frame (constant 0) is supported.
+    let level = match c.arguments.first() {
+        Some((Operand::ConstantOperand(k), _)) => match k.as_ref() {
+            Constant::Int { value, .. } => *value,
+            _ => return unsup("llvm.frameaddress with a non-constant level"),
+        },
+        _ => return unsup("llvm.frameaddress with a non-constant level"),
+    };
+    if level != 0 {
+        return unsup("llvm.frameaddress of a parent frame (level != 0)");
+    }
+    let base = ctx.const_i64(FRAME_ADDR_BASE);
+    let sp = ctx.sp()?;
+    Ok(Some(ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Sub,
+        a: base,
+        b: sp,
+    })))
+}
+
 /// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
 /// (`core::panicking::*` — `panic`, `panic_fmt`, `panic_const_*`, `panic_bounds_check` — plus the
 /// `unwrap`/`expect`/slice-index failure helpers) are `-> !` and abort the process, and they are
@@ -16748,6 +16794,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `llvm.va_start`/`llvm.va_copy` set up the `__va_list_tag` for the overflow-only varargs ABI.
         if let Some(name) = callee_name(c) {
             if lower_va_intrinsic(ctx, c, &name)? {
+                return Ok(());
+            }
+            // `llvm.frameaddress(0)` → the downward stack-pointer proxy (`FRAME_ADDR_BASE - sp`), for
+            // software stack-overflow checks (QuickJS's `js_check_stack_overflow`).
+            if let Some(idx) = lower_frameaddress(ctx, c, &name)? {
+                if let Some(dest) = &c.dest {
+                    if let Some(&vid) = ctx.s.name2id.get(dest) {
+                        ctx.idx_of.insert(vid, idx);
+                    }
+                }
                 return Ok(());
             }
         }

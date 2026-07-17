@@ -5871,6 +5871,48 @@ fn dynamic_alloca_runtime_count() {
 }
 
 #[test]
+fn frameaddress_is_downward_stack_proxy() {
+    // `llvm.frameaddress(0)` (`__builtin_frame_address(0)`) is used as an opaque stack-pointer token
+    // for software stack-overflow checks — QuickJS's `js_check_stack_overflow`, hit per call in the
+    // interpreter core. The C idiom assumes a *downward* native stack, but the SVM data-stack grows
+    // *up*, so the on-ramp returns the downward proxy `FRAME_ADDR_BASE - sp`: it must *decrease* with
+    // call depth. `@main` (shallow, non-empty frame so the callee SP differs) takes its frame address,
+    // then `@deeper` (one call deeper, larger `sp`) takes its own — the deeper one must be strictly
+    // smaller. This is the exact monotonic property the overflow check relies on. Checked interp == JIT.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %slot = alloca i64\n  \
+        store i64 0, ptr %slot\n  \
+        %a = call ptr @llvm.frameaddress.p0(i32 0)\n  \
+        %ai = ptrtoint ptr %a to i64\n  \
+        %d = call i64 @deeper()\n  \
+        %cmp = icmp ugt i64 %ai, %d\n  \
+        %r = zext i1 %cmp to i32\n  \
+        ret i32 %r\n}\n\
+        define i64 @deeper() {\n\
+        entry:\n  \
+        %f = call ptr @llvm.frameaddress.p0(i32 0)\n  \
+        %fi = ptrtoint ptr %f to i64\n  \
+        ret i64 %fi\n}\n\
+        declare ptr @llvm.frameaddress.p0(i32)";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate frameaddress .ll");
+    svm_verify::verify_module(&t.module).expect("verify frameaddress");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run frameaddress");
+    assert_eq!(
+        r,
+        vec![Value::I32(1)],
+        "deeper frame address < shallower (downward proxy: decreases with depth)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 1, "JIT frameaddress downward = 1"),
+        other => panic!("JIT frameaddress: unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn vector_shift_per_lane_amount() {
     // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
     // Postgres' `simd.h`). svm-ir's `VShift` takes one scalar count for all lanes, so the on-ramp
