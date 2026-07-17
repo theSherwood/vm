@@ -117,6 +117,25 @@ try {
   const cleared = await page.evaluate((sel) => !document.querySelector(`${sel} .cm-error-widget`), card('hello'));
   cleared ? ok('error decoration clears on edit') : fail('error decoration not cleared on edit');
 
+  // Phase 3: every JIT-emittable reactor (not just Doom) exposes the wasm-JIT toggle + a "Prove it"
+  // button, and running the parity check confirms the interpreter and wasm-JIT tiers are byte-identical.
+  const jitCards = await page.evaluate(() =>
+    [...document.querySelectorAll('.demo')].filter((d) => d.querySelector('.jit-label')).map((d) => d.dataset.demo));
+  jitCards.includes('bounce (interactive — arrow keys)') && jitCards.includes('life (Conway — heap persistence)')
+    ? ok(`wasm-JIT toggle on ${jitCards.length} reactors (bounce/life/mandelzoom/DOOM)`)
+    : fail(`jit cards: ${JSON.stringify(jitCards)}`);
+
+  // Prove interp ≡ JIT on the bounce reactor (committed asset, fast).
+  await page.click(`${card('bounce (interactive — arrow keys)')} .prove`);
+  await page.waitForFunction(
+    (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
+    `${card('bounce (interactive — arrow keys)')} .state`, { timeout: 30_000 });
+  const parity = await page.evaluate((sel) => document.querySelector(sel).textContent,
+    `${card('bounce (interactive — arrow keys)')} .state`);
+  parity.includes('interpreter ≡ wasm-JIT') && parity.includes('byte-identical')
+    ? ok(`parity proven in-page: ${parity}`)
+    : fail(`parity: ${parity}`);
+
   // The Vim toggle engages the Vim keymap on the editors (registered + editor holds vim state).
   await page.check('#vim');
   const vim = await page.evaluate((sel) => {
