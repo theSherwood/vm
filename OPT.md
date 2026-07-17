@@ -319,9 +319,12 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   size **and** make the interpreter slightly slower (removing them was 0.94–0.97×). Gate hoisting on a
   cheap benefit estimate (invariant op count / loop-body share) so a pass only fires when it pays.
   Until then the passes are a net loss on hoist-free loops.
-- [ ] **Broaden the ablation corpus.** SCCP and jump-threading barely move on the current corpus
-  (their speed effect is ~0 there). Add branch-heavy / constant-propagation-heavy shapes and more
-  realistic residuals so each pass has a case that actually exercises its run-time win.
+- [x] **Broaden the ablation corpus + measure the full pass set.** The harness now leaves out **all
+  eleven** togglable passes (was six) and adds two cases so the Phase-3/4 passes have a shape that
+  exercises them: a **memory** case (a redundant same-address load for `mem`, a diamond-join reload
+  for `load_elim`) and an **interproc** case (a constant `call_indirect` → `devirt` → `inline` → `dfe`,
+  nearly halving the module). `OPT_BENCH.md` regenerated; the interprocedural passes turn out to be the
+  biggest *size* wins in the corpus. (Still open: more branch/const-prop-heavy shapes to sharpen SCCP.)
 - [ ] **Multi-run statistics in the harness.** Single-run numbers show visible variance (one JIT row
   read 2× its neighbors). Report medians + spread over several runs before treating any delta as load-
   bearing.

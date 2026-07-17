@@ -18,7 +18,9 @@ SVM_BENCH_CSV=1 cargo test --release -p svm-peval --test opt_bench -- --include-
 
 - numbers below: release build, single host, single run — machine-dependent, ratios are the story.
 - `none` = only the always-on intra-block canonicalization (fold / DCE / copy-prop / merge / prune).
-  `all` = full pipeline. The togglable passes are the six global/analysis passes.
+  `all` = full pipeline. The **eleven** togglable passes are: `sccp`, `reassociate`, `gvn`, `licm`,
+  `local_cse`, `jump_thread` (Phase 2); `devirt`, `inline`, `dfe` (Phase 3); `mem`, `load_elim`
+  (Phase 4).
 
 ## How to read it
 
@@ -35,82 +37,84 @@ ablation variant (the size test is also a correctness guard). Two backends answe
 
 ## Size ablation (encoded bytes)
 
-Per case: `input → none → all` (instructions / bytes). Each pass column is the **byte delta if that
-pass is removed** from the full pipeline:
+`input → all` is the whole pipeline's size reduction. The **contributions** column lists each pass's
+*byte delta if it is removed* from the full pipeline: `+N` = the output is N bytes larger without it
+(the pass shrinks code by N — what it buys); `−N` = N bytes *smaller* without it (the pass **grows**
+static size, e.g. LICM/GVN thread values through new block params — a size cost paid for a run-time
+win). Passes not listed for a case had zero delta there.
 
-- `+N` — the output is N bytes *larger* without the pass ⇒ the pass shrinks code by N (what it buys).
-- `−N` — the output is N bytes *smaller* without the pass ⇒ the pass *grows* static size (LICM/GVN
-  hoist or thread values through new block params — a size cost paid for a run-time win).
+| case | input→all (i/b) | pass contributions (Δbytes if removed) |
+|---|---|---|
+| reg-sum residual (loop) | 7/233 → 5/142 | gvn −5, licm −10, local_cse +2 |
+| licm+cse kernel | 7/71 → 6/77 | licm −9, local_cse +3 |
+| sccp const-loop | 6/57 → 4/63 | sccp +1, gvn −6, licm −9, local_cse +4 |
+| reassoc chain | 8/41 → 2/26 | **reassociate +15** |
+| correlated branch | 8/73 → 6/55 | **jump_thread +18** |
+| memory (mem + load_elim) | 5/85 → 3/77 | **mem +4, load_elim +4** |
+| interproc (devirt+inline+dfe) | 10/82 → 7/41 | **devirt +41, inline +18, dfe +47** |
 
-| case | input i/b | none i/b | all i/b | sccp | reassoc | gvn | licm | local_cse | jump_thread |
-|---|---|---|---|---|---|---|---|---|---|
-| reg-sum residual (loop, all passes) | 7/233 | 5/127 | 5/142 | +0 | +0 | −5 | −10 | +2 | +0 |
-| licm+cse kernel | 7/71 | 7/71 | 6/77 | +0 | +0 | +0 | −9 | +3 | +0 |
-| sccp const-loop | 6/57 | 6/57 | 4/63 | +1 | +0 | −6 | −9 | +4 | +0 |
-| reassoc chain | 8/41 | 8/41 | 2/26 | +0 | **+15** | +0 | +0 | +0 | +0 |
-| correlated branch | 8/73 | 8/73 | 6/55 | +0 | +0 | +0 | +0 | +0 | **+18** |
+Reading it:
 
-Reading the rows:
-
-- **reassociate** is the only pass that touches the constant chain `((((x+1)+2)+3)+4)` — it collapses
-  the tail to `x+10` (41 → 26 bytes); nothing else helps.
-- **jump threading** is the only pass that resolves the correlated branch (73 → 55) — it threads the
-  edge past the empty forwarder that SCCP can't (the forwarder's selector is a different constant on
-  each incoming edge). No other pass moves it.
-- **local_cse** dedupes the redundant `a*b` in the loop bodies (a few bytes each); on these single-block
-  bodies GVN adds nothing on top (the +0 gvn columns), since the local pass already caught it.
-- **LICM (and GVN)** carry *negative* size deltas: they hoist/clone the invariant into a preheader and
-  thread its result back through a new block parameter, which is larger static code — deliberately, to
-  save run time. Whether that pays off is the run-time table.
+- **The interprocedural passes are the biggest size wins in the corpus.** On the interproc case a
+  constant `call_indirect` is devirtualized to a direct call, the small leaf is inlined, and the leaf +
+  an unused function are DCE'd — nearly halving the module (82 → 41 B). The three deltas overlap
+  because they *cascade*: `devirt` (+41) is the enabler (without it the indirect call blocks inlining
+  and keeps the funcref'd function alive), and `dfe` (+47) collects the whole payoff of removing the
+  now-dead functions.
+- **The simplifiers each single-handedly shrink their target shape**: `reassociate` collapses the
+  constant chain `((((x+1)+2)+3)+4)` to `x+10` (+15), `jump_thread` threads the correlated branch past
+  its empty forwarder (+18), `local_cse` dedupes redundant computations (+2–4).
+- **The memory passes** trim a redundant same-address load (`mem`) and a diamond-join reload that only
+  cross-block `load_elim` can reach (a multi-predecessor block can't be merged, so intra-block
+  forwarding never sees it) — +4 each here.
+- **LICM and GVN carry *negative* size deltas** on loops: they hoist/thread invariants through new
+  block params, which is larger static code — deliberately, to save run time (next section).
 
 ## Run-time ablation (N = 1,000,000)
 
-The register-machine sum loop and a **heavy-invariant loop** — a counted loop whose body recomputes
-`inv = (a*b + a)*(b + 7) + a*b` (invariant in the runtime params `a`, `b`) every iteration. `interp/all`
-is each variant's interpreter run time relative to the full pipeline; `>1` means removing that pass made
-the interpreter slower, i.e. the pass was buying that run time.
+Two loops: the register-machine sum residual, and a **heavy-invariant loop** whose body recomputes
+`inv = (a*b + a)*(b + 7) + a*b` (invariant in runtime params `a`, `b`) every iteration. `interp/all` is
+each variant's interpreter run time ÷ the full pipeline's; `>1` means removing that pass made the
+interpreter slower — the pass was buying that run time. Rows for passes that don't apply to a loop
+(the interproc/memory passes, and the simplifiers here) sit at ~1.00× and are elided.
 
 ### reg-machine sum 1..=N (already-tight loop)
 
-| variant | bytes | compile_ms | jit_ms | interp_ms | interp/all |
-|---|---|---|---|---|---|
-| none | 127 | 0.221 | 0.625 | 64.34 | 1.10× |
-| all | 142 | 0.217 | 0.624 | 58.39 | 1.00× |
-| −sccp | 142 | 0.204 | 0.620 | 59.37 | 1.02× |
-| −reassociate | 142 | 0.206 | 0.620 | 59.99 | 1.03× |
-| −gvn | 137 | 0.225 | 0.647 | 56.43 | 0.97× |
-| −licm | 132 | 0.222 | 0.621 | 60.51 | 1.04× |
-| −local_cse | 144 | 0.204 | 0.621 | 58.47 | 1.00× |
-| −jump_thread | 142 | 0.224 | 0.621 | 58.47 | 1.00× |
+| variant | bytes | jit_ms | interp_ms | interp/all |
+|---|---|---|---|---|
+| none | 127 | 0.620 | 65.76 | 1.10× |
+| all | 142 | 0.622 | 59.68 | 1.00× |
+| −gvn | 137 | 0.624 | 56.40 | 0.94× |
+| −licm | 132 | 0.630 | 60.95 | 1.02× |
+| _(sccp / reassoc / cse / jump_thread / devirt / inline / dfe / mem / load_elim)_ | 142 | ~0.62 | ~59 | ~1.00× |
 
 ### heavy-invariant loop (LICM showcase)
 
-| variant | bytes | compile_ms | jit_ms | interp_ms | interp/all |
-|---|---|---|---|---|---|
-| none | 87 | 0.224 | 0.592 | 103.47 | 1.32× |
-| all | 100 | 0.234 | 0.599 | 78.81 | 1.00× |
-| −sccp | 100 | 0.280 | 0.593 | 78.91 | 1.00× |
-| −reassociate | 100 | 0.245 | 0.593 | 79.64 | 1.01× |
-| −gvn | 97 | 0.238 | 0.593 | 78.36 | 1.00× |
-| −licm | 85 | 0.388 | 1.123 | 91.94 | **1.17×** |
-| −local_cse | 105 | 0.239 | 0.592 | 79.50 | 1.01× |
-| −jump_thread | 100 | 0.253 | 0.609 | 79.98 | 1.02× |
+| variant | bytes | jit_ms | interp_ms | interp/all |
+|---|---|---|---|---|
+| none | 87 | 0.589 | 103.15 | 1.32× |
+| all | 100 | 0.589 | 81.07 | 1.00× |
+| −gvn | 97 | 0.592 | 76.64 | 0.98× |
+| −licm | 85 | 0.589 | 90.69 | **1.16×** |
+| _(all other passes)_ | 100 | ~0.59 | ~78–79 | ~1.00× |
 
 ## Takeaways
 
-1. **On the JIT, svm-opt's scalar passes are ~run-time-neutral** (`jit_ms` is flat ~0.6 ms across every
-   variant on both loops). The JIT's own optimizer re-derives the same native code, so the IR-level win
-   is washed out. svm-opt's JIT-path value is size/compile, not native speed.
+1. **On the JIT, svm-opt's passes are ~run-time-neutral** (`jit_ms` flat ~0.6 ms across every variant on
+   both loops). Cranelift (`opt_level="speed"`) re-derives the same native code, so the IR-level win is
+   washed out. svm-opt's JIT-path value is **code size / compile time** — where the interprocedural
+   passes shine (halving the interproc module) — not native speed.
 2. **On the interpreter, the optimizer buys real run time**: the full pipeline is **1.32×** on the
    heavy-invariant loop and **1.10×** on the already-tight sum loop.
-3. **LICM is the dominant run-time pass** — worth **1.17×** on the heavy loop by itself (it moves the
-   five-op invariant chain out of the per-iteration path). It is a pure run-time optimization: it *costs*
-   static size (the negative size deltas) and only pays off when there is real invariant work to hoist.
-   On the tight sum loop, which has nothing worth hoisting, LICM/GVN slightly *hurt* both size and interp
-   time — a signal that a cost model (hoist only when the loop body warrants it) is the natural next step.
-4. **The simplifying passes earn their size**: reassociation and jump threading each single-handedly
-   shrink their target shape (15 B and 18 B), and local CSE trims the redundant multiplies. SCCP's win is
-   small on this corpus (its big wins are branch-elimination shapes; more of those would sharpen it).
+3. **LICM is the dominant run-time pass** — **1.16×** on the heavy loop by itself (it moves the five-op
+   invariant chain out of the per-iteration path). It's a pure run-time optimization: it *costs* static
+   size (the negative deltas) and only pays off when there's real invariant work to hoist. On the tight
+   sum loop, which has nothing worth hoisting, LICM/GVN slightly *hurt* both size and interp time — the
+   signal for a **hoist cost model** (only hoist when the loop body warrants it), still the clearest
+   actionable follow-up.
+4. **The interprocedural + simplifier passes are size plays** (devirt/inline/dfe, reassociate,
+   jump_threading, CSE) and are loop-run-time-neutral — but code size *is* the JIT-path win, so they
+   earn their keep where the loop passes don't.
 
-_The corpus is small and hand-built to isolate each pass; broadening it (more realistic residuals, more
-branch-heavy shapes) is tracked under OPT.md Phase 5._
+_The corpus is small and hand-built to isolate each pass. Remaining follow-ups (OPT.md): a LICM/GVN
+hoist cost model, multi-run medians + variance, and Wasmtime-relative numbers._
