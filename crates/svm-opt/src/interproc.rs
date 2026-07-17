@@ -3,13 +3,16 @@
 //! rather than inside `optimize_func`. Output is re-verified like everything else in this crate, so a
 //! bug here is a clean verify error, never an escape (untrusted-for-escape posture, §20a).
 //!
-//! Three passes: **constant-funcref devirtualization** (an indirect call on a constant funcref →
-//! direct call), the **budgeted direct-call inliner** (splice a small callee — straight-line in place,
-//! or multi-block by splicing its CFG in and threading values across the call), and **dead-function
-//! elimination** (drop functions no reachable code can call). They
-//! compose into the end-to-end interprocedural story: devirtualization turns a `call_indirect` into a
-//! direct `call`, the inliner splices a small callee in, and DFE sweeps the now-uncalled leaf — and,
-//! because devirtualization removes the indirect dispatch, DFE's conservative gate lifts too.
+//! Four passes: **constant-funcref devirtualization** (an indirect call on a constant funcref → direct
+//! call), **interprocedural constant propagation** (specialize a function on constants its callers
+//! agree on — a monotone fixpoint that also resolves constant funcrefs flowing into dispatchers), the
+//! **budgeted direct-call inliner** (splice a small callee — straight-line in place, or multi-block by
+//! splicing its CFG in and threading values across the call), and **dead-function elimination** (drop
+//! functions no reachable code can call). They compose into the end-to-end interprocedural story:
+//! devirtualization turns a constant `call_indirect` into a direct `call`, const_prop feeds constants
+//! (including funcrefs, which a re-run of devirt then resolves) into callees, the inliner splices a
+//! small callee in, and DFE sweeps the now-uncalled leaf — and, because devirtualization removes the
+//! indirect dispatch, DFE's conservative gate lifts too.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
@@ -17,7 +20,7 @@ use alloc::vec::Vec;
 use svm_ir::{Block, Export, Func, FuncIdx, FuncType, Inst, Module, Terminator, ValType};
 use svm_verify::func_value_types;
 
-use crate::{block_consts, each_operand, get, map_operands, map_term_operands, Known};
+use crate::{each_operand, get, map_operands, map_term_operands, Known};
 
 /// Visit every **static function index** a function references: a direct `call`, a `ref.func`, a
 /// `thread.spawn` entry, and the `return_call` terminator. This mirrors `svm_ir::offset_func_indices`
@@ -647,32 +650,80 @@ fn substitute_params(entry: &Block, subs: &[(usize, Known)]) -> Block {
     }
 }
 
-/// **Interprocedural constant propagation.** If a function's parameter is passed the *same*
-/// compile-time constant at **every** direct call site, that parameter is that constant inside the
-/// function — so we substitute it in the entry block ([`substitute_params`]). The per-function passes
-/// then fold through it (branch resolution, arithmetic), and dead-function elimination reclaims code the
-/// folding kills. The signature is unchanged (the parameter stays, now dead; callers keep passing the
-/// constant), so all funcidxs stay valid.
+/// A constant-propagation lattice value for a function parameter: `Bottom` (no call reaches it yet), a
+/// single known constant, or `Top` (could be anything). `join` moves up the lattice only.
+#[derive(Clone, Copy, PartialEq)]
+enum Cp {
+    Bottom,
+    Const(Known),
+    Top,
+}
+
+impl Cp {
+    fn join(self, other: Cp) -> Cp {
+        match (self, other) {
+            (Cp::Bottom, x) | (x, Cp::Bottom) => x,
+            (Cp::Const(a), Cp::Const(b)) if a == b => Cp::Const(a),
+            _ => Cp::Top,
+        }
+    }
+}
+
+/// Per block-local value, the constant it statically holds here — like [`crate::block_consts`] but a
+/// `ref.func` counts as its funcidx (a funcref **is** its index; the identity table), so a constant
+/// funcref flows through the analysis as an `i32` and can resolve a `call_indirect`.
+fn block_knowns(b: &Block, fn_results: &[usize]) -> Vec<Option<Known>> {
+    let mut k = vec![None; b.params.len()];
+    for inst in &b.insts {
+        let rc = inst.result_count(fn_results);
+        if rc == 1 {
+            k.push(match inst {
+                Inst::RefFunc { func } => Some(Known::I32(*func as i32)),
+                other => crate::const_value(other),
+            });
+        } else {
+            for _ in 0..rc {
+                k.push(None);
+            }
+        }
+    }
+    k
+}
+
+/// **Interprocedural constant propagation.** A monotone fixpoint computes, per function parameter, the
+/// join of the value passed at every call that can reach it; a parameter that resolves to a single
+/// constant is substituted in the entry block ([`substitute_params`]). The per-function passes then fold
+/// through it (branch resolution, arithmetic), and — because a **constant funcref** propagated into a
+/// dispatcher's parameter makes its `call_indirect` index constant — the devirtualization that runs
+/// after this pass resolves that indirect call to a direct one. Signatures are unchanged (a substituted
+/// parameter is left dead, callers keep passing it), so all funcidxs stay valid.
 ///
-/// Sound only where we can see **every** value a parameter can take. A function is left alone if it is
-/// the entry (`func 0`) or an export (the host calls it with arbitrary arguments), if its reference is
-/// taken (`ref.func`) or it is a `thread.spawn` entry (callable other than by an argument-visible direct
-/// call), or if its entry block is a loop header (a parameter is then a phi, not the call argument). And
-/// if **any** indirect dispatch survives devirtualization (a funcref value equals its funcidx, so it
-/// could target — and pass arbitrary arguments to — any function), the pass bails entirely, exactly as
-/// dead-function elimination does. (That last gate also means the const-funcref-callback cascade —
-/// propagating a constant funcref into a callee that then `call_indirect`s it — is deferred: it needs a
-/// joint target/const analysis, since the callee's dispatch index is only constant *after* this pass.)
-/// Output is re-verified like everything else.
+/// **Soundness** rests on seeing *every* call that can reach a parameter. A direct `call`/`return_call`
+/// feeds its callee; an indirect `call_indirect`/`return_call_indirect` whose index resolves to a
+/// constant funcref feeds exactly that (signature-matching) target — a mismatched or out-of-range index
+/// traps and reaches no one. Values we cannot see are seeded `Top` and never substituted: the entry
+/// (`func 0`), exports, `ref.func`-taken and `thread.spawn` functions (reachable via a path the fixpoint
+/// doesn't model), and loop-header entries (a parameter is a phi there, not the call argument). The two
+/// hard gates: any `cont.new` (a funcref value run *later* with resume-time arguments) makes the pass
+/// bail, and if **any** indirect index is still `Top` at the fixpoint — an unknown funcref that could
+/// reach any function with arguments we never counted — the pass bails entirely. Output is re-verified.
 pub fn const_prop(m: &Module) -> Module {
     let n = m.funcs.len();
-    if n == 0 || has_indirect_funcref_dispatch(m) {
+    if n == 0 {
+        return m.clone();
+    }
+    // A `cont.new` dispatches on a funcref value but runs it *later* with resume-time arguments we
+    // cannot see — too subtle to model, so bail if any is present.
+    if m.funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::ContNew { .. })))
+    {
         return m.clone();
     }
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
 
-    // Functions whose parameters we cannot fully see: the entry, exports, address-taken / spawned
-    // functions, and loop-header entries.
+    // Parameters we cannot fully see are seeded `Top`.
     let mut opaque = vec![false; n];
     opaque[0] = true;
     for e in &m.exports {
@@ -697,65 +748,139 @@ pub fn const_prop(m: &Module) -> Module {
         }
     }
 
-    // Per callee parameter, the constant agreed by every call site so far (`conflict` once a site
-    // disagrees or passes a non-constant); `called` marks a callee that has at least one direct site.
-    let mut agreed: Vec<Vec<Option<Known>>> =
-        m.funcs.iter().map(|f| vec![None; f.params.len()]).collect();
-    let mut conflict: Vec<Vec<bool>> = m
+    let mut val: Vec<Vec<Cp>> = m
         .funcs
         .iter()
-        .map(|f| vec![false; f.params.len()])
+        .enumerate()
+        .map(|(i, f)| vec![if opaque[i] { Cp::Top } else { Cp::Bottom }; f.params.len()])
         .collect();
-    let mut called = vec![false; n];
 
-    let mut record = |callee: FuncIdx, args: &[u32], consts: &[Option<Known>]| {
-        let f = callee as usize;
-        if f >= n || opaque[f] {
-            return;
-        }
-        called[f] = true;
-        for (j, &a) in args.iter().enumerate() {
-            if j >= agreed[f].len() || conflict[f][j] {
-                continue;
-            }
-            match get(consts, a) {
-                Some(k) => match agreed[f][j] {
-                    None => agreed[f][j] = Some(k),
-                    Some(prev) if prev == k => {}
-                    Some(_) => conflict[f][j] = true,
-                },
-                None => conflict[f][j] = true,
+    // Resolve a block-local operand to a lattice value. `fp` is the count of leading locals that are
+    // **function parameters** — the function's arity in the *entry* block (where block params equal the
+    // function's), and `0` in every other block (whose low locals are phis this analysis doesn't track,
+    // so they read as their static constant, i.e. `Top`). A function parameter reads its current `val`;
+    // anything else reads its static constant, or `Top`. Pure over `val` so the caller can then mutate.
+    let eval = |val: &[Vec<Cp>], ci: usize, fp: usize, knowns: &[Option<Known>], local: u32| {
+        if (local as usize) < fp {
+            val[ci][local as usize]
+        } else {
+            match get(knowns, local) {
+                Some(k) => Cp::Const(k),
+                None => Cp::Top,
             }
         }
     };
-    for caller in &m.funcs {
-        for b in &caller.blocks {
-            let consts = block_consts(b, &fn_results);
-            for inst in &b.insts {
-                if let Inst::Call { func, args } = inst {
-                    record(*func, args, &consts);
+    // The target of an indirect call whose index resolves to a signature-matching constant funcref.
+    let target = |cp: Cp, ty: &FuncType| -> Option<usize> {
+        if let Cp::Const(Known::I32(g)) = cp {
+            let g = g as usize;
+            if g < n && m.funcs[g].params == ty.params && m.funcs[g].results == ty.results {
+                return Some(g);
+            }
+        }
+        None
+    };
+
+    loop {
+        let mut changed = false;
+        for ci in 0..n {
+            let caller = &m.funcs[ci];
+            let np = caller.params.len();
+            for (bi, b) in caller.blocks.iter().enumerate() {
+                let fp = if bi == 0 { np } else { 0 };
+                let knowns = block_knowns(b, &fn_results);
+                // Collect (callee, arg-lattice-values) for every call this block makes, reading `val`.
+                let mut feeds: Vec<(usize, Vec<Cp>)> = Vec::new();
+                let mut push = |callee: usize, args: &[u32], val: &[Vec<Cp>]| {
+                    let cps = args
+                        .iter()
+                        .map(|&a| eval(val, ci, fp, &knowns, a))
+                        .collect();
+                    feeds.push((callee, cps));
+                };
+                for inst in &b.insts {
+                    match inst {
+                        Inst::Call { func, args } => push(*func as usize, args, &val),
+                        Inst::CallIndirect { ty, idx, args } => {
+                            if let Some(g) = target(eval(&val, ci, fp, &knowns, *idx), ty) {
+                                push(g, args, &val);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match &b.term {
+                    Terminator::ReturnCall { func, args } => push(*func as usize, args, &val),
+                    Terminator::ReturnCallIndirect { ty, idx, args } => {
+                        if let Some(g) = target(eval(&val, ci, fp, &knowns, *idx), ty) {
+                            push(g, args, &val);
+                        }
+                    }
+                    _ => {}
+                }
+                // Apply the joins (writing `val`), now that the reads are done.
+                for (callee, cps) in feeds {
+                    if callee >= n {
+                        continue;
+                    }
+                    for (j, cp) in cps.into_iter().enumerate() {
+                        if j >= val[callee].len() {
+                            break;
+                        }
+                        let nv = val[callee][j].join(cp);
+                        if nv != val[callee][j] {
+                            val[callee][j] = nv;
+                            changed = true;
+                        }
+                    }
                 }
             }
-            if let Terminator::ReturnCall { func, args } = &b.term {
-                record(*func, args, &consts);
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // If any indirect index is still `Top` at the fixpoint, an unknown funcref could reach any function
+    // with arguments we never counted — unsound to specialize anyone.
+    for ci in 0..n {
+        let caller = &m.funcs[ci];
+        let np = caller.params.len();
+        for (bi, b) in caller.blocks.iter().enumerate() {
+            let fp = if bi == 0 { np } else { 0 };
+            let knowns = block_knowns(b, &fn_results);
+            let idx_top = |idx: u32| eval(&val, ci, fp, &knowns, idx) == Cp::Top;
+            for inst in &b.insts {
+                if let Inst::CallIndirect { idx, .. } = inst {
+                    if idx_top(*idx) {
+                        return m.clone();
+                    }
+                }
+            }
+            if let Terminator::ReturnCallIndirect { idx, .. } = &b.term {
+                if idx_top(*idx) {
+                    return m.clone();
+                }
             }
         }
     }
 
     let mut funcs = m.funcs.clone();
     let mut changed = false;
-    for (i, f) in funcs.iter_mut().enumerate() {
-        if opaque[i] || !called[i] {
+    for i in 0..n {
+        if opaque[i] {
             continue;
         }
-        let subs: Vec<(usize, Known)> = (0..f.params.len())
-            .filter(|&j| !conflict[i][j])
-            .filter_map(|j| agreed[i][j].map(|k| (j, k)))
+        let subs: Vec<(usize, Known)> = (0..funcs[i].params.len())
+            .filter_map(|j| match val[i][j] {
+                Cp::Const(k) => Some((j, k)),
+                _ => None,
+            })
             .collect();
         if subs.is_empty() {
             continue;
         }
-        f.blocks[0] = substitute_params(&f.blocks[0], &subs);
+        funcs[i].blocks[0] = substitute_params(&funcs[i].blocks[0], &subs);
         changed = true;
     }
 

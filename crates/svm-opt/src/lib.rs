@@ -278,6 +278,14 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     } else {
         devirt
     };
+    // Re-devirtualize: a constant funcref that const_prop propagated into a dispatcher's parameter now
+    // makes its `call_indirect` index constant, so devirt can resolve it to a direct call. Idempotent
+    // when const_prop changed nothing, so it is a no-op with const_prop off.
+    let cp = if cfg.devirt && cfg.const_prop {
+        interproc::devirtualize(&cp)
+    } else {
+        cp
+    };
     let inlined = if cfg.inline {
         interproc::inline_calls(&cp)
     } else {
