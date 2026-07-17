@@ -65,13 +65,13 @@ fn chibicc_ir(name: &str, src: &str) -> (svm_ir::Module, u32, Vec<i64>) {
 fn llvm_ir(name: &str, src: &str) -> (svm_ir::Module, u32, Vec<i64>) {
     let base = std::env::temp_dir().join(format!("fb_llvm_{name}"));
     let cf = base.with_extension("c");
-    let bc = base.with_extension("bc");
+    let bc = base.with_extension("ll");
     std::fs::write(&cf, src).unwrap();
     assert!(Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-fno-vectorize",
             "-fno-slp-vectorize"
         ])
@@ -81,7 +81,7 @@ fn llvm_ir(name: &str, src: &str) -> (svm_ir::Module, u32, Vec<i64>) {
         .status()
         .unwrap()
         .success());
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate");
     let e = run_entry(&t.module);
     (t.module, e, vec![t.entry_sp as i64]) // llvm sp lead = entry_sp
 }

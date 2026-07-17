@@ -69,7 +69,7 @@ fn peval_specialize_runs_in_sandbox_and_matches_host() {
         return; // toolchain unavailable — skip
     };
     let t =
-        svm_llvm::translate_bc_path(&bc).expect("translate the in-sandbox specializer to svm-IR");
+        svm_llvm::translate_ll_path(&bc).expect("translate the in-sandbox specializer to svm-IR");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "the probe must produce a powerbox entry"

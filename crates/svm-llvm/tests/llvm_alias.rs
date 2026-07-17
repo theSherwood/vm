@@ -11,29 +11,16 @@
 //! Gated only on `llvm-as-18` (far lighter than the on-ramp's `rustc +1.81` lane).
 
 use std::path::PathBuf;
-use std::process::Command;
-
 use svm_ir::ValType;
 use svm_jit::JitOutcome;
 
-/// Assemble `ll` to LLVM-18 bitcode with `llvm-as-18`; `None` (skip) if the tool is unavailable.
+/// Write `ll` to a temp `.ll` for the in-house textual reader (no `llvm-as` round-trip). Always
+/// `Some` — kept `Option`-returning so the call sites read like the other harnesses.
 fn assemble(name: &str, ll: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let llp = dir.join(format!("svm_alias_{}_{}.ll", std::process::id(), name));
-    let bc = dir.join(format!("svm_alias_{}_{}.bc", std::process::id(), name));
     std::fs::write(&llp, ll).expect("write .ll");
-    match Command::new("llvm-as-18")
-        .arg(&llp)
-        .arg("-o")
-        .arg(&bc)
-        .status()
-    {
-        Ok(s) if s.success() => Some(bc),
-        _ => {
-            eprintln!("note: skipping {name} (llvm-as-18 unavailable)");
-            None
-        }
-    }
+    Some(llp)
 }
 
 /// A function alias (`@aliasfn` → `@real`) called by `@entry`. `@real(x) = x + 100`;
@@ -64,7 +51,7 @@ fn on_ramp_resolves_function_alias() {
         return; // toolchain unavailable — skip
     };
     // Before the fix this is `Unsupported("call to external/undefined function `aliasfn`")`.
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode with a function alias");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode with a function alias");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
 

@@ -14,11 +14,11 @@ use svm_run::{Backend, Limits, Outcome, RunConfig};
 fn check(name: &str, src: &str) {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_snp_{}_{}.c", std::process::id(), name));
-    let bc = dir.join(format!("svm_snp_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("svm_snp_{}_{}.ll", std::process::id(), name));
     let exe = dir.join(format!("svm_snp_{}_{}", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let clang = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -49,7 +49,7 @@ fn check(name: &str, src: &str) {
         .code()
         .unwrap() as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {
