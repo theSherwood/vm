@@ -5815,6 +5815,31 @@ fn freeze_of_aggregate() {
 }
 
 #[test]
+fn struct_constant_return() {
+    // A **struct-constant** return — `ret {i64,i64} {i64 0, i64 6}` — is how QuickJS returns its
+    // `JS_EXCEPTION` sentinel (a 16-byte `JSValue` `{value, tag}` passed by value; tag 6 =
+    // exception). `agg_of` tracks only *local* aggregates, so a constant one dropped to the scalar
+    // `operand` path and was rejected; `agg_fields` now materializes it field-wise, like a struct φ
+    // incoming. A hand-written `.ll` (clang folds the simple C shapes to a `select`) exercises the
+    // constant return, the multi-result `call`, and the caller-side `extractvalue`.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %v = call {i64, i64} @exc()\n  \
+        %t = extractvalue {i64, i64} %v, 1\n  \
+        %r = trunc i64 %t to i32\n  \
+        ret i32 %r\n}\n\
+        define {i64, i64} @exc() {\n\
+        entry:\n  \
+        ret {i64, i64} {i64 0, i64 6}\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate struct-const-return .ll");
+    svm_verify::verify_module(&t.module).expect("verify struct-const-return");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run struct-const-return");
+    assert_eq!(r, vec![Value::I32(6)], "JS_EXCEPTION-shaped {{0,6}}, field 1 = 6");
+}
+
+#[test]
 fn vector_shift_per_lane_amount() {
     // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
     // Postgres' `simd.h`). svm-ir's `VShift` takes one scalar count for all lanes, so the on-ramp

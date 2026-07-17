@@ -14950,6 +14950,28 @@ impl<'a> BlockCtx<'a> {
         }
     }
 
+    /// Field slots of an **aggregate operand**, whether a tracked local (recorded field-wise in
+    /// `agg` by a multi-result `call`/`insertvalue`) or a **constant aggregate** materialized on
+    /// the spot — a `{…}` struct literal (e.g. QuickJS's `JS_EXCEPTION` = `{i64 0, i64 6}`, which
+    /// its `JSValue`-by-value ABI returns/passes directly), `zeroinitializer`, or `undef`. `None`
+    /// when `op` is not aggregate-typed — the caller then uses the scalar [`operand`] path. The
+    /// constant case derives its field types from the operand's own struct type, so no consumer
+    /// has to thread them; this is [`agg_operand`] without the caller-supplied `ftys`.
+    fn agg_fields(&mut self, op: &Operand) -> Option<Result<Vec<ValIdx>, Error>> {
+        match op {
+            Operand::LocalOperand { .. } => self.agg_of(op).map(Ok),
+            Operand::ConstantOperand(c) => {
+                let ty = c.get_type(self.types);
+                match struct_field_vtypes(ty.as_ref(), self.types) {
+                    Some(Ok(ftys)) => Some(self.agg_operand(op, &ftys)),
+                    Some(Err(e)) => Some(Err(e)),
+                    None => None,
+                }
+            }
+            Operand::MetadataOperand => None,
+        }
+    }
+
     /// The data-SP's block-local index (always parameter 0 of every block, §3d).
     fn sp(&self) -> Result<ValIdx, Error> {
         self.id(SP)
@@ -19723,9 +19745,12 @@ fn translate_term(
     match term {
         LTerm::Ret(r) => match &r.return_operand {
             None => Ok(Terminator::Return(Vec::new())),
-            // A small by-value struct return yields its fields (§3a multi-result); a scalar, one value.
-            Some(op) => match ctx.agg_of(op) {
-                Some(fields) => Ok(Terminator::Return(fields)),
+            // A small by-value struct return yields its fields (§3a multi-result); a scalar, one
+            // value. `agg_fields` covers a struct **constant** return too (`ret {i64,i64} {0,6}`
+            // — QuickJS's `JS_EXCEPTION`), which `agg_of` alone (locals only) would drop to the
+            // scalar path and reject.
+            Some(op) => match ctx.agg_fields(op) {
+                Some(fields) => Ok(Terminator::Return(fields?)),
                 None => Ok(Terminator::Return(vec![ctx.operand(op)?])),
             },
         },
