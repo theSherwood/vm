@@ -2100,8 +2100,9 @@ fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
 /// argv, and run the module's `_start` on the **reserved-window** bytecode engine (Postgres grows its
 /// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
 /// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
-/// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). Function-0 arity is
-/// 4 (`stdout, stdin, exit, memory`), granted by [`grant_onramp_caps`]; `fs` is resolved by name.
+/// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). The `stdout, stdin,
+/// exit, memory, fs` caps are all resolved by name (the current paramless `_start`); a pre-S15c
+/// artifact whose `_start` takes the 4-cap prefix positionally is also accepted.
 pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         status,
@@ -2117,13 +2118,19 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
         Err(_) => return unsupported(STATUS_UNSUPPORTED),
     };
     let m = &resolved;
-    if m.funcs.first().map_or(0, |f| f.params.len()) != 4 {
-        return unsupported(STATUS_UNSUPPORTED); // Postgres' `_start` takes the 4-cap prefix.
+    // Postgres' `_start` arity depends on the on-ramp entry convention: the current `synth_start_argv`
+    // (slice S15c) emits a **paramless** `_start` that resolves its caps **by name**, while an older
+    // pre-S15c artifact takes the 4-cap prefix (`stdout, stdin, exit, memory`) **positionally**. Accept
+    // both — anything past the 4-cap prefix is not a shape Postgres' entry uses.
+    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    if arity > 4 {
+        return unsupported(STATUS_UNSUPPORTED);
     }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
-    // The on-ramp powerbox prefix Postgres' `_start` expects, positionally: stdout, stdin, exit,
-    // memory (the heap-growth cap `malloc` uses). Registered by name too (`cap.self.resolve`). Granted
+    // Grant the on-ramp powerbox prefix — stdout, stdin, exit, memory (the heap-growth cap `malloc`
+    // uses) — and register each **by name** (`cap.self.resolve`), which the paramless `_start` needs;
+    // a positional `_start` additionally receives the first `arity` of them as its params. Granted
     // directly — not via `grant_onramp_caps`, whose graphical `display`/`keyboard`/`webgpu` caps would
     // add a host import a headless Postgres neither needs nor can satisfy.
     let out = host.grant_stream(StreamRole::Out);
@@ -2134,12 +2141,15 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
     host.register_cap_name("exit", exit);
     let memory = host.grant_memory();
     host.register_cap_name("memory", memory);
-    let slots = vec![
+    // Positional prefix for a pre-S15c `_start` (`arity` of stdout/stdin/exit/memory); empty for the
+    // current paramless entry, which resolves every cap by name.
+    let slots: Vec<Value> = [
         Value::I32(out),
         Value::I32(inp),
         Value::I32(exit),
         Value::I32(memory),
-    ];
+    ][..arity]
+    .to_vec();
     // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed).
     let (files, dirs) = match svm_fs::decode_image(image) {
         Ok(seed) => seed,
