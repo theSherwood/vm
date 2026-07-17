@@ -1673,7 +1673,7 @@ fn libm_bundled_vs_native() {
         "-DASSEMBLER=0",
     ];
 
-    // Guest: each openlibm source + the driver → bitcode, then `llvm-link` into one module.
+    // Guest: each openlibm source + the driver → `.ll`, then `llvm-link -S` into one module.
     let mut bcs: Vec<PathBuf> = Vec::new();
     for name in OPENLIBM_SRCS
         .iter()
@@ -1683,16 +1683,16 @@ fn libm_bundled_vs_native() {
         let (src, out) = if name == "__driver" {
             (
                 driver.clone(),
-                std::env::temp_dir().join(format!("olbc_{pid}_driver.bc")),
+                std::env::temp_dir().join(format!("olbc_{pid}_driver.ll")),
             )
         } else {
             (
                 ol.join("src").join(format!("{name}.c")),
-                std::env::temp_dir().join(format!("olbc_{pid}_{name}.bc")),
+                std::env::temp_dir().join(format!("olbc_{pid}_{name}.ll")),
             )
         };
         let mut cmd = Command::new("clang");
-        cmd.args(cflags).args(["-emit-llvm", "-c"]);
+        cmd.args(cflags).args(["-emit-llvm", "-S"]);
         for i in &incs {
             cmd.arg(i);
         }
@@ -1705,8 +1705,9 @@ fn libm_bundled_vs_native() {
             }
         }
     }
-    let linked = std::env::temp_dir().join(format!("olbc_{pid}_libm.bc"));
+    let linked = std::env::temp_dir().join(format!("olbc_{pid}_libm.ll"));
     if !Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
@@ -1740,7 +1741,7 @@ fn libm_bundled_vs_native() {
     let native = Command::new(&exe).output().expect("run native libm");
 
     // Guest: translate → resolve caps → verify → run (JIT via the powerbox).
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate bundled libm");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate bundled libm");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify libm module");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run libm");
@@ -3452,18 +3453,18 @@ fn demo_lmdb_mmap_cap_vs_native() {
     let pid = std::process::id();
     let tmp = std::env::temp_dir();
 
-    // Guest bitcode: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one .bc.
+    // Guest `.ll`: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one module.
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-DSVM_GUEST",
         "-fno-vectorize",
         "-fno-slp-vectorize",
     ];
     let mut bcs = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = tmp.join(format!("svm_llvm_lmdb_{pid}_{tag}.bc"));
+        let out = tmp.join(format!("svm_llvm_lmdb_{pid}_{tag}.ll"));
         let ok = Command::new("clang")
             .args(cflags)
             .arg(&inc)
@@ -3489,19 +3490,16 @@ fn demo_lmdb_mmap_cap_vs_native() {
             }
         }
     }
-    let linked = tmp.join(format!("svm_llvm_lmdb_{pid}.bc"));
-    let linked_ok = Command::new("llvm-link-18")
+    let linked = tmp.join(format!("svm_llvm_lmdb_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !linked_ok {
@@ -3527,7 +3525,7 @@ fn demo_lmdb_mmap_cap_vs_native() {
         return;
     }
 
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -3649,19 +3647,19 @@ fn demo_lmdb_crash_recovery() {
     let pid = std::process::id();
     let tmp = std::env::temp_dir();
 
-    // Guest bitcode: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one .bc.
+    // Guest `.ll`: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one module.
     // (Distinct tag from demo_lmdb_mmap_cap_vs_native so the two tests can run in parallel.)
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-DSVM_GUEST",
         "-fno-vectorize",
         "-fno-slp-vectorize",
     ];
     let mut bcs = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = tmp.join(format!("svm_llvm_lmdbcrash_{pid}_{tag}.bc"));
+        let out = tmp.join(format!("svm_llvm_lmdbcrash_{pid}_{tag}.ll"));
         let ok = Command::new("clang")
             .args(cflags)
             .arg(&inc)
@@ -3687,19 +3685,16 @@ fn demo_lmdb_crash_recovery() {
             }
         }
     }
-    let linked = tmp.join(format!("svm_llvm_lmdbcrash_{pid}.bc"));
-    let linked_ok = Command::new("llvm-link-18")
+    let linked = tmp.join(format!("svm_llvm_lmdbcrash_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !linked_ok {
@@ -3707,7 +3702,7 @@ fn demo_lmdb_crash_recovery() {
         return;
     }
 
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -3817,14 +3812,14 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-DSVM_GUEST",
         "-fno-vectorize",
         "-fno-slp-vectorize",
     ];
     let mut bcs = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = tmp.join(format!("svm_llvm_lmdbzc_{pid}_{tag}.bc"));
+        let out = tmp.join(format!("svm_llvm_lmdbzc_{pid}_{tag}.ll"));
         let ok = Command::new("clang")
             .args(cflags)
             .arg(&inc)
@@ -3850,19 +3845,16 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
             }
         }
     }
-    let linked = tmp.join(format!("svm_llvm_lmdbzc_{pid}.bc"));
-    let linked_ok = Command::new("llvm-link-18")
+    let linked = tmp.join(format!("svm_llvm_lmdbzc_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !linked_ok {
@@ -3888,7 +3880,7 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
         return;
     }
 
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
