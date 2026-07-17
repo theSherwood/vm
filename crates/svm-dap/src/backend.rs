@@ -3,13 +3,16 @@
 //! (the reference oracle, full feature set) or the **bytecode VM** the browser playground actually
 //! runs, over `svm_interp::bytecode::DebugRun`.
 //!
-//! The bytecode engine covers only the **forward-debug subset** (breakpoints, stepping, backtrace,
-//! scalar/aggregate inspection) — reverse debugging (`seek`/`step_back`), data breakpoints
-//! (`set_watchpoint`), and multithreading are single-vCPU-out-of-scope and stay tree-walker-only
-//! (per G2). The `supports_*` gates let `DapServer` refuse those cleanly on the bytecode backend
-//! instead of returning a wrong answer. Correctness of the shared subset is guaranteed by
-//! `crates/svm/tests/debug_parity.rs`, which proves the two engines report identical stop locations,
-//! per-frame locals, and results.
+//! The bytecode engine covers the **forward-debug subset today** (breakpoints, stepping, backtrace,
+//! scalar/aggregate inspection). Reverse debugging (`seek`/`step_back`), data breakpoints
+//! (`set_watchpoint`), and multithreading are **not yet built on it** — gated off by `supports_*` so
+//! `DapServer` refuses them cleanly rather than returning a wrong answer. They are *not* delegated to
+//! the tree-walker: it is the differential oracle only (and far too slow to sit on any user-facing
+//! path). The direction is to build all three **on the bytecode engine** — reverse via deterministic
+//! replay (+ checkpoints), watchpoints via a per-op watched-range check in the debug-stepping loop,
+//! and multithreading via a deterministic cooperative multi-vCPU *debug scheduler* (see DEBUGGING.md
+//! G3). Correctness of the shared subset is guaranteed by `crates/svm/tests/debug_parity.rs`, which
+//! proves the two engines report identical stop locations, per-frame locals, and results.
 
 use svm_interp::bytecode::DebugRun;
 use svm_interp::{

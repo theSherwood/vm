@@ -32,6 +32,10 @@ live = []
 svm-interp = { path = "../crates/svm-interp" }
 svm-encode = { path = "../crates/svm-encode" }
 svm-text   = { path = "../crates/svm-text" }
+# The Debug Adapter Protocol server (DEBUGGING.md), driven over the bytecode `Debuggee` backend so
+# the playground can debug SVM guests. Pure request→messages logic + hand-rolled JSON — wasm-clean
+# (`run_stdio`, its only std::io surface, is never called here). See `svm_dap_request`.
+svm-dap    = { path = "../crates/svm-dap" }
 # `Module` is named by the fixture/corpus bins and by `powerbox_exec` (shared with the cdylib).
 svm-ir     = { path = "../crates/svm-ir" }
 svm-fs     = { path = "../crates/svm-fs" }
