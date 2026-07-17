@@ -140,5 +140,45 @@ rematerialized in the preheader instead of threaded, so the hoisted form is smal
    jump_threading, CSE) and are loop-run-time-neutral — but code size *is* the JIT-path win, so they
    earn their keep where the loop passes don't.
 
-_The corpus is small and hand-built to isolate each pass. Remaining follow-ups (OPT.md): multi-run
-medians + variance, and Wasmtime-relative numbers._
+## Wasmtime-relative (JIT lane, `bench/`)
+
+The ablation above measures svm-opt against *itself*. This measures it against the bar that matters
+(DESIGN.md §1a): run the **same wasm bytes** on the SVM JIT (transpiled to IR) and on **Wasmtime**, with
+and without svm-opt in front of the SVM JIT. Both lower core wasm through Cranelift, so it is like-for-
+like. `compute32 = svm-jit ÷ Wasmtime-wasm32` per-iteration time (>1 = svm slower); best-of-5.
+
+Regenerate from `bench/`:
+
+```
+cargo run --release -- --from-wasm --csv --reps 5             # baseline (no svm-opt)
+cargo run --release -- --from-wasm --optimize --csv --reps 5  # with svm-opt in front of the JIT
+```
+
+| kernel | svm/Wasmtime, no opt | svm/Wasmtime, +svm-opt |
+|---|---|---|
+| **irreducible** (clang relooper output) | **1.52×** | **0.97×** |
+| alu | 1.02× | 1.01× |
+| float | 1.01× | 1.01× |
+| simd | 0.98× | 1.02× |
+| calli | 1.14× | 1.16× |
+| hostcall | 1.15× | 1.15× |
+| memsum | 1.80× | 1.81× |
+| scatter | 1.50× | 1.54× |
+| locals_c | 1.81× | 1.86× |
+| hostbuf | 0.60× | 0.60× |
+
+_(`cache` is DRAM-latency-bound — the harness gives it a custom, low-repeat span — so its ratio is
+memory-stall noise, not IR quality; elided.)_
+
+**The one clear win is `irreducible`: 1.52× → 0.97×** — svm-opt turns a kernel 52% slower than Wasmtime
+into parity. That kernel is `clang --target=wasm32` output whose control flow the LLVM relooper left
+irreducible; svm-opt's jump-threading / SCCP / block-merging untangle it into IR Cranelift lowers well.
+That is exactly the shape Cranelift can't fix on its own — it sees the tangled IR as given. **Everywhere
+else the ratio is flat** (within run-to-run noise), which *confirms* the ablation's thesis: on straight-
+line and loop compute the JIT re-derives svm-opt's scalar passes, so the optimizer neither helps nor
+hurts native speed — its JIT-path value is code size / compile time, plus untangling structure the
+backend inherits. The absolute gap to Wasmtime (memsum/locals_c ~1.8×) is a JIT-backend story, not an
+svm-opt one — svm-opt moves it only where the IR arrives structurally worse than Wasmtime's.
+
+_The corpus is small and hand-built to isolate each pass. Remaining follow-up (OPT.md): multi-run
+medians + variance._

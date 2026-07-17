@@ -50,6 +50,7 @@
 //! This is a watch-it-over-time regression harness, not a statistical benchmark. Run with:
 //!   cargo run --release                          # from bench/, human table
 //!   cargo run --release -- --from-wasm           # SVM IR transpiled from the WAT (same bytes as wasm)
+//!   cargo run --release -- --optimize            # run svm-opt over the SVM IR before the SVM lanes
 //!   cargo run --release -- --csv                 # machine-readable line per kernel
 //!   cargo run --release -- --save-baseline FILE  # record the current ratios
 //!   cargo run --release -- --check FILE           # rerun + flag any ratio regression
@@ -1546,10 +1547,31 @@ struct Ratios {
     jit_vs_native: Option<f64>,
 }
 
+/// Run the svm-opt AOT optimizer over `m`, re-verifying the result. A verify failure (a pass the
+/// optimizer mishandled on this kernel) falls back to the unoptimized module with a note, so a kernel
+/// is never silently miscompiled — the cross-check below would also catch a wrong result.
+fn optimize_ir(m: &svm_ir::Module, name: &str) -> svm_ir::Module {
+    let opt = svm_opt::optimize_module(m);
+    match svm_verify::verify_module(&opt) {
+        Ok(()) => opt,
+        Err(e) => {
+            eprintln!(
+                "note: --optimize keeps `{name}` unoptimized (svm-opt output failed verify: {e:?})"
+            );
+            m.clone()
+        }
+    }
+}
+
 /// Time one kernel, taking the **best (min)** of `reps` passes per engine. Cross-checks every
 /// engine agrees on the result first, so we never benchmark a miscompile.
-fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
+fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     let m = svm_text::parse_module(&k.ir).expect("parse our IR text");
+    let m = if optimize {
+        optimize_ir(&m, &k.name)
+    } else {
+        m
+    };
     // wasm32 bytes come either pre-compiled (the `irreducible` kernel's clang output) or by
     // assembling the hand-written WAT.
     let wasm32 = match &k.wasm32_bytes {
@@ -1863,8 +1885,19 @@ fn print_table(results: &[(Resolved, Raw)]) {
     );
     println!(
         "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
-        "kernel", "native", "jit", "interp", "i/jit", "jit/nat", "wasm32", "ratio", "wasm64",
-        "ratio", "svm", "wasm32", "ratio"
+        "kernel",
+        "native",
+        "jit",
+        "interp",
+        "i/jit",
+        "jit/nat",
+        "wasm32",
+        "ratio",
+        "wasm64",
+        "ratio",
+        "svm",
+        "wasm32",
+        "ratio"
     );
     println!(
         "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
@@ -1929,6 +1962,10 @@ fn main() {
     // `--from-wasm`: get each compute kernel's SVM IR by transpiling its WAT (the same bytes Wasmtime
     // runs) instead of using the hand-written IR — the apples-to-apples comparison.
     let from_wasm = args.iter().any(|a| a == "--from-wasm");
+    // `--optimize`: run the svm-opt AOT optimizer over each kernel's SVM IR before the SVM lanes
+    // (jit + interp), so the Wasmtime-relative ratios reflect the optimizer. Pairs with `--from-wasm`
+    // for the cleanest apples-to-apples: the same wasm bytes → transpiled IR → svm-opt → JIT vs Wasmtime.
+    let optimize = args.iter().any(|a| a == "--optimize");
     // `--fast-cap`: route HostCall kernels through the §9/D45 devirtualized fast path (vs the generic
     // thunk) so the two can be compared head-to-head.
     FAST_CAP.store(args.iter().any(|a| a == "--fast-cap"), Ordering::Relaxed);
@@ -1966,7 +2003,7 @@ fn main() {
     let results: Vec<(Resolved, Raw)> = resolve_kernels(from_wasm)
         .into_iter()
         .map(|k| {
-            let raw = measure(&engine, &k, reps);
+            let raw = measure(&engine, &k, reps, optimize);
             (k, raw)
         })
         .collect();

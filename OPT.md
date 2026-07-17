@@ -354,8 +354,16 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
 - [ ] **Multi-run statistics in the harness.** Single-run numbers show visible variance (one JIT row
   read 2× its neighbors). Report medians + spread over several runs before treating any delta as load-
   bearing.
-- [ ] **Wasmtime-relative numbers** (also under Phase 5): measure optimized-residual run time against
-  Wasmtime on the same workloads, per DESIGN.md §1a — the "measured relative to wasm/Wasmtime" bar.
+- [x] **Wasmtime-relative numbers** (Phase 5, DESIGN.md §1a). Wired svm-opt into the `bench/`
+  vs-Wasmtime harness behind `--optimize`: the same wasm bytes run on the SVM JIT (transpiled to IR,
+  optionally svm-opt'd) and on Wasmtime, both via Cranelift. `compute32 = svm-jit ÷ Wasmtime` best-of-5,
+  optimizer on vs off (`OPT_BENCH.md` "Wasmtime-relative"). Result: **flat everywhere except the
+  `irreducible` kernel — 1.52× → 0.97×**, where svm-opt untangles clang's relooper output into IR
+  Cranelift lowers well. This is the §1a bar made concrete *and* an independent confirmation of the
+  ablation thesis: the JIT re-derives the scalar passes on ordinary compute (neutral), and svm-opt's
+  native-speed win is precisely where the IR arrives structurally worse than Wasmtime's. The bench
+  falls back to unoptimized IR (with a note) if svm-opt output ever fails re-verify, so a kernel is
+  never silently miscompiled.
 - [ ] **Note for Phase 3/4 targeting.** Because the JIT backend (`opt_level="speed"`) already does its
   own GVN/CSE/LICM, scalar passes are ~JIT-run-time-neutral; the higher-leverage host-JIT wins are the
   cross-boundary transforms Cranelift *cannot* see — inlining (Phase 3) and memory passes (Phase 4).
