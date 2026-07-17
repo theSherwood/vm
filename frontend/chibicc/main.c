@@ -9,6 +9,7 @@ bool opt_fcommon = true;
 bool opt_fpic;
 bool opt_emit_ir; // emit SVM text IR instead of x86-64 assembly
 bool opt_g;       // -g: also emit the SVM debug-info section (DEBUGGING.md §6 waist)
+bool opt_child_entry; // --child-entry: emit function 0 with the §14 child ABI (spawnable via instantiate_module)
 
 static FileType opt_x;
 static StringArray opt_include;
@@ -136,6 +137,16 @@ static void parse_args(int argc, char **argv) {
 
     if (!strcmp(argv[i], "--emit-ir")) {
       opt_emit_ir = true;
+      continue;
+    }
+
+    // `--child-entry`: emit the module's entry (`_start`, function 0) with the §14 child ABI
+    // (`(i64 starter) -> (i64 status)`) instead of the top-level powerbox entry (`() -> (i32)`), so
+    // the program can be spawned as an `Instantiator.instantiate_module` child (a shell "exec"). It
+    // still parses the §3e args buffer into `main(argc, argv)`; `main`'s `int` result is zero-extended
+    // to the `i64` status the parent reads via `join`. For a command that needs no capabilities.
+    if (!strcmp(argv[i], "--child-entry")) {
+      opt_child_entry = true;
       continue;
     }
 
