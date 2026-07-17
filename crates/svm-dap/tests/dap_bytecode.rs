@@ -383,9 +383,74 @@ fn read_named(s: &mut DapServer, seq: i64, a: &str, b: &str) -> (String, String)
 }
 
 #[test]
-fn dap_over_bytecode_refuses_reverse_debugging() {
-    // The bytecode backend is forward-only: stepBack / reverseContinue fail cleanly (the browser's
-    // client hides those controls, but the server must not pretend to honor them).
+fn dap_over_bytecode_reverse_matches_the_tree_walker() {
+    // Run to the loop breakpoint three times (i = 3, 2, 1), then reverseContinue back to the previous
+    // hit — on both engines. The bytecode backend does this by deterministic replay; the observations
+    // must match the tree-walker's time-travel.
+    fn script(engine: Option<&str>) -> (String, String, String) {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut la = vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ];
+        if let Some(e) = engine {
+            la.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(la)));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("/work/sum.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(7))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![]))); // hit 1: i=3
+        s.handle(&req(5, "continue", Json::obj(vec![]))); // hit 2: i=2
+        s.handle(&req(6, "continue", Json::obj(vec![]))); // hit 3: i=1
+        let at3 = read_locals(&mut s, 7); // (i=1, acc=5)
+                                          // reverseContinue → back to the previous breakpoint hit (i=2).
+        let rev = s.handle(&req(8, "reverseContinue", Json::obj(vec![])));
+        let reason = event(&rev, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let back = read_locals(&mut s, 9); // (i=2, acc=3)
+        (
+            format!("{},{}", at3.0, at3.1),
+            reason,
+            format!("{},{}", back.0, back.1),
+        )
+    }
+
+    let bytecode = script(Some("bytecode"));
+    assert_eq!(bytecode.0, "1,5", "3rd hit is i=1, acc=5");
+    assert_eq!(
+        bytecode.1, "breakpoint",
+        "reverseContinue lands on a breakpoint"
+    );
+    assert_eq!(bytecode.2, "2,3", "…the previous hit: i=2, acc=3");
+    assert_eq!(
+        bytecode,
+        script(None),
+        "bytecode reverse ≡ tree-walker reverse"
+    );
+}
+
+#[test]
+fn dap_over_bytecode_step_back_rewinds_one_op() {
+    // stepBack re-executes to one op earlier: after two forward steps the op clock advances, and a
+    // stepBack lands strictly before the current position (still inside the guest, i.e. a `step` stop).
     let mut s = DapServer::new();
     s.handle(&req(1, "initialize", Json::obj(vec![])));
     s.handle(&req(
@@ -398,17 +463,46 @@ fn dap_over_bytecode_refuses_reverse_debugging() {
             ("engine", Json::s("bytecode")),
         ]),
     ));
-    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
-    let back = s.handle(&req(4, "stepBack", Json::obj(vec![])));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("/work/sum.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(7))])]),
+            ),
+        ]),
+    ));
+    s.handle(&req(4, "configurationDone", Json::obj(vec![]))); // stop at the loop body, i=3
+    let back = s.handle(&req(5, "stepBack", Json::obj(vec![])));
     assert_eq!(
         response(&back).get("success"),
-        Some(&Json::Bool(false)),
-        "stepBack refused"
+        Some(&Json::Bool(true)),
+        "stepBack succeeds"
     );
-    let rev = s.handle(&req(5, "reverseContinue", Json::obj(vec![])));
+    // Rewinds to one op earlier — still inside the guest, so a `step` stop (not `terminated`).
     assert_eq!(
-        response(&rev).get("success"),
-        Some(&Json::Bool(false)),
-        "reverseContinue refused"
+        event(&back, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("step")),
+        "lands as a step stop inside the guest",
     );
+    // The frame is still readable after the rewind (we didn't fall off the start of the program).
+    let out = s.handle(&req(
+        6,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let frames = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(!frames.is_empty(), "a live frame after stepBack");
 }

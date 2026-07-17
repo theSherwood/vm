@@ -1565,6 +1565,10 @@ function buildCard(name, ex) {
       mk('⤼ Step Over', 'Step over the next source line', 'next'),
       mk('↳ Step In', 'Step into a call', 'stepIn'),
       mk('↰ Step Out', 'Run to the caller', 'stepOut'),
+      // Reverse debugging (bytecode backend, deterministic replay): step one op back, or run backward
+      // to the previous breakpoint.
+      mk('⤺ Step Back', 'Re-execute to one step earlier', 'stepBack'),
+      mk('◀◀ Reverse', 'Run backward to the previous breakpoint', 'reverseContinue'),
       mk('■ Stop', 'End the debug session', null),
     );
     dbgVars = el('pre', 'dbg-vars');

@@ -260,6 +260,15 @@ try {
     ? ok('Continue advanced the loop — i=4, acc=5')
     : fail(`debug continue: ${stepped}`);
 
+  // Reverse: run backward to the previous breakpoint hit (deterministic replay) — the locals rewind.
+  await page.click(`${dbgCard} .dbg-controls button[data-cmd="reverseContinue"]`);
+  await page.waitForFunction((sel) => /i\s*=\s*5/.test(document.querySelector(`${sel} .dbg-vars`).textContent),
+    dbgCard, { timeout: 10_000 });
+  const reversed = await page.evaluate((sel) => document.querySelector(`${sel} .dbg-vars`).textContent, dbgCard);
+  /i\s*=\s*5/.test(reversed) && /acc\s*=\s*0/.test(reversed)
+    ? ok('Reverse walked back to the previous breakpoint — i=5, acc=0')
+    : fail(`reverse: ${reversed}`);
+
   // Stop ends the session: the panel hides and the editor is writable again.
   await page.click(`${dbgCard} .dbg-controls button[data-cmd="stop"]`);
   const ended = await page.evaluate((sel) => ({
