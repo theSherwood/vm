@@ -8,6 +8,7 @@
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
 import { runJitModule } from './wasmjit-module.js';
+import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
 
@@ -288,6 +289,40 @@ block0(v0: i64):
   v1 = i64.const 5
   return v1
 }
+`,
+  },
+
+  'Debugger (SVM — breakpoints, step, variables)': {
+    debug: true,
+    bp: 7, // a breakpoint pre-placed on line 8 (0-based 7), the loop body
+    mode: 'plain',
+    desc: 'The §DEBUGGING Debug Adapter Protocol debugger, running on the bytecode engine right here ' +
+      'in the sandbox. This SVM program sums i = n…1; its `debug` section maps the loop body to source ' +
+      'lines and names the loop variables. Click the gutter to set/clear breakpoints (one is pre-placed ' +
+      'on line 8), then press Debug: it stops at the line, highlights it, and shows i / acc in the ' +
+      'Variables pane. Step and Continue walk the loop — watch acc accumulate. Run executes it normally ' +
+      '(→ 15). Same DAP server VS Code speaks, driven over the wasm FFI.',
+    src: `; Sum i = n..1 into acc. Click the gutter to set a breakpoint, then press Debug.
+func () -> (i64) {
+block0():
+  vn = i64.const 5
+  vacc0 = i64.const 0
+  br block1(vn, vacc0)
+block1(vi: i64, vacc: i64):
+  vsum = i64.add vacc vi
+  vone = i64.const 1
+  vnext = i64.sub vi vone
+  br_if vnext block1(vnext, vsum) block2(vsum)
+block2(vr: i64):
+  return vr
+}
+
+debug.file 0 "sum.svm"
+debug.fname 0 "sum"
+debug.loc 0 1 0 0 8 3
+debug.loc 0 1 2 0 10 3
+debug.var 0 "i" ssa 0 "i64"
+debug.var 0 "acc" ssa 1 "i64"
 `,
   },
 
@@ -1035,6 +1070,106 @@ async function proveModuleParity(c) {
   }
 }
 
+// ---- the DAP debugger (DEBUGGING.md): breakpoints · stepping · variables, on the bytecode engine --
+// One debug session at a time. The panel drives the `svm-dap` server (bytecode backend) through the
+// `dap.js` client over the wasm FFI: launch the SVM text, run to a breakpoint, highlight the stopped
+// source line, and show the paused frame's named locals; Step/Continue advance it. This is the same
+// DAP an editor speaks — the playground is just another DAP frontend.
+let dapClient = null; // the active DAP client while a session runs (else null)
+let dapCard = null; // the card the session belongs to
+
+// The DAP source a breakpoint request targets — the program's own `debug.file 0 "…"` (so the server's
+// file match binds); falls back to a generic name if the program declares none.
+function dapSourceName(src) {
+  const m = /debug\.file\s+0\s+"([^"]+)"/.exec(src);
+  return m ? m[1] : 'source';
+}
+
+// Push the card's current breakpoint lines (editor 0-based → DAP 1-based) to the server.
+function dapSyncBreakpoints(c) {
+  const breakpoints = c.editor.breakpointLines().map((l) => ({ line: l + 1 }));
+  dapClient.send('setBreakpoints', {
+    source: { path: dapSourceName(c.editor.getValue()) },
+    breakpoints,
+  });
+}
+
+// Render the paused frame + its named locals into the card's Variables pane, and highlight the source
+// line (frame.line is 1-based; 0 ⇒ an unmapped op, so no highlight).
+function dapShowStop(c) {
+  const frame = dapClient.send('stackTrace', { threadId: 1 }).response.body.stackFrames[0];
+  if (!frame) return;
+  if (frame.line > 0) c.editor.setStopLine(frame.line - 1);
+  const scope = dapClient.send('scopes', { frameId: frame.id }).response.body.scopes[0];
+  const vars = dapClient.send('variables', { variablesReference: scope.variablesReference })
+    .response.body.variables;
+  const rows = vars
+    .map((v) => `<div><span class="bpname">${v.name}</span> = ${v.value}${v.type ? ` <em>${v.type}</em>` : ''}</div>`)
+    .join('');
+  c.el.dbgVars.innerHTML = `<div>${frame.name} · line ${frame.line}</div>${rows}`;
+}
+
+// Handle a resume reply: a `terminated` event ends the session; a `stopped` event pauses (show it).
+function dapHandle(c, reply) {
+  if (reply.events.some((e) => e.event === 'terminated')) {
+    endDebug(c, 'program finished');
+    return;
+  }
+  const stopped = reply.events.find((e) => e.event === 'stopped');
+  if (stopped) {
+    dapShowStop(c);
+    setState(c, 'running', `paused (${stopped.body.reason}) — Step / Continue, Stop to end`);
+  }
+}
+
+// Start a debug session on the card's current SVM text (on the bytecode engine).
+function startDebug(c) {
+  if (broken) return;
+  stopReactor();
+  if (dapCard) endDebug(dapCard, null); // supersede any running session
+  const src = c.editor.getValue();
+  dapClient = createDapClient(eng.ex, eng.memory);
+  dapCard = c;
+  c.el.result.textContent = '';
+  c.el.dbgVars.innerHTML = '';
+  dapClient.send('initialize', {});
+  const launch = dapClient.send('launch', { programText: src, function: 0, args: [], engine: 'bytecode' });
+  if (!launch.response.success) {
+    endDebug(c, null);
+    setState(c, 'error', 'debug launch failed — does the program parse and run single-threaded?');
+    return;
+  }
+  dapSyncBreakpoints(c);
+  c.editor.setReadOnly(true);
+  c.el.dbg.classList.add('active');
+  c.el.run.disabled = true;
+  logTo(c, 'debug session started (bytecode engine) — running to the first breakpoint');
+  dapHandle(c, dapClient.send('configurationDone', {}));
+}
+
+// A step verb (continue / next / stepIn / stepOut) on the active session.
+function debugStep(c, command) {
+  if (dapCard !== c || !dapClient) return;
+  c.editor.clearStopLine();
+  dapHandle(c, dapClient.send(command, {}));
+}
+
+// End the session: disconnect, clear the stop highlight, restore the editor.
+function endDebug(c, message) {
+  if (!dapClient || dapCard !== c) {
+    if (message && c) setState(c, 'done', message);
+    return;
+  }
+  dapClient.send('disconnect', {});
+  dapClient = null;
+  dapCard = null;
+  c.editor.clearStopLine();
+  c.editor.setReadOnly(false);
+  c.el.dbg.classList.remove('active');
+  c.el.run.disabled = broken;
+  if (message) setState(c, 'done', message);
+}
+
 // SVM **text** guests: parse+verify inside the sandbox (`svm_parse`), then run across Workers under the
 // card's selected powerbox recipe.
 async function runText(c) {
@@ -1109,6 +1244,7 @@ async function runText(c) {
 async function runDemo(c) {
   if (broken) return;
   if (c.editor) c.editor.clearError();
+  if (dapCard) endDebug(dapCard, null); // a fresh Run supersedes any debug session
   stopReactor(); // a fresh Run supersedes any running reactor loop
   const ex = c.ex;
   if (ex.kind === 'reactor') return runReactor(c);
@@ -1228,6 +1364,15 @@ function buildCard(name, ex) {
     const saved = loadSaved(id);
     if (saved != null && saved !== dflt) editor.setValue(saved);
     editor.onChange(() => saveSrc(id, editor.getValue(), dflt));
+    // Debug-capable cards: a gutter click toggles a breakpoint (live-synced to an active session), and
+    // the demo may pre-place one. (`c` is referenced by the click closure, which only fires post-build.)
+    if (ex.debug) {
+      if (ex.bp != null) editor.toggleBreakpoint(ex.bp);
+      editor.onGutterClick((line) => {
+        editor.toggleBreakpoint(line);
+        if (dapCard === c) dapSyncBreakpoints(c);
+      });
+    }
   } else {
     section.appendChild(el('pre', 'note',
       ex.kind === 'reactor'
@@ -1263,6 +1408,14 @@ function buildCard(name, ex) {
     shareBtn = el('button', 'share', 'Share');
     shareBtn.title = 'Copy a link that reproduces the current editor contents';
     controls.append(resetBtn, shareBtn);
+  }
+  // A debug-capable card gets a Debug button (starts a DAP session on the bytecode engine).
+  let debugBtn = null;
+  if (ex.debug) {
+    debugBtn = el('button', 'debug', 'Debug');
+    debugBtn.title = 'Debug this SVM program on the bytecode engine — breakpoints, stepping, variables';
+    debugBtn.disabled = true;
+    controls.appendChild(debugBtn);
   }
   let jit = null;
   let proveBtn = null;
@@ -1324,11 +1477,37 @@ function buildCard(name, ex) {
     section.appendChild(pad);
   }
 
+  // Debugger panel (DAP over the bytecode engine): step controls + a live Variables pane. Hidden until
+  // a session pauses (`.dbg.active`). Only built for debug-capable cards.
+  let dbg = null, dbgVars = null;
+  if (ex.debug) {
+    dbg = el('div', 'dbg');
+    const dc = el('div', 'dbg-controls');
+    const mk = (label, title, cmd) => {
+      const b = el('button', null, label);
+      b.title = title;
+      b.dataset.cmd = cmd || 'stop';
+      b.addEventListener('click', () => (cmd ? debugStep(c, cmd) : endDebug(c, 'debug session ended')));
+      return b;
+    };
+    dc.append(
+      mk('▶ Continue', 'Run to the next breakpoint', 'continue'),
+      mk('⤼ Step Over', 'Step over the next source line', 'next'),
+      mk('↳ Step In', 'Step into a call', 'stepIn'),
+      mk('↰ Step Out', 'Run to the caller', 'stepOut'),
+      mk('■ Stop', 'End the debug session', null),
+    );
+    dbgVars = el('pre', 'dbg-vars');
+    dbg.append(dc, dbgVars);
+    section.appendChild(dbg);
+  }
+
   const c = {
     name, ex, editor, id,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, prove: proveBtn, reset: resetBtn, share: shareBtn },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
   };
   runBtn.addEventListener('click', () => runDemo(c));
+  if (debugBtn) debugBtn.addEventListener('click', () => startDebug(c));
   stopBtn.addEventListener('click', () => stopDemo(c));
   if (proveBtn) proveBtn.addEventListener('click', () => (c.ex.kind === 'module' ? proveModuleParity : proveParity)(c));
   if (resetBtn) resetBtn.addEventListener('click', () => {
@@ -1426,6 +1605,7 @@ async function main() {
   for (const c of cards) {
     c.el.run.disabled = false;
     if (c.el.prove) c.el.prove.disabled = false;
+    if (c.el.debug) c.el.debug.disabled = false;
   }
   setEngineState('ready', 'engine ready');
 }

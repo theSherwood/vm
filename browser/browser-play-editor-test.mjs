@@ -226,6 +226,51 @@ try {
     fail(`share URL not emitted: ${shareURL}`);
   }
 
+  // The DAP debugger card: a breakpoint is pre-placed, Debug pauses on the bytecode engine at the
+  // source line (highlighted), the Variables pane shows the loop locals, and Continue advances the loop.
+  const dbgCard = card('Debugger (SVM — breakpoints, step, variables)');
+  const dbg0 = await page.evaluate((sel) => ({
+    hasDebugBtn: !!document.querySelector(`${sel} .debug`),
+    bpDots: document.querySelectorAll(`${sel} .cm-bp-marker`).length,
+  }), dbgCard);
+  dbg0.hasDebugBtn && dbg0.bpDots === 1
+    ? ok(`debug card: Debug button + ${dbg0.bpDots} pre-placed breakpoint`)
+    : fail(`debug card: ${JSON.stringify(dbg0)}`);
+
+  // Start debugging → it runs to the breakpoint and pauses.
+  await page.click(`${dbgCard} .debug`);
+  await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
+    dbgCard, { timeout: 20_000 });
+  const paused = await page.evaluate((sel) => ({
+    active: document.querySelector(`${sel} .dbg`).classList.contains('active'),
+    stopLine: !!document.querySelector(`${sel} .cm-stop-line`),
+    vars: document.querySelector(`${sel} .dbg-vars`).textContent,
+    readonly: document.querySelector(`${sel} .CodeMirror`).CodeMirror.getOption('readOnly'),
+  }), dbgCard);
+  paused.active && paused.stopLine && /i\s*=\s*5/.test(paused.vars) && /acc\s*=\s*0/.test(paused.vars) && paused.readonly
+    ? ok(`debugger paused at the breakpoint — i=5, acc=0, line highlighted`)
+    : fail(`debug paused: ${JSON.stringify(paused)}`);
+
+  // Continue once → next loop iteration: acc accumulates (5), i decrements (4).
+  await page.click(`${dbgCard} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => /acc\s*=\s*5/.test(document.querySelector(`${sel} .dbg-vars`).textContent),
+    dbgCard, { timeout: 10_000 });
+  const stepped = await page.evaluate((sel) => document.querySelector(`${sel} .dbg-vars`).textContent, dbgCard);
+  /i\s*=\s*4/.test(stepped) && /acc\s*=\s*5/.test(stepped)
+    ? ok('Continue advanced the loop — i=4, acc=5')
+    : fail(`debug continue: ${stepped}`);
+
+  // Stop ends the session: the panel hides and the editor is writable again.
+  await page.click(`${dbgCard} .dbg-controls button[data-cmd="stop"]`);
+  const ended = await page.evaluate((sel) => ({
+    active: document.querySelector(`${sel} .dbg`).classList.contains('active'),
+    stopLine: !!document.querySelector(`${sel} .cm-stop-line`),
+    readonly: document.querySelector(`${sel} .CodeMirror`).CodeMirror.getOption('readOnly'),
+  }), dbgCard);
+  !ended.active && !ended.stopLine && !ended.readonly
+    ? ok('Stop ended the debug session (panel hidden, editor writable)')
+    : fail(`debug stop: ${JSON.stringify(ended)}`);
+
   // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.
   await page.selectOption('#theme', 'dark');
   const themed = await page.evaluate(() => ({
