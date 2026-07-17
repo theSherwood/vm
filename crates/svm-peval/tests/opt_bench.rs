@@ -89,6 +89,13 @@ fn leave_one_out() -> Vec<(&'static str, OptConfig)> {
             },
         ),
         ("devirt", OptConfig { devirt: false, ..a }),
+        (
+            "const_prop",
+            OptConfig {
+                const_prop: false,
+                ..a
+            },
+        ),
         ("inline", OptConfig { inline: false, ..a }),
         ("dfe", OptConfig { dfe: false, ..a }),
         ("mem", OptConfig { mem: false, ..a }),
@@ -697,6 +704,74 @@ fn multiblock_inline_case() -> Module {
     }
 }
 
+/// A caller passing a constant `flag=1` to a helper **too big to inline** (its dead arm exceeds
+/// `MAX_CALLEE_INSTS`), so only interprocedural constant propagation — not inline+SCCP — can make the
+/// flag constant inside the helper, fold its branch, and DCE the large dead arm. Isolates `const_prop`.
+fn const_prop_case() -> Module {
+    // b2(r): a 26-op chain on r, so the helper exceeds the inliner's size cap and stays a call.
+    let mut arm: Vec<Inst> = Vec::new();
+    let mut last = 0u32; // r = v0
+    for i in 0..26 {
+        let op = if i % 2 == 0 { BinOp::Mul } else { BinOp::Add };
+        arm.push(bin32(op, last, 0));
+        last = (i + 1) as u32;
+    }
+    let helper = Func {
+        params: vec![ValType::I32, ValType::I32], // flag=v0, x=v1
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32, ValType::I32],
+                insts: vec![
+                    Inst::ConstI32(0),
+                    Inst::IntCmp {
+                        ty: IntTy::I32,
+                        op: CmpOp::Ne,
+                        a: 0,
+                        b: 2,
+                    },
+                ], // flag != 0
+                term: Terminator::BrIf {
+                    cond: 3,
+                    then_blk: 1,
+                    then_args: vec![1],
+                    else_blk: 2,
+                    else_args: vec![1],
+                },
+            },
+            Block {
+                params: vec![ValType::I32], // x
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
+            Block {
+                params: vec![ValType::I32], // r (dead arm once flag is known 1)
+                insts: arm,
+                term: Terminator::Return(vec![last]),
+            },
+        ],
+    };
+    let entry = Func {
+        params: vec![ValType::I32], // x
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![1, 0],
+                }, // helper(1, x)
+            ],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    Module {
+        funcs: vec![entry, helper],
+        ..Default::default()
+    }
+}
+
 fn corpus() -> Vec<Case> {
     vec![
         Case {
@@ -745,6 +820,11 @@ fn corpus() -> Vec<Case> {
             name: "multiblock inline (inline+dfe)",
             module: multiblock_inline_case(),
             args: vec![i64s(&[3, 4]), i64s(&[7, -2]), i64s(&[10, 10])],
+        },
+        Case {
+            name: "const_prop (arg → branch fold)",
+            module: const_prop_case(),
+            args: vec![i32s(&[0]), i32s(&[5]), i32s(&[-3])],
         },
     ]
 }

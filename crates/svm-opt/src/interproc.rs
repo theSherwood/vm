@@ -11,13 +11,13 @@
 //! direct `call`, the inliner splices a small callee in, and DFE sweeps the now-uncalled leaf — and,
 //! because devirtualization removes the indirect dispatch, DFE's conservative gate lifts too.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use svm_ir::{Block, Export, Func, FuncIdx, FuncType, Inst, Module, Terminator, ValType};
 use svm_verify::func_value_types;
 
-use crate::{each_operand, map_operands, map_term_operands};
+use crate::{block_consts, each_operand, get, map_operands, map_term_operands, Known};
 
 /// Visit every **static function index** a function references: a direct `call`, a `ref.func`, a
 /// `thread.spawn` entry, and the `return_call` terminator. This mirrors `svm_ir::offset_func_indices`
@@ -598,6 +598,177 @@ pub fn inline_calls(m: &Module) -> Module {
         imports: m.imports.clone(),
         exports: m.exports.clone(),
         debug_info: None, // instruction positions shift once bodies are spliced
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Interprocedural constant propagation (OPT.md Phase 3).
+// ---------------------------------------------------------------------------------------
+
+/// Whether block `0` (the entry) is the target of any branch — i.e. it is a loop header, so its
+/// parameters are phis fed by back edges as well as the function's arguments. In that case a parameter
+/// is *not* simply its incoming call argument, so it must not be replaced by a call-site constant.
+fn entry_has_predecessors(f: &Func) -> bool {
+    !crate::cfg::Cfg::new(&f.blocks).preds[0].is_empty()
+}
+
+/// Materialize each `(param, constant)` in `subs` at the top of the entry block and rewrite the
+/// parameter's uses to it. Prepending `c = subs.len()` constants shifts every instruction result by
+/// `c`; a use of a substituted parameter becomes the matching constant, other parameter uses are
+/// unchanged. The parameter list is untouched (the signature must stay valid) — the parameter is simply
+/// left dead.
+fn substitute_params(entry: &Block, subs: &[(usize, Known)]) -> Block {
+    let np = entry.params.len();
+    let c = subs.len() as u32;
+    let mut param_to_const: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut insts: Vec<Inst> = Vec::with_capacity(subs.len() + entry.insts.len());
+    for (pos, (j, k)) in subs.iter().enumerate() {
+        param_to_const.insert(*j as u32, np as u32 + pos as u32);
+        insts.push(k.to_const_inst());
+    }
+    let remap = |o: u32| -> u32 {
+        if (o as usize) < np {
+            param_to_const.get(&o).copied().unwrap_or(o)
+        } else {
+            o + c
+        }
+    };
+    for inst in &entry.insts {
+        let mut ni = inst.clone();
+        map_operands(&mut ni, &mut |o| remap(o));
+        insts.push(ni);
+    }
+    let mut term = entry.term.clone();
+    map_term_operands(&mut term, &mut |o| remap(o));
+    Block {
+        params: entry.params.clone(),
+        insts,
+        term,
+    }
+}
+
+/// **Interprocedural constant propagation.** If a function's parameter is passed the *same*
+/// compile-time constant at **every** direct call site, that parameter is that constant inside the
+/// function — so we substitute it in the entry block ([`substitute_params`]). The per-function passes
+/// then fold through it (branch resolution, arithmetic), and dead-function elimination reclaims code the
+/// folding kills. The signature is unchanged (the parameter stays, now dead; callers keep passing the
+/// constant), so all funcidxs stay valid.
+///
+/// Sound only where we can see **every** value a parameter can take. A function is left alone if it is
+/// the entry (`func 0`) or an export (the host calls it with arbitrary arguments), if its reference is
+/// taken (`ref.func`) or it is a `thread.spawn` entry (callable other than by an argument-visible direct
+/// call), or if its entry block is a loop header (a parameter is then a phi, not the call argument). And
+/// if **any** indirect dispatch survives devirtualization (a funcref value equals its funcidx, so it
+/// could target — and pass arbitrary arguments to — any function), the pass bails entirely, exactly as
+/// dead-function elimination does. (That last gate also means the const-funcref-callback cascade —
+/// propagating a constant funcref into a callee that then `call_indirect`s it — is deferred: it needs a
+/// joint target/const analysis, since the callee's dispatch index is only constant *after* this pass.)
+/// Output is re-verified like everything else.
+pub fn const_prop(m: &Module) -> Module {
+    let n = m.funcs.len();
+    if n == 0 || has_indirect_funcref_dispatch(m) {
+        return m.clone();
+    }
+    let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+
+    // Functions whose parameters we cannot fully see: the entry, exports, address-taken / spawned
+    // functions, and loop-header entries.
+    let mut opaque = vec![false; n];
+    opaque[0] = true;
+    for e in &m.exports {
+        if (e.func as usize) < n {
+            opaque[e.func as usize] = true;
+        }
+    }
+    for (i, f) in m.funcs.iter().enumerate() {
+        if entry_has_predecessors(f) {
+            opaque[i] = true;
+        }
+    }
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::RefFunc { func } | Inst::ThreadSpawn { func, .. } = inst {
+                    if (*func as usize) < n {
+                        opaque[*func as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Per callee parameter, the constant agreed by every call site so far (`conflict` once a site
+    // disagrees or passes a non-constant); `called` marks a callee that has at least one direct site.
+    let mut agreed: Vec<Vec<Option<Known>>> =
+        m.funcs.iter().map(|f| vec![None; f.params.len()]).collect();
+    let mut conflict: Vec<Vec<bool>> = m
+        .funcs
+        .iter()
+        .map(|f| vec![false; f.params.len()])
+        .collect();
+    let mut called = vec![false; n];
+
+    let mut record = |callee: FuncIdx, args: &[u32], consts: &[Option<Known>]| {
+        let f = callee as usize;
+        if f >= n || opaque[f] {
+            return;
+        }
+        called[f] = true;
+        for (j, &a) in args.iter().enumerate() {
+            if j >= agreed[f].len() || conflict[f][j] {
+                continue;
+            }
+            match get(consts, a) {
+                Some(k) => match agreed[f][j] {
+                    None => agreed[f][j] = Some(k),
+                    Some(prev) if prev == k => {}
+                    Some(_) => conflict[f][j] = true,
+                },
+                None => conflict[f][j] = true,
+            }
+        }
+    };
+    for caller in &m.funcs {
+        for b in &caller.blocks {
+            let consts = block_consts(b, &fn_results);
+            for inst in &b.insts {
+                if let Inst::Call { func, args } = inst {
+                    record(*func, args, &consts);
+                }
+            }
+            if let Terminator::ReturnCall { func, args } = &b.term {
+                record(*func, args, &consts);
+            }
+        }
+    }
+
+    let mut funcs = m.funcs.clone();
+    let mut changed = false;
+    for (i, f) in funcs.iter_mut().enumerate() {
+        if opaque[i] || !called[i] {
+            continue;
+        }
+        let subs: Vec<(usize, Known)> = (0..f.params.len())
+            .filter(|&j| !conflict[i][j])
+            .filter_map(|j| agreed[i][j].map(|k| (j, k)))
+            .collect();
+        if subs.is_empty() {
+            continue;
+        }
+        f.blocks[0] = substitute_params(&f.blocks[0], &subs);
+        changed = true;
+    }
+
+    if !changed {
+        return m.clone();
+    }
+    Module {
+        funcs,
+        memory: m.memory,
+        data: m.data.clone(),
+        imports: m.imports.clone(),
+        exports: m.exports.clone(),
+        debug_info: None, // instruction positions shift in a specialized entry block
     }
 }
 

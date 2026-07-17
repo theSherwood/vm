@@ -274,6 +274,23 @@ tracked enhancement, not a blocker.
     signature mismatch is left to trap); peval differential + `opt_sccp` fuzz cover the pipeline. This
     completes the Phase 3 trio (**devirt + inliner + DFE**); multi-block-callee inlining (below) has
     since landed too.
+  - [x] **Interprocedural constant propagation** (`svm_opt::interproc::const_prop`): if a function's
+    parameter is the **same compile-time constant at every direct call site**, that parameter is that
+    constant inside the function, so it is materialized in the entry block and the parameter's uses are
+    rewritten to it (the signature is unchanged — the parameter is left dead, callers keep passing it).
+    The per-function passes then fold through it (branch resolution, arithmetic) and DFE reclaims the
+    now-dead code — the win the vs-Wasmtime data pointed at (interprocedural transforms are svm-opt's
+    JIT edge, since Cranelift is per-function). Complements inlining: it reaches callees **too big to
+    inline**, where inline+SCCP cannot fold the constant (ablation `const_prop` case: **+100 B**, an
+    isolated win no other pass reproduces). Runs after devirt, before inline. Sound only where every
+    value a parameter can take is visible: the entry, exports, `ref.func`/`thread.spawn` functions, and
+    loop-header entries are left alone, and — like DFE — the pass bails entirely while any indirect
+    dispatch survives (a funcref value equals its funcidx, so it could reach any function). `OptConfig.
+    const_prop` toggle (default on). Tests (`tests/interproc.rs`): a constant arg folds a callee branch;
+    differing constants across sites are **not** specialized; an exported function is left alone; the
+    pass is the identity while `call_indirect` is present. **Deferred:** the const-funcref-callback
+    cascade (propagating a constant funcref into a callee that `call_indirect`s it) — it needs a joint
+    target/const analysis, since the callee's dispatch index is only constant *after* this pass.
 - [ ] **Phase 4 — memory passes.** Redundant-load elimination + store-to-load forwarding over
   the effects table (clobber rules 2/4); opt-in scratch-region contract for DSE; simple range
   analysis so LICM/DCE can touch provably in-bounds loads.
