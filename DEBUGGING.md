@@ -150,10 +150,17 @@ different things depending on which pair you compare:
   the same `VarLoc`s as `Inspector::read_var` (SSA from the typed slot, window/fixed from window memory),
   with `read_var_by_name_parity` checking it matches op-for-op — so `DebugRun` now mirrors the Inspector's
   full forward API (breakpoints, stepping, backtrace, indexed **and** named inspection), all parity-tested.
-  What's left is purely **server-side routing**: a backend seam in `svm-dap` that dispatches the
-  forward-subset handlers to either engine — feature plumbing for users whose *correctness* is already
-  guaranteed by the parity tests here, not a parity risk. The JIT path is Stage 5 (separate). The *static*
-  source-map half is covered transitively by **G1**.
+  **The server-side seam now landed.** `svm-dap` grew a `Debuggee` trait (the ~20 forward-subset
+  methods `DapServer` drives), implemented for both the tree-walker `Inspector` and a new
+  `BytecodeBackend` over `DebugRun` (persistent breakpoint set + fuel; `DebugRun` gained public
+  `var_addr`/`read_window` for aggregate/pointer expansion). A launch `"engine":"bytecode"` argument
+  selects it; `supports_reverse`/`supports_watch` gates make `stepBack`/`reverseContinue`/data
+  breakpoints fail cleanly on the forward-only backend. `dap_over_bytecode_matches_the_tree_walker`
+  replays a full scripted DAP conversation against **both** engines and asserts identical observations
+  (breakpoint binding, stop reason, source frame, and `(i, acc)` at every loop iteration through
+  termination) — the runtime, server-level counterpart of `debug_parity.rs`'s engine-level checks. This
+  is what a browser DAP frontend (over the wasm FFI) drives. The JIT path is Stage 5 (separate). The
+  *static* source-map half is covered transitively by **G1**.
 
 ---
 

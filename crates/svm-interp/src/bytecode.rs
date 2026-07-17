@@ -3446,6 +3446,46 @@ impl DebugRun {
         }
     }
 
+    /// The **window address** of a source variable by name in the frame `depth` from the top — the
+    /// bytecode counterpart of `Inspector::var_addr`. `Some(addr)` only for a memory-located variable
+    /// (`Window`/`WindowVia`/`Fixed`); `None` for a promoted SSA scalar (no address), a name that
+    /// isn't an in-scope var here, or no debug info. Feeds a DAP `variables` aggregate/array/pointer
+    /// expansion (and, on the tree-walker, data breakpoints).
+    pub fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
+        let di = self.debug.as_ref()?;
+        let (module, func, block, inst, base) = self.frame_at(depth)?;
+        if module != 0 {
+            return None;
+        }
+        let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
+        match &var.loc {
+            VarLoc::Ssa { .. } | VarLoc::SsaList(_) => None,
+            VarLoc::Window { off } => {
+                Some((self.vm.regs[base].i64() as u64).wrapping_add(*off as u64))
+            }
+            VarLoc::WindowVia { base: locs, off } => {
+                let v = super::loclist_value(locs, block, inst)?;
+                let addr = match self.value_in_frame(depth, v as usize)? {
+                    Value::I32(x) => x as i64 as u64,
+                    Value::I64(x) => x as u64,
+                    _ => return None,
+                };
+                Some(addr.wrapping_add(*off as u64))
+            }
+            VarLoc::Fixed { addr } => Some(*addr),
+        }
+    }
+
+    /// Read `len` bytes from the guest window at `addr` — the bytecode counterpart of
+    /// `Inspector::read_window`, for a DAP `variables` backend walking an aggregate / following a
+    /// pointer. Errs if the range is unmapped or the module has no memory.
+    pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        match self.mem.as_ref() {
+            Some(m) => m.read_window(addr, len),
+            None => Err(Trap::Malformed),
+        }
+    }
+
     /// The running frame's block-local SSA value `idx` ([`value_in_frame`] at depth 0).
     pub fn value(&self, idx: usize) -> Option<Value> {
         self.value_in_frame(0, idx)

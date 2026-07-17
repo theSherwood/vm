@@ -17,8 +17,10 @@ use std::collections::BTreeMap;
 use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue, WatchId, WatchKind};
 use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
+mod backend;
 mod expr;
 mod json;
+pub use backend::{BytecodeBackend, Debuggee};
 pub use json::{parse, Json};
 
 /// The DAP server: protocol state + (after `launch`) a debug [`Session`]. Drive it by feeding parsed
@@ -34,9 +36,11 @@ pub struct DapServer {
     terminated: bool,
 }
 
-/// The live debug target, created by `launch`.
+/// The live debug target, created by `launch`. The stepping engine is a [`Debuggee`] trait object —
+/// the tree-walking [`Inspector`] (full features) or the bytecode [`BytecodeBackend`] (forward-debug
+/// subset, the engine the browser playground runs), chosen by the launch `engine` argument.
 struct Session {
-    inspector: Inspector,
+    inspector: Box<dyn Debuggee>,
     debug: Option<DebugInfo>,
     /// `(file, line) → first IR pc on that line` — the reverse of `Inspector::source_loc`, for
     /// binding source-line breakpoints.
@@ -278,18 +282,34 @@ impl DapServer {
         // (possibly empty) ⇒ a fixed multithreaded interleaving (a witness, or the deterministic
         // default); neither ⇒ single-threaded. Multithreaded debugging surfaces every `thread.spawn`
         // vCPU as a DAP thread.
-        let scheduled = args.get("seed").is_some() || args.get("schedule").is_some();
-        let inspector = if let Some(seed) = args.get("seed").and_then(|v| v.as_i64()) {
-            Inspector::attach_scheduled_seeded(&module, func, &call_args, fuel, seed as u64)
-        } else if let Some(plan) = args.get("schedule").and_then(|v| v.as_array()) {
-            let plan: Vec<u64> = plan
-                .iter()
-                .filter_map(|t| t.as_i64())
-                .map(|t| t as u64)
-                .collect();
-            Inspector::attach_scheduled(&module, func, &call_args, fuel, plan)
+        // The debug engine: `"bytecode"` drives the bytecode VM (what the browser runs) over
+        // `BytecodeBackend`, forward-debug subset only and single-vCPU (seed/schedule ignored);
+        // anything else uses the full-featured tree-walker `Inspector` (the default — every existing
+        // test and multithreaded/reverse debugging).
+        let engine = args
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .unwrap_or("treewalk");
+        let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
+            match BytecodeBackend::new(module, func, &call_args, fuel) {
+                Some(b) => (Box::new(b), false),
+                None => return (false, Json::Null, vec![]), // outside the bytecode debug subset
+            }
         } else {
-            Inspector::attach(&module, func, &call_args, fuel)
+            let scheduled = args.get("seed").is_some() || args.get("schedule").is_some();
+            let insp = if let Some(seed) = args.get("seed").and_then(|v| v.as_i64()) {
+                Inspector::attach_scheduled_seeded(&module, func, &call_args, fuel, seed as u64)
+            } else if let Some(plan) = args.get("schedule").and_then(|v| v.as_array()) {
+                let plan: Vec<u64> = plan
+                    .iter()
+                    .filter_map(|t| t.as_i64())
+                    .map(|t| t as u64)
+                    .collect();
+                Inspector::attach_scheduled(&module, func, &call_args, fuel, plan)
+            } else {
+                Inspector::attach(&module, func, &call_args, fuel)
+            };
+            (Box::new(insp), scheduled)
         };
         self.session = Some(Session {
             inspector,
@@ -440,11 +460,18 @@ impl DapServer {
                 .and_then(|d| d.as_str())
                 .and_then(parse_data_id)
             {
-                Some((addr, len)) => {
-                    let id = session.inspector.set_watchpoint(addr, len, kind);
-                    session.data_watch_ids.push(id);
-                    out.push(Json::obj(vec![("verified", Json::Bool(true))]));
-                }
+                // `set_watchpoint` returns `None` on a backend without watchpoints (bytecode) — report
+                // the data breakpoint unverified rather than silently dropping it.
+                Some((addr, len)) => match session.inspector.set_watchpoint(addr, len, kind) {
+                    Some(id) => {
+                        session.data_watch_ids.push(id);
+                        out.push(Json::obj(vec![("verified", Json::Bool(true))]));
+                    }
+                    None => out.push(Json::obj(vec![
+                        ("verified", Json::Bool(false)),
+                        ("message", Json::s("watchpoints unsupported on this engine")),
+                    ])),
+                },
                 None => out.push(Json::obj(vec![
                     ("verified", Json::Bool(false)),
                     ("message", Json::s("unresolved dataId")),
@@ -880,10 +907,11 @@ impl DapServer {
 
     fn on_step_back(&mut self) -> (bool, Json, Vec<Event>) {
         // Reverse single-step (DEBUGGING.md W1): `Inspector::step_back` re-executes to one unit of
-        // logical time earlier. At the start it stays put. Lands as a `step` stop.
+        // logical time earlier. At the start it stays put. Lands as a `step` stop. Unsupported on the
+        // forward-only bytecode backend — fail cleanly there.
         let stop = match self.session.as_mut() {
-            Some(s) => s.inspector.step_back(),
-            None => return (false, Json::Null, vec![]),
+            Some(s) if s.inspector.supports_reverse() => s.inspector.step_back(),
+            _ => return (false, Json::Null, vec![]),
         };
         (true, Json::Null, self.stop_events(stop))
     }
@@ -896,17 +924,20 @@ impl DapServer {
         let Some(session) = self.session.as_mut() else {
             return (false, Json::Null, vec![]);
         };
+        if !session.inspector.supports_reverse() {
+            return (false, Json::Null, vec![]); // forward-only backend (bytecode)
+        }
         session.frame_refs.clear();
         session.place_refs.clear();
         // The time-travel coordinate: the global scheduler `turn` when multithreaded, the op `clock`
         // single-threaded.
         let scheduled = session.scheduled;
-        let pos = |i: &Inspector| if scheduled { i.turn() } else { i.clock() };
-        let target = pos(&session.inspector);
+        let pos = |i: &dyn Debuggee| if scheduled { i.turn() } else { i.clock() };
+        let target = pos(session.inspector.as_ref());
         session.inspector.seek(0);
         let mut prev: Option<u64> = None;
         while let Stop::Break { reason, pc } = session.inspector.run_until_stop() {
-            let t = pos(&session.inspector);
+            let t = pos(session.inspector.as_ref());
             if t >= target {
                 break; // reached (or passed) where we started
             }
@@ -998,7 +1029,7 @@ impl DapServer {
             None => (&[][..], &[][..]),
         };
         let mut env = EvalEnv {
-            inspector: &session.inspector,
+            inspector: session.inspector.as_ref(),
             types,
             vars,
             frame_idx,
@@ -1343,7 +1374,7 @@ fn scalar_to_i64(types: &[TypeDef], id: TypeId, bytes: &[u8]) -> Option<i64> {
 /// stopped frame, reading the focused thread's window through the neutral structured types. Holds
 /// only immutable borrows; navigation is pure address arithmetic over `TypeDef` (frontend-neutral).
 struct EvalEnv<'a> {
-    inspector: &'a Inspector,
+    inspector: &'a dyn Debuggee,
     types: &'a [TypeDef],
     vars: &'a [VarInfo],
     frame_idx: usize,
