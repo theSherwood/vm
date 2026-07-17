@@ -15,8 +15,11 @@
 //! Scope: `write` / `read` / `malloc` / `free` / `exit`, plus `open` / `close` / `lseek` / `unlink`
 //! over an in-memory filesystem (a `path → bytes` memfs) with a host-side fd table, and
 //! `getcwd` / `chdir` / `getenv` / `setenv` over a host-side cwd + environment. `malloc` is a
-//! first-fit free list over a configured window-heap region. Still to come (POSIX.md §6):
-//! `stat`/`readdir`, signals, and `fork`/`exec`. Pure computation (`strlen`, `snprintf`, `math`, …)
+//! first-fit free list over a configured window-heap region. A minimal **`exec` surface** (STAGE1.md
+//! §5) lets a shell on this personality launch an external command: `exec_lookup` resolves a name
+//! against a `name → Module` PATH registry and `exec_stdout` hands back the `Stream` to forward — the
+//! spawn itself is the shell's own `Instantiator` `cap.call` (op 13), not a personality op. Still to
+//! come (POSIX.md §6): signals and `fork`/`clone`. Pure computation (`strlen`, `snprintf`, `math`, …)
 //! is **guest code**, not a cap — it needs no authority (POSIX.md §1).
 #![forbid(unsafe_code)]
 
@@ -46,6 +49,16 @@ pub const OP_READDIR: u32 = 15;
 pub const OP_CLOSEDIR: u32 = 16;
 pub const OP_ARGC: u32 = 17;
 pub const OP_ARGV: u32 = 18;
+/// **Personality `exec` surface** (STAGE1.md §5) — how a shell running on this personality launches an
+/// external command. `exec_lookup(name_ptr, name_len) -> module_handle | -1` resolves a command name
+/// against the [`Inner::commands`] PATH registry (a `name → Module` handle map the embedder seeds); the
+/// shell then drives `Instantiator.instantiate_module_named` (op 13) + `join` on the returned handle.
+/// `exec_stdout() -> stream_handle` returns the `Stream` the shell should re-grant to the child under
+/// the name `"stdout"` so the command's `write(1, …)` reaches the shell's sink. Neither op *is* the
+/// spawn — op 13 is a guest `cap.call` (the compiled shell holds the `Instantiator`); the personality
+/// only supplies the registry lookup and the forwardable stdout handle.
+pub const OP_EXEC_LOOKUP: u32 = 19;
+pub const OP_EXEC_STDOUT: u32 = 20;
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
@@ -109,6 +122,13 @@ const ALIGN: u64 = 16;
 /// so an embedder/test can read the captured output back after a run.
 struct Inner {
     stdout: Vec<u8>,
+    /// When set, fd-1 writes go **here** instead of [`Inner::stdout`], and [`Posix::stdout`] reads it
+    /// back. This unifies the shell's own output with a spawned child's: the embedder points it at the
+    /// `Host`'s shared stdout sink (`Host::shared_stdout`), the same buffer a re-granted `Stream` writes
+    /// to, so the shell's `write(1, …)` and the command's `write(1, …)` interleave in one stream
+    /// (STAGE1.md §5). `None` keeps the self-contained captured-`Vec` behaviour (unchanged for every
+    /// existing embedder).
+    stdout_sink: Option<Arc<Mutex<Vec<u8>>>>,
     stderr: Vec<u8>,
     /// Preloaded standard input; `read(0, …)` drains it from `stdin_pos`.
     stdin: Vec<u8>,
@@ -152,6 +172,14 @@ struct Inner {
     /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
     /// invalidates the entry so the next `getenv` re-materializes the new value.
     env_ptrs: HashMap<String, u64>,
+    /// The **PATH registry** (STAGE1.md §5): command name → the granted `Module` handle in the shell's
+    /// cap table. `exec_lookup` scans it; the embedder seeds it with [`Posix::register_command`] after
+    /// granting each command `Module`. A plain `Vec` (a shell's PATH is short); first match wins.
+    commands: Vec<(String, i32)>,
+    /// The `Stream` handle `exec_stdout` returns — the stdout the shell re-grants to a spawned child
+    /// under the name `"stdout"`. Set by [`Posix::set_exec_stdout`]; `0` until then (a shell that never
+    /// spawns never reads it).
+    exec_stdout_handle: i32,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -162,13 +190,14 @@ pub struct Posix {
 }
 
 impl Posix {
-    /// Bytes the guest `write`-to-fd-1'd.
+    /// Bytes the guest `write`-to-fd-1'd — from the shared sink when one is set ([`Posix::set_stdout_sink`]),
+    /// else the personality's own captured buffer.
     pub fn stdout(&self) -> Vec<u8> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stdout
-            .clone()
+        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match &st.stdout_sink {
+            Some(sink) => sink.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            None => st.stdout.clone(),
+        }
     }
     /// Bytes the guest `write`-to-fd-2'd.
     pub fn stderr(&self) -> Vec<u8> {
@@ -222,6 +251,37 @@ impl Posix {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).args =
             args.iter().map(|s| s.to_string()).collect();
     }
+
+    /// Route fd-1 (`stdout`) writes to a **shared sink** instead of the personality's own buffer, so a
+    /// spawned child's re-granted `Stream` output and the shell's own output land in one stream
+    /// (STAGE1.md §5). Pass the `Host`'s shared stdout (`Host::shared_stdout()`). [`Posix::stdout`] then
+    /// reads this sink back.
+    pub fn set_stdout_sink(&self, sink: Arc<Mutex<Vec<u8>>>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stdout_sink = Some(sink);
+    }
+
+    /// Register a command in the PATH registry (STAGE1.md §5): `name → module_handle`, where
+    /// `module_handle` is the handle a granted command `Module` has in the shell's cap table. The
+    /// shell's `exec_lookup(name)` returns it (or `-1` when absent). A later registration of the same
+    /// name shadows the earlier (last wins), matching a `PATH` re-export.
+    pub fn register_command(&self, name: &str, module_handle: i32) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.commands.retain(|(n, _)| n != name);
+        st.commands.push((name.to_string(), module_handle));
+    }
+
+    /// Set the `Stream` handle the shell re-grants to a spawned child as its `"stdout"` — what
+    /// `exec_stdout()` returns. Grant the `Stream` on the same `Host`, routed to the shared sink
+    /// (`set_stdout_sink`), so the child's output joins the shell's (STAGE1.md §5).
+    pub fn set_exec_stdout(&self, handle: i32) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .exec_stdout_handle = handle;
+    }
 }
 
 /// The §7 import-name resolver for the POSIX subset: binds libc symbol names to the
@@ -253,6 +313,10 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         // symmetric analogue of `getenv`/`environ`. A guest crt reads these to build `main`'s argv.
         "argc" => OP_ARGC,
         "argv" => OP_ARGV,
+        // Personality `exec` surface (STAGE1.md §5): PATH lookup + the forwardable stdout handle, so a
+        // shell on this personality can spawn an external command via `Instantiator` op 13.
+        "exec_lookup" => OP_EXEC_LOOKUP,
+        "exec_stdout" => OP_EXEC_STDOUT,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -287,6 +351,7 @@ pub fn resolve_bound(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {
     let inner = Arc::new(Mutex::new(Inner {
         stdout: Vec::new(),
+        stdout_sink: None,
         stderr: Vec::new(),
         stdin,
         stdin_pos: 0,
@@ -301,6 +366,8 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         cwd: "/".to_string(),
         env: HashMap::new(),
         env_ptrs: HashMap::new(),
+        commands: Vec::new(),
+        exec_stdout_handle: 0,
     }));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -333,6 +400,8 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
             OP_ARGC => Ok(vec![st.args.len() as i64]),
             OP_ARGV => st.argv(args, mem),
+            OP_EXEC_LOOKUP => st.exec_lookup(args, mem),
+            OP_EXEC_STDOUT => Ok(vec![st.exec_stdout_handle as i64]),
             OP_GETCWD => st.getcwd(args, mem),
             OP_CHDIR => st.chdir(args, mem),
             OP_GETENV => st.getenv(args, mem),
@@ -356,7 +425,13 @@ impl Inner {
         }
         let data = mem.read_bytes(buf, len).ok_or(Trap::Malformed)?;
         match fd {
-            1 => self.stdout.extend_from_slice(&data),
+            1 => match &self.stdout_sink {
+                Some(sink) => sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&data),
+                None => self.stdout.extend_from_slice(&data),
+            },
             2 => self.stderr.extend_from_slice(&data),
             f if f >= FIRST_FD as i64 => return Ok(vec![self.file_write(f as usize, &data)]),
             _ => return Ok(vec![EBADF]),
@@ -622,6 +697,31 @@ impl Inner {
         }
         mem.write_bytes(buf, &bytes).ok_or(Trap::Malformed)?;
         Ok(vec![len])
+    }
+
+    /// `exec_lookup(name_ptr, name_len) -> module_handle | -1`: resolve a command name against the PATH
+    /// registry (STAGE1.md §5). Returns the granted `Module` handle (a small non-negative i32) or `-1`
+    /// when the name is absent — the shell's "command not found". A non-UTF-8 name is likewise `-1` (an
+    /// unfindable command, not a trap).
+    fn exec_lookup(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, len).ok_or(Trap::Malformed)?;
+        let Ok(name) = std::str::from_utf8(&bytes) else {
+            return Ok(vec![-1]);
+        };
+        let h = self
+            .commands
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| *h as i64)
+            .unwrap_or(-1);
+        Ok(vec![h])
     }
 
     /// Allocate the first free fd at [`FIRST_FD`] or above for `of`, extending the table if needed.

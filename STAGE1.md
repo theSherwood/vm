@@ -179,13 +179,24 @@ keystone of self-similarity. It is **not built**. Until it lands:
   a drop-in for unmodified compiled commands. Real redirection/pipelines of
   external commands wait on the endpoint work.
 
-5. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of command
-   `Module`s and the `Instantiator` handle, so the Stage-0 shell dispatches an
-   unknown command to a spawned child instead of `<cmd>: not found`, threading
-   the child's status into `$?`. The compiled shell drives `instantiate_module`/
-   `join` through generic capability imports (the handle-as-first-arg convention,
-   `codegen_ir.c` §7); commands are `--child-entry` modules the embedder mounts.
-   Full stdout inheritance rides the module+grant primitive above.
+5. **`spawn` in the personality** *(substrate done — `crates/svm/tests/stage1_posix_spawn.rs`)*
+   — `svm-posix` gained a minimal **`exec` surface**: a `PATH` registry (`name →
+   Module` handle, `Posix::register_command`) reached by an `exec_lookup` op, plus
+   an `exec_stdout` op handing back the forwardable stdout `Stream`. A compiled-C
+   shell **running on the real personality** now dispatches an unknown command to
+   a spawned external child instead of `<cmd>: not found`: it reads its own `argv`
+   (`argc`/`argv`), looks the command up, and — the spawn being the shell's own
+   `Instantiator` op 13 + `join` (`Resolved::CapBound`) — re-grants `stdout` by
+   name and threads the child's `argc` into the status. The **two stdout models
+   are unified**: `Posix::set_stdout_sink(host.shared_stdout())` routes the
+   personality's fd-1 writes and the child's re-granted `Stream` writes into one
+   `Host` sink, so shell and command output interleave. Differential interp==JIT,
+   three paths (builtin / external / not-found). Confinement untouched (op 13 is
+   the existing fuzzed spawn path; the personality is authority-TCB, §2a).
+   **Follow-up:** fold this onto the full `c_shell.rs` builtin dispatch — its
+   128 KiB window with the personality heap at `win/2` has no room for a 128 KiB
+   command carve, so it needs a larger window and a relocated heap (the focused
+   test uses a dedicated 384 KiB `pool` static + a top-of-window heap).
 6. **Pipelines across real children** — replace the memfs-temp pipeline staging
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
