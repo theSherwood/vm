@@ -186,6 +186,19 @@ different things depending on which pair you compare:
   `dap_over_bytecode_watchpoint_matches_the_tree_walker` proves a write data breakpoint on `[0,8)`
   stops the store on the same line, reason "data breakpoint", on both engines.
 
+  **Watchpoints reached the playground panel (slice 6, the browser consumer of slice 5).** The
+  `browser/web/play.js` Variables pane now renders a ● **watch toggle** per source variable: clicking it
+  mints a `dataId` (`dataBreakpointInfo`, scoped to the paused frame) and arms it (`setDataBreakpoints`,
+  the full-set replace) — the exact request pair a VS Code data breakpoint issues, driven over the wasm
+  FFI. A promoted SSA scalar has no window address, so the server returns a `null` `dataId` and the
+  toggle is greyed — honestly unwatchable. The armed set is re-armed on every stop and cleared with the
+  session. A new demo card ("Debugger (SVM — watchpoints …)") carries a counter at a fixed window
+  address named `count` via an explicit `debug` section, so the watch is armable and trips ("data
+  breakpoint", stopping before the loop-body store writes it) — the one hand-written case where a named
+  variable is memory-located rather than SSA-promoted. Covered by `dap_over_bytecode_named_watchpoint_
+  matches_the_tree_walker` (the same demo program, armed *by name* through `dataBreakpointInfo`, on both
+  engines) and the `browser-play-editor-test.mjs` panel check (arm ● → Continue → "data breakpoint").
+
   **Direction — the one remaining gap is bytecode-engine work, never tree-walker delegation.** The
   tree-walker is the differential oracle only (far too slow for any user-facing path):
   - **Multithreading** (`threads`/`select_task`/`stopped_task`) — the largest: a deterministic

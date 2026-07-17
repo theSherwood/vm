@@ -551,6 +551,194 @@ fn dap_over_bytecode_watchpoint_matches_the_tree_walker() {
     );
 }
 
+// The playground's watchpoint demo (browser/web/play.js `EXAMPLES['Debugger (watchpoints …)']`): a
+// counter at a *fixed* window address, bumped each loop iteration, with a named source variable
+// `count` over it (`debug.var … fixed 0`) so the panel can arm a data breakpoint by name — exactly
+// what `dataBreakpointInfo` + `setDataBreakpoints` resolve. A breakpoint is pre-placed on the loop
+// body (line 12) so a session pauses there to arm the watch. Kept in sync with the playground source.
+const WATCH_COUNTER_DBG: &str = r#"; A counter lives at a fixed window address. Set a watch on `count` in the
+; Variables pane (click its ● toggle), then Continue: the debugger stops the
+; instant a store changes it — stop reason "data breakpoint".
+memory 16
+func () -> (i64) {
+block0():
+  a0 = i64.const 0
+  z = i64.const 0
+  i64.store a0 z
+  br block1(z)
+block1(i: i64):
+  a1 = i64.const 0
+  one = i64.const 1
+  n = i64.add i one
+  i64.store a1 n
+  limit = i64.const 3
+  done = i64.ge_s n limit
+  br_if done block2(n) block1(n)
+block2(r: i64):
+  a2 = i64.const 0
+  out = i64.load a2
+  return out
+}
+
+debug.file 0 "counter.svm"
+debug.fname 0 "count_up"
+debug.loc 0 0 0 0 7 3
+debug.loc 0 0 1 0 8 3
+debug.loc 0 0 2 0 9 3
+debug.loc 0 1 0 0 12 3
+debug.loc 0 1 1 0 13 3
+debug.loc 0 1 2 0 14 3
+debug.loc 0 1 3 0 15 3
+debug.loc 0 1 4 0 16 3
+debug.loc 0 1 5 0 17 3
+debug.loc 0 2 0 0 20 3
+debug.loc 0 2 1 0 21 3
+debug.type 0 base "long" signed 8
+debug.var 0 "count" fixed 0 "long" 0
+"#;
+
+#[test]
+fn dap_over_bytecode_named_watchpoint_matches_the_tree_walker() {
+    // Arm a data breakpoint *by name* (the playground path: `dataBreakpointInfo` on the in-scope
+    // variable `count`, then `setDataBreakpoints` on the minted `dataId`), then Continue: the debugger
+    // stops *before* the loop-body store that touches `count`, reason "data breakpoint", on the same
+    // source line — identically on both engines. This is the runtime, server-level proof that the
+    // browser panel's watch-a-variable flow resolves and trips on the bytecode backend.
+    fn script(engine: Option<&str>) -> (bool, String, i64, String) {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut la = vec![
+            ("programText", Json::s(WATCH_COUNTER_DBG)),
+            ("function", Json::i(0)),
+        ];
+        if let Some(e) = engine {
+            la.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(la)));
+        // Break on line 12 (the loop body) so we pause with `count` in scope to arm the watch.
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("counter.svm"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(12))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+        // Resolve the paused frame's Locals scope, then mint a `dataId` for `count` through it — the
+        // exact request sequence `browser/web/dap.js` issues from the Variables pane.
+        let st = s.handle(&req(
+            5,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        let frame_id = response(&st)
+            .get("body")
+            .unwrap()
+            .get("stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("id")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let sc = s.handle(&req(
+            6,
+            "scopes",
+            Json::obj(vec![("frameId", Json::i(frame_id))]),
+        ));
+        let var_ref = response(&sc)
+            .get("body")
+            .unwrap()
+            .get("scopes")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("variablesReference")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let info = s.handle(&req(
+            7,
+            "dataBreakpointInfo",
+            Json::obj(vec![
+                ("variablesReference", Json::i(var_ref)),
+                ("name", Json::s("count")),
+            ]),
+        ));
+        let data_id = response(&info)
+            .get("body")
+            .and_then(|b| b.get("dataId"))
+            .and_then(|d| d.as_str())
+            .map(str::to_owned);
+        let arm = s.handle(&req(
+            8,
+            "setDataBreakpoints",
+            Json::obj(vec![(
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![
+                    ("dataId", data_id.clone().map(Json::s).unwrap_or(Json::Null)),
+                    ("accessType", Json::s("write")),
+                ])]),
+            )]),
+        ));
+        let verified = response(&arm)
+            .get("body")
+            .and_then(|b| b.get("breakpoints"))
+            .and_then(|b| b.as_array())
+            .and_then(|a| a.first())
+            .and_then(|b| b.get("verified"))
+            .cloned()
+            == Some(Json::Bool(true));
+        // Continue → stop before the loop-body store's write to `count`.
+        let cont = s.handle(&req(9, "continue", Json::obj(vec![])));
+        let reason = event(&cont, "stopped")
+            .and_then(|e| e.get("body")?.get("reason")?.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let out = s.handle(&req(
+            10,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        let line = response(&out)
+            .get("body")
+            .unwrap()
+            .get("stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("line")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        (verified, reason, line, data_id.unwrap_or_default())
+    }
+
+    let bytecode = script(Some("bytecode"));
+    assert!(
+        bytecode.0,
+        "the named data breakpoint verifies on the bytecode engine"
+    );
+    assert_eq!(bytecode.1, "data breakpoint", "stops for the watchpoint");
+    assert_eq!(
+        bytecode.3, "0:8",
+        "`count` resolves to a fixed window range [0, 8)"
+    );
+    assert_eq!(
+        bytecode.2, 15,
+        "stops at the loop-body store's line (before it writes)"
+    );
+    assert_eq!(
+        bytecode,
+        script(None),
+        "bytecode named watchpoint ≡ tree-walker named watchpoint"
+    );
+}
+
 #[test]
 fn dap_over_bytecode_step_back_rewinds_one_op() {
     // stepBack re-executes to one op earlier: after two forward steps the op clock advances, and a

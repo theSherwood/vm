@@ -320,6 +320,59 @@ block2(r: i64):
 `,
   },
 
+  'Debugger (SVM — watchpoints / data breakpoints)': {
+    debug: true,
+    bp: 11, // a breakpoint pre-placed on line 12 (0-based 11), the loop body, so a session pauses to arm
+    mode: 'plain',
+    desc: 'The same DAP debugger, showing data breakpoints (watchpoints) on the bytecode engine. ' +
+      'A counter lives at a fixed window address, named `count` by the `debug` section. Press Debug: it ' +
+      'stops at the pre-placed breakpoint (line 12) with `count` in the Variables pane. Click the ● next ' +
+      'to `count` to break when it changes, then Continue — the debugger stops the instant the loop-body ' +
+      'store writes it (stop reason “data breakpoint”), before the write lands. Continue again to watch ' +
+      'it climb 0 → 1 → 2. A promoted SSA value has no address, so its ● is greyed — honestly ' +
+      'unwatchable. This is DEBUGGING.md slice 5 (the engine-side watchpoints) reaching the playground.',
+    src: `; A counter lives at a fixed window address. Set a watch on \`count\` in the
+; Variables pane (click its ● toggle), then Continue: the debugger stops the
+; instant a store changes it — stop reason "data breakpoint".
+memory 16
+func () -> (i64) {
+block0():
+  a0 = i64.const 0
+  z = i64.const 0
+  i64.store a0 z
+  br block1(z)
+block1(i: i64):
+  a1 = i64.const 0
+  one = i64.const 1
+  n = i64.add i one
+  i64.store a1 n
+  limit = i64.const 3
+  done = i64.ge_s n limit
+  br_if done block2(n) block1(n)
+block2(r: i64):
+  a2 = i64.const 0
+  out = i64.load a2
+  return out
+}
+
+debug.file 0 "counter.svm"
+debug.fname 0 "count_up"
+debug.loc 0 0 0 0 7 3
+debug.loc 0 0 1 0 8 3
+debug.loc 0 0 2 0 9 3
+debug.loc 0 1 0 0 12 3
+debug.loc 0 1 1 0 13 3
+debug.loc 0 1 2 0 14 3
+debug.loc 0 1 3 0 15 3
+debug.loc 0 1 4 0 16 3
+debug.loc 0 1 5 0 17 3
+debug.loc 0 2 0 0 20 3
+debug.loc 0 2 1 0 21 3
+debug.type 0 base "long" signed 8
+debug.var 0 "count" fixed 0 "long" 0
+`,
+  },
+
   // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
   //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
@@ -1258,6 +1311,8 @@ async function proveModuleParity(c) {
 // DAP an editor speaks — the playground is just another DAP frontend.
 let dapClient = null; // the active DAP client while a session runs (else null)
 let dapCard = null; // the card the session belongs to
+let dapWatch = new Set(); // source-variable names armed as data breakpoints (watchpoints) this session
+let dapScopeRef = 0; // the paused frame's Locals `variablesReference` (what `dataBreakpointInfo` scopes to)
 
 // The DAP source a breakpoint request targets — the program's own `debug.file 0 "…"` if it declares
 // one, else the name the engine's auto debug info uses (svm-text's AUTO_DEBUG_FILE = "source.svm"), so
@@ -1277,18 +1332,52 @@ function dapSyncBreakpoints(c) {
 }
 
 // Render the paused frame + its named locals into the card's Variables pane, and highlight the source
-// line (frame.line is 1-based; 0 ⇒ an unmapped op, so no highlight).
+// line (frame.line is 1-based; 0 ⇒ an unmapped op, so no highlight). Each memory-located variable gets
+// a ● watch toggle (a data breakpoint); a promoted SSA scalar has no window address, so its toggle is
+// disabled — the server honestly reports a null `dataId` for it. Re-arms the active watch set each stop.
 function dapShowStop(c) {
   const frame = dapClient.send('stackTrace', { threadId: 1 }).response.body.stackFrames[0];
   if (!frame) return;
   if (frame.line > 0) c.editor.setStopLine(frame.line - 1);
   const scope = dapClient.send('scopes', { frameId: frame.id }).response.body.scopes[0];
-  const vars = dapClient.send('variables', { variablesReference: scope.variablesReference })
-    .response.body.variables;
+  dapScopeRef = scope.variablesReference;
+  const vars = dapClient.send('variables', { variablesReference: dapScopeRef }).response.body.variables;
   const rows = vars
-    .map((v) => `<div><span class="bpname">${v.name}</span> = ${v.value}${v.type ? ` <em>${v.type}</em>` : ''}</div>`)
+    .map((v) => {
+      // A `null` dataId ⇒ no watchable window address here (an SSA-promoted scalar) → disabled toggle.
+      const dataId = dapClient.send('dataBreakpointInfo', { variablesReference: dapScopeRef, name: v.name })
+        .response.body.dataId;
+      const on = dapWatch.has(v.name);
+      const cls = `wp${dataId == null ? ' off' : ''}${on ? ' on' : ''}`;
+      const title = dataId == null ? 'no watchable address here'
+        : (on ? 'Remove this data breakpoint' : 'Break when this value changes');
+      const toggle = `<button class="${cls}" data-watch="${v.name}"${dataId == null ? ' disabled' : ''} title="${title}">●</button>`;
+      return `<div>${toggle} <span class="bpname">${v.name}</span> = ${v.value}${v.type ? ` <em>${v.type}</em>` : ''}</div>`;
+    })
     .join('');
   c.el.dbgVars.innerHTML = `<div>${frame.name} · line ${frame.line}</div>${rows}`;
+  dapArmWatches(); // (re)arm the watched set against this stop's addresses
+}
+
+// Arm the current watch set as DAP data breakpoints: mint a fresh `dataId` for each watched variable
+// (`dataBreakpointInfo`, scoped to the paused frame) and replace the server's set (`setDataBreakpoints`
+// takes the full list each call). A name that no longer resolves to an address is silently dropped.
+function dapArmWatches() {
+  if (!dapClient) return;
+  const breakpoints = [];
+  for (const name of dapWatch) {
+    const dataId = dapClient.send('dataBreakpointInfo', { variablesReference: dapScopeRef, name })
+      .response.body.dataId;
+    if (dataId != null) breakpoints.push({ dataId, accessType: 'write' });
+  }
+  dapClient.send('setDataBreakpoints', { breakpoints });
+}
+
+// Toggle a data breakpoint on a source variable, then re-render (which re-arms + refreshes the ● state).
+function dapToggleWatch(c, name) {
+  if (dapCard !== c || !dapClient) return;
+  dapWatch.has(name) ? dapWatch.delete(name) : dapWatch.add(name);
+  dapShowStop(c);
 }
 
 // Handle a resume reply: a `terminated` event ends the session; a `stopped` event pauses (show it).
@@ -1312,6 +1401,7 @@ function startDebug(c) {
   const src = c.editor.getValue();
   dapClient = createDapClient(eng.ex, eng.memory);
   dapCard = c;
+  dapWatch = new Set();
   c.el.result.textContent = '';
   c.el.dbgVars.innerHTML = '';
   dapClient.send('initialize', {});
@@ -1345,6 +1435,7 @@ function endDebug(c, message) {
   dapClient.send('disconnect', {});
   dapClient = null;
   dapCard = null;
+  dapWatch = new Set();
   c.editor.clearStopLine();
   c.editor.setReadOnly(false);
   c.el.dbg.classList.remove('active');
@@ -1703,6 +1794,12 @@ function buildCard(name, ex) {
   };
   runBtn.addEventListener('click', () => runDemo(c));
   if (debugBtn) debugBtn.addEventListener('click', () => startDebug(c));
+  // Clicking a variable's ● toggle arms/clears a data breakpoint on it (delegated: the Variables pane
+  // is re-rendered on every stop, so the listener lives on the stable container).
+  if (dbgVars) dbgVars.addEventListener('click', (ev) => {
+    const b = ev.target.closest('button[data-watch]');
+    if (b && !b.disabled) dapToggleWatch(c, b.dataset.watch);
+  });
   stopBtn.addEventListener('click', () => stopDemo(c));
   if (proveBtn) proveBtn.addEventListener('click', () => (c.ex.kind === 'module' ? proveModuleParity : proveParity)(c));
   if (resetBtn) resetBtn.addEventListener('click', () => {
