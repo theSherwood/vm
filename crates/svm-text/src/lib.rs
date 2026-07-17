@@ -674,47 +674,92 @@ enum Tok {
     Str(Vec<u8>),
 }
 
-fn tokenize(src: &str) -> Result<Vec<Tok>, ParseError> {
+// Tokenize, tracking the 1-based **source line** of every token (`lines[k]` is the start line of
+// `toks[k]`) so the parser can synthesize a debug line table for hand-written programs (auto debug
+// info — DEBUGGING.md). The line is recorded at each token's start; a multi-line string literal
+// advances the counter by the newlines it spans.
+fn tokenize(src: &str) -> Result<(Vec<Tok>, Vec<u32>), ParseError> {
     let bytes = src.as_bytes();
     let mut i = 0;
+    let mut line = 1u32;
     let mut toks = Vec::new();
+    let mut lines = Vec::new();
+    macro_rules! emit {
+        ($t:expr) => {{
+            toks.push($t);
+            lines.push(line);
+        }};
+    }
     while i < bytes.len() {
         let c = bytes[i];
         match c {
-            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' => i += 1,
             b';' => {
-                // line comment to end of line
+                // line comment to end of line (the trailing `\n` is counted by the arm above)
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
-            b'(' => push(&mut toks, Tok::LParen, &mut i),
-            b')' => push(&mut toks, Tok::RParen, &mut i),
-            b'{' => push(&mut toks, Tok::LBrace, &mut i),
-            b'}' => push(&mut toks, Tok::RBrace, &mut i),
-            b'[' => push(&mut toks, Tok::LBracket, &mut i),
-            b']' => push(&mut toks, Tok::RBracket, &mut i),
-            b':' => push(&mut toks, Tok::Colon, &mut i),
-            b',' => push(&mut toks, Tok::Comma, &mut i),
-            b'=' => push(&mut toks, Tok::Equals, &mut i),
+            b'(' => {
+                emit!(Tok::LParen);
+                i += 1;
+            }
+            b')' => {
+                emit!(Tok::RParen);
+                i += 1;
+            }
+            b'{' => {
+                emit!(Tok::LBrace);
+                i += 1;
+            }
+            b'}' => {
+                emit!(Tok::RBrace);
+                i += 1;
+            }
+            b'[' => {
+                emit!(Tok::LBracket);
+                i += 1;
+            }
+            b']' => {
+                emit!(Tok::RBracket);
+                i += 1;
+            }
+            b':' => {
+                emit!(Tok::Colon);
+                i += 1;
+            }
+            b',' => {
+                emit!(Tok::Comma);
+                i += 1;
+            }
+            b'=' => {
+                emit!(Tok::Equals);
+                i += 1;
+            }
             b'-' => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                    toks.push(Tok::Arrow);
+                    emit!(Tok::Arrow);
                     i += 2;
                 } else {
                     let (tok, ni) = lex_number(bytes, i)?;
-                    toks.push(tok);
+                    emit!(tok);
                     i = ni;
                 }
             }
             b'0'..=b'9' => {
                 let (tok, ni) = lex_number(bytes, i)?;
-                toks.push(tok);
+                emit!(tok);
                 i = ni;
             }
             b'"' => {
+                let start = i;
                 let (tok, ni) = lex_string(bytes, i)?;
-                toks.push(tok);
+                emit!(tok);
+                line += bytes[start..ni].iter().filter(|&&b| b == b'\n').count() as u32;
                 i = ni;
             }
             _ if is_ident_start(c) => {
@@ -724,17 +769,12 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ParseError> {
                 }
                 let s = std::str::from_utf8(&bytes[start..i])
                     .map_err(|_| ParseError("non-utf8 identifier".into()))?;
-                toks.push(Tok::Ident(s.to_string()));
+                emit!(Tok::Ident(s.to_string()));
             }
             _ => return err(format!("unexpected character {:?}", c as char)),
         }
     }
-    Ok(toks)
-}
-
-fn push(toks: &mut Vec<Tok>, t: Tok, i: &mut usize) {
-    toks.push(t);
-    *i += 1;
+    Ok((toks, lines))
 }
 
 /// Lex an integer or float literal. A `.` or exponent makes it a float.
@@ -855,17 +895,40 @@ fn is_ident_char(c: u8) -> bool {
 // ----------------------------------------------------------------------------
 
 /// Parse a module from text.
+/// Parse SVM text to a [`Module`] (no debug info synthesized — a program with no explicit `debug`
+/// section gets `debug_info == None`, the long-standing behavior every consumer expects).
 pub fn parse_module(src: &str) -> Result<Module, ParseError> {
-    let toks = tokenize(src)?;
+    parse_module_inner(src, false)
+}
+
+/// Parse SVM text and, if the program carries **no** explicit `debug` section, synthesize one from the
+/// source: a line table (each instruction → its source line) and an SSA-value table (each value → its
+/// text name, scoped to its block). This makes any hand-written SVM program debuggable — set a
+/// breakpoint on a line, inspect the values by name — the DAP debugger's on-ramp for SVM text
+/// (DEBUGGING.md). A program that *does* declare `debug.*` is respected verbatim.
+pub fn parse_module_debug(src: &str) -> Result<Module, ParseError> {
+    parse_module_inner(src, true)
+}
+
+/// The synthetic source name auto debug info attributes lines to (matched by the DAP breakpoint
+/// request's `source.path`).
+pub const AUTO_DEBUG_FILE: &str = "source.svm";
+
+fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError> {
+    let (toks, lines) = tokenize(src)?;
     // Calls may forward-reference functions defined later, so we need every
     // function's result arity before parsing bodies (it determines how many value
     // indices a `call` binds). A cheap header-only prescan supplies it.
     let fn_results = prescan_fn_results(&toks)?;
     let mut p = Parser {
         toks: &toks,
+        lines: &lines,
         pos: 0,
         fn_results,
         imports: Vec::new(),
+        auto_debug,
+        auto_locs: Vec::new(),
+        auto_vars: Vec::new(),
     };
     let mut funcs = Vec::new();
     let mut memory = None;
@@ -1118,18 +1181,17 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     .map_err(|_| ParseError(format!("export funcidx out of range: {n}")))?;
                 exports.push(Export { name, func });
             }
-            _ => funcs.push(p.parse_func()?),
+            _ => funcs.push(p.parse_func(funcs.len() as u32)?),
         }
     }
-    let debug_info = if dbg_files.is_empty()
+    let no_explicit = dbg_files.is_empty()
         && dbg_locs.is_empty()
         && dbg_types.is_empty()
         && dbg_vars.is_empty()
         && dbg_blobs.is_empty()
-        && dbg_func_names.is_empty()
-    {
-        None
-    } else {
+        && dbg_func_names.is_empty();
+    let debug_info = if !no_explicit {
+        // An explicit `debug` section wins verbatim.
         Some(DebugInfo {
             files: dbg_files,
             locs: dbg_locs,
@@ -1138,6 +1200,18 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             blobs: dbg_blobs,
             func_names: dbg_func_names,
         })
+    } else if auto_debug && !p.auto_locs.is_empty() {
+        // No explicit section, and the caller asked to synthesize one from the source.
+        Some(DebugInfo {
+            files: vec![AUTO_DEBUG_FILE.to_string()],
+            locs: std::mem::take(&mut p.auto_locs),
+            types: Vec::new(),
+            vars: std::mem::take(&mut p.auto_vars),
+            blobs: Vec::new(),
+            func_names: Vec::new(),
+        })
+    } else {
+        None
     };
     Ok(Module {
         funcs,
@@ -1154,9 +1228,13 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
 fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
     let mut p = Parser {
         toks,
+        lines: &[],
         pos: 0,
         fn_results: Vec::new(),
         imports: Vec::new(),
+        auto_debug: false,
+        auto_locs: Vec::new(),
+        auto_vars: Vec::new(),
     };
     let mut out = Vec::new();
     while !p.at_end() {
@@ -1296,12 +1374,20 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
 
 struct Parser<'a> {
     toks: &'a [Tok],
+    /// The 1-based source line of each token (`lines[k]` ↔ `toks[k]`), for the auto debug line table.
+    /// Empty in the header prescan (which needs no positions).
+    lines: &'a [u32],
     pos: usize,
     /// Result arity of each function (by index), from the prescan.
     fn_results: Vec<usize>,
     /// §7 named imports declared at module top, in order; a `call.import <idx>` recovers its
     /// op signature from here (imports always precede the functions that reference them).
     imports: Vec<Import>,
+    /// When set, synthesize debug info (a line table + SSA-value names) for a program that carries no
+    /// explicit `debug` section, so any hand-written SVM text is debuggable. Accumulated below.
+    auto_debug: bool,
+    auto_locs: Vec<Loc>,
+    auto_vars: Vec<VarInfo>,
 }
 
 /// A branch edge whose target is still a label name.
@@ -1313,6 +1399,19 @@ struct PBlock {
     params: Vec<ValType>,
     insts: Vec<Inst>,
     term: PTerm,
+    /// Source positions for the auto debug line table (empty unless `auto_debug`).
+    dbg: PBlockDbg,
+}
+
+/// Per-block source positions gathered while parsing, for synthesizing debug info: the block's
+/// terminator line (its scope end), the line of each instruction, and each SSA value's `(name,
+/// block-local index, scope-start line)` — params scoped from the header, results from just after the
+/// line that defines them (so a value shows only once assigned).
+#[derive(Default)]
+struct PBlockDbg {
+    term_line: u32,
+    inst_lines: Vec<u32>,
+    vars: Vec<(String, u32, u32)>,
 }
 
 enum PTerm {
@@ -1349,6 +1448,11 @@ impl<'a> Parser<'a> {
         self.toks.get(self.pos)
     }
 
+    /// The 1-based source line of the upcoming token (`0` if positions weren't tracked / at EOF).
+    fn cur_line(&self) -> u32 {
+        self.lines.get(self.pos).copied().unwrap_or(0)
+    }
+
     fn next(&mut self) -> Result<&Tok, ParseError> {
         let t = self
             .toks
@@ -1374,7 +1478,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_func(&mut self) -> Result<Func, ParseError> {
+    fn parse_func(&mut self, func_idx: u32) -> Result<Func, ParseError> {
         // `func (types) -> (types) { blocks }`
         let kw = self.ident()?;
         if kw != "func" {
@@ -1399,6 +1503,33 @@ impl<'a> Parser<'a> {
         for (i, b) in pblocks.iter().enumerate() {
             if labels.insert(b.label.clone(), i as u32).is_some() {
                 return err(format!("duplicate block label `{}`", b.label));
+            }
+        }
+
+        // Synthesize this function's debug line table + SSA-value names (auto debug info): each
+        // instruction maps to its source line, and each value to its text name, scoped to its block.
+        if self.auto_debug {
+            for (b_idx, b) in pblocks.iter().enumerate() {
+                for (inst, &line) in b.dbg.inst_lines.iter().enumerate() {
+                    self.auto_locs.push(Loc {
+                        func: func_idx,
+                        block: b_idx as u32,
+                        inst: inst as u32,
+                        file: 0,
+                        line,
+                        col: 0,
+                    });
+                }
+                for (name, idx, scope_start) in &b.dbg.vars {
+                    self.auto_vars.push(VarInfo {
+                        func: func_idx,
+                        name: name.clone(),
+                        ty: String::new(),
+                        loc: VarLoc::Ssa { value: *idx },
+                        type_id: None,
+                        scope: Some((*scope_start, b.dbg.term_line)),
+                    });
+                }
             }
         }
         let edge = |e: PEdge| -> Result<(u32, Vec<u32>), ParseError> {
@@ -1480,10 +1611,13 @@ impl<'a> Parser<'a> {
 
     fn parse_block(&mut self) -> Result<PBlock, ParseError> {
         // `label(name: type, ...):` then instruction lines, then a terminator.
+        let header_line = self.cur_line();
         let label = self.ident()?;
         // Per-block value-name table; parameters take indices 0..k.
         let mut names: HashMap<String, u32> = HashMap::new();
         let mut params = Vec::new();
+        // Auto debug positions (only filled when synthesizing debug info).
+        let mut dbg = PBlockDbg::default();
 
         self.expect(&Tok::LParen)?;
         while self.peek() != Some(&Tok::RParen) {
@@ -1497,6 +1631,10 @@ impl<'a> Parser<'a> {
             if names.insert(n.clone(), idx).is_some() {
                 return err(format!("duplicate value name `{n}`"));
             }
+            // A parameter is live from the block header.
+            if self.auto_debug {
+                dbg.vars.push((n, idx, header_line));
+            }
             params.push(t);
         }
         self.expect(&Tok::RParen)?;
@@ -1507,6 +1645,7 @@ impl<'a> Parser<'a> {
 
         // Parse instruction lines until we hit a terminator keyword.
         loop {
+            let cur = self.cur_line();
             let kw = match self.peek() {
                 Some(Tok::Ident(s)) => s.clone(),
                 _ => return err("expected instruction or terminator"),
@@ -1521,11 +1660,13 @@ impl<'a> Parser<'a> {
                     | "unreachable"
             ) {
                 let term = self.parse_term(&names)?;
+                dbg.term_line = cur;
                 return Ok(PBlock {
                     label,
                     params,
                     insts,
                     term,
+                    dbg,
                 });
             }
 
@@ -1535,6 +1676,9 @@ impl<'a> Parser<'a> {
             let lhs = self.try_binding_lhs();
             let inst = self.parse_inst(&names)?;
             let n = inst.result_count(&self.fn_results);
+            if self.auto_debug {
+                dbg.inst_lines.push(cur);
+            }
             match lhs {
                 Some(lhs) => {
                     if lhs.len() != n {
@@ -1546,6 +1690,11 @@ impl<'a> Parser<'a> {
                     for name in lhs {
                         if names.insert(name.clone(), next_idx).is_some() {
                             return err(format!("duplicate value name `{name}`"));
+                        }
+                        // A result is live from *after* the line that assigns it (so it shows only
+                        // once computed — the stop is *before* the op).
+                        if self.auto_debug {
+                            dbg.vars.push((name, next_idx, cur + 1));
                         }
                         next_idx += 1;
                     }
@@ -2578,6 +2727,53 @@ block0(v0: i64):
         // Print → re-parse is identity (exports preserved in declaration order).
         let m2 = parse_module(&print_module(&m)).expect("reparse");
         assert_eq!(m, m2, "export syntax must round-trip");
+    }
+
+    #[test]
+    fn auto_debug_synthesizes_a_line_table_and_named_ssa_values() {
+        let src = "\
+func () -> (i64) {
+block0():
+  vn = i64.const 5
+  vacc0 = i64.const 0
+  br block1(vn, vacc0)
+block1(vi: i64, vacc: i64):
+  vsum = i64.add vacc vi
+  vone = i64.const 1
+  vnext = i64.sub vi vone
+  br_if vnext block1(vnext, vsum) block2(vsum)
+block2(vr: i64):
+  return vr
+}
+";
+        // Plain parse leaves a program with no `debug` section as `None` (unchanged behavior).
+        assert!(parse_module(src).unwrap().debug_info.is_none());
+
+        // The debug parse synthesizes a source-named line table + SSA-value table.
+        let di = parse_module_debug(src)
+            .unwrap()
+            .debug_info
+            .expect("auto debug info");
+        assert_eq!(di.files, vec![AUTO_DEBUG_FILE.to_string()]);
+
+        // block1 inst0 (`vsum = i64.add`) is on source line 7; inst2 (`vnext = i64.sub`) on line 9.
+        let loc = |b, i| {
+            di.locs
+                .iter()
+                .find(|l| l.func == 0 && l.block == b && l.inst == i)
+                .unwrap()
+        };
+        assert_eq!(loc(1, 0).line, 7);
+        assert_eq!(loc(1, 2).line, 9);
+
+        // Loop params i/acc are ssa 0/1, live from the block header (line 6); the result `vsum`
+        // (block-local index 2) is scoped from just after its defining line (7 → 8).
+        let var = |n: &str| di.vars.iter().find(|v| v.name == n).unwrap();
+        assert!(matches!(var("vi").loc, VarLoc::Ssa { value: 0 }));
+        assert_eq!(var("vi").scope.unwrap().0, 6);
+        assert!(matches!(var("vacc").loc, VarLoc::Ssa { value: 1 }));
+        assert!(matches!(var("vsum").loc, VarLoc::Ssa { value: 2 }));
+        assert_eq!(var("vsum").scope.unwrap().0, 8);
     }
 
     #[test]

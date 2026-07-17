@@ -297,32 +297,26 @@ block0(v0: i64):
     bp: 7, // a breakpoint pre-placed on line 8 (0-based 7), the loop body
     mode: 'plain',
     desc: 'The §DEBUGGING Debug Adapter Protocol debugger, running on the bytecode engine right here ' +
-      'in the sandbox. This SVM program sums i = n…1; its `debug` section maps the loop body to source ' +
-      'lines and names the loop variables. Click the gutter to set/clear breakpoints (one is pre-placed ' +
-      'on line 8), then press Debug: it stops at the line, highlights it, and shows i / acc in the ' +
-      'Variables pane. Step and Continue walk the loop — watch acc accumulate. Run executes it normally ' +
-      '(→ 15). Same DAP server VS Code speaks, driven over the wasm FFI.',
+      'in the sandbox — no `debug` section needed. The engine auto-derives a line table and names the ' +
+      'SSA values straight from the SVM text, so any program you write here is debuggable. Click the ' +
+      'gutter to set/clear breakpoints (one is pre-placed on line 8), then press Debug: it stops at the ' +
+      'line, highlights it, and shows the in-scope values (i / acc) in the Variables pane. Step and ' +
+      'Continue walk the loop — watch acc accumulate. Run executes it normally (→ 15). Same DAP server ' +
+      'VS Code speaks, driven over the wasm FFI.',
     src: `; Sum i = n..1 into acc. Click the gutter to set a breakpoint, then press Debug.
 func () -> (i64) {
 block0():
-  vn = i64.const 5
-  vacc0 = i64.const 0
-  br block1(vn, vacc0)
-block1(vi: i64, vacc: i64):
-  vsum = i64.add vacc vi
-  vone = i64.const 1
-  vnext = i64.sub vi vone
-  br_if vnext block1(vnext, vsum) block2(vsum)
-block2(vr: i64):
-  return vr
+  n = i64.const 5
+  acc0 = i64.const 0
+  br block1(n, acc0)
+block1(i: i64, acc: i64):
+  sum = i64.add acc i
+  one = i64.const 1
+  next = i64.sub i one
+  br_if next block1(next, sum) block2(sum)
+block2(r: i64):
+  return r
 }
-
-debug.file 0 "sum.svm"
-debug.fname 0 "sum"
-debug.loc 0 1 0 0 8 3
-debug.loc 0 1 2 0 10 3
-debug.var 0 "i" ssa 0 "i64"
-debug.var 0 "acc" ssa 1 "i64"
 `,
   },
 
@@ -1078,11 +1072,12 @@ async function proveModuleParity(c) {
 let dapClient = null; // the active DAP client while a session runs (else null)
 let dapCard = null; // the card the session belongs to
 
-// The DAP source a breakpoint request targets — the program's own `debug.file 0 "…"` (so the server's
-// file match binds); falls back to a generic name if the program declares none.
+// The DAP source a breakpoint request targets — the program's own `debug.file 0 "…"` if it declares
+// one, else the name the engine's auto debug info uses (svm-text's AUTO_DEBUG_FILE = "source.svm"), so
+// breakpoints bind for a hand-written program with no explicit `debug` section.
 function dapSourceName(src) {
   const m = /debug\.file\s+0\s+"([^"]+)"/.exec(src);
-  return m ? m[1] : 'source';
+  return m ? m[1] : 'source.svm';
 }
 
 // Push the card's current breakpoint lines (editor 0-based → DAP 1-based) to the server.

@@ -247,6 +247,141 @@ fn dap_over_bytecode_matches_the_tree_walker() {
     );
 }
 
+// A program with NO explicit debug section — the server synthesizes one (line table + SSA names) so
+// hand-written SVM text is debuggable. Same sum loop, sans the `debug.*` directives.
+const PLAIN_SUM: &str = r#"
+func () -> (i64) {
+block0():
+  vn = i64.const 5
+  vacc0 = i64.const 0
+  br block1(vn, vacc0)
+block1(vi: i64, vacc: i64):
+  vsum = i64.add vacc vi
+  vone = i64.const 1
+  vnext = i64.sub vi vone
+  br_if vnext block1(vnext, vsum) block2(vsum)
+block2(vr: i64):
+  return vr
+}
+"#;
+
+#[test]
+fn dap_over_bytecode_debugs_plain_svm_via_synthesized_debug_info() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(PLAIN_SUM)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "launch ok"
+    );
+
+    // A breakpoint on the loop body (line 8, `vsum = i64.add`) binds against the synthesized table.
+    let out = s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(8))])]),
+            ),
+        ]),
+    ));
+    let bp0 = &response(&out)
+        .get("body")
+        .unwrap()
+        .get("breakpoints")
+        .unwrap()
+        .as_array()
+        .unwrap()[0];
+    assert_eq!(
+        bp0.get("verified"),
+        Some(&Json::Bool(true)),
+        "breakpoint binds on plain SVM"
+    );
+    assert_eq!(bp0.get("line"), Some(&Json::i(8)));
+
+    // Run to it; the loop variables read back by their **text names** (i / acc), not v-indices.
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert!(
+        event(&out, "stopped").is_some(),
+        "stops at the synthesized breakpoint"
+    );
+    let (i, acc) = read_named(&mut s, 5, "vi", "vacc");
+    assert_eq!(
+        (i.as_str(), acc.as_str()),
+        ("5", "0"),
+        "vi=5, vacc=0 at the first hit"
+    );
+}
+
+/// Read two named locals at the current stop (innermost frame).
+fn read_named(s: &mut DapServer, seq: i64, a: &str, b: &str) -> (String, String) {
+    let out = s.handle(&req(
+        seq,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let top = &response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0];
+    let fid = top.get("id").unwrap().as_i64().unwrap();
+    let out = s.handle(&req(
+        seq,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    let vref = response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        seq,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    let vars = response(&out)
+        .get("body")
+        .unwrap()
+        .get("variables")
+        .unwrap();
+    let map: std::collections::HashMap<&str, &str> = vars
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            (
+                v.get("name").unwrap().as_str().unwrap(),
+                v.get("value").unwrap().as_str().unwrap(),
+            )
+        })
+        .collect();
+    (
+        map.get(a).copied().unwrap_or("?").to_string(),
+        map.get(b).copied().unwrap_or("?").to_string(),
+    )
+}
+
 #[test]
 fn dap_over_bytecode_refuses_reverse_debugging() {
     // The bytecode backend is forward-only: stepBack / reverseContinue fail cleanly (the browser's

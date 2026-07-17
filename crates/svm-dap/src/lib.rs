@@ -263,7 +263,9 @@ impl DapServer {
                 None => return (false, Json::Null, vec![]),
             },
         };
-        let Ok(module) = svm_text::parse_module(&text) else {
+        // Synthesize debug info for a program with no explicit `debug` section, so hand-written SVM
+        // text is debuggable (breakpoints by line, SSA values by name). An explicit section wins.
+        let Ok(module) = svm_text::parse_module_debug(&text) else {
             return (false, Json::Null, vec![]);
         };
         let func = args.get("function").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
