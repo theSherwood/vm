@@ -77,12 +77,24 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    is the substrate guarantee the shell's command dispatch rests on: look a
    command up, spawn its entry, thread its exit code into `$?`. Differential
    interp==JIT. The name→entry map itself is trivial glue and lands in slice 4.
+   - **C-applet ABI** *(done — `stage1_granted_argv_applet.rs`)* — the applet
+     receives its `stdout` as an *entry argument* (via `instantiate_granted`,
+     op 8 — the handle is the child's 3rd arg) and writes through it, rather than
+     resolving by name. This is the shape a **chibicc-compiled** applet must take:
+     the frontend's generic capability import passes the handle as the *first C
+     argument at runtime* (`codegen_ir.c` §7) and cannot emit `cap.self.resolve`,
+     so `applet(inst, addrspace, stdout_h)` writing through `stdout_h` is the
+     natural form. Proven with a seeded-argv echo, differential interp==JIT.
 4. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of applet
    entries and the `Instantiator`/`stdout` handles, so the Stage-0 shell
    dispatches an unknown command to a spawned child instead of
    `<cmd>: not found`, threading the child's status into `$?`. This is the
-   chibicc-integration slice: the compiled shell drives `instantiate_named`/
-   `join` through generic capability imports.
+   chibicc-integration slice: the compiled shell drives `instantiate_granted`/
+   `join` through generic capability imports, applets are C funcs taking
+   `(inst, addrspace, stdout_h)` (the ABI pinned in slice 3), and the parent
+   seeds the argv[] block (the layout pinned in slice 1). The remaining frontend
+   piece is exposing an `instantiate_granted`/`join` import binding and reaching
+   an applet's function index from the shell.
 5. **Pipelines across real children** — replace the memfs-temp pipeline staging
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
