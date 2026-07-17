@@ -34,14 +34,50 @@ use crate::ssa::{from_ssa, to_ssa, Def, Value};
 use crate::thread::{dominates, Threader};
 use crate::{each_operand, map_operands, map_term_operands};
 
-/// One hoist to apply: the loop instruction's result `rv` (in `block`) moves to preheader `ph` as
-/// `clone` (operands already rewritten to preheader-valid values), typed `ty`.
+/// How an invariant operand is named in the preheader: either an existing value that already reaches
+/// the preheader, or a constant to **rematerialize** there (a fresh copy) rather than thread in.
+enum Rep {
+    Value(Value),
+    Const(Inst),
+}
+
+/// One hoist to apply: the loop instruction's result `rv` (in `block`, its original form `inst`) moves
+/// to preheader `ph`, typed `ty`. `reps` names each operand in the preheader; operands are rewritten
+/// when the hoist is applied (after any constants are materialized there).
 struct Hoist {
     rv: Value,
     block: u32,
     ph: u32,
-    clone: Inst,
+    inst: Inst,
+    reps: BTreeMap<Value, Rep>,
     ty: ValType,
+}
+
+/// A rematerializable constant: recomputing it anywhere is free, so hoisting one out of a loop only
+/// adds a threaded block parameter (pure overhead). Such ops are never hoisted on their own; when a
+/// worthwhile hoist *uses* one, it is re-emitted in the preheader instead of threaded.
+fn is_const(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::ConstI32(_)
+            | Inst::ConstI64(_)
+            | Inst::ConstF32(_)
+            | Inst::ConstF64(_)
+            | Inst::ConstV128(_)
+    )
+}
+
+/// The result type of a constant instruction (used to type a rematerialized copy). Only called on
+/// values for which [`is_const`] holds.
+fn const_type(inst: &Inst) -> ValType {
+    match inst {
+        Inst::ConstI32(_) => ValType::I32,
+        Inst::ConstI64(_) => ValType::I64,
+        Inst::ConstF32(_) => ValType::F32,
+        Inst::ConstF64(_) => ValType::F64,
+        Inst::ConstV128(_) => ValType::V128,
+        _ => unreachable!("const_type on a non-constant instruction"),
+    }
 }
 
 /// Enumerate a terminator's out-edges as `(target, &args)`.
@@ -94,6 +130,17 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
         def_block[v] = match d {
             Def::Param { block, .. } | Def::Result { block, .. } => *block,
         };
+    }
+    // Values defined by a constant instruction — rematerializable in the preheader instead of threaded.
+    let mut const_def: BTreeMap<Value, Inst> = BTreeMap::new();
+    for (b, blk) in s.blocks.iter().enumerate() {
+        let mut slot = blk.params.len();
+        for inst in &blk.insts {
+            if is_const(inst) {
+                const_def.insert(s.values[b][slot], inst.clone());
+            }
+            slot += inst.result_count(&fn_results);
+        }
     }
     // inst_results[b][ii] and in_args[b][j] (all incoming args for parameter j of block b).
     let mut inst_results: Vec<Vec<Vec<Value>>> = Vec::with_capacity(nblocks);
@@ -223,14 +270,18 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
         }
 
         // Name an invariant operand in the preheader: a value already dominating the preheader is used
-        // directly; an invariant header parameter becomes its entry argument. Otherwise not hoistable.
-        let avail_at_ph = |o: Value| -> Option<Value> {
+        // directly; a loop-body constant is rematerialized there; an invariant header parameter becomes
+        // its entry argument. Otherwise not hoistable.
+        let avail_at_ph = |o: Value| -> Option<Rep> {
             if dominates(&idom, def_block[o as usize], ph) {
-                return Some(o);
+                return Some(Rep::Value(o));
+            }
+            if let Some(c) = const_def.get(&o) {
+                return Some(Rep::Const(c.clone()));
             }
             if let Some(&j) = header_slot.get(&o) {
                 if invariant[o as usize] {
-                    return entry_arg[j];
+                    return entry_arg[j].map(Rep::Value);
                 }
             }
             None
@@ -246,8 +297,11 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
                 if !inst.effects().is_pure() {
                     continue; // must be pure + non-trapping to speculate above the loop
                 }
+                if is_const(inst) {
+                    continue; // free to recompute — threading it out would be pure overhead
+                }
                 // Every operand must be nameable in the preheader.
-                let mut reps: BTreeMap<Value, Value> = BTreeMap::new();
+                let mut reps: BTreeMap<Value, Rep> = BTreeMap::new();
                 let mut ok = true;
                 each_operand(inst, |o| match avail_at_ph(o) {
                     Some(r) => {
@@ -259,13 +313,12 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
                     continue;
                 }
                 let rv = results[0];
-                let mut clone = inst.clone();
-                map_operands(&mut clone, &mut |o| reps[&o]);
                 hoists.push(Hoist {
                     rv,
                     block: b,
                     ph,
-                    clone,
+                    inst: inst.clone(),
+                    reps,
                     ty: gtype[rv as usize],
                 });
             }
@@ -283,12 +336,31 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
         gtype,
         avail: BTreeMap::new(),
     };
+    // Constants rematerialized in a preheader, keyed per preheader, so each distinct constant is
+    // emitted at most once there.
+    let mut const_cache: BTreeMap<u32, Vec<(Inst, Value)>> = BTreeMap::new();
     for h in hoists {
-        let new_rv = threader.s.num_values;
-        threader.s.num_values += 1;
-        threader.s.blocks[h.ph as usize].insts.push(h.clone);
-        threader.s.values[h.ph as usize].push(new_rv);
-        threader.gtype.push(h.ty);
+        // Name every operand in the preheader, materializing constants (deduped per preheader).
+        let mut operand_val: BTreeMap<Value, Value> = BTreeMap::new();
+        for (&o, rep) in &h.reps {
+            let v = match rep {
+                Rep::Value(v) => *v,
+                Rep::Const(c) => {
+                    let cache = const_cache.entry(h.ph).or_default();
+                    if let Some((_, v)) = cache.iter().find(|(i, _)| i == c) {
+                        *v
+                    } else {
+                        let v = threader.emit(h.ph, c.clone(), const_type(c));
+                        const_cache.entry(h.ph).or_default().push((c.clone(), v));
+                        v
+                    }
+                }
+            };
+            operand_val.insert(o, v);
+        }
+        let mut clone = h.inst.clone();
+        map_operands(&mut clone, &mut |o| operand_val[&o]);
+        let new_rv = threader.emit(h.ph, clone, h.ty);
         let threaded = threader.make_available(new_rv, h.ph, h.block);
         let bi = h.block as usize;
         for inst in &mut threader.s.blocks[bi].insts {

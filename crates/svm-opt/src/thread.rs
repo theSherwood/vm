@@ -9,7 +9,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use svm_ir::{Terminator, ValType};
+use svm_ir::{Inst, Terminator, ValType};
 
 use crate::ssa::{SsaFunc, Value};
 
@@ -104,5 +104,17 @@ impl Threader<'_> {
             append_edge_arg(&mut self.s.blocks[p as usize].term, at, arg);
         }
         g
+    }
+
+    /// Append a single-result instruction to block `b` and return its fresh value, typed `ty`. Used to
+    /// place a hoisted computation (or a rematerialized constant) in a preheader before threading its
+    /// result back into the loop.
+    pub fn emit(&mut self, b: u32, inst: Inst, ty: ValType) -> Value {
+        let v = self.s.num_values;
+        self.s.num_values += 1;
+        self.gtype.push(ty);
+        self.s.blocks[b as usize].insts.push(inst);
+        self.s.values[b as usize].push(v);
+        v
     }
 }
