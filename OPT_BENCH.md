@@ -18,8 +18,9 @@ SVM_BENCH_CSV=1 cargo test --release -p svm-peval --test opt_bench -- --include-
 
 - numbers below: release build, single host, single run — machine-dependent, ratios are the story.
 - `none` = only the always-on intra-block canonicalization (fold / DCE / copy-prop / merge / prune).
-  `all` = full pipeline. The **eleven** togglable passes are: `sccp`, `reassociate`, `gvn`, `licm`,
-  `local_cse`, `jump_thread` (Phase 2); `devirt`, `inline`, `dfe` (Phase 3); `mem`, `load_elim`
+  `all` = full pipeline. The **twelve** togglable passes are: `sccp`, `reassociate`, `gvn`, `licm`,
+  `local_cse`, `jump_thread` (Phase 2); `devirt`, `const_prop`, `inline`, `dfe` (Phase 3); `mem`,
+  `load_elim`
   (Phase 4).
 
 ## How to read it
@@ -53,6 +54,7 @@ win). Passes not listed for a case had zero delta there.
 | memory (mem + load_elim) | 5/85 → 3/77 | **mem +4, load_elim +4** |
 | interproc (devirt+inline+dfe) | 10/82 → 7/41 | **devirt +41, inline +18, dfe +47** |
 | multiblock inline (inline+dfe) | 4/67 → 3/64 | inline +3, **dfe +33** |
+| const_prop (arg → branch fold) | 30/141 → 2/41 | **const_prop +100** |
 
 Reading it:
 
@@ -74,6 +76,11 @@ Reading it:
   the byte win comes downstream — `dfe` (+33) reclaiming the now-dead callee, and the caller's own code
   folding through the inlined region. The point is capability, not raw bytes: this callee shape was a
   hard `call` before.
+- **Interprocedural constant propagation** (the `const_prop` case, a helper too big to inline called
+  with a constant `flag`) is a clean **+100** — an isolated win no other pass reproduces. The helper
+  exceeds the inliner's size cap, so inline+SCCP can't fold the flag; only propagating the constant into
+  the callee resolves its branch and lets DCE reclaim the large dead arm. This is the interprocedural
+  edge the vs-Wasmtime table pointed at, made to fire where inlining can't reach.
 - **LICM's negative delta on loops is bounded by a cost model**: it hoists/threads invariants through
   new block params (larger static code, to save run time — next section), but never a bare constant
   (free to recompute — threading one is pure overhead) and it rematerializes an invariant's constant

@@ -186,6 +186,9 @@ pub struct OptConfig {
     /// Constant-funcref devirtualization (`svm_opt::interproc::devirtualize`) — module-level, runs
     /// before inlining (a devirtualized call becomes an inlining candidate).
     pub devirt: bool,
+    /// Interprocedural constant propagation (`svm_opt::interproc::const_prop`) — module-level;
+    /// substitutes a parameter that is the same constant at every direct call site into the callee.
+    pub const_prop: bool,
     /// Budgeted direct-call inlining (`svm_opt::interproc::inline_calls`) — module-level, runs once
     /// before the per-function passes.
     pub inline: bool,
@@ -211,6 +214,7 @@ impl OptConfig {
             local_cse: true,
             jump_thread: true,
             devirt: true,
+            const_prop: true,
             inline: true,
             dfe: true,
             mem: true,
@@ -228,6 +232,7 @@ impl OptConfig {
             local_cse: false,
             jump_thread: false,
             devirt: false,
+            const_prop: false,
             inline: false,
             dfe: false,
             mem: false,
@@ -257,19 +262,26 @@ pub fn optimize_module(m: &Module) -> Module {
 /// is this with [`OptConfig::all`]; the benchmark harness varies `cfg` to measure each pass.
 pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     // Interprocedural pre-passes (OPT.md Phase 3), at module scope. Devirtualization turns a constant
-    // `call_indirect` into a direct `call`; inlining then splices small callees into their callers so
-    // the per-function passes below fold through the inlined bodies; and dead-function elimination at
-    // the end sweeps the now-uncalled leaves (its indirect-dispatch gate having lifted once devirt ran).
-    // All three preserve every function's signature, so funcidxs and `fn_results` stay valid.
+    // `call_indirect` into a direct `call`; interprocedural constant propagation substitutes a
+    // parameter that is the same constant at every call site into the callee (so the per-function passes
+    // fold through it); inlining splices small callees into their callers so those passes fold through
+    // the inlined bodies; and dead-function elimination at the end sweeps the now-uncalled leaves (its
+    // indirect-dispatch gate having lifted once devirt ran). All preserve every function's signature, so
+    // funcidxs and `fn_results` stay valid.
     let devirt = if cfg.devirt {
         interproc::devirtualize(m)
     } else {
         m.clone()
     };
-    let inlined = if cfg.inline {
-        interproc::inline_calls(&devirt)
+    let cp = if cfg.const_prop {
+        interproc::const_prop(&devirt)
     } else {
         devirt
+    };
+    let inlined = if cfg.inline {
+        interproc::inline_calls(&cp)
+    } else {
+        cp
     };
     let m = &inlined;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
@@ -2707,7 +2719,7 @@ fn remove_params(b: &Block, dropped: &[usize]) -> Block {
 /// single-result instruction contributes its literal value (after folding, every folded op has
 /// become a `const`). This is the same seeding as [`fold_block`], minus the folding — it runs after
 /// `fold_block` in the fixpoint, so operands are already materialized where they can be.
-fn block_consts(b: &Block, fn_results: &[usize]) -> Vec<Option<Known>> {
+pub(crate) fn block_consts(b: &Block, fn_results: &[usize]) -> Vec<Option<Known>> {
     let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
     for inst in &b.insts {
         let rc = inst.result_count(fn_results);

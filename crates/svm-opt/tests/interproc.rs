@@ -8,8 +8,8 @@ use svm_interp::{Trap, Value};
 use svm_ir::{
     BinOp, Block, CmpOp, Export, Func, FuncType, Inst, IntTy, Module, Terminator, ValType,
 };
-use svm_opt::interproc::{dead_func_elim, devirtualize, inline_calls};
-use svm_opt::optimize_module;
+use svm_opt::interproc::{const_prop, dead_func_elim, devirtualize, inline_calls};
+use svm_opt::{optimize_module, optimize_module_with, OptConfig};
 use svm_verify::verify_module;
 
 fn n_call_indirect(m: &Module) -> usize {
@@ -680,4 +680,246 @@ fn does_not_devirtualize_on_signature_mismatch() {
         assert!(r0.is_err(), "mismatched call_indirect should trap");
         assert_eq!(r0, r1, "trap preserved at a={a}");
     }
+}
+
+// ---- interprocedural constant propagation (const_prop) ----
+
+fn n_brif(m: &Module) -> usize {
+    m.funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .filter(|b| matches!(b.term, Terminator::BrIf { .. }))
+        .count()
+}
+
+/// `sel(flag, v) = flag ? v : -v`, a two-arm helper whose branch tests `flag`.
+fn sel_helper() -> Func {
+    Func {
+        params: vec![ValType::I32, ValType::I32], // flag=v0, v=v1
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32, ValType::I32],
+                insts: vec![Inst::ConstI32(0), cmp(CmpOp::Ne, 0, 2)], // v3 = flag != 0
+                term: Terminator::BrIf {
+                    cond: 3,
+                    then_blk: 1,
+                    then_args: vec![1],
+                    else_blk: 2,
+                    else_args: vec![1],
+                },
+            },
+            Block {
+                params: vec![ValType::I32], // v
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
+            Block {
+                params: vec![ValType::I32], // v
+                insts: vec![
+                    Inst::ConstI32(0),
+                    Inst::IntBin {
+                        ty: IntTy::I32,
+                        op: BinOp::Sub,
+                        a: 1,
+                        b: 0,
+                    },
+                ], // -v
+                term: Terminator::Return(vec![2]),
+            },
+        ],
+    }
+}
+
+/// const_prop-only config (plus SCCP to fold the propagated constant), no inline/dfe — so the callee
+/// survives and the effect of the substitution is observable on it.
+fn cp_only() -> OptConfig {
+    OptConfig {
+        const_prop: true,
+        sccp: true,
+        ..OptConfig::none()
+    }
+}
+
+#[test]
+fn const_arg_folds_a_branch_in_the_callee() {
+    // entry(x): sel(1, x) + sel(1, x)  — both sites pass flag=1, so const_prop makes `flag` constant in
+    // `sel`, SCCP folds `flag != 0` to true, and the branch (and the negate arm) disappear.
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32], // x
+            insts: vec![
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![1, 0],
+                }, // sel(1, x) -> v2
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![3, 0],
+                }, // sel(1, x) -> v4
+                add(2, 4),
+            ],
+            term: Terminator::Return(vec![5]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, sel_helper()],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    assert_eq!(n_brif(&m), 1, "precondition: the helper branches on flag");
+
+    let opt = optimize_module_with(&m, &cp_only());
+    verify_module(&opt).expect("re-verifies");
+    assert_eq!(
+        n_brif(&opt),
+        0,
+        "const_prop + sccp should fold the helper's branch away"
+    );
+    for x in [0i32, 3, -5, 100] {
+        assert_eq!(run(&m, 0, &[Value::I32(x)]), run(&opt, 0, &[Value::I32(x)]));
+        assert_eq!(run(&opt, 0, &[Value::I32(x)]), Ok(vec![Value::I32(2 * x)]));
+        // sel(1,x)=x, twice
+    }
+}
+
+#[test]
+fn a_parameter_with_differing_constants_is_not_specialized() {
+    // Two sites pass flag=1 and flag=0 — no single constant, so `sel` must keep its branch and behave
+    // correctly for both.
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32], // x
+            insts: vec![
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![1, 0],
+                }, // sel(1, x) = x
+                Inst::ConstI32(0),
+                Inst::Call {
+                    func: 1,
+                    args: vec![3, 0],
+                }, // sel(0, x) = -x
+                add(2, 4),
+            ],
+            term: Terminator::Return(vec![5]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, sel_helper()],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    let opt = optimize_module_with(&m, &cp_only());
+    verify_module(&opt).expect("re-verifies");
+    assert_eq!(
+        n_brif(&opt),
+        1,
+        "a parameter that isn't a single constant across all sites must not be specialized"
+    );
+    for x in [0i32, 3, -5, 100] {
+        assert_eq!(run(&m, 0, &[Value::I32(x)]), run(&opt, 0, &[Value::I32(x)]));
+        assert_eq!(run(&opt, 0, &[Value::I32(x)]), Ok(vec![Value::I32(0)])); // x + (-x)
+    }
+}
+
+#[test]
+fn an_exported_function_is_not_specialized() {
+    // `sel` is exported, so the host may call it with any `flag` — the single internal call passing
+    // flag=1 must not license specializing it. Its branch stays.
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![1, 0],
+                },
+            ],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, sel_helper()],
+        exports: vec![Export {
+            name: "sel".into(),
+            func: 1,
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    // const_prop alone must leave the exported callee's branch in place.
+    let cp = const_prop(&m);
+    verify_module(&cp).expect("re-verifies");
+    assert_eq!(
+        n_brif(&cp),
+        1,
+        "an exported function must not be specialized to an internal call's constant"
+    );
+    // still exercised via the interpreter through the sel export
+    let ph = cp.resolve_export("sel").unwrap();
+    for f in [0i32, 1] {
+        for v in [4i32, -9] {
+            assert_eq!(
+                run(&m, ph, &[Value::I32(f), Value::I32(v)]),
+                run(&cp, ph, &[Value::I32(f), Value::I32(v)]),
+            );
+        }
+    }
+}
+
+#[test]
+fn const_prop_bails_when_indirect_dispatch_is_present() {
+    // A funcref value equals its funcidx, so a surviving `call_indirect` could reach any function with
+    // arguments const_prop can't see. The pass must then leave every function alone — here `sel`, whose
+    // one direct caller passes flag=1, keeps its branch because an indirect call could pass flag=0.
+    let sig = FuncType {
+        params: vec![ValType::I32, ValType::I32],
+        results: vec![ValType::I32],
+    };
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32], // x
+            insts: vec![
+                Inst::ConstI32(1),
+                Inst::Call {
+                    func: 1,
+                    args: vec![1, 0],
+                }, // sel(1, x) — a direct call passing a constant flag
+                Inst::ConstI32(1), // a runtime-looking funcref for the indirect call
+                Inst::CallIndirect {
+                    ty: sig,
+                    idx: 3,
+                    args: vec![1, 0],
+                }, // (*fp)(1, x) — keeps the whole module in the conservative regime
+                add(2, 4),
+            ],
+            term: Terminator::Return(vec![5]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, sel_helper()],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    let cp = const_prop(&m);
+    verify_module(&cp).expect("re-verifies");
+    assert_eq!(
+        n_brif(&cp),
+        1,
+        "const_prop must not specialize any function while indirect dispatch is present"
+    );
+    assert_eq!(cp, m, "const_prop is the identity here");
 }
