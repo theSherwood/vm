@@ -592,7 +592,8 @@ Notes:
 
 ### ▶ Active target — QuickJS (a full JS engine; the densest breadth proof)
 
-**Status: SPIKE — promoted from the candidate list (§7) to active work.** Bellard's **QuickJS**
+**Status: ★ RUNS — the curated eval demo executes byte-identical to native** (see "QuickJS RUNS in the
+sandbox" below; harness `demo_quickjs_eval_vs_native`). Bellard's **QuickJS**
 (2024-01-13, MIT) is the strongest self-validating interpreter on the list: NaN-boxing, a bytecode VM
 with **computed-goto** dispatch (`indirectbr`/`blockaddress` — DONE, slices AV+AW), **BigInt** (`libbf`),
 regex (`libregexp`), Unicode tables, and a **test262** runner. "Little is left unproven if it passes."
@@ -631,20 +632,80 @@ aggregate field-wise (test `struct_constant_return`; helps any by-value-aggregat
 correctly-rounded guest `strtod` + a small `demos/quickjs/libc_shim.c` (`fesetround`/`strtol`/`lrint`/
 `abort`/`malloc_usable_size`); the mem/alloc/non-varargs-stdio names are on-ramp-synthesized, not gaps.
 
-**Blocking gaps now (the two walls the spike reached).** (1) **Dynamic `alloca`** — `JS_CallInternal`
-(the bytecode interpreter core) allocates its operand stack with a *runtime-sized* `alloca`; the on-ramp
-lowers only constant-size `alloca` (→ window frame slots). A variable-length `alloca` is a translator
-slice of its own — a runtime data-SP bump + restore on the §3d data-stack. (2) **Directed-rounding dtoa**
-— QuickJS's shortest Number→string (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are
-round-to-nearest only (no rounding-mode op); `toFixed`/`toPrecision` use `FE_TONEAREST` (honored), so the
-current driver is unaffected, but general `String(0.1)` needs a rounding-mode primitive or a
-directed-rounding-free guest dtoa.
+**Dynamic `alloca` — DONE.** `JS_CallInternal` (the bytecode interpreter core) allocates its operand
+stack with a *runtime-sized* `alloca` (`alloca i8, i64 %n`); the on-ramp lowered only constant-size
+`alloca` (→ fixed frame slots). Now a function with a dynamic alloca reserves an 8-byte `DYN_TOP`
+running-top slot (seeded at entry to `sp + frame_size`); each dynamic `alloca` bumps it by
+`align16(count·elem)` and returns the old top, and a **call** in that function hands the callee `DYN_TOP`
+(not `sp + frame_size`) so its frame sits above the variable-length region. Function-lifetime only (no
+`llvm.stacksave`/`stackrestore` in QuickJS — fail-closed if seen); C++ `invoke` + dynamic alloca in one
+function is fail-closed (astronomically rare). Test `dynamic_alloca_runtime_count` (interp == JIT).
 
-**Remaining slice sequence.** (a) **dynamic `alloca`** (the current wall) → the interpreter core
-translates; (b) widen the JS program past `toFixed` + the directed-rounding dtoa follow-up; (c) regex /
-BigInt / `try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH
-dependency); (d) the `run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's
-analog of SQLite's sqllogictest. Harness: `demo_quickjs_eval_vs_native` (`#[ignore]`d at the alloca wall).
+**`llvm.frameaddress` — DONE.** With alloca cleared, `JS_CallInternal` reached `js_check_stack_overflow`,
+which reads the stack pointer via `__builtin_frame_address(0)`. QuickJS assumes a *downward* native stack
+(`stack_limit = stack_top - stack_size`; overflow when `sp < stack_limit`), but the SVM data-stack grows
+*up* — so `llvm.frameaddress(0)` lowers to the **downward proxy** `FRAME_ADDR_BASE - sp` (decreases with
+depth; the large base cancels out of the check's arithmetic, leaving "overflow when data-stack growth
+since `JS_UpdateStackTop` exceeds `stack_size`"). The result is only compared, never dereferenced; level
+> 0 (parent-frame unwinders) fails closed. Test `frameaddress_is_downward_stack_proxy` (interp == JIT).
+
+**`select` of aggregates — DONE.** Past the stack-check surface the translator fail-closed in
+`js_array_iterator_next` with `value not available in block`: a `select i1 %c, {i64,i64} %a, {i64,i64} %b`
+choosing between two 16-byte `JSValue`s. Aggregates live field-wise in the `agg` side-table, so the
+scalar `select` arm `ctx.operand`ed the struct and missed. Now lowered field-wise (one scalar `Select`
+per field, over the shared condition, recorded in `agg`); the result crosses block edges via the
+type-classified `agg_layout` fan-out already in the scan. Test `select_of_aggregate` (interp == JIT,
+result crossing a block edge). The libc surface it exposed was filled in `demos/quickjs/libc_shim.c`
+(`strcat`; deterministic `gettimeofday`/`clock_gettime`/`localtime_r`; single-threaded `pthread_*` /
+`pthread_cond_*` no-op stubs for `Atomics.wait`).
+
+**`llvm.round.f64` — DONE, and it was the last translate gap.** `JS_ComputeMemoryUsage` calls C
+`round()` (nearest, ties *away from zero*) → `llvm.round`, distinct from the `llvm.roundeven` (ties to
+even) the on-ramp already handles, with no direct SVM op. Synthesized boundary-safely as
+`t = trunc(x); |x-t| >= 0.5 ? t + copysign(1,x) : t` — `x-t` is exact, so no add-before-round
+double-rounding at `0.5⁻` (the bug in `trunc(x + copysign(0.5,x))`); inf/NaN fall through to `t`. Test
+`llvm_round_ties_away_from_zero` (incl. the `0.5⁻` boundary; interp == JIT).
+
+### ★★★ QuickJS RUNS in the sandbox — byte-identical to native
+
+**With `llvm.round` cleared, the unmodified QuickJS 2024-01-13 engine (1175 functions) translates,
+verifies, and *executes*** — `JS_NewRuntime`/`JS_NewContext`/`JS_Eval` of the driver program (recursion,
+a `sort` closure, `JSON.stringify`, string methods, `toFixed`) produces stdout **byte-identical to the
+native `cc` build**:
+
+```
+1,2,3,5,7,8,9 | sumfib=17710 | {"a":1,"b":[true,null,"x"]} | abc | 0.3000
+```
+
+Ladder-#? equivalent for the breadth lane: a full JS engine — NaN-boxing, a bytecode VM with
+computed-goto dispatch, BigInt (`libbf`), regex, Unicode — runs on the SVM under the powerbox, no
+ambient authority. Harness `demo_quickjs_eval_vs_native` (green; `#[ignore]`d only for wall-clock — a
+whole JS engine on the tree-walker takes tens of seconds).
+
+**Shortest Number→string works — the directed-rounding concern was a false alarm.** A REPL user typing
+`0.1+0.2` hits QuickJS's shortest Number→string (`js_ecvt1`), which toggles `FE_DOWNWARD`/`FE_UPWARD`
+around a `snprintf("%e")`. That `%e` is *our* correctly-rounded bignum dtoa (`__vm_fmt_sci`), which
+ignores `fesetround` and always rounds to nearest — **and QuickJS's shortest search still converges to
+the right digits**. Verified guest == native on `0.1+0.2` → `0.30000000000000004`, `1/3`, `String(0.1)`,
+`1e21`, `Math.PI`, `123456789.123456789`, … So no rounding-mode primitive is needed for general JS float
+printing after all.
+
+**Playground REPL — DONE (the build/wiring; a real-browser run is the only unverified step).** A
+`qjs_repl.c` stdin driver (reads JS from the `Stream` cap, evaluates it, prints `print`/`console.log`
+output + the completion value) runs **byte-identical to native** (`demo_quickjs_repl_stdin`). Wired into
+`browser/build-onramp-assets.mjs` (fetch QuickJS + openlibm, compile the engine + shims, `llvm-link -S`,
+translate at `--host-page 65536` → `qjs_repl.svmb`, ~4.3 MB) and registered as a **playground example**
+in `web/play.js`. Boot is milliseconds (no snapshot/restore, unlike Postgres). Interp tier only for now
+(`jit`/`kind:'module'`); the in-browser wasm-JIT tier + a real-browser differential are the remaining
+verification (needs a browser env with GitHub egress to build the asset).
+
+**Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
+(c) ~~`select` of aggregates~~ **done**; (d) ~~`llvm.round`~~ **done** → ★ **the eval RUNS byte-identical
+to native**; (e) ~~`qjs_repl.c` + playground wiring~~ **done** (`.svmb` asset + `web/play.js` entry;
+shortest-float printing confirmed working — no dtoa slice needed); (f) real-browser verification of the
+playground tab + the wasm-JIT tier (for speed); (g) regex / BigInt / `try`/`catch` breadth; (h) the
+`run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's analog of SQLite's
+sqllogictest.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

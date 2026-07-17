@@ -484,6 +484,30 @@ WITH RECURSIVE fib(n, a, b) AS (
 SELECT n, a AS fib FROM fib;
 `,
   },
+  'JavaScript (QuickJS — write & run JS)': {
+    kind: 'module',
+    editable: true,
+    lang: 'js',
+    url: './assets/qjs_repl.svmb',
+    mode: 'io',
+    desc: 'Bellard\'s unmodified QuickJS 2024-01-13 — a full JavaScript engine (NaN-boxing, a bytecode ' +
+      'VM with computed-goto dispatch, BigInt, regex, Unicode) compiled through the LLVM on-ramp. Edit ' +
+      'the JS on the left and click Run: it evaluates in a fresh runtime (each Run starts clean), and ' +
+      'prints anything you print()/console.log() plus the value of the last expression. Real QuickJS, ' +
+      'running client-side in the sandbox — no ambient authority.',
+    src: `// Write JavaScript here, then click Run. Each Run is a fresh QuickJS runtime.
+function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+console.log("fib(0..10):", Array.from({length: 11}, (_, i) => fib(i)).join(" "));
+
+const xs = [5, 3, 8, 1, 9, 2, 7];
+console.log("sorted:", xs.slice().sort((a, b) => a - b).join(","));
+
+console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: Math.PI } }));
+
+// the completion value of the last expression is printed too:
+"0.1 + 0.2 = " + (0.1 + 0.2);
+`,
+  },
   'PostgreSQL (17.5 — write & run SQL)': {
     kind: 'pg',
     editable: true,

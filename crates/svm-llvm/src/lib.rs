@@ -1205,6 +1205,22 @@ const SP: ValueId = usize::MAX;
 /// makes at least one direct varargs call. See `frame_layout` / the varargs call-site lowering.
 const VARARG_SCRATCH: ValueId = usize::MAX - 1;
 
+/// A sentinel `frame` key (never a real SSA value) holding the `sp`-relative offset of this
+/// function's **dynamic-alloca running top**: an 8-byte slot storing the current top-of-dynamic-
+/// stack window pointer. Initialized at function entry to `sp + frame_size` (just above the fixed
+/// frame) and bumped by each dynamic (`alloca T, i32 %n`) `alloca`; a call in such a function hands
+/// the callee *this* pointer (not `sp + frame_size`) so its frame sits above the variable-length
+/// allocations. Present in `frame` only when the function has a dynamic alloca. Dynamic allocas are
+/// function-lifetime here (no `llvm.stacksave`/`stackrestore` — a clean `Unsupported` if seen), so
+/// the top only grows within an activation and is discarded on return.
+const DYN_TOP: ValueId = usize::MAX - 2;
+
+/// Base for the **downward stack-pointer proxy** returned by `llvm.frameaddress(0)` (see
+/// [`lower_frameaddress`]): the value is `FRAME_ADDR_BASE - sp`, so it *decreases* with call depth
+/// like a native (downward-growing) stack pointer. A large constant, safely above any window offset,
+/// so the proxy never underflows and cancels out of the C stack-overflow arithmetic it feeds.
+const FRAME_ADDR_BASE: i64 = 1 << 40;
+
 /// Accumulates the §6 debug-info **neutral core** as functions are lowered — the LLVM on-ramp as a
 /// third independent producer feeding the frontend-neutral waist (DEBUGGING.md §6 / D-DBG-7).
 ///
@@ -2482,15 +2498,27 @@ fn frame_layout(
     if f.is_var_arg {
         off = 8;
     }
+    let mut has_dyn = false;
     for bb in &f.basic_blocks {
         for instr in &bb.instrs {
             if let Instruction::Alloca(a) = instr {
                 let n = match &a.num_elements {
                     Operand::ConstantOperand(c) => match c.as_ref() {
                         Constant::Int { value, .. } => *value as u64,
-                        _ => return unsup("dynamic alloca (non-constant element count)"),
+                        // A non-`Int` constant count is unusual; treat it as dynamic (laid out at
+                        // runtime by the `Alloca` lowering) rather than fixed-slot.
+                        _ => {
+                            has_dyn = true;
+                            continue;
+                        }
                     },
-                    _ => return unsup("dynamic alloca (non-constant element count)"),
+                    // A **dynamic** alloca (runtime element count, e.g. QuickJS's `JS_CallInternal`
+                    // operand stack): no fixed frame slot — the `Alloca` lowering bumps the `DYN_TOP`
+                    // running top at runtime. Just note the function has one.
+                    _ => {
+                        has_dyn = true;
+                        continue;
+                    }
                 };
                 let size = type_size(a.allocated_type.as_ref(), types)?.saturating_mul(n);
                 // Natural alignment: the larger of the type's alignment and the `alloca`'s declared
@@ -2528,6 +2556,14 @@ fn frame_layout(
         off = off.div_ceil(8) * 8;
         frame.insert(VARARG_SCRATCH, off);
         off += max_vararg_slots.max(1) * 8;
+    }
+    // Reserve the 8-byte **dynamic-alloca running-top** slot at the end of the fixed frame, so the
+    // variable-length region begins cleanly at `frame_size` (16-aligned). The entry prologue seeds it
+    // to `sp + frame_size`; each dynamic `alloca` bumps it (see `DYN_TOP`).
+    if has_dyn {
+        off = off.div_ceil(8) * 8;
+        frame.insert(DYN_TOP, off);
+        off += 8;
     }
     Ok((frame, off.div_ceil(16) * 16))
 }
@@ -14080,6 +14116,7 @@ fn lower_float_intrinsic(
             | "llvm.floor"
             | "llvm.ceil"
             | "llvm.trunc"
+            | "llvm.round"
             | "llvm.rint"
             | "llvm.nearbyint"
             | "llvm.roundeven"
@@ -14245,6 +14282,64 @@ fn lower_float_intrinsic(
         "llvm.ceil" => un(ctx, FUnOp::Ceil)?,
         "llvm.trunc" => un(ctx, FUnOp::Trunc)?,
         "llvm.rint" | "llvm.nearbyint" | "llvm.roundeven" => un(ctx, FUnOp::Nearest)?,
+        // C `round()` — nearest, ties **away from zero** (distinct from `roundeven`'s ties-to-even,
+        // and from JS `Math.round`'s ties-up). No native op; synthesize boundary-safely:
+        //   t = trunc(x);  return |x - t| >= 0.5 ? t + copysign(1, x) : t
+        // `x - t` is exact (|x - t| < 1), so there is no add-before-round double-rounding at `0.5⁻`
+        // (the bug in `trunc(x + copysign(0.5, x))`). inf/NaN fall through: `x - t` is NaN, the `>= 0.5`
+        // is false, so `t` (= inf/NaN) is returned — matching libm.
+        "llvm.round" => {
+            let x = ctx.operand(args[0])?;
+            let t = ctx.push(Inst::FUn {
+                ty,
+                op: FUnOp::Trunc,
+                a: x,
+            });
+            let d = ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Sub,
+                a: x,
+                b: t,
+            });
+            let ad = ctx.push(Inst::FUn {
+                ty,
+                op: FUnOp::Abs,
+                a: d,
+            });
+            let (half, one) = match ty {
+                FloatTy::F32 => (
+                    ctx.push(Inst::ConstF32(0.5f32.to_bits())),
+                    ctx.push(Inst::ConstF32(1.0f32.to_bits())),
+                ),
+                FloatTy::F64 => (
+                    ctx.push(Inst::ConstF64(0.5f64.to_bits())),
+                    ctx.push(Inst::ConstF64(1.0f64.to_bits())),
+                ),
+            };
+            let ge = ctx.push(Inst::FCmp {
+                ty,
+                op: FCmpOp::Ge,
+                a: ad,
+                b: half,
+            });
+            let signed_one = ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Copysign,
+                a: one,
+                b: x,
+            });
+            let adj = ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Add,
+                a: t,
+                b: signed_one,
+            });
+            ctx.push(Inst::Select {
+                cond: ge,
+                a: adj,
+                b: t,
+            })
+        }
         "llvm.minnum" | "llvm.minimum" => bin2(ctx, FBinOp::Min)?,
         "llvm.maxnum" | "llvm.maximum" => bin2(ctx, FBinOp::Max)?,
         "llvm.copysign" => bin2(ctx, FBinOp::Copysign)?,
@@ -14389,6 +14484,46 @@ fn lower_va_intrinsic(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// `llvm.frameaddress(0)` (clang's `__builtin_frame_address(0)`) — used as an opaque **stack-pointer
+/// token** for software stack-overflow checks (e.g. QuickJS's `js_check_stack_overflow`, which the
+/// interpreter core `JS_CallInternal` hits per call). The C idiom assumes a *downward*-growing native
+/// stack (`stack_limit = stack_top - stack_size`; overflow when `frame_addr < stack_limit`), but the
+/// SVM §3d data-stack grows *up* (`sp` increases with depth). Returning raw `sp` would invert the check
+/// and fire on every call; instead return the **downward proxy** `FRAME_ADDR_BASE - sp`, which
+/// decreases with depth. The large base cancels out of the check's `stack_top - stack_size` and
+/// `frame_addr - alloca_size` arithmetic, leaving exactly "overflow when data-stack growth since
+/// `JS_UpdateStackTop` exceeds `stack_size`". The result is only ever compared / arithmetic'd, never
+/// dereferenced. Only frame level 0 is meaningful here — a parent-frame `frameaddress(k>0)` (unwinders)
+/// fails closed. Returns the result index, or `None` if `name` is not `llvm.frameaddress`.
+fn lower_frameaddress(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+    name: &str,
+) -> Result<Option<ValIdx>, Error> {
+    if !name.starts_with("llvm.frameaddress") {
+        return Ok(None);
+    }
+    // The single argument is the frame level; only the current frame (constant 0) is supported.
+    let level = match c.arguments.first() {
+        Some((Operand::ConstantOperand(k), _)) => match k.as_ref() {
+            Constant::Int { value, .. } => *value,
+            _ => return unsup("llvm.frameaddress with a non-constant level"),
+        },
+        _ => return unsup("llvm.frameaddress with a non-constant level"),
+    };
+    if level != 0 {
+        return unsup("llvm.frameaddress of a parent frame (level != 0)");
+    }
+    let base = ctx.const_i64(FRAME_ADDR_BASE);
+    let sp = ctx.sp()?;
+    Ok(Some(ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Sub,
+        a: base,
+        b: sp,
+    })))
 }
 
 /// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
@@ -14577,9 +14712,7 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
                 offset: 0,
                 align: 8,
             });
-            let sp = ctx.sp()?;
-            let fs = ctx.const_i64(ctx.frame_size as i64);
-            let callee_sp = ctx.add_i64(sp, fs);
+            let callee_sp = ctx.callee_base()?;
             ctx.push_effect(Inst::Call {
                 func: helper,
                 args: vec![callee_sp, exn, dtor],
@@ -15341,6 +15474,38 @@ impl<'a> BlockCtx<'a> {
         })
     }
 
+    /// Address of this function's dynamic-alloca running-top slot (`sp + DYN_TOP_off`), or `None`
+    /// when the function has no dynamic alloca.
+    fn dyn_top_addr(&mut self) -> Result<Option<ValIdx>, Error> {
+        match self.frame.get(&DYN_TOP).copied() {
+            Some(off) => {
+                let sp = self.sp()?;
+                let c = self.const_i64(off as i64);
+                Ok(Some(self.add_i64(sp, c)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The data-SP base to hand a callee. In a function with a dynamic `alloca` this is the current
+    /// `DYN_TOP` (loaded from its slot), so the callee's frame sits *above* any variable-length
+    /// allocations; otherwise the fixed `sp + frame_size`. Before the first dynamic alloca `DYN_TOP`
+    /// still reads `sp + frame_size` (its entry-seeded value), so both paths agree.
+    fn callee_base(&mut self) -> Result<ValIdx, Error> {
+        if let Some(slot) = self.dyn_top_addr()? {
+            Ok(self.push(Inst::Load {
+                op: LoadOp::I64,
+                addr: slot,
+                offset: 0,
+                align: 0,
+            }))
+        } else {
+            let sp = self.sp()?;
+            let fs = self.const_i64(self.frame_size as i64);
+            Ok(self.add_i64(sp, fs))
+        }
+    }
+
     /// The reserved C++ EH region's base window address (`Helpers::eh_base`), or `Unsupported` if an
     /// EH op was reached without the region having been reserved (a gating bug — should never fire).
     fn eh_base(&self) -> Result<u64, Error> {
@@ -15728,6 +15893,24 @@ fn translate_block(
         ctx.agg.insert(vid, parts);
     }
     ctx.next_val = params.len() as ValIdx;
+
+    // Entry prologue: seed the dynamic-alloca running top (`DYN_TOP` slot) to `sp + frame_size` — the
+    // base of the variable-length region, just above this activation's fixed frame. Emitted first in
+    // the entry block (which dominates all uses), before any dynamic `alloca` or call reads it.
+    if bi == 0 {
+        if let Some(slot) = ctx.dyn_top_addr()? {
+            let sp = ctx.sp()?;
+            let fs = ctx.const_i64(ctx.frame_size as i64);
+            let base = ctx.add_i64(sp, fs);
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: slot,
+                value: base,
+                offset: 0,
+                align: 0,
+            });
+        }
+    }
 
     // A tail-position call in this block (final instruction is a `tail`/`musttail` call whose result
     // the `ret` returns) lowers to a `return_call` terminator instead of a `call` + `ret`.
@@ -16546,6 +16729,35 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
     }
 
+    // `select` between two **aggregate** values (a small by-value struct — e.g. QuickJS selecting
+    // between two 16-byte `JSValue`s: `select i1 %c, {i64,i64} %a, {i64,i64} %b`). Lower field-wise —
+    // one scalar `Select` per field over the shared condition — and record the result in the `agg`
+    // table. Runs after `lower_i128`/`lower_mask`, so i128 and `<N x i1>`-mask selects are already
+    // handled; only true when the operands are struct aggregates (`agg_fields` is `None` for a scalar,
+    // which falls through to the scalar `Select` arm that would otherwise `ctx.operand` the struct and
+    // fail with "value … not available in block").
+    if let I::Select(x) = instr {
+        if let Some(a) = ctx.agg_fields(&x.true_value) {
+            let a = a?;
+            let b = ctx.agg_fields(&x.false_value).ok_or_else(|| {
+                Error::Unsupported("select: aggregate/scalar operand mismatch".into())
+            })??;
+            if a.len() != b.len() {
+                return unsup("select: mismatched aggregate field counts");
+            }
+            let cond = ctx.operand(&x.condition)?;
+            let fields: Vec<ValIdx> = a
+                .iter()
+                .zip(&b)
+                .map(|(&av, &bv)| ctx.push(Inst::Select { cond, a: av, b: bv }))
+                .collect();
+            if let Some(&vid) = ctx.s.name2id.get(&x.dest) {
+                ctx.agg.insert(vid, fields);
+            }
+            return Ok(());
+        }
+    }
+
     // No-result instructions (effects only): handle and return early.
     if let I::Store(st) = instr {
         // A `store atomic` (seq-cst): a native `iN.atomic.store` for i32/i64, or the narrow path for
@@ -16672,6 +16884,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             if lower_va_intrinsic(ctx, c, &name)? {
                 return Ok(());
             }
+            // `llvm.frameaddress(0)` → the downward stack-pointer proxy (`FRAME_ADDR_BASE - sp`), for
+            // software stack-overflow checks (QuickJS's `js_check_stack_overflow`).
+            if let Some(idx) = lower_frameaddress(ctx, c, &name)? {
+                if let Some(dest) = &c.dest {
+                    if let Some(&vid) = ctx.s.name2id.get(dest) {
+                        ctx.idx_of.insert(vid, idx);
+                    }
+                }
+                return Ok(());
+            }
         }
         // Float math intrinsics lower to inline float ops (not a call).
         if let Some(idx) = lower_float_intrinsic(ctx, c, types)? {
@@ -16780,11 +17002,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 return Ok(());
             }
         }
-        // Pass the callee its own data-stack frame at `sp + frame_size` (§3d), then the mapped
-        // arguments. The IR signature is `(sp, c-args…)`, so the callee's frame never overlaps ours.
+        // Pass the callee its own data-stack frame (§3d), then the mapped arguments. The IR
+        // signature is `(sp, c-args…)`, so the callee's frame never overlaps ours. `callee_base`
+        // is `sp + frame_size` normally, or the dynamic-alloca running top when this function has
+        // variable-length allocations (so the callee sits above them).
         let sp = ctx.sp()?;
-        let fs = ctx.const_i64(ctx.frame_size as i64);
-        let callee_sp = ctx.add_i64(sp, fs);
+        let callee_sp = ctx.callee_base()?;
         let mut args = vec![callee_sp];
         // A call to a `(...)` function (§varargs) — direct or **indirect** (a `(...)` function
         // pointer): only the fixed parameters are IR arguments; the variadic arguments are marshaled
@@ -16994,19 +17217,66 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
 
     let (dest, idx) = match instr {
         I::Alloca(a) => {
-            // The slot's `sp`-relative offset (laid out by `frame_layout`): address = `sp + off`.
             let vid = *ctx
                 .s
                 .name2id
                 .get(&a.dest)
                 .ok_or_else(|| Error::Unsupported("alloca without result".into()))?;
-            let off = *ctx
-                .frame
-                .get(&vid)
-                .ok_or_else(|| Error::Unsupported("alloca missing frame slot".into()))?;
-            let sp = ctx.sp()?;
-            let c = ctx.const_i64(off as i64);
-            (&a.dest, ctx.add_i64(sp, c))
+            if let Some(&off) = ctx.frame.get(&vid) {
+                // Static alloca: its `sp`-relative slot (laid out by `frame_layout`) — address `sp + off`.
+                let sp = ctx.sp()?;
+                let c = ctx.const_i64(off as i64);
+                (&a.dest, ctx.add_i64(sp, c))
+            } else {
+                // Dynamic alloca (runtime element count): bump the `DYN_TOP` running top by
+                // `align16(count * elem_size)` and hand back the *old* top as the base address. The
+                // stored top stays 16-aligned so the next alloca / callee frame is aligned.
+                let slot = ctx.dyn_top_addr()?.ok_or_else(|| {
+                    Error::Unsupported("dynamic alloca without a DYN_TOP slot".into())
+                })?;
+                // Count → i64 (clang emits an i64 count on x86-64; zero-extend a narrower one).
+                let raw = ctx.operand(&a.num_elements)?;
+                let n = match int_bits(a.num_elements.get_type(ctx.types).as_ref()) {
+                    Some(64) => raw,
+                    Some(w) if w < 64 => ctx.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: raw,
+                    }),
+                    _ => return unsup("dynamic alloca with a non-integer element count"),
+                };
+                let elem = type_size(a.allocated_type.as_ref(), ctx.types)?;
+                let bytes = if elem == 1 {
+                    n
+                } else {
+                    let e = ctx.const_i64(elem as i64);
+                    ctx.mul_i64(n, e)
+                };
+                // align16(bytes) = (bytes + 15) & ~15
+                let c15 = ctx.const_i64(15);
+                let summed = ctx.add_i64(bytes, c15);
+                let mask = ctx.const_i64(!15i64);
+                let bytes16 = ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::And,
+                    a: summed,
+                    b: mask,
+                });
+                let top = ctx.push(Inst::Load {
+                    op: LoadOp::I64,
+                    addr: slot,
+                    offset: 0,
+                    align: 0,
+                });
+                let new_top = ctx.add_i64(top, bytes16);
+                ctx.push_effect(Inst::Store {
+                    op: StoreOp::I64,
+                    addr: slot,
+                    value: new_top,
+                    offset: 0,
+                    align: 0,
+                });
+                (&a.dest, top)
+            }
         }
         I::Load(l) => {
             let addr = ctx.operand(&l.address)?;
@@ -19861,6 +20131,13 @@ fn lower_invoke(
     aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     use std::collections::hash_map::Entry;
+    // A function with a dynamic `alloca` computes its callee SP from the runtime `DYN_TOP`, but this
+    // synthetic EH-invoke call block builds `sp + frame_size` with raw block-local indices. The
+    // combination (C++ exceptions + a variable-length `alloca` in the same function) is astronomically
+    // rare and unneeded by any current target — fail closed rather than pass the wrong callee frame.
+    if ctx.frame.contains_key(&DYN_TOP) {
+        return unsup("invoke (C++ EH) in a function with a dynamic alloca");
+    }
     let base = ctx.eh_base()?;
 
     // Resolve the callee — a direct call to a defined function only.

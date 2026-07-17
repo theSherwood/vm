@@ -1802,24 +1802,28 @@ fn fetch_quickjs() -> Option<PathBuf> {
 /// (the Postgres set) — inverse hyperbolics, `log1p`, `hypot`.
 const QUICKJS_OPENLIBM_EXTRA: &[&str] = &["s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot"];
 
-/// **▶ QuickJS eval — the full-JS-engine breadth target (SPIKE, in progress).** Wires the whole
-/// differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the
-/// `demos/quickjs/qjs_eval.c` driver + the guest libm + the libc/stdio shims to bitcode,
-/// `llvm-link -S` into one `.ll` module, then translate → verify → run vs a native `cc` oracle. The libc
-/// waist is now shimmed (printf engine + `strtod` + `libc_shim.c`); it is **ignored** because the
-/// interpreter core (`JS_CallInternal`) uses a **dynamic `alloca`** (runtime-sized operand stack)
-/// the on-ramp doesn't yet lower, and general Number→string needs directed-rounding dtoa — see
-/// LLVM.md "Active target — QuickJS" for the live gap list. Run by hand:
+/// **▶ QuickJS eval — the full-JS-engine breadth target. RUNS byte-identical to native.** Wires the
+/// whole differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the
+/// `demos/quickjs/qjs_eval.c` driver + the guest libm + the libc/stdio shims to `.ll`, `llvm-link -S`
+/// into one textual module, then translate → verify → run vs a native `cc` oracle. The unmodified
+/// QuickJS 2024-01-13 engine (1175 funcs) translates, verifies, and executes the driver program
+/// (recursion + a `sort` closure + `JSON.stringify` + string methods + `toFixed`) with stdout
+/// byte-identical to native. **`#[ignore]`d only for wall-clock**: it fetches openlibm and runs a
+/// whole JS engine on the tree-walking interpreter (tens of seconds). Run by hand:
 /// `cargo test --test translate demo_quickjs_eval_vs_native -- --ignored --nocapture`.
-#[test]
-#[ignore = "QuickJS spike: blocked on dynamic alloca in JS_CallInternal (translator gap, LLVM.md)"]
-fn demo_quickjs_eval_vs_native() {
+///
+/// Shared harness: build the linked QuickJS module for `driver_rel` (a `demos/quickjs/*.c` driver),
+/// run it under the powerbox with `stdin`, and assert stdout byte-matches the native `cc` oracle
+/// (fed the same stdin). Used by both the `qjs_eval` (built-in program) and `qjs_repl` (JS from
+/// stdin) tests. Skips cleanly when QuickJS/openlibm/clang are unavailable.
+fn quickjs_diff(driver_rel: &str, stdin: &[u8]) {
     let (Some(qjs), Some(ol)) = (fetch_quickjs(), fetch_openlibm()) else {
         return;
     };
     let pid = std::process::id();
     let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../svm-run/demos/quickjs/qjs_eval.c");
+        .join("../svm-run/demos/quickjs")
+        .join(driver_rel);
     let incs = [
         format!("-I{}", qjs.display()),
         format!("-I{}", ol.display()),
@@ -1839,11 +1843,14 @@ fn demo_quickjs_eval_vs_native() {
         "-DCONFIG_VERSION=\"2024-01-13\"",
         "-DASSEMBLER=0",
     ];
+    // Per-driver discriminator so the two QuickJS tests don't collide on temp files under parallel
+    // `--ignored` runs.
+    let disc = driver_rel.replace(['.', '/', '\\'], "_");
     // Compile QuickJS TUs + driver + the guest-libm set, each → textual `.ll`.
     let qjs_tus = ["quickjs", "libregexp", "libunicode", "cutils", "libbf"];
     let mut bcs: Vec<PathBuf> = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{tag}.ll"));
+        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_{tag}.ll"));
         let mut cmd = Command::new("clang");
         cmd.args(cflags);
         for i in &incs {
@@ -1899,7 +1906,7 @@ fn demo_quickjs_eval_vs_native() {
             }
         }
     }
-    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_linked.ll"));
+    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_linked.ll"));
     // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
     // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests it.
     let link_ok = Command::new("llvm-link")
@@ -1914,8 +1921,8 @@ fn demo_quickjs_eval_vs_native() {
         eprintln!("note: skipping quickjs (llvm-link unavailable)");
         return;
     }
-    // Native oracle: the same driver + engine + guest libm, no system `-lm`.
-    let exe = std::env::temp_dir().join(format!("qjsbc_{pid}_native"));
+    // Native oracle: the same driver + engine + guest libm, no system `-lm`. Fed the same stdin.
+    let exe = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_native"));
     let mut cc = Command::new("cc");
     cc.args([
         "-O2",
@@ -1941,22 +1948,55 @@ fn demo_quickjs_eval_vs_native() {
             return;
         }
     }
-    let native = Command::new(&exe).output().expect("run native quickjs");
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native quickjs");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native quickjs")
+    };
     assert!(
         native.status.success() && !native.stdout.is_empty(),
         "native quickjs oracle produced no output"
     );
-    // Guest: translate → resolve caps → verify → run under the powerbox, diff stdout vs the oracle.
+    // Guest: translate → resolve caps → verify → run under the powerbox with the same stdin, diff.
     let t = svm_llvm::translate_ll_path(&linked).expect("translate quickjs");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify quickjs module");
-    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run quickjs");
+    let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run quickjs");
     assert_eq!(
         run.stdout,
         native.stdout,
         "quickjs: guest {:?} vs native {:?}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+/// **▶ QuickJS eval — the full JS engine RUNS byte-identical to native.** The `qjs_eval.c` driver's
+/// built-in program (recursion + a `sort` closure + `JSON.stringify` + string methods + `toFixed`).
+/// `#[ignore]`d only for wall-clock (a whole JS engine on the tree-walker + an openlibm fetch).
+#[test]
+#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
+fn demo_quickjs_eval_vs_native() {
+    quickjs_diff("qjs_eval.c", b"");
+}
+
+/// **▶ QuickJS REPL — evaluate JS piped in on stdin** (the playground driver, `qjs_repl.c`): the
+/// engine reads a program from the `Stream` capability, evaluates it, and prints `print`/`console.log`
+/// output plus the completion value — byte-identical to native over a JS program exercising a closure
+/// sort, `JSON.stringify`, and shortest float formatting (`0.1+0.2` → `0.30000000000000004`).
+#[test]
+#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
+fn demo_quickjs_repl_stdin() {
+    quickjs_diff(
+        "qjs_repl.c",
+        b"console.log('sum', [1,2,3,4].reduce((a,b)=>a+b,0));\n\
+          print([5,3,8,1].sort((a,b)=>a-b).join(','));\n\
+          JSON.stringify({pi: Math.PI, f: 0.1+0.2});",
     );
 }
 
@@ -5820,6 +5860,181 @@ fn struct_constant_return() {
         vec![Value::I32(6)],
         "JS_EXCEPTION-shaped {{0,6}}, field 1 = 6"
     );
+}
+
+#[test]
+fn dynamic_alloca_runtime_count() {
+    // A **dynamic `alloca`** — `alloca i32, i64 %n` with a *runtime* element count — is how QuickJS's
+    // `JS_CallInternal` sizes its operand stack. The on-ramp lays static allocas at fixed frame
+    // offsets; a dynamic one bumps a per-frame `DYN_TOP` running top at runtime, and a call in the
+    // same function hands the callee that top so its frame sits *above* the variable-length region.
+    // `@consume` writes its own local `alloca` (999) before reading the caller's dynamic buffer — if
+    // the callee frame overlapped the dynamic allocation the store would clobber it and the result
+    // would be wrong. clang folds a constant-sized VLA back to a static alloca, so this is a
+    // hand-written `.ll`; `%n` comes from a call so it stays runtime. Checked interp == JIT.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %n = call i64 @five()\n  \
+        %p = alloca i32, i64 %n\n  \
+        store i32 10, ptr %p\n  \
+        %p1 = getelementptr i32, ptr %p, i64 1\n  \
+        store i32 20, ptr %p1\n  \
+        %s = call i32 @consume(ptr %p)\n  \
+        ret i32 %s\n}\n\
+        define i64 @five() {\n\
+        entry:\n  \
+        ret i64 5\n}\n\
+        define i32 @consume(ptr %q) {\n\
+        entry:\n  \
+        %scratch = alloca i32\n  \
+        store i32 999, ptr %scratch\n  \
+        %a = load i32, ptr %q\n  \
+        %q1 = getelementptr i32, ptr %q, i64 1\n  \
+        %b = load i32, ptr %q1\n  \
+        %r = add i32 %a, %b\n  \
+        ret i32 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate dynamic-alloca .ll");
+    svm_verify::verify_module(&t.module).expect("verify dynamic-alloca");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run dynamic-alloca");
+    assert_eq!(
+        r,
+        vec![Value::I32(30)],
+        "p[0]+p[1] = 10+20 = 30 (callee frame sits above the dynamic region)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 30, "JIT dynamic-alloca = 30"),
+        other => panic!("JIT dynamic-alloca: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn frameaddress_is_downward_stack_proxy() {
+    // `llvm.frameaddress(0)` (`__builtin_frame_address(0)`) is used as an opaque stack-pointer token
+    // for software stack-overflow checks — QuickJS's `js_check_stack_overflow`, hit per call in the
+    // interpreter core. The C idiom assumes a *downward* native stack, but the SVM data-stack grows
+    // *up*, so the on-ramp returns the downward proxy `FRAME_ADDR_BASE - sp`: it must *decrease* with
+    // call depth. `@main` (shallow, non-empty frame so the callee SP differs) takes its frame address,
+    // then `@deeper` (one call deeper, larger `sp`) takes its own — the deeper one must be strictly
+    // smaller. This is the exact monotonic property the overflow check relies on. Checked interp == JIT.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %slot = alloca i64\n  \
+        store i64 0, ptr %slot\n  \
+        %a = call ptr @llvm.frameaddress.p0(i32 0)\n  \
+        %ai = ptrtoint ptr %a to i64\n  \
+        %d = call i64 @deeper()\n  \
+        %cmp = icmp ugt i64 %ai, %d\n  \
+        %r = zext i1 %cmp to i32\n  \
+        ret i32 %r\n}\n\
+        define i64 @deeper() {\n\
+        entry:\n  \
+        %f = call ptr @llvm.frameaddress.p0(i32 0)\n  \
+        %fi = ptrtoint ptr %f to i64\n  \
+        ret i64 %fi\n}\n\
+        declare ptr @llvm.frameaddress.p0(i32)";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate frameaddress .ll");
+    svm_verify::verify_module(&t.module).expect("verify frameaddress");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run frameaddress");
+    assert_eq!(
+        r,
+        vec![Value::I32(1)],
+        "deeper frame address < shallower (downward proxy: decreases with depth)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 1, "JIT frameaddress downward = 1"),
+        other => panic!("JIT frameaddress: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn select_of_aggregate() {
+    // A `select` between two **aggregate** values — `select i1 %c, {i64,i64} %a, {i64,i64} %b` — is how
+    // QuickJS picks between two 16-byte `JSValue`s (blocked `js_array_iterator_next`). Aggregates live
+    // field-wise in the `agg` side-table, so the scalar `select` arm `ctx.operand`ed them and failed
+    // ("value not available in block"); the aggregate arm now lowers one scalar `Select` per field. The
+    // result crosses a block edge (`entry` → `next`), so this also exercises the `agg_layout` cross-block
+    // fan-out (`block_params`/`branch_args`). `@truth` returns 1 → the `{10,20}` operand wins; 10+20=30.
+    let ll = "define i64 @main() {\n\
+        entry:\n  \
+        %a0 = insertvalue {i64, i64} undef, i64 10, 0\n  \
+        %a = insertvalue {i64, i64} %a0, i64 20, 1\n  \
+        %b0 = insertvalue {i64, i64} undef, i64 30, 0\n  \
+        %b = insertvalue {i64, i64} %b0, i64 40, 1\n  \
+        %c = call i1 @truth()\n  \
+        %s = select i1 %c, {i64, i64} %a, {i64, i64} %b\n  \
+        br label %next\n\
+        next:\n  \
+        %f0 = extractvalue {i64, i64} %s, 0\n  \
+        %f1 = extractvalue {i64, i64} %s, 1\n  \
+        %r = add i64 %f0, %f1\n  \
+        ret i64 %r\n}\n\
+        define i1 @truth() {\n\
+        entry:\n  \
+        ret i1 1\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate select-aggregate .ll");
+    svm_verify::verify_module(&t.module).expect("verify select-aggregate");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run select-aggregate");
+    assert_eq!(
+        r,
+        vec![Value::I64(30)],
+        "select picks {{10,20}} (cond true), crossing a block edge: 10+20 = 30"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0], 30, "JIT select-aggregate = 30"),
+        other => panic!("JIT select-aggregate: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn llvm_round_ties_away_from_zero() {
+    // C `round()` (`llvm.round`) is nearest, ties **away from zero** — distinct from `roundeven`
+    // (ties to even). QuickJS's `JS_ComputeMemoryUsage` hits it; it was the last QuickJS translate
+    // gap. The on-ramp synthesizes it boundary-safely as `|x-t|>=0.5 ? t+copysign(1,x) : t`. Checks:
+    // 2.5→3 and -2.5→-3 (ties away, *not* roundeven's 2/-2), 0.5→1, and the `0.5⁻` boundary
+    // `0x3FDFFFFFFFFFFFFF` = 0.49999999999999994 → 0 (the case where `trunc(x+0.5)` wrongly gives 1).
+    // Weighted `3*1000 + (-3)*100 + 1*10 + 0 = 2710`; interp == JIT.
+    let ll = "define i64 @main() {\n\
+        entry:\n  \
+        %a = call double @llvm.round.f64(double 2.5)\n  \
+        %b = call double @llvm.round.f64(double -2.5)\n  \
+        %c = call double @llvm.round.f64(double 0.5)\n  \
+        %d = call double @llvm.round.f64(double 0x3FDFFFFFFFFFFFFF)\n  \
+        %ia = fptosi double %a to i64\n  \
+        %ib = fptosi double %b to i64\n  \
+        %ic = fptosi double %c to i64\n  \
+        %id = fptosi double %d to i64\n  \
+        %t0 = mul i64 %ia, 1000\n  \
+        %t1 = mul i64 %ib, 100\n  \
+        %t2 = mul i64 %ic, 10\n  \
+        %s0 = add i64 %t0, %t1\n  \
+        %s1 = add i64 %t2, %id\n  \
+        %r = add i64 %s0, %s1\n  \
+        ret i64 %r\n}\n\
+        declare double @llvm.round.f64(double)";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate llvm.round .ll");
+    svm_verify::verify_module(&t.module).expect("verify llvm.round");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run llvm.round");
+    assert_eq!(
+        r,
+        vec![Value::I64(2710)],
+        "round: 2.5→3, -2.5→-3, 0.5→1, 0.5⁻→0 (ties away, boundary-safe)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0], 2710, "JIT llvm.round = 2710"),
+        other => panic!("JIT llvm.round: unexpected {other:?}"),
+    }
 }
 
 #[test]

@@ -58,11 +58,63 @@ runtime-`va_list` family), the guest `strtod`, and the small `libc_shim.c`
 The mem/string + alloc + non-varargs stdio names (`memcpy`/`fwrite`/`puts`/
 `malloc`/…) are on-ramp-synthesized (slices N/O/X), not gaps.
 
-**NEXT (blocking) — dynamic `alloca`.** `JS_CallInternal` (the bytecode
-interpreter core) allocates its operand stack with a **runtime-sized `alloca`**
-(`alloca(alloc_size)`); the on-ramp lowers only constant-size `alloca` (→ window
-frame slots). A variable-length `alloca` needs a runtime data-SP bump + restore
-— a translator slice of its own (cf. the §3d data-stack), the current wall.
+**DONE — dynamic `alloca`.** `JS_CallInternal` allocates its operand stack with
+a **runtime-sized `alloca`** (`alloca i8, i64 %n`); the on-ramp now lowers it via
+a per-frame `DYN_TOP` running top (bumped by `align16(count·elem)`), and a call in
+such a function hands the callee that top so its frame sits above the
+variable-length region. Test `dynamic_alloca_runtime_count` (interp == JIT).
+
+**DONE — `llvm.frameaddress`.** `JS_CallInternal`'s `js_check_stack_overflow`
+reads the stack pointer via `__builtin_frame_address(0)`. QuickJS assumes a
+*downward* native stack, but the SVM data-stack grows *up*, so `frameaddress(0)`
+lowers to the downward proxy `FRAME_ADDR_BASE - sp` (decreases with depth; the
+base cancels out of the check's arithmetic). Test
+`frameaddress_is_downward_stack_proxy` (interp == JIT).
+
+**DONE — `select` of aggregates.** `js_array_iterator_next` does
+`select i1 %c, {i64,i64} %a, {i64,i64} %b` (choosing between two `JSValue`s);
+now lowered field-wise into the `agg` side-table (test `select_of_aggregate`,
+interp == JIT). The libc surface it exposed is in `libc_shim.c`: `strcat`;
+deterministic `gettimeofday`/`clock_gettime`/`localtime_r`; single-threaded
+`pthread_*` no-op stubs (for `Atomics.wait`).
+
+**DONE — `llvm.round`** (the last translate gap). `JS_ComputeMemoryUsage` calls C
+`round()` (ties away from zero); synthesized boundary-safely as
+`t=trunc(x); |x-t|>=0.5 ? t+copysign(1,x) : t` (test `llvm_round_ties_away_from_zero`).
+
+## ★ It runs — byte-identical to native
+
+The unmodified QuickJS engine (1175 functions) now **translates, verifies, and
+executes** the driver, with stdout byte-identical to the native `cc` build:
+
+```
+1,2,3,5,7,8,9 | sumfib=17710 | {"a":1,"b":[true,null,"x"]} | abc | 0.3000
+```
+
+`demo_quickjs_eval_vs_native` is green (`#[ignore]`d only for wall-clock — a whole
+JS engine on the tree-walking interpreter takes tens of seconds; the JIT/wasm tier
+is much faster).
+
+## Playground REPL — `qjs_repl.c`
+
+`qjs_repl.c` reads a JS program from **stdin** (the `Stream` capability),
+evaluates it, and prints `print`/`console.log` output plus the completion value
+— a full JS REPL in the sandbox. Runs **byte-identical to native**
+(`demo_quickjs_repl_stdin`), including shortest float printing: `0.1+0.2` →
+`0.30000000000000004`, `Math.PI` → `3.141592653589793`, etc.
+
+The **directed-rounding dtoa concern turned out to be a false alarm**: QuickJS's
+shortest `Number→string` (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` around a
+`snprintf("%e")` that, here, is the correctly-rounded bignum dtoa (`__vm_fmt_sci`)
+— it ignores `fesetround` and always rounds to nearest, yet QuickJS's shortest
+search still converges to the right digits. No rounding-mode primitive needed.
+
+Wired into the browser playground: `browser/build-onramp-assets.mjs` fetches
+QuickJS + openlibm, compiles the engine + shims, `llvm-link -S`s them, and
+translates to `qjs_repl.svmb` at `--host-page 65536` (~4.3 MB); `web/play.js`
+registers it as a "JavaScript (QuickJS — write & run JS)" example. Boot is
+milliseconds. Remaining: a real-browser run + the in-browser wasm-JIT tier (for
+speed) — needs a browser env with GitHub egress to build the asset.
 
 **NEXT (semantic) — directed-rounding dtoa.** QuickJS's shortest Number→string
 (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` to find the shortest round-trip
