@@ -193,10 +193,21 @@ keystone of self-similarity. It is **not built**. Until it lands:
    `Host` sink, so shell and command output interleave. Differential interp==JIT,
    three paths (builtin / external / not-found). Confinement untouched (op 13 is
    the existing fuzzed spawn path; the personality is authority-TCB, §2a).
-   **Follow-up:** fold this onto the full `c_shell.rs` builtin dispatch — its
-   128 KiB window with the personality heap at `win/2` has no room for a 128 KiB
-   command carve, so it needs a larger window and a relocated heap (the focused
-   test uses a dedicated 384 KiB `pool` static + a top-of-window heap).
+
+   **Folded into the full Stage-0 shell** *(done — `crates/svm/tests/c_shell.rs`)*:
+   the real `c_shell.rs` shell now spawns external commands from its command
+   dispatch — the `else` (was `<cmd>: not found`) branch does `exec_lookup` and,
+   on a hit, `spawn_cmd` (grant record + args carve + op 13 + `join`), threading
+   the child's status into `$?`. The layout tension is resolved as the focused
+   test does: a 384 KiB `pool` static forces a window with a 128 KiB-aligned
+   command carve **below the stack**, and the personality heap moves to the top of
+   the window (the shell never `malloc`s, so it is never touched). `run_shell`
+   takes an optional PATH of `(name, C source)` commands; with none registered
+   `exec_lookup` always misses, so the 24 existing shell tests are unchanged. Two
+   new tests cover a spawned command's argv delivery + `$?` and its status flowing
+   through `&&`/`||`. A `>`/`|` redirect on an *external* command is not honored
+   (the command always writes to the terminal sink) — that is the Power-2
+   `Endpoint` gap below, not a regression.
 6. **Pipelines across real children** — replace the memfs-temp pipeline staging
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
