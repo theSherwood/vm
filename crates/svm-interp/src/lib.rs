@@ -6218,6 +6218,56 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                             (0, None, 2, None, list)
                         }
+                        // §14 `instantiate_module_named(module, grants_ptr, grants_n, entry, off,
+                        // size_log2, quota)` (STAGE1.md — the shell "exec" primitive): the union of op 5
+                        // (run a host-granted **separate `Module`**) and op 11 (a **named grant list**
+                        // re-granted into the child's powerbox). It is the only op that runs a foreign
+                        // program *and* hands it capabilities — so a compiled command (its own module)
+                        // can resolve an inherited `stdout` by name and do real I/O, not just return a
+                        // status. `module` is arg 0, the grant list at args 1/2, the carve args follow
+                        // (`askip = 3`). Forged module / non-copyable grant / bad record fail closed,
+                        // exactly as ops 5 and 11 do individually.
+                        13 => {
+                            let mh =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as i32;
+                            let g = {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let g = hg.resolve_module(mh)?;
+                                (
+                                    g.funcs.clone(),
+                                    g.memory_log2,
+                                    g.data.clone(),
+                                    g.durable,
+                                    g.digest,
+                                )
+                            };
+                            let grants_ptr =
+                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            let grants_n =
+                                get_i64(&frames[top].vals, *args.get(2).ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                            let mut list: Vec<(String, i32)> = Vec::new();
+                            for i in 0..grants_n {
+                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                                let name_off =
+                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                                let name_len =
+                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                                let name_bytes = m.read_window(name_off, name_len)?;
+                                let name =
+                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                                {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                }
+                                list.push((name, handle));
+                            }
+                            (0, Some(g), 3, None, list)
+                        }
                         o => (o, None, 0, None, Vec::new()),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.

@@ -917,6 +917,154 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     slot as i32
 }
 
+/// STAGE1.md — `instantiate_module_named(module, grants_ptr, grants_n, entry, off, size_log2, quota)`
+/// (Instantiator op 13): the **shell exec** primitive — the union of [`instantiate`]'s separate-module
+/// path (op 5: resolve + compile a host-granted `Module`, materialize its data into the carve) and
+/// [`instantiate_named`]'s by-name grant list (op 11: re-grant caps into the child's powerbox). It is
+/// the only op that runs a foreign program *and* hands it capabilities, so a compiled command (its own
+/// module) can resolve an inherited `stdout` by name and do real I/O. The child ctx is per-spawn, so
+/// the code is compiled uncached (like op 11). A forged module / non-copyable grant / bad record fails
+/// closed exactly as ops 5 and 11 do individually.
+///
+/// # Safety
+/// As [`instantiate`]/[`instantiate_named`]: `rt`/`mem_base`/`mem_size`/`trap_out` are the baked
+/// nursery, live parent window base, mapped byte count, and run trap cell, valid for the call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn instantiate_module_named(
+    rt: *const Nursery,
+    mem_base: u64,
+    mem_size: u64,
+    handle: i32,
+    module: i64,
+    grants_ptr: i64,
+    grants_n: i64,
+    entry: i64,
+    off: i64,
+    size_log2: i64,
+    _fuel: i64,
+    trap_out: *mut i64,
+) -> i32 {
+    let rt = &*rt;
+    // A durable run may not spawn a separate-module child (host-supplied identity + freeze residue are
+    // a later slice), matching the `instantiate` op-5 path.
+    if rt.durable.load(Ordering::Acquire) {
+        return EINVAL as i32;
+    }
+    let build_addr = rt.grant_build_named.load(Ordering::Acquire);
+    let release_addr = rt.grant_release.load(Ordering::Acquire);
+    if build_addr == 0 || release_addr == 0 {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
+    let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
+    let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
+
+    let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
+        return 0; // `*trap_out` already holds the CapFault
+    };
+    // Resolve the granted separate module (op 5): its funcs, declared memory, and data segments.
+    let Some((child_funcs, mod_mem, child_data)) = rt.resolve_child(module, trap_out) else {
+        return 0; // forged Module handle / no resolver — CapFault set
+    };
+    let entry = entry as u64;
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let off = off as u64;
+    // A named child receives no positional grant, so its entry is the 1- or 2-arg form (a compiled
+    // command's `--child-entry` `_start` is the 1-arg starter form; it finds granted caps by name).
+    let want_as = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| f.params.len() >= 2);
+    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
+        f.results.as_slice() == [ValType::I64]
+            && (f.params.len() == 1 || f.params.len() == 2)
+            && f.params.iter().all(|p| *p == ValType::I64)
+    });
+    // A module child's carve must equal its declared memory (§14 transparency), as in op 5.
+    let mod_ok = mod_mem.is_none_or(|ml| ml == size_log2 as i32);
+    let fits = child_size != 0
+        && child_size <= size
+        && off & (child_size - 1) == 0
+        && off.checked_add(child_size).is_some_and(|e| e <= size);
+    if !ok_entry || !fits || !mod_ok {
+        return EINVAL as i32;
+    }
+    // Materialize the module's data segments into the carve (op 5) before the grants + run.
+    write_data_segments(child_data, mem_base, base + off, child_size);
+
+    // Build the child powerbox host-side from the grant records (op 11); a bad record/name sets
+    // `*trap_out` and fails the whole spawn closed.
+    let mut gc = crate::GrantChild {
+        ctx: core::ptr::null_mut(),
+        inst_handle: 0,
+        as_handle: 0,
+        grant_handle: 0,
+    };
+    if build(
+        rt.cap_ctx,
+        mem_base as *mut u8,
+        mem_size,
+        grants_ptr as u64,
+        grants_n as u64,
+        child_size,
+        &mut gc,
+        trap_out,
+    ) == 0
+    {
+        return 0; // `*trap_out` already set by the builder
+    }
+
+    // Compile the foreign module's entry confined to the carve, with the child powerbox ctx so its
+    // `cap.self.resolve(name)` routes to the granted caps. Per-spawn ctx ⇒ uncached (like op 11).
+    let compiled = crate::compile_child(
+        child_funcs,
+        entry as FuncIdx,
+        size_log2 as u8,
+        rt.cap_thunk,
+        gc.ctx,
+        rt.epoch_addr,
+        crate::InstEnv::null(),
+    );
+    let outcome = match compiled {
+        Ok(code) => {
+            let mut args = vec![gc.inst_handle as i64];
+            if want_as {
+                args.push(gc.as_handle as i64);
+            }
+            let n_results = child_funcs[entry as usize].results.len();
+            Some(crate::run_child_code(
+                &code,
+                base + off,
+                size_log2 as u8,
+                mem_base as *mut u8,
+                &args,
+                n_results,
+            ))
+        }
+        Err(_) => None,
+    };
+    release(gc.ctx);
+
+    let (result, trap) = match outcome {
+        Some(rt) => rt,
+        None => {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
+    };
+    let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = children.len();
+    children.push(Child {
+        result,
+        trap,
+        joined: false,
+    });
+    slot as i32
+}
+
 /// `join(child_handle) -> result` — block on the child's completion (it already ran synchronously at
 /// `instantiate` today) and return its `i64` result, propagating a child trap as the parent's
 /// (`*trap_out`). A forged / already-joined handle is inert (a `CapFault`), matching the interpreter's
