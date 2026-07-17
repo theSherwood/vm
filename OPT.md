@@ -234,19 +234,26 @@ tracked enhancement, not a blocker.
     (below) removes those first, then DFE applies. `OptConfig.dfe` toggle (default on), runs once after
     the per-function passes; output re-verified; debug info dropped on any removal. Tests in
     `tests/interproc.rs`; covered by the `opt_sccp` fuzz target (whole pipeline).
-  - [x] **Budgeted direct-call inliner** (`svm_opt::interproc::inline_calls`): splices a **single-
-    block, straight-line** callee into a direct `call` site in place — its params bind to the call's
-    args, its instruction results take fresh caller-local indices where the call was, and the call's
-    result forwards to the callee's returned values (renumbered through the shared `map_operands`
-    map). No block split / cross-block threading, so the common leaf-helper case (the `a*3+b*5+7`
-    demo shape) is handled with the boring straight-line substitution; **multi-block callees stay
-    calls** (block-local SSA would need value threading through the inlined region — a later slice).
-    Module-wide instruction budget + `MAX_CALLEE_INSTS` size guard + direct-self-recursion skip bound
-    growth and guarantee termination. `OptConfig.inline` toggle (default on), runs first at module
-    scope so the per-function passes fold through the inlined bodies and DFE sweeps the now-uncalled
-    leaf — the end-to-end interprocedural story. Tests in `tests/interproc.rs` (leaf inlined +
-    DFE-removed, live code across the call site renumbered, multi-block callee left alone); the peval
-    differential suite + `opt_sccp` fuzz target now exercise it on real residuals.
+  - [x] **Budgeted direct-call inliner** (`svm_opt::interproc::inline_calls`): splices a small callee
+    into a direct `call` site. A **single-block, straight-line** callee is substituted in place — its
+    params bind to the call's args, its instruction results take fresh caller-local indices where the
+    call was, and the call's result forwards to the callee's returned values (renumbered through the
+    shared `map_operands` map). A **multi-block callee** (internal control flow) is spliced by
+    **CFG surgery** (`inline_multi_block_call`): the caller block is split at the call, the callee's
+    blocks are appended (targets shifted, each `return` → branch to a fresh **continuation** block that
+    receives the return values), and each **captured** pre-call value used after the call is threaded
+    through the callee — appended as a pass-through parameter to every callee block and carried along
+    every edge (including back edges of loops in the callee) to the continuation. This over-threads;
+    the always-on dead-block-parameter cleanup prunes the params that weren't needed. Tail-call callee
+    exits are excluded (a separate transform). Module-wide instruction budget + `MAX_CALLEE_INSTS`
+    (total, across all callee blocks) size guard + direct-self-recursion skip bound growth and
+    guarantee termination. `OptConfig.inline` toggle (default on), runs first at module scope so the
+    per-function passes fold through the inlined bodies and DFE sweeps the now-uncalled leaf — the
+    end-to-end interprocedural story. Tests in `tests/interproc.rs` (single-block leaf inlined +
+    DFE-removed, live code across the call site renumbered; a multi-block `abs` callee inlined with a
+    captured value threaded through the join; a callee with a **loop** threaded around its back edge;
+    full-pipeline devirt→inline→DFE), all re-verified; the peval differential suite + `opt_sccp` fuzz
+    target now exercise it on real residuals.
   - [x] **Constant-funcref devirtualization** (`svm_opt::interproc::devirtualize`): a
     `call_indirect`/`return_call_indirect` whose `idx` is a compile-time-constant funcref (a
     `ref.func k`, or an in-range `ConstI32 k` — a funcref is a plain `i32`, the identity table) and
@@ -257,8 +264,8 @@ tracked enhancement, not a blocker.
     inlining so a devirtualized call becomes an inlining candidate — and, with the indirect dispatch
     gone, DFE's gate lifts. Tests in `tests/interproc.rs` (devirt → inline → DFE end-to-end; a
     signature mismatch is left to trap); peval differential + `opt_sccp` fuzz cover the pipeline. This
-    completes the Phase 3 trio (**devirt + inliner + DFE**); multi-block-callee inlining (below) is the
-    remaining interprocedural enhancement.
+    completes the Phase 3 trio (**devirt + inliner + DFE**); multi-block-callee inlining (below) has
+    since landed too.
 - [ ] **Phase 4 — memory passes.** Redundant-load elimination + store-to-load forwarding over
   the effects table (clobber rules 2/4); opt-in scratch-region contract for DSE; simple range
   analysis so LICM/DCE can touch provably in-bounds loads.
@@ -355,11 +362,15 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
 
 ### Enhancements (tracked, not gating)
 
-- [ ] **Multi-block-callee inlining.** The Phase 3 inliner handles single-block straight-line callees
-  in place; a callee with internal control flow needs a structural CFG splice — clone its blocks into
-  the caller and thread every value live across the call site through the cloned region (block-local
-  SSA has no cross-block value visibility except via block params). Reuses `crate::thread` +
-  `map_operands`/`remap_targets`; recursion guard via the inline stack (cf. peval's `is_recursion`).
+- [x] **Multi-block-callee inlining.** Landed (`inline_multi_block_call`). A callee with internal
+  control flow is spliced by CFG surgery: split the caller block at the call, append the callee's
+  blocks (targets shifted, `return`s → branch to a fresh continuation block that receives the results),
+  and thread each value live across the call site through the callee — appended as a pass-through
+  block parameter to every callee block and carried along every edge (loops' back edges included) to
+  the continuation, with the dead-block-parameter cleanup pruning the over-threaded params. Termination
+  is the same instruction budget + total-insts size guard + self-recursion skip as the single-block
+  path. (Chose uniform over-threading + cleanup over selective `crate::thread::make_available` — same
+  result, simpler code.)
 - [ ] Debug-info (line map) preservation through transforms.
 - [ ] Loop unrolling / peeling under `OptConfig` budgets.
 - [ ] Interprocedural constant propagation (beyond what inlining exposes).
