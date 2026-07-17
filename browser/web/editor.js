@@ -47,8 +47,9 @@ export function createEditor(textarea, lang) {
     indentUnit: 2,
     lineWrapping: false,
     mode: MODE[lang] || MODE.svm,
-    // A dedicated gutter left of the line numbers for parse/verify error markers.
-    gutters: ['svm-error-gutter', 'CodeMirror-linenumbers'],
+    // Two dedicated gutters left of the line numbers: parse/verify error markers, and the debugger's
+    // breakpoint dots (DEBUGGING.md — the DAP-over-bytecode panel).
+    gutters: ['svm-error-gutter', 'dap-bp-gutter', 'CodeMirror-linenumbers'],
   });
 
   // --- per-instance parse/verify error surfacing --------------------------------------------------
@@ -91,6 +92,39 @@ export function createEditor(textarea, lang) {
   };
   cm.on('change', clearError); // clear the decoration as soon as the author starts fixing it
 
+  // --- per-instance debugger decoration (breakpoint gutter + stop-line highlight) -----------------
+  // The playground's DAP panel drives these: a click in the breakpoint gutter toggles a dot (0-based
+  // line), and a stop highlights the paused source line. Pure UI — the real breakpoint/stop state
+  // lives in the DAP session; these just render it.
+  const breakpoints = new Set(); // 0-based lines with a breakpoint dot
+  let stopLine = null;
+  const setBreakpoint = (line, on) => {
+    if (on) {
+      const dot = document.createElement('span');
+      dot.className = 'cm-bp-marker';
+      dot.textContent = '●';
+      cm.setGutterMarker(line, 'dap-bp-gutter', dot);
+      breakpoints.add(line);
+    } else {
+      cm.setGutterMarker(line, 'dap-bp-gutter', null);
+      breakpoints.delete(line);
+    }
+  };
+  const clearBreakpoints = () => {
+    for (const line of [...breakpoints]) setBreakpoint(line, false);
+  };
+  const clearStopLine = () => {
+    if (stopLine !== null) cm.removeLineClass(stopLine, 'background', 'cm-stop-line');
+    stopLine = null;
+  };
+  const setStopLine = (line) => {
+    clearStopLine();
+    if (line == null) return;
+    stopLine = line;
+    cm.addLineClass(line, 'background', 'cm-stop-line');
+    cm.scrollIntoView({ line, ch: 0 }, 80);
+  };
+
   const api = {
     cm,
     getValue: () => cm.getValue(),
@@ -101,6 +135,14 @@ export function createEditor(textarea, lang) {
     onChange: (fn) => cm.on('change', fn),
     markError,
     clearError,
+    // Debugger surface (0-based lines).
+    onGutterClick: (fn) => cm.on('gutterClick', (_cm, line) => fn(line)),
+    toggleBreakpoint: (line) => { setBreakpoint(line, !breakpoints.has(line)); return breakpoints.has(line); },
+    breakpointLines: () => [...breakpoints].sort((a, b) => a - b),
+    clearBreakpoints,
+    setStopLine,
+    clearStopLine,
+    setReadOnly: (on) => cm.setOption('readOnly', on),
     refresh: () => cm.refresh(),
     focus: () => cm.focus(),
     setVim: (on) => cm.setOption('keyMap', on ? 'vim' : 'default'),

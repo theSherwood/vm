@@ -80,6 +80,17 @@
       button.run { background: var(--accent); color: #fff; border-color: var(--accent); }
       button.run:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
       button.prove { font-size: 0.8rem; color: var(--accent); border-color: var(--border); }
+      button.debug { color: var(--accent); }
+      /* Debugger panel: the step controls + a live variables pane, shown while a session is paused. */
+      .dbg { margin: 0.4rem 0 0.75rem; display: none; }
+      .dbg.active { display: block; }
+      .dbg-controls { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
+      .dbg-controls button { padding: 0.25rem 0.7rem; }
+      .dbg-vars { background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+                  padding: 0.45rem 0.6rem; margin: 0; min-height: 1.2rem; max-height: 12rem; overflow: auto;
+                  font: 0.8rem/1.5 ui-monospace, monospace; }
+      .dbg-vars .bpname { color: var(--accent); }
+      .dbg-vars:empty { display: none; }
       .state { font-size: 0.82rem; color: var(--muted); font-variant-numeric: tabular-nums; }
       .state[data-state="error"], .state[data-state="stopped"] { color: var(--bad); }
       .state[data-state="done"] { color: var(--good); }
@@ -124,6 +135,10 @@
       .svm-error-gutter { width: 0.8rem; }
       .cm-error-marker { color: #d1242f; cursor: help; }
       .cm-error-line { background: #fbe9eb; }
+      /* Debugger: the breakpoint gutter + dot, and the paused source line (DAP panel). */
+      .dap-bp-gutter { width: 0.9rem; cursor: pointer; }
+      .cm-bp-marker { color: #d1242f; cursor: pointer; }
+      .cm-stop-line { background: #fff8c5; }
       .cm-error-widget {
         background: #ffeef0; color: #86181d; border-left: 3px solid #d1242f;
         font: 0.78rem/1.4 ui-monospace, monospace; padding: 0.2rem 0.5rem; white-space: pre-wrap;
@@ -156,6 +171,8 @@
       :root[data-theme="dark"] .CodeMirror-dialog { background: #1d1d1d; color: #ddd; }
       :root[data-theme="dark"] .cm-error-line { background: #3a1d20; }
       :root[data-theme="dark"] .cm-error-marker { color: #ff7b72; }
+      :root[data-theme="dark"] .cm-stop-line { background: #3d3a1e; }
+      :root[data-theme="dark"] .cm-bp-marker { color: #ff7b72; }
       :root[data-theme="dark"] .cm-error-widget { background: #2d1417; color: #ffb4ac; border-left-color: #f85149; }
     </style>
   </head>
