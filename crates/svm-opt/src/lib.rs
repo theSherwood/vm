@@ -86,6 +86,7 @@ pub mod gvn;
 pub mod instrument;
 pub mod interproc;
 pub mod licm;
+pub mod load_elim;
 pub mod reassociate;
 pub mod sccp;
 pub mod ssa;
@@ -194,6 +195,9 @@ pub struct OptConfig {
     /// Memory forwarding (`mem_forward`): intra-block redundant-load elimination + store-to-load
     /// forwarding (OPT.md Phase 4).
     pub mem: bool,
+    /// Cross-block redundant-load elimination (`svm_opt::load_elim`) — module-level, runs with the
+    /// other whole-function passes before `optimize_func` (OPT.md Phase 4).
+    pub load_elim: bool,
 }
 
 impl OptConfig {
@@ -210,6 +214,7 @@ impl OptConfig {
             inline: true,
             dfe: true,
             mem: true,
+            load_elim: true,
         }
     }
     /// Every optional pass off — only the always-on intra-block canonicalization runs. The ablation
@@ -226,6 +231,7 @@ impl OptConfig {
             inline: false,
             dfe: false,
             mem: false,
+            load_elim: false,
         }
     }
 }
@@ -286,6 +292,14 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
                 // out of loops; the fixpoint below DCEs the emptied-out originals.
                 let g = if cfg.licm {
                     licm::licm(&g, &m.funcs, has_memory)
+                } else {
+                    g
+                };
+                // Cross-block redundant-load elimination (OPT.md Phase 4): remove a load whose location
+                // a dominating access already established with no write between, threading that value
+                // in — the memory analogue of GVN. Runs after GVN so addresses are already congruent.
+                let g = if cfg.load_elim {
+                    load_elim::load_elim(&g, &m.funcs, has_memory)
                 } else {
                     g
                 };
@@ -1824,7 +1838,7 @@ fn local_cse(b: &Block, fn_results: &[usize]) -> Block {
 /// type. The narrowing stores (`i32.store8`, …) write only the low bytes, and a matching load would
 /// zero/sign-extend them, so the loaded value is not the stored value — those are deliberately not
 /// forwardable. A cross-type match (store `f32`, load `i32`) is excluded too: same bytes, wrong type.
-fn store_forward_load_op(op: StoreOp) -> Option<LoadOp> {
+pub(crate) fn store_forward_load_op(op: StoreOp) -> Option<LoadOp> {
     match op {
         StoreOp::I32 => Some(LoadOp::I32),
         StoreOp::I64 => Some(LoadOp::I64),

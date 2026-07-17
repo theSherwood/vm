@@ -278,8 +278,24 @@ tracked enhancement, not a blocker.
     `tests/memopt.rs` (forwarded store; redundant load across a pure op; the aliasing `a==b` may-alias
     store that must block forwarding; a disjoint-offset store that must *not*; an overlapping-offset
     store that must; `v128` store→load forwarding); the peval differential suite + `opt_sccp` fuzz
-    cover the pipeline. **Next:** cross-block load elimination (GVN-style, threading the available value
-    through block params) and an opt-in scratch-region contract for dead-store elimination (DSE needs a
+    cover the pipeline.
+  - [x] **Cross-block redundant-load elimination** (`svm_opt::load_elim`) — the memory analogue of
+    GVN. A load whose location a **dominating** access (an earlier load, or a matching store)
+    established, with **no memory write on any path between**, is removed and its result forwarded —
+    threaded across blocks by `crate::thread::Threader`, exactly as GVN threads a congruent dominating
+    value. "Same location" is `(address value-number, offset, op)` — the address by `crate::vn`
+    congruence (block-local SSA never shares an operand id). Alias model is conservative across blocks:
+    **any** write / side effect (store / atomic / `mem.copy`/`fill` / call) on a between-path clobbers,
+    and the between region must be **acyclic** (loop-carried loads deferred) so the source runs once
+    before the load and the partial-block clobber checks (after the source, before the load) are valid.
+    Sound on value *and* traps (the dominating same-width access proved the address in-bounds). The load
+    is removed with a block-local rebuild (general DCE keeps loads as possible traps). Runs per-function
+    after GVN (addresses already congruent); `OptConfig.load_elim` toggle (default on). Tests
+    (`tests/load_elim.rs`): sequential + diamond-join forwarding, a between-store that must block it
+    (checked at `addr==other` where a missed clobber would miscompile), and an adversarial loop with a
+    per-iteration store that must **not** be eliminated; the whole pipeline (18-case randomized
+    differential, 46 peval differentials, `opt_sccp` fuzz) exercises it. **Next:** loop-invariant load
+    hoisting and an opt-in scratch-region contract for dead-store elimination (DSE needs a
     private-region guarantee to stay sound under shared-memory threads).
 - [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `svm-opt` on a module and JITs the
   result, peval-demo shape); PEVAL_BENCH + Wasmtime-relative numbers with the optimizer on;
