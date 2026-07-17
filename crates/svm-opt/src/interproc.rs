@@ -4,17 +4,20 @@
 //! bug here is a clean verify error, never an escape (untrusted-for-escape posture, §20a).
 //!
 //! Three passes: **constant-funcref devirtualization** (an indirect call on a constant funcref →
-//! direct call), the **budgeted direct-call inliner** (splice a small straight-line callee into its
-//! caller), and **dead-function elimination** (drop functions no reachable code can call). They
+//! direct call), the **budgeted direct-call inliner** (splice a small callee — straight-line in place,
+//! or multi-block by splicing its CFG in and threading values across the call), and **dead-function
+//! elimination** (drop functions no reachable code can call). They
 //! compose into the end-to-end interprocedural story: devirtualization turns a `call_indirect` into a
 //! direct `call`, the inliner splices a small callee in, and DFE sweeps the now-uncalled leaf — and,
 //! because devirtualization removes the indirect dispatch, DFE's conservative gate lifts too.
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
-use svm_ir::{Block, Export, Func, FuncIdx, FuncType, Inst, Module, Terminator};
+use svm_ir::{Block, Export, Func, FuncIdx, FuncType, Inst, Module, Terminator, ValType};
+use svm_verify::func_value_types;
 
-use crate::{map_operands, map_term_operands};
+use crate::{each_operand, map_operands, map_term_operands};
 
 /// Visit every **static function index** a function references: a direct `call`, a `ref.func`, a
 /// `thread.spawn` entry, and the `return_call` terminator. This mirrors `svm_ir::offset_func_indices`
@@ -285,24 +288,256 @@ fn inline_single_block_call(
     }
 }
 
-/// Whether `callee` (a function) is an inlining candidate for a direct call: a **single block** that
-/// ends in `return` and is no larger than [`MAX_CALLEE_INSTS`]. Multi-block callees (internal control
-/// flow) are left as calls — inlining them in block-local SSA needs cross-block value threading, a
-/// later slice.
-fn is_inlinable(callee: &Func) -> bool {
-    callee.blocks.len() == 1
-        && matches!(callee.blocks[0].term, Terminator::Return(_))
-        && callee.blocks[0].insts.len() <= MAX_CALLEE_INSTS
+/// Total instructions across every block of a function — the size charged against the inline budget
+/// (a multi-block callee's cost is its whole body, not just its entry).
+fn callee_total_insts(callee: &Func) -> usize {
+    callee.blocks.iter().map(|b| b.insts.len()).sum()
 }
 
-/// **Budgeted direct-call inliner.** Repeatedly splice a small single-block callee into a direct
-/// `call` site until no eligible site remains or the module-wide instruction budget is spent. Direct
-/// self-recursion is skipped, and the budget bounds total growth (so cycles of small functions
-/// terminate). Inlining does not change any function's signature, so caller/callee indices stay valid;
-/// the now-uncalled callee is swept later by [`dead_func_elim`]. Debug info is dropped once anything is
-/// inlined (instruction positions shift).
+/// Whether `callee` is an inlining candidate for a direct call: no larger than [`MAX_CALLEE_INSTS`]
+/// instructions total, every block exits only by an internal branch (`br`/`br_if`/`br_table` — targets
+/// stay inside the callee), a value `return`, or `unreachable`, and at least one block actually
+/// `return`s (so the spliced-in continuation has a predecessor). Tail-call exits
+/// (`return_call`/`return_call_indirect`) are excluded — turning a callee tail call into a caller
+/// non-tail call is a separate transform. A single-block `return` callee takes the in-place fast path
+/// ([`inline_single_block_call`]); anything else with internal control flow takes the CFG-splicing path
+/// ([`inline_multi_block_call`]).
+fn is_inlinable(callee: &Func) -> bool {
+    if callee.blocks.is_empty() || callee_total_insts(callee) > MAX_CALLEE_INSTS {
+        return false;
+    }
+    let exits_ok = callee.blocks.iter().all(|b| {
+        matches!(
+            b.term,
+            Terminator::Br { .. }
+                | Terminator::BrIf { .. }
+                | Terminator::BrTable { .. }
+                | Terminator::Return(_)
+                | Terminator::Unreachable
+        )
+    });
+    let has_return = callee
+        .blocks
+        .iter()
+        .any(|b| matches!(b.term, Terminator::Return(_)));
+    exits_ok && has_return
+}
+
+/// Read every value operand of a terminator (the read-only counterpart of [`map_term_operands`]).
+fn each_term_operand(term: &Terminator, mut visit: impl FnMut(u32)) {
+    let mut t = term.clone();
+    map_term_operands(&mut t, &mut |o| {
+        visit(o);
+        o
+    });
+}
+
+/// Rewrite a callee block's terminator for splicing into the caller: internal branch targets are
+/// shifted by `off` (where the callee's blocks now live), operand indices ≥ `np` are shifted by `capc`
+/// (the block grew by `capc` captured pass-through parameters at slots `[np, np+capc)`), every out-edge
+/// carries this block's captured parameters along (`cap_params`), and a `return` becomes a branch to
+/// the continuation block `cont` passing the return values plus the captured parameters.
+fn transform_callee_term(
+    term: &Terminator,
+    np: u32,
+    capc: u32,
+    off: u32,
+    cont: u32,
+    cap_params: &[u32],
+) -> Terminator {
+    let shift = |idx: u32| if idx < np { idx } else { idx + capc };
+    // Edge args: shift each, then append the captured pass-through params.
+    let ext = |args: &[u32]| -> Vec<u32> {
+        let mut v: Vec<u32> = args.iter().map(|&a| shift(a)).collect();
+        v.extend_from_slice(cap_params);
+        v
+    };
+    match term {
+        Terminator::Br { target, args } => Terminator::Br {
+            target: off + target,
+            args: ext(args),
+        },
+        Terminator::BrIf {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        } => Terminator::BrIf {
+            cond: shift(*cond),
+            then_blk: off + then_blk,
+            then_args: ext(then_args),
+            else_blk: off + else_blk,
+            else_args: ext(else_args),
+        },
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => Terminator::BrTable {
+            idx: shift(*idx),
+            targets: targets.iter().map(|(t, a)| (off + t, ext(a))).collect(),
+            default: (off + default.0, ext(&default.1)),
+        },
+        Terminator::Return(rvals) => Terminator::Br {
+            target: cont,
+            args: ext(rvals),
+        },
+        Terminator::Unreachable => Terminator::Unreachable,
+        Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. } => {
+            unreachable!("tail-call callee exits are excluded by is_inlinable")
+        }
+    }
+}
+
+/// Inline a **multi-block** callee at a direct `call` site by splicing its CFG into the caller. The
+/// caller block is split at the call: the instructions before it stay (branching into the callee, whose
+/// parameters bind to the call's arguments), and the instructions after it move to a fresh
+/// **continuation** block whose parameters receive the callee's return values. The callee's blocks are
+/// appended (targets shifted past the caller's existing blocks), and every `return` becomes a branch to
+/// the continuation.
+///
+/// Block-local SSA forbids the continuation from naming values defined before the call, so each such
+/// **captured** value (a pre-call value used after the call) is **threaded** through the callee: it is
+/// appended as a pass-through parameter to every callee block and passed along every edge, arriving at
+/// the continuation. This over-threads (a block that doesn't need a captured value still carries it);
+/// the always-on dead-block-parameter cleanup prunes the unused ones afterward.
+///
+/// Sound because it is the call's own control/data flow made explicit: the callee body runs between the
+/// pre- and post-call code exactly as the call did, its arguments bind to the callee's parameters, its
+/// return values flow to where the call's results were used, and each captured value reaches the
+/// continuation unchanged (one definition, threaded verbatim along every path). Returns the caller's new
+/// block list.
+fn inline_multi_block_call(
+    caller: &Func,
+    bi: usize,
+    call_idx: usize,
+    callee: &Func,
+    fn_results: &[usize],
+    caller_block_types: &[ValType],
+) -> Vec<Block> {
+    let b = &caller.blocks[bi];
+    let p = b.params.len() as u32;
+
+    // First result index of each caller-block instruction, and the block's total value count.
+    let mut result_start = Vec::with_capacity(b.insts.len());
+    let mut n = p;
+    for inst in &b.insts {
+        result_start.push(n);
+        n += inst.result_count(fn_results) as u32;
+    }
+    let base_c = result_start[call_idx];
+    let rc = b.insts[call_idx].result_count(fn_results) as u32;
+    let call_args: Vec<u32> = match &b.insts[call_idx] {
+        Inst::Call { args, .. } => args.clone(),
+        _ => unreachable!("call site must be a direct call"),
+    };
+
+    // Captured = pre-call values (local index < base_c) referenced by post-call insts or the terminator.
+    let mut used: BTreeSet<u32> = BTreeSet::new();
+    for inst in &b.insts[(call_idx + 1)..] {
+        each_operand(inst, |o| {
+            if o < base_c {
+                used.insert(o);
+            }
+        });
+    }
+    each_term_operand(&b.term, |o| {
+        if o < base_c {
+            used.insert(o);
+        }
+    });
+    let cap: Vec<u32> = used.into_iter().collect();
+    let capc = cap.len() as u32;
+    let cap_types: Vec<ValType> = cap
+        .iter()
+        .map(|&c| caller_block_types[c as usize])
+        .collect();
+
+    let off = caller.blocks.len() as u32; // callee entry lands at off + 0
+    let k = callee.blocks.len() as u32;
+    let cont = off + k;
+
+    // Pre-call block (keeps index bi): the pre-call insts, then a branch into the callee passing the
+    // call arguments followed by the captured values.
+    let mut pre_args = call_args;
+    pre_args.extend(cap.iter().copied());
+    let pre_block = Block {
+        params: b.params.clone(),
+        insts: b.insts[..call_idx].to_vec(),
+        term: Terminator::Br {
+            target: off,
+            args: pre_args,
+        },
+    };
+
+    // Callee blocks: append the captured params to each, shift internal operands/targets, thread.
+    let mut callee_blocks: Vec<Block> = Vec::with_capacity(k as usize);
+    for cb in &callee.blocks {
+        let np = cb.params.len() as u32;
+        let mut params = cb.params.clone();
+        params.extend(cap_types.iter().copied());
+        let mut insts = cb.insts.clone();
+        for inst in &mut insts {
+            map_operands(inst, &mut |o| if o < np { o } else { o + capc });
+        }
+        let cap_params: Vec<u32> = (np..np + capc).collect();
+        let term = transform_callee_term(&cb.term, np, capc, off, cont, &cap_params);
+        callee_blocks.push(Block {
+            params,
+            insts,
+            term,
+        });
+    }
+
+    // Continuation block: post-call insts + original terminator, with pre-call/call values remapped to
+    // the continuation's own locals. Its parameters are the call's results then the captured values.
+    let mut map: Vec<u32> = vec![u32::MAX; n as usize];
+    for r in 0..rc {
+        map[(base_c + r) as usize] = r; // call result r → continuation param r
+    }
+    for (i, &c) in cap.iter().enumerate() {
+        map[c as usize] = rc + i as u32; // captured value → continuation param rc+i
+    }
+    let mut next_cont = rc + capc;
+    let mut cont_insts: Vec<Inst> = Vec::new();
+    for i in (call_idx + 1)..b.insts.len() {
+        let mut inst = b.insts[i].clone();
+        map_operands(&mut inst, &mut |o| map[o as usize]);
+        let rcount = b.insts[i].result_count(fn_results) as u32;
+        for r in 0..rcount {
+            map[(result_start[i] + r) as usize] = next_cont;
+            next_cont += 1;
+        }
+        cont_insts.push(inst);
+    }
+    let mut cont_term = b.term.clone();
+    map_term_operands(&mut cont_term, &mut |o| map[o as usize]);
+    let mut cont_params = callee.results.clone();
+    cont_params.extend(cap_types.iter().copied());
+    let cont_block = Block {
+        params: cont_params,
+        insts: cont_insts,
+        term: cont_term,
+    };
+
+    let mut blocks = caller.blocks.clone();
+    blocks[bi] = pre_block;
+    blocks.extend(callee_blocks);
+    blocks.push(cont_block);
+    blocks
+}
+
+/// **Budgeted direct-call inliner.** Repeatedly splice a small callee into a direct `call` site until
+/// no eligible site remains or the module-wide instruction budget is spent — a straight-line
+/// single-block callee in place ([`inline_single_block_call`]), a callee with internal control flow by
+/// splicing its CFG in ([`inline_multi_block_call`]). Direct self-recursion is skipped, and the budget
+/// bounds total growth (so cycles of small functions terminate). Inlining does not change any function's
+/// signature, so caller/callee indices stay valid; the now-uncalled callee is swept later by
+/// [`dead_func_elim`]. Debug info is dropped once anything is inlined (instruction positions shift).
 pub fn inline_calls(m: &Module) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let has_memory = m.memory.is_some();
     let mut funcs = m.funcs.clone();
     let mut budget = INLINE_INSN_BUDGET;
     let mut changed = false;
@@ -318,7 +553,7 @@ pub fn inline_calls(m: &Module) -> Module {
                         if callee == ci || callee >= funcs.len() {
                             continue; // skip direct self-recursion / out-of-range
                         }
-                        let csize = funcs[callee].blocks.first().map_or(0, |b| b.insts.len());
+                        let csize = callee_total_insts(&funcs[callee]);
                         if is_inlinable(&funcs[callee]) && csize <= budget {
                             site = Some((ci, bi, ii, callee, csize));
                             break 'scan;
@@ -331,10 +566,24 @@ pub fn inline_calls(m: &Module) -> Module {
             Some(s) => s,
             None => break,
         };
-        let callee_block = funcs[callee].blocks[0].clone();
-        let new_block =
-            inline_single_block_call(&funcs[ci].blocks[bi], ii, &callee_block, &fn_results);
-        funcs[ci].blocks[bi] = new_block;
+        if funcs[callee].blocks.len() == 1 {
+            // Straight-line callee: splice its body in place (no new blocks, no threading).
+            let callee_block = funcs[callee].blocks[0].clone();
+            funcs[ci].blocks[bi] =
+                inline_single_block_call(&funcs[ci].blocks[bi], ii, &callee_block, &fn_results);
+        } else {
+            // Callee has internal control flow: splice its CFG in, threading captured values through.
+            let block_types = func_value_types(&funcs[ci], &funcs, has_memory);
+            let callee_fn = funcs[callee].clone();
+            funcs[ci].blocks = inline_multi_block_call(
+                &funcs[ci],
+                bi,
+                ii,
+                &callee_fn,
+                &fn_results,
+                &block_types[bi],
+            );
+        }
         budget -= csize;
         changed = true;
     }

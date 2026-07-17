@@ -52,6 +52,7 @@ win). Passes not listed for a case had zero delta there.
 | correlated branch | 8/73 → 6/55 | **jump_thread +18** |
 | memory (mem + load_elim) | 5/85 → 3/77 | **mem +4, load_elim +4** |
 | interproc (devirt+inline+dfe) | 10/82 → 7/41 | **devirt +41, inline +18, dfe +47** |
+| multiblock inline (inline+dfe) | 4/67 → 3/64 | inline +3, **dfe +33** |
 
 Reading it:
 
@@ -67,6 +68,12 @@ Reading it:
 - **The memory passes** trim a redundant same-address load (`mem`) and a diamond-join reload that only
   cross-block `load_elim` can reach (a multi-predecessor block can't be merged, so intra-block
   forwarding never sees it) — +4 each here.
+- **Multi-block inlining** (the `multiblock inline` case, a caller of a three-block `max` with a value
+  threaded across the call) shows a smaller *net* `inline` delta (+3) than the single-block `interproc`
+  case (+18): splicing a callee's CFG into the caller grows the caller by roughly the callee's body, so
+  the byte win comes downstream — `dfe` (+33) reclaiming the now-dead callee, and the caller's own code
+  folding through the inlined region. The point is capability, not raw bytes: this callee shape was a
+  hard `call` before.
 - **LICM and GVN carry *negative* size deltas** on loops: they hoist/thread invariants through new
   block params, which is larger static code — deliberately, to save run time (next section). LICM's
   **hoist cost model** keeps that cost honest: it never hoists a bare constant (free to recompute —

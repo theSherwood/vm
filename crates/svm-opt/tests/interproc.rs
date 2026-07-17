@@ -5,7 +5,9 @@
 //! dispatch (`call_indirect`) is present, since a funcref equals its funcidx (identity table).
 
 use svm_interp::{Trap, Value};
-use svm_ir::{BinOp, Block, Export, Func, FuncType, Inst, IntTy, Module, Terminator, ValType};
+use svm_ir::{
+    BinOp, Block, CmpOp, Export, Func, FuncType, Inst, IntTy, Module, Terminator, ValType,
+};
 use svm_opt::interproc::{dead_func_elim, devirtualize, inline_calls};
 use svm_opt::optimize_module;
 use svm_verify::verify_module;
@@ -336,29 +338,108 @@ fn inlines_with_live_code_after_the_call() {
     }
 }
 
-#[test]
-fn does_not_inline_a_multiblock_callee() {
-    // A two-block callee (internal control flow) must stay a call — inlining it in block-local SSA
-    // needs cross-block threading, deferred to a later slice.
-    let two_block = Func {
+fn cmp(op: CmpOp, a: u32, b: u32) -> Inst {
+    Inst::IntCmp {
+        ty: IntTy::I32,
+        op,
+        a,
+        b,
+    }
+}
+
+/// `abs(x)` as a three-block callee: `b0` tests `x < 0` and branches; `b1` returns `0 - x`; `b2`
+/// returns `x`. Two return points joining at the inlined continuation.
+fn abs_callee() -> Func {
+    Func {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![
             Block {
-                params: vec![ValType::I32],
-                insts: vec![],
-                term: Terminator::Br {
-                    target: 1,
-                    args: vec![0],
+                params: vec![ValType::I32],                            // x = v0
+                insts: vec![Inst::ConstI32(0), cmp(CmpOp::LtS, 0, 1)], // v1=0, v2 = x<0
+                term: Terminator::BrIf {
+                    cond: 2,
+                    then_blk: 1,
+                    then_args: vec![0],
+                    else_blk: 2,
+                    else_args: vec![0],
                 },
             },
             Block {
-                params: vec![ValType::I32],
-                insts: vec![Inst::ConstI32(5), add(0, 1)],
+                params: vec![ValType::I32], // x = v0
+                insts: vec![
+                    Inst::ConstI32(0),
+                    Inst::IntBin {
+                        // v1=0, v2 = 0 - x
+                        ty: IntTy::I32,
+                        op: BinOp::Sub,
+                        a: 1,
+                        b: 0,
+                    },
+                ],
                 term: Terminator::Return(vec![2]),
             },
+            Block {
+                params: vec![ValType::I32], // x = v0
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
         ],
+    }
+}
+
+#[test]
+fn inlines_a_multiblock_callee_threading_a_captured_value() {
+    // entry(a): k = 10; t = abs(a); return t + k
+    // `k` is defined before the call and used after it, so inlining abs (three blocks, two returns)
+    // must thread `k` through the callee's CFG to the continuation where `t + k` lives.
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32], // a = v0
+            insts: vec![
+                Inst::ConstI32(10), // v1 = k
+                Inst::Call {
+                    func: 1,
+                    args: vec![0],
+                }, // v2 = abs(a)
+                add(2, 1),          // v3 = t + k
+            ],
+            term: Terminator::Return(vec![3]),
+        }],
     };
+    let m = Module {
+        funcs: vec![entry, abs_callee()],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    let inl = inline_calls(&m);
+    verify_module(&inl).expect("inlined module re-verifies");
+    assert_eq!(n_calls(&inl), 0, "the multi-block callee is inlined away");
+    assert!(
+        inl.funcs[0].blocks.len() > 1,
+        "inlining a multi-block callee splits the caller into a CFG"
+    );
+    for a in [0i32, 4, -4, 40, -40, 1000, -1000] {
+        assert_eq!(
+            run(&m, 0, &[Value::I32(a)]),
+            run(&inl, 0, &[Value::I32(a)]),
+            "divergence at a={a}"
+        );
+        assert_eq!(
+            run(&inl, 0, &[Value::I32(a)]),
+            Ok(vec![Value::I32(a.wrapping_abs().wrapping_add(10))]),
+            "abs(a)+10 at a={a}"
+        );
+    }
+}
+
+#[test]
+fn multiblock_inline_through_the_full_pipeline() {
+    // The whole optimizer must inline the multi-block callee, DFE the now-dead function, and preserve
+    // behavior — with the output re-verified (guards the threaded block params + CFG splice).
     let entry = Func {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
@@ -372,23 +453,113 @@ fn does_not_inline_a_multiblock_callee() {
         }],
     };
     let m = Module {
-        funcs: vec![entry, two_block],
+        funcs: vec![entry, abs_callee()],
+        ..Default::default()
+    };
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    assert_eq!(n_calls(&opt), 0, "callee inlined");
+    assert_eq!(opt.funcs.len(), 1, "the inlined-away callee is DFE'd");
+    for a in [0i32, 7, -7, 123, -123] {
+        assert_eq!(
+            run(&m, 0, &[Value::I32(a)]),
+            run(&opt, 0, &[Value::I32(a)]),
+            "divergence at a={a}"
+        );
+    }
+}
+
+#[test]
+fn inlines_a_callee_with_a_loop_threading_a_captured_value_around_the_back_edge() {
+    // callee sum(n) = n + (n-1) + ... + 1, a counted loop (a back edge inside the callee).
+    //   b0(n): br b1(n, 0)
+    //   b1(i, acc): brif i!=0 -> b2(i, acc) else b3(acc)
+    //   b2(i, acc): br b1(i-1, acc+i)
+    //   b3(acc): return acc
+    let sum = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32],     // n = v0
+                insts: vec![Inst::ConstI32(0)], // v1 = 0
+                term: Terminator::Br {
+                    target: 1,
+                    args: vec![0, 1],
+                },
+            },
+            Block {
+                params: vec![ValType::I32, ValType::I32], // i=v0, acc=v1
+                insts: vec![Inst::ConstI32(0), cmp(CmpOp::Ne, 0, 2)], // v2=0, v3 = i!=0
+                term: Terminator::BrIf {
+                    cond: 3,
+                    then_blk: 2,
+                    then_args: vec![0, 1],
+                    else_blk: 3,
+                    else_args: vec![1],
+                },
+            },
+            Block {
+                params: vec![ValType::I32, ValType::I32], // i=v0, acc=v1
+                insts: vec![
+                    Inst::ConstI32(1), // v2 = 1
+                    Inst::IntBin {
+                        ty: IntTy::I32,
+                        op: BinOp::Sub,
+                        a: 0,
+                        b: 2,
+                    }, // v3 = i-1
+                    add(1, 0),         // v4 = acc + i
+                ],
+                term: Terminator::Br {
+                    target: 1,
+                    args: vec![3, 4],
+                },
+            },
+            Block {
+                params: vec![ValType::I32], // acc = v0
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
+        ],
+    };
+    // entry(a): k = 100; t = sum(a); return t + k  — `k` threads through the loop callee.
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::ConstI32(100),
+                Inst::Call {
+                    func: 1,
+                    args: vec![0],
+                },
+                add(2, 1),
+            ],
+            term: Terminator::Return(vec![3]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, sum],
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");
-
     let inl = inline_calls(&m);
-    assert_eq!(
-        n_calls(&inl),
-        1,
-        "a multi-block callee must not be inlined by this slice"
-    );
-    for a in [0i32, 4, 40] {
-        assert_eq!(
-            run(&m, 0, &[Value::I32(a)]),
-            run(&inl, 0, &[Value::I32(a)]),
-            "divergence at a={a}"
-        );
+    verify_module(&inl).expect("inlined module re-verifies");
+    assert_eq!(n_calls(&inl), 0, "the loop callee is inlined away");
+    // Also drive it through the whole optimizer (which re-runs the cleanup fixpoint over the CFG).
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    for a in [0i32, 1, 2, 5, 10] {
+        let want = (1..=a).sum::<i32>() + 100;
+        for candidate in [&inl, &opt] {
+            assert_eq!(
+                run(candidate, 0, &[Value::I32(a)]),
+                Ok(vec![Value::I32(want)]),
+                "sum(1..={a})+100"
+            );
+        }
     }
 }
 

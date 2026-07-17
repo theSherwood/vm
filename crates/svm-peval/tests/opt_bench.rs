@@ -631,6 +631,72 @@ fn interproc_case() -> Module {
     }
 }
 
+/// A caller with a **multi-block** callee (internal control flow), so the inliner must splice the
+/// callee's CFG in and thread a captured value across the call — the shape single-block inlining can't
+/// touch. `entry(a,b): k=a+b; t=max(a,b); return t+k`; `max` is a three-block branch (two returns).
+/// After inline + DFE the whole thing collapses into one function with no call.
+fn multiblock_inline_case() -> Module {
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let entry = Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64, ValType::I64], // a, b
+            insts: vec![
+                add(0, 1), // v2 = k = a + b  (captured across the call)
+                Inst::Call {
+                    func: 1,
+                    args: vec![0, 1],
+                }, // v3 = max(a, b)
+                add(3, 2), // v4 = t + k
+            ],
+            term: Terminator::Return(vec![4]),
+        }],
+    };
+    // max(a, b): b0 tests a<b and branches; b1 returns b; b2 returns a.
+    let max = Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I64, ValType::I64], // a, b
+                insts: vec![Inst::IntCmp {
+                    ty: IntTy::I64,
+                    op: CmpOp::LtS,
+                    a: 0,
+                    b: 1,
+                }], // v2 = a < b
+                term: Terminator::BrIf {
+                    cond: 2,
+                    then_blk: 1,
+                    then_args: vec![1],
+                    else_blk: 2,
+                    else_args: vec![0],
+                },
+            },
+            Block {
+                params: vec![ValType::I64], // b
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
+            Block {
+                params: vec![ValType::I64], // a
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
+        ],
+    };
+    Module {
+        funcs: vec![entry, max],
+        ..Default::default()
+    }
+}
+
 fn corpus() -> Vec<Case> {
     vec![
         Case {
@@ -674,6 +740,11 @@ fn corpus() -> Vec<Case> {
             name: "interproc (devirt+inline+dfe)",
             module: interproc_case(),
             args: vec![i64s(&[3, 4]), i64s(&[-2, 7]), i64s(&[10, 10])],
+        },
+        Case {
+            name: "multiblock inline (inline+dfe)",
+            module: multiblock_inline_case(),
+            args: vec![i64s(&[3, 4]), i64s(&[7, -2]), i64s(&[10, 10])],
         },
     ]
 }
