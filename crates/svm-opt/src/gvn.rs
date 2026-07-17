@@ -81,6 +81,19 @@ pub fn gvn(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
     // a join recomputation match the original even though its operands are fresh block parameters.
     let vn = crate::vn::value_numbers(&s, &cfg, &fn_results);
 
+    // Values produced by a constant instruction — never threaded as CSE representatives (below).
+    let mut const_valued = vec![false; nvals];
+    for (b, blk) in s.blocks.iter().enumerate() {
+        let mut slot = blk.params.len();
+        for inst in &blk.insts {
+            let rc = inst.result_count(&fn_results);
+            if rc == 1 && crate::const_value(inst).is_some() {
+                const_valued[s.values[b][slot] as usize] = true;
+            }
+            slot += rc;
+        }
+    }
+
     // ---- Redundancy: replace a value with a congruent one whose definition dominates it. Processing
     // in RPO, the first value of each VN becomes its leader; a later congruent value it dominates is
     // rewritten to it (threaded across blocks as needed). Leaders are never rewritten, so no chains.
@@ -102,6 +115,15 @@ pub fn gvn(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
                 continue; // 0-result (no value) or multi-result (calls) — never CSE candidates
             }
             let v = results[0];
+            // A constant is free to rematerialize, so replacing it with a *threaded* dominating
+            // constant is pure overhead (new block params on every edge between) — the same cost model
+            // `licm` uses. It also matters for de-relooping: a relooper's dispatch selector is a local
+            // constant at each predecessor; threading it into a parameter hides it from `jump_thread`,
+            // which needs the local constant to resolve the dispatch `br_table` and recover the
+            // (SVM-legal) irreducible CFG. Leave constants in place.
+            if const_valued[v as usize] {
+                continue;
+            }
             let k = vn[v as usize];
             match leader.get(&k) {
                 Some(&l)

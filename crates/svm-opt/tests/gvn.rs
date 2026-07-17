@@ -174,6 +174,185 @@ fn join_recomputation_of_a_derived_expression() {
     );
 }
 
+fn count_params(m: &Module) -> usize {
+    m.funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .map(|b| b.params.len())
+        .sum()
+}
+
+#[test]
+fn a_redundant_constant_is_not_threaded() {
+    // b0(a): k=5; s=a+5; if a { b1(a) } else { b2(a) }.  b1/b2 forward to b3.
+    // b3(x): k'=5; return x+5.  k' is congruent to b0's k=5 and b0 dominates b3, so *plain* GVN would
+    // thread b0's constant into b3 (adding a block parameter on every edge between). But a constant is
+    // free to rematerialize — threading it is pure overhead — so GVN leaves it local: no new params.
+    let f = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32],                // a
+                insts: vec![Inst::ConstI32(5), add(0, 1)], // v1=5, v2=a+5
+                term: Terminator::BrIf {
+                    cond: 0,
+                    then_blk: 1,
+                    then_args: vec![0],
+                    else_blk: 2,
+                    else_args: vec![0],
+                },
+            },
+            Block {
+                params: vec![ValType::I32],
+                insts: vec![],
+                term: Terminator::Br {
+                    target: 3,
+                    args: vec![0],
+                },
+            },
+            Block {
+                params: vec![ValType::I32],
+                insts: vec![],
+                term: Terminator::Br {
+                    target: 3,
+                    args: vec![0],
+                },
+            },
+            Block {
+                params: vec![ValType::I32],                // x
+                insts: vec![Inst::ConstI32(5), add(0, 1)], // v1=5, v2=x+5
+                term: Terminator::Return(vec![2]),
+            },
+        ],
+    };
+    let m = module(f);
+    let before = count_params(&m);
+    let gvn_only = optimize_module_with(
+        &m,
+        &OptConfig {
+            gvn: true,
+            ..OptConfig::none()
+        },
+    );
+    verify_module(&gvn_only).expect("gvn-only re-verifies");
+    for a in [0i32, 1, -7, 100] {
+        assert_eq!(run(&m, &[Value::I32(a)]), run(&gvn_only, &[Value::I32(a)]));
+    }
+    assert!(
+        count_params(&gvn_only) <= before,
+        "GVN threaded a constant (params grew {before} -> {}) — constants must stay local",
+        count_params(&gvn_only)
+    );
+}
+
+#[test]
+fn a_dispatch_loop_is_de_relooped() {
+    // A hand-built *relooped* loop: an empty dispatch block (`block1`) whose `br_table` switches on a
+    // dispatch parameter that every predecessor supplies as a **local constant** — exactly the shape
+    // LLVM's relooper emits for irreducible control flow. `jump_thread` can resolve each edge and drop
+    // the dispatch (recovering the SVM-legal irreducible CFG) — but *only* if GVN hasn't first threaded
+    // those dispatch constants into parameters. With GVN leaving constants local, the full pipeline
+    // de-reloops: no `br_table` survives, and behavior is unchanged.
+    let f = Func {
+        params: vec![ValType::I32], // n
+        results: vec![ValType::I32],
+        blocks: vec![
+            Block {
+                params: vec![ValType::I32], // n=v0
+                insts: vec![Inst::ConstI32(0), Inst::ConstI32(0), Inst::ConstI32(0)], // acc,i,disp
+                term: Terminator::Br {
+                    target: 1,
+                    args: vec![0, 1, 2, 3],
+                },
+            },
+            // block1: the dispatch — empty, br_table on `disp` (v3).
+            Block {
+                params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32], // n,acc,i,disp
+                insts: vec![],
+                term: Terminator::BrTable {
+                    idx: 3,
+                    targets: vec![(2, vec![0, 1, 2]), (3, vec![0, 1, 2])],
+                    default: (3, vec![0, 1, 2]),
+                },
+            },
+            // block2 (state A): if i<n do work (-> block4) else exit (-> block5).
+            Block {
+                params: vec![ValType::I32, ValType::I32, ValType::I32], // n,acc,i
+                insts: vec![Inst::IntCmp {
+                    ty: IntTy::I32,
+                    op: svm_ir::CmpOp::LtS,
+                    a: 2,
+                    b: 0,
+                }], // v3 = i<n
+                term: Terminator::BrIf {
+                    cond: 3,
+                    then_blk: 4,
+                    then_args: vec![0, 1, 2],
+                    else_blk: 5,
+                    else_args: vec![1],
+                },
+            },
+            // block3 (state B): acc+=2, i++, dispatch back to state A (disp=0, a local const).
+            Block {
+                params: vec![ValType::I32, ValType::I32, ValType::I32], // n,acc,i
+                insts: vec![
+                    Inst::ConstI32(2),
+                    add(1, 3), // acc+2
+                    Inst::ConstI32(1),
+                    add(2, 5),         // i+1
+                    Inst::ConstI32(0), // disp=0
+                ],
+                term: Terminator::Br {
+                    target: 1,
+                    args: vec![0, 4, 6, 7],
+                },
+            },
+            // block4 (state A work): acc+=i, i++, dispatch to state B (disp=1, a local const).
+            Block {
+                params: vec![ValType::I32, ValType::I32, ValType::I32], // n,acc,i
+                insts: vec![
+                    add(1, 2), // acc+i
+                    Inst::ConstI32(1),
+                    add(2, 4),         // i+1
+                    Inst::ConstI32(1), // disp=1
+                ],
+                term: Terminator::Br {
+                    target: 1,
+                    args: vec![0, 3, 5, 6],
+                },
+            },
+            // block5: exit.
+            Block {
+                params: vec![ValType::I32], // acc
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            },
+        ],
+    };
+    let m = module(f);
+    assert_eq!(count(&m, |i| matches!(i, Inst::Load { .. })), 0, "sanity");
+    assert!(
+        m.funcs[0]
+            .blocks
+            .iter()
+            .any(|b| matches!(b.term, Terminator::BrTable { .. })),
+        "precondition: the input has a dispatch br_table"
+    );
+    let args: Vec<Vec<Value>> = [0i32, 1, 2, 3, 6, 9]
+        .iter()
+        .map(|&n| vec![Value::I32(n)])
+        .collect();
+    let opt = check_equiv(&m, &args);
+    assert!(
+        !opt.funcs[0]
+            .blocks
+            .iter()
+            .any(|b| matches!(b.term, Terminator::BrTable { .. })),
+        "the dispatch br_table must be threaded away (de-relooped)"
+    );
+}
+
 #[test]
 fn impure_loads_at_a_join_are_not_deduped_by_gvn() {
     // GVN's safety line: a load has a unique value number (it may trap / read changing memory), so GVN

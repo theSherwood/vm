@@ -174,11 +174,19 @@ tracked enhancement, not a blocker.
     definition **dominates** the redundant one is threaded to it by adding block parameters + edge args
     along the intervening edges (the internal SSA form's first cross-block-use lowering); new params
     are typed via the verifier's `func_value_types`, so the threaded IR re-verifies. Only pure ops get
-    a shared number (loads/atomics/calls stay unique). Runs before the per-function cleanup. Tests
-    (`tests/gvn.rs`): diamond-join redundancy, a derived two-level expression across a diamond, impure
-    loads at a join **not** deduped, and a 600-case randomized branchy-DAG differential (behavior
-    preserved + optimizer demonstrably firing); also covered by the `opt_sccp` fuzz target (whole
-    pipeline).
+    a shared number (loads/atomics/calls stay unique). **Constants are never threaded** (the same cost
+    model `licm` uses): a constant is free to rematerialize, so replacing a congruent one with a
+    *threaded* dominating constant only adds block params — pure overhead. This also **enables
+    de-relooping**: LLVM's relooper encodes irreducible control flow as a dispatch variable set to a
+    local constant at each predecessor of a `br_table` header; if GVN threaded those into params,
+    `jump_thread` could no longer see them, but leaving them local lets it resolve the dispatch per edge
+    until the header dies — recovering the irreducible CFG that **SVM IR runs natively and wasm can't
+    represent** (measured: transpiled-from-wasm `irreducible` kernel 1.17× → 0.40× vs Wasmtime,
+    `OPT_BENCH.md`). Runs before the per-function cleanup. Tests (`tests/gvn.rs`): diamond-join
+    redundancy, a derived two-level expression across a diamond, a redundant **constant not threaded**, a
+    hand-built dispatch loop **de-relooped** by the pipeline, impure loads at a join **not** deduped, and
+    a 600-case randomized branchy-DAG differential (behavior preserved + optimizer demonstrably firing);
+    also covered by the `opt_sccp` fuzz target (whole pipeline).
   - [x] **Branch & select simplification** (in `resolve_term` / `forward_to_operand`): a
     `br_if`/`br_table` whose targets all coincide (same block *and* args) becomes an unconditional
     `br` (the selector computation dies for DCE, and the now-single-predecessor target merges); a
@@ -357,13 +365,15 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
 - [x] **Wasmtime-relative numbers** (Phase 5, DESIGN.md §1a). Wired svm-opt into the `bench/`
   vs-Wasmtime harness behind `--optimize`: the same wasm bytes run on the SVM JIT (transpiled to IR,
   optionally svm-opt'd) and on Wasmtime, both via Cranelift. `compute32 = svm-jit ÷ Wasmtime` best-of-5,
-  optimizer on vs off (`OPT_BENCH.md` "Wasmtime-relative"). Result: **flat everywhere except the
-  `irreducible` kernel — 1.52× → 0.97×**, where svm-opt untangles clang's relooper output into IR
-  Cranelift lowers well. This is the §1a bar made concrete *and* an independent confirmation of the
-  ablation thesis: the JIT re-derives the scalar passes on ordinary compute (neutral), and svm-opt's
-  native-speed win is precisely where the IR arrives structurally worse than Wasmtime's. The bench
-  falls back to unoptimized IR (with a note) if svm-opt output ever fails re-verify, so a kernel is
-  never silently miscompiled.
+  optimizer on vs off (`OPT_BENCH.md` "Wasmtime-relative"). Headline: **`irreducible` 1.17× → 0.40×**
+  (svm-jit 2.5× *faster* than Wasmtime) via de-relooping — svm-opt recovers the irreducible CFG from
+  clang's relooped wasm and SVM runs it natively (wasm can't represent it, so Wasmtime pays a
+  per-iteration dispatch); the loop kernels also improve (`memsum`/`locals_c` ~1.2× → ~0.96×) from the
+  GVN constant cost model tightening loops, and the rest is flat. This is the §1a bar made concrete
+  *and* an independent confirmation of the ablation thesis: the JIT re-derives the scalar passes on
+  ordinary compute (neutral), and svm-opt's native-speed win is the structural transforms Cranelift
+  can't reconstruct (de-reloop, un-thread). The bench falls back to unoptimized IR (with a note) if
+  svm-opt output ever fails re-verify, so a kernel is never silently miscompiled.
 - [ ] **Note for Phase 3/4 targeting.** Because the JIT backend (`opt_level="speed"`) already does its
   own GVN/CSE/LICM, scalar passes are ~JIT-run-time-neutral; the higher-leverage host-JIT wins are the
   cross-boundary transforms Cranelift *cannot* see — inlining (Phase 3) and memory passes (Phase 4).

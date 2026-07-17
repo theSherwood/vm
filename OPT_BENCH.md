@@ -45,9 +45,9 @@ win). Passes not listed for a case had zero delta there.
 
 | case | input→all (i/b) | pass contributions (Δbytes if removed) |
 |---|---|---|
-| reg-sum residual (loop) | 7/233 → 5/132 | gvn −5 |
+| reg-sum residual (loop) | 7/233 → 5/127 | _(all passes size-neutral)_ |
 | licm+cse kernel | 7/71 → 6/74 | licm −6, local_cse +3 |
-| sccp const-loop | 6/57 → 5/59 | sccp +1, reassociate −2, gvn −3, licm −5 |
+| sccp const-loop | 6/57 → 5/56 | sccp +1, reassociate −2, licm −5 |
 | reassoc chain | 8/41 → 2/26 | **reassociate +15** |
 | correlated branch | 8/73 → 6/55 | **jump_thread +18** |
 | memory (mem + load_elim) | 5/85 → 3/77 | **mem +4, load_elim +4** |
@@ -74,13 +74,17 @@ Reading it:
   the byte win comes downstream — `dfe` (+33) reclaiming the now-dead callee, and the caller's own code
   folding through the inlined region. The point is capability, not raw bytes: this callee shape was a
   hard `call` before.
-- **LICM and GVN carry *negative* size deltas** on loops: they hoist/thread invariants through new
-  block params, which is larger static code — deliberately, to save run time (next section). LICM's
-  **hoist cost model** keeps that cost honest: it never hoists a bare constant (free to recompute —
-  threading one is pure overhead), and rematerializes an invariant's constant operands in the preheader
-  instead of threading them. So on the **hoist-free reg-sum loop LICM's delta is now +0** (was −10), and
-  on the real-invariant loops the hoist still fires while the module *shrinks* (licm+cse −6 not −9;
-  heavy-invariant loop 100→94 B in the run-time section).
+- **LICM's negative delta on loops is bounded by a cost model**: it hoists/threads invariants through
+  new block params (larger static code, to save run time — next section), but never a bare constant
+  (free to recompute — threading one is pure overhead) and it rematerializes an invariant's constant
+  operands in the preheader instead of threading them. So on the **hoist-free reg-sum loop LICM's delta
+  is +0** (was −10), and on real-invariant loops the hoist still fires while the module *shrinks*
+  (licm+cse −6 not −9; heavy-invariant loop 100→94 B in the run-time section).
+- **GVN now carries the same constant cost model** and so no longer shows a negative delta: it used to
+  thread a dominating constant to replace a congruent one (−5 on reg-sum, −3 on sccp const-loop), which
+  is the same pure overhead. Leaving constants local drops those costs to **+0** (reg-sum 132→127 B),
+  and — crucially — keeps a relooper's dispatch selectors as *local constants*, which is what lets
+  `jump_thread` **de-reloop** irreducible control flow (see below).
 
 ## Run-time ablation (N = 1,000,000)
 
@@ -154,31 +158,41 @@ cargo run --release -- --from-wasm --csv --reps 5             # baseline (no svm
 cargo run --release -- --from-wasm --optimize --csv --reps 5  # with svm-opt in front of the JIT
 ```
 
+Back-to-back best-of-5, same session (ratios only — absolute ns drift with host load):
+
 | kernel | svm/Wasmtime, no opt | svm/Wasmtime, +svm-opt |
 |---|---|---|
-| **irreducible** (clang relooper output) | **1.52×** | **0.97×** |
-| alu | 1.02× | 1.01× |
-| float | 1.01× | 1.01× |
-| simd | 0.98× | 1.02× |
-| calli | 1.14× | 1.16× |
-| hostcall | 1.15× | 1.15× |
-| memsum | 1.80× | 1.81× |
-| scatter | 1.50× | 1.54× |
-| locals_c | 1.81× | 1.86× |
-| hostbuf | 0.60× | 0.60× |
+| **irreducible** (clang relooper output) | **1.17×** | **0.40×** |
+| memsum | 1.23× | 0.96× |
+| locals_c | 1.16× | 0.96× |
+| hostcall | 1.17× | 1.10× |
+| alu | 1.03× | 1.04× |
+| alu_c | 1.03× | 1.04× |
+| float | 1.02× | 1.03× |
+| simd | 1.06× | 1.10× |
+| scatter | 1.10× | 1.11× |
+| calli | 1.26× | 1.28× |
+| hostbuf | 0.49× | 0.49× |
 
 _(`cache` is DRAM-latency-bound — the harness gives it a custom, low-repeat span — so its ratio is
 memory-stall noise, not IR quality; elided.)_
 
-**The one clear win is `irreducible`: 1.52× → 0.97×** — svm-opt turns a kernel 52% slower than Wasmtime
-into parity. That kernel is `clang --target=wasm32` output whose control flow the LLVM relooper left
-irreducible; svm-opt's jump-threading / SCCP / block-merging untangle it into IR Cranelift lowers well.
-That is exactly the shape Cranelift can't fix on its own — it sees the tangled IR as given. **Everywhere
-else the ratio is flat** (within run-to-run noise), which *confirms* the ablation's thesis: on straight-
-line and loop compute the JIT re-derives svm-opt's scalar passes, so the optimizer neither helps nor
-hurts native speed — its JIT-path value is code size / compile time, plus untangling structure the
-backend inherits. The absolute gap to Wasmtime (memsum/locals_c ~1.8×) is a JIT-backend story, not an
-svm-opt one — svm-opt moves it only where the IR arrives structurally worse than Wasmtime's.
+**The headline is `irreducible`: 1.17× → 0.40×** — svm-opt makes the SVM JIT **2.5× faster than
+Wasmtime** on it. This is the §1a differentiator made real. That kernel is a C `goto` into a loop —
+genuinely irreducible control flow. Wasmtime *must* reloop it (wasm can't express irreducible CFG), so
+even from the same source it pays a per-iteration dispatch. Under `--from-wasm` the SVM lane starts from
+clang's *already-relooped* wasm and inherits that dispatch; svm-opt then **de-reloops** it — GVN keeps
+the relooper's dispatch selectors as local constants (its new constant cost model), and `jump_thread`
+resolves the dispatch `br_table` per edge until it dies, recovering the irreducible CFG that **SVM IR
+runs natively but wasm cannot represent**. (Running the *native* SVM IR directly — no reloop ever — is
+0.29×; de-relooping the transpiled form recovers most of that edge.)
+
+**The loop kernels also improve** — `memsum` 1.23→0.96, `locals_c` 1.16→0.96 — because the same GVN
+constant cost model stops threading loop constants into block params, tightening the loop bodies (the
+GVN analogue of the LICM win). **The rest is flat** (within run-to-run noise), which *confirms* the
+ablation's thesis: on straight-line compute the JIT re-derives svm-opt's scalar passes, so the optimizer
+is native-speed-neutral there — its JIT-path value is code size / compile time, plus the structural wins
+(de-relooping, un-threading) that the backend inherits and can't reconstruct itself.
 
 _The corpus is small and hand-built to isolate each pass. Remaining follow-up (OPT.md): multi-run
 medians + variance._
