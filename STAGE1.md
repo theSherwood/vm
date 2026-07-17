@@ -54,9 +54,12 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    seeded bytes) is the parent's result — with the child's output also readable
    from the shared carve. No shell yet; this de-risks the mechanism and pins the
    ABI (`stage1_spawn_wait.rs`).
-2. **stdio-inherited child** — combine a separate-module child with granted
-   `stdout` so the child *writes* to the shell's sink (real `echo`/`cat` as
-   external programs), via the `instantiate_*` grant path.
+2. **stdio-inherited child** *(done — `stage1_stdio_child.rs`)* — a same-module
+   BusyBox-applet child inherits a granted `stdout` (`instantiate_named`, op 11)
+   and echoes its parent-seeded `argv` to it: a real external `echo` — argv in,
+   bytes out through inherited stdio, status back — differential interp==JIT. (A
+   *separate*-module child with granted stdio is a later variant; the
+   same-module applet shape is what the shell actually wants.)
 3. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of child
    `Module`s and the `Instantiator`/`Module` handles, so the Stage-0 shell
    dispatches an unknown command to a spawned child instead of
