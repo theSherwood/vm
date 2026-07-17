@@ -48,12 +48,18 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 
 ## Slice plan
 
-1. **Spawn/wait spike** *(this slice)* — a differential (interp+JIT) test
-   proving the core: a parent seeds `argv` bytes into a child's carve,
-   `instantiate_module`s it, `join`s, and the child's return (a function of the
-   seeded bytes) is the parent's result — with the child's output also readable
-   from the shared carve. No shell yet; this de-risks the mechanism and pins the
-   ABI (`stage1_spawn_wait.rs`).
+1. **Spawn/wait spike** *(done — `stage1_spawn_wait.rs`)* — a differential
+   (interp+JIT) test proving the core: a parent seeds `argv` bytes into a child's
+   carve, `instantiate_module`s it, `join`s, and the child's return (a function
+   of the seeded bytes) is the parent's result — with the child's output also
+   readable from the shared carve. No shell yet; de-risks the mechanism.
+   - **argv[] vector ABI** *(done — `stage1_argv_vector.rs`)* — pins the real
+     `main(argc, argv)` marshalling: `argc` (i32), an `argv[]` pointer array, and
+     a string blob laid in the child's carve. An applet reads `argc`, follows
+     `argv[1]`'s pointer to its bytes, and echoes them to the granted stdout —
+     proving pointer-array *indirection* (the output tracks `argv[1]`, not a flat
+     read), status = `argc`, differential interp==JIT. This is the layout the
+     personality's `spawn` will lay down.
 2. **stdio-inherited child** *(done — `stage1_stdio_child.rs`)* — a same-module
    BusyBox-applet child inherits a granted `stdout` (`instantiate_named`, op 11)
    and echoes its parent-seeded `argv` to it: a real external `echo` — argv in,
@@ -71,12 +77,24 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    is the substrate guarantee the shell's command dispatch rests on: look a
    command up, spawn its entry, thread its exit code into `$?`. Differential
    interp==JIT. The name→entry map itself is trivial glue and lands in slice 4.
+   - **C-applet ABI** *(done — `stage1_granted_argv_applet.rs`)* — the applet
+     receives its `stdout` as an *entry argument* (via `instantiate_granted`,
+     op 8 — the handle is the child's 3rd arg) and writes through it, rather than
+     resolving by name. This is the shape a **chibicc-compiled** applet must take:
+     the frontend's generic capability import passes the handle as the *first C
+     argument at runtime* (`codegen_ir.c` §7) and cannot emit `cap.self.resolve`,
+     so `applet(inst, addrspace, stdout_h)` writing through `stdout_h` is the
+     natural form. Proven with a seeded-argv echo, differential interp==JIT.
 4. **`spawn` in the personality** — give `svm-posix` a `PATH` registry of applet
    entries and the `Instantiator`/`stdout` handles, so the Stage-0 shell
    dispatches an unknown command to a spawned child instead of
    `<cmd>: not found`, threading the child's status into `$?`. This is the
-   chibicc-integration slice: the compiled shell drives `instantiate_named`/
-   `join` through generic capability imports.
+   chibicc-integration slice: the compiled shell drives `instantiate_granted`/
+   `join` through generic capability imports, applets are C funcs taking
+   `(inst, addrspace, stdout_h)` (the ABI pinned in slice 3), and the parent
+   seeds the argv[] block (the layout pinned in slice 1). The remaining frontend
+   piece is exposing an `instantiate_granted`/`join` import binding and reaching
+   an applet's function index from the shell.
 5. **Pipelines across real children** — replace the memfs-temp pipeline staging
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
@@ -87,3 +105,15 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 Security posture is unchanged: children keep their **own guarded windows**; the
 D38 confinement lowering (the most sensitive code in the tree) is not touched.
 Stage 1 only *composes* existing, fuzzed primitives.
+
+## Known caveat — crash handling waits for async convergence
+
+A crashing command must not crash the shell, which needs `poll` (op 9:
+`0` running / `1` returned / `2` trapped) to detect a trapped child and
+`detach` instead of `join` (a `join` propagates the child's trap to the
+parent). But **`poll` after a synchronous spawn is not yet backend-portable**:
+the interpreter runs a child lazily (at `join`), so `poll` reports `0`
+(running); the JIT runs it eagerly on its own OS thread, so `poll` reports `1`
+(returned). A differential `poll`-based control flow therefore disagrees today.
+This converges with the async-children work (slice 5 / PROCESS.md §4), which is
+where crash-status mapping (`$?` = 128 + signal) lands — not before.
