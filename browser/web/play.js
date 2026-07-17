@@ -8,12 +8,9 @@
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
-import { mountEditor, setDoc, getDoc, setVim, refresh as refreshEditor, markError, clearError } from './editor.js';
+import { createEditor, setVimAll, refreshAll } from './editor.js';
 
 const $ = (id) => document.getElementById(id);
-const logEl = $('log');
-const log = (m) => { logEl.textContent += m + '\n'; };
-const setState = (state, text) => { const e = $('state'); e.dataset.state = state; e.textContent = text; };
 
 // Each example: the SVM text, its powerbox mode, and what to expect. The kernels are the proven
 // schedule-independent ones from `gencorpus.rs` (same ground truths the validation page asserts).
@@ -477,34 +474,17 @@ function winSizeOf(src) {
   return 1 << log2;
 }
 
+// ---- per-card run machinery ----------------------------------------------------------------------
+// Each demo renders as a self-contained card (its own editor + controls + output). The run functions
+// take that card's context `c`, so state never leaks between cards, and only one run is ever active at
+// a time (a fresh Run supersedes any running reactor). `eng`/`run` are the shared wasm engine; `broken`
+// latches when a threaded run is Stopped mid-flight (shared state may wedge → every card's Run disables).
 let eng, run, aborter = null, broken = false;
+const cards = [];
 
-function loadExample(name) {
-  stopReactor(); // switching examples ends any running reactor loop
-  const ex = EXAMPLES[name];
-  $('mode').value = ex.mode;
-  $('desc').textContent = ex.desc;
-  // The "wasm-JIT" toggle is only meaningful for a JIT-emittable reactor (Doom): show it there.
-  if ($('jitLabel')) $('jitLabel').hidden = !ex.jit;
-  if (ex.kind === 'reactor') {
-    // A per-frame reactor module: the "source" is binary; click Run to start the loop, arrow keys steer.
-    setDoc(
-      `// ${name}\n// A pre-built on-ramp reactor module: ${ex.url}\n// Click Run — the page calls the ` +
-      `guest's tick() once per animation frame\n// (svm_onramp_open/frame), and the arrow keys steer ` +
-      `it via the keyboard capability.`,
-      'note', true);
-  } else if (ex.kind === 'module' && !ex.editable) {
-    // A pre-built on-ramp module with a fixed program: the "source" is binary, not editable. Show a note.
-    setDoc(
-      `// ${name}\n// A pre-built on-ramp module: ${ex.url}\n// Click Run — it executes as a real ` +
-      `C/C++ guest via svm_run_onramp,\n// and its stdout appears in the pane on the right.`,
-      'note', true);
-  } else {
-    // Text examples (SVM text), and **editable** modules (whose source is fed to the guest as stdin —
-    // Lua/SQL), stay editable, highlighted in their declared language (SVM text by default).
-    setDoc(ex.src, ex.lang || 'svm', false);
-  }
-}
+const setState = (c, state, text) => { c.el.state.dataset.state = state; c.el.state.textContent = text; };
+const logTo = (c, m) => { c.el.log.textContent += m + '\n'; };
+const setEngineState = (state, text) => { const e = $('engine-state'); e.dataset.state = state; e.textContent = text; };
 
 // Fetched `.svmb` bytes, cached (a 6 MB SQLite module is worth not re-downloading on every Run).
 const moduleCache = new Map();
@@ -520,47 +500,47 @@ async function fetchModule(url) {
   return bytes;
 }
 
-// Blit the framebuffer the last run presented (via the `display` capability) to the canvas. w/h of 0
-// ⇒ the guest presented no frame: hide the canvas. Copies the RGBA out of wasm memory into a fresh
+// Blit the framebuffer the last run presented (via the `display` capability) to this card's canvas.
+// w/h of 0 ⇒ no frame: hide the canvas. Copies the RGBA out of wasm memory into a fresh
 // Uint8ClampedArray (putImageData rejects a SharedArrayBuffer-backed view, and a later alloc could
 // detach the buffer). The canvas' intrinsic size is the frame's; CSS scales it up (pixelated).
-function presentFrame(w, h) {
-  const canvas = $('canvas');
-  if (!w || !h) { canvas.style.display = 'none'; return; }
+function presentFrame(c, w, h) {
+  const canvas = c.el.canvas;
+  if (!w || !h) { canvas.hidden = true; return; }
   const sp = eng.ex.svm_framebuffer_ptr();
   const sl = eng.ex.svm_framebuffer_len();
   const rgba = new Uint8ClampedArray(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
   canvas.width = w;
   canvas.height = h;
   canvas.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
-  canvas.style.display = 'block';
-  // No per-frame logging: the reactor loop calls this ~60×/second, which would flood the log pane.
+  canvas.hidden = false;
 }
 
 // Run a pre-built on-ramp module single-shot on the main engine: alloc a buffer, copy the module in,
-// `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read the captured stdout.
-// No Workers (these guests are single-threaded), so it never touches the par.js shared-window path.
-async function runModule(ex) {
-  setState('running', 'fetching module…');
-  $('result').textContent = '';
-  $('stdout').textContent = '';
-  $('canvas').style.display = 'none';
+// `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read the captured stdout. No
+// Workers (these guests are single-threaded), so it never touches the par.js shared-window path.
+async function runModule(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching module…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
   let bytes;
   try {
     bytes = await fetchModule(ex.url);
   } catch (e) {
-    setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
-    log(`fetch failed: ${e.message}`);
+    setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    logTo(c, `fetch failed: ${e.message}`);
     return;
   }
-  log(`fetched ${ex.url}: ${bytes.length}B module`);
+  logTo(c, `fetched ${ex.url}: ${bytes.length}B module`);
   const p = eng.ex.svm_alloc(bytes.length);
   // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua). Alloc
   // both buffers *before* filling: svm_alloc may grow (detach) the linear memory, so take one fresh
   // view after all allocations and write into it.
   let stdinP = 0, stdinLen = 0, stdinBytes = null;
   if (ex.editable) {
-    stdinBytes = new TextEncoder().encode(getDoc());
+    stdinBytes = new TextEncoder().encode(c.editor.getValue());
     if (stdinBytes.length > 0) {
       stdinP = eng.ex.svm_alloc(stdinBytes.length);
       stdinLen = stdinBytes.length;
@@ -569,61 +549,56 @@ async function runModule(ex) {
   const view = new Uint8Array(eng.memory.buffer);
   view.set(bytes, p);
   if (stdinP) view.set(stdinBytes, stdinP);
-  setState('running', 'running…');
+  setState(c, 'running', 'running…');
   const t0 = performance.now();
   const rv = eng.ex.svm_run_onramp(p, bytes.length, stdinP, stdinLen);
   const status = eng.ex.svm_status();
   const sp = eng.ex.svm_stdout_ptr();
   const sl = eng.ex.svm_stdout_len();
   const stdout = new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
-  // A framebuffer the guest presented through the `display` capability (0×0 ⇒ none): blit it to the
-  // canvas. Read the RGBA out of wasm memory into a fresh copy — putImageData needs a non-shared
-  // Uint8ClampedArray, and the slice also guards against the buffer detaching on a later alloc.
   const fbW = eng.ex.svm_framebuffer_width();
   const fbH = eng.ex.svm_framebuffer_height();
-  presentFrame(fbW, fbH);
+  presentFrame(c, fbW, fbH);
   eng.ex.svm_dealloc(p, bytes.length);
   if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
   const ms = (performance.now() - t0).toFixed(0);
-  $('stdout').textContent = stdout;
-  $('result').textContent = `${rv}`;
+  c.el.stdout.textContent = stdout;
+  c.el.result.textContent = `${rv}`;
   // 0 = OK, 5 = clean Exit; anything else is a decode error / trap / unsupported.
   if (status === 0 || status === 5) {
-    setState('done', `done · status ${status} · ${ms}ms`);
-    log(`svm_run_onramp → ${rv} (status ${status}) in ${ms}ms`);
+    setState(c, 'done', `done · status ${status} · ${ms}ms`);
+    logTo(c, `svm_run_onramp → ${rv} (status ${status}) in ${ms}ms`);
   } else {
-    setState('error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
-    log(`svm_run_onramp status ${status}`);
+    setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
+    logTo(c, `svm_run_onramp status ${status}`);
   }
 }
 
 // Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
 // pre-translated+resolved module + the data image, feed the editor's SQL as stdin, mount the image on
-// an in-memory `fs` cap, run to a queried backend, read the captured stdout. A fresh boot per Run (a
-// few synchronous seconds), like the standalone bench — no Workers (Postgres --single is
-// single-threaded), so it never touches par.js's shared-window path; it just runs on `eng.ex`.
-async function runPg(ex) {
-  setState('running', 'fetching module + image…');
-  $('result').textContent = '';
-  $('stdout').textContent = '';
-  $('canvas').style.display = 'none';
+// an in-memory `fs` cap, run to a queried backend, read the captured stdout. A fresh boot per Run.
+async function runPg(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching module + image…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
   let modBytes, imgBytes;
   try {
     [modBytes, imgBytes] = await Promise.all([fetchModule(ex.url), fetchModule(ex.image)]);
   } catch (e) {
-    setState('error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
-    log(`fetch failed: ${e.message}`);
+    setState(c, 'error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
+    logTo(c, `fetch failed: ${e.message}`);
     return;
   }
-  log(`fetched ${ex.url}: ${modBytes.length}B module, ${ex.image}: ${imgBytes.length}B image`);
-  const sql = new TextEncoder().encode(getDoc());
-  setState('running', 'booting postgres… (a few seconds — the whole backend runs in the sandbox)');
-  $('run').disabled = true;
+  logTo(c, `fetched ${ex.url}: ${modBytes.length}B module, ${ex.image}: ${imgBytes.length}B image`);
+  const sql = new TextEncoder().encode(c.editor.getValue());
+  setState(c, 'running', 'booting postgres… (a few seconds — the whole backend runs in the sandbox)');
+  c.el.run.disabled = true;
   // Yield one paint so "booting…" lands before the synchronous, multi-second boot blocks the thread.
   await new Promise((r) => setTimeout(r, 30));
   try {
-    // Alloc all three before filling: svm_alloc may grow (detach) the linear memory, so take one fresh
-    // view after the last allocation and write into that.
+    // Alloc all three before filling: svm_alloc may grow (detach) the linear memory.
     const modP = eng.ex.svm_alloc(modBytes.length);
     const imgP = eng.ex.svm_alloc(imgBytes.length);
     const inP = sql.length ? eng.ex.svm_alloc(sql.length) : 0;
@@ -641,36 +616,35 @@ async function runPg(ex) {
     eng.ex.svm_dealloc(modP, modBytes.length);
     eng.ex.svm_dealloc(imgP, imgBytes.length);
     if (inP) eng.ex.svm_dealloc(inP, sql.length);
-    $('stdout').textContent = stdout;
-    $('result').textContent = `${rv}`;
-    // 0 = OK, 5 = clean Exit (the boot always ends in exit(0)); anything else is a fault.
+    c.el.stdout.textContent = stdout;
+    c.el.result.textContent = `${rv}`;
     if (status === 0 || status === 5) {
-      setState('done', `booted + ran in ${ms}ms · status ${status}`);
-      log(`svm_run_pg → ${rv} (status ${status}) in ${ms}ms`);
+      setState(c, 'done', `booted + ran in ${ms}ms · status ${status}`);
+      logTo(c, `svm_run_pg → ${rv} (status ${status}) in ${ms}ms`);
     } else {
-      setState('error', `boot failed: status ${status} (1=decode 3=trap 6=verify)`);
-      log(`svm_run_pg status ${status}`);
+      setState(c, 'error', `boot failed: status ${status} (1=decode 3=trap 6=verify)`);
+      logTo(c, `svm_run_pg status ${status}`);
     }
   } catch (e) {
-    setState('error', `run error: ${e.message}`);
-    log(`run error: ${e.message}`);
+    setState(c, 'error', `run error: ${e.message}`);
+    logTo(c, `run error: ${e.message}`);
   } finally {
-    $('run').disabled = broken;
+    c.el.run.disabled = broken;
   }
 }
 
-// ---- the reactor run model (interactive per-frame guests: bounce, eventually Doom) ----------------
-// Open a reactor module once, then drive it one `tick` per requestAnimationFrame: each frame the
-// guest runs, presents a frame (blitted to the canvas), and drains the key events we forwarded.
+// ---- the reactor run model (interactive per-frame guests: bounce, life, Doom) --------------------
+// Open a reactor module once, then drive it one `tick` per requestAnimationFrame. Only one reactor
+// runs at a time; `activeReactorCard` is the card it belongs to (for teardown + the GPU canvas).
 let reactorRAF = null; // the pending requestAnimationFrame id while a reactor loop runs (else null)
 let jitReactor = null; // the wasm-JIT reactor driver while a JIT loop runs (else null → interpreter)
+let activeReactorCard = null;
 
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
 function stopReactor() {
   teardownWebGPU(); // drop any GPU device + the servicer (no-op for non-webgpu reactors)
-  const gc = $('gpucanvas');
-  if (gc) gc.style.display = 'none';
-  if (reactorRAF === null) return;
+  if (activeReactorCard) activeReactorCard.el.gpucanvas.hidden = true;
+  if (reactorRAF === null) { activeReactorCard = null; return; }
   cancelAnimationFrame(reactorRAF);
   reactorRAF = null;
   if (jitReactor) {
@@ -679,39 +653,41 @@ function stopReactor() {
   } else {
     eng.ex.svm_onramp_close();
   }
+  activeReactorCard = null;
 }
 
-async function runReactor(ex) {
+async function runReactor(c) {
+  const ex = c.ex;
   stopReactor();
-  setState('running', 'fetching module…');
-  $('result').textContent = '';
-  $('stdout').textContent = '';
-  $('canvas').style.display = 'none';
+  activeReactorCard = c;
+  setState(c, 'running', 'fetching module…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
   // The "wasm-JIT" toggle runs an emittable reactor's whole tick() on emitted wasm (near-native) rather
   // than the interpreter. Only offered for JIT-capable examples (Doom); falls back if the emit fails.
-  const useJit = !!(ex.jit && $('jit') && $('jit').checked);
+  const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
   let bytes;
   try {
     bytes = await fetchModule(ex.url);
   } catch (e) {
-    setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     return;
   }
   // A GPU demo: bring up a `navigator.gpu` device + the WebGPU canvas and install the servicer BEFORE
   // the reactor's first `tick`, so the guest's `webgpu` capability calls (set_shader/present) render.
-  // Device creation is the only async step — awaited here, off the main-thread reactor loop.
   if (ex.webgpu) {
     if (!webgpuAvailable()) {
-      setState('error', 'no WebGPU in this browser — the GPU demo needs it (try Chrome/Edge)');
+      setState(c, 'error', 'no WebGPU in this browser — the GPU demo needs it (try Chrome/Edge)');
       return;
     }
     try {
-      $('gpucanvas').style.display = 'block';
-      await initWebGPU($('gpucanvas'));
-      log('WebGPU device ready — the guest ships one WGSL shader; the GPU renders every frame');
+      c.el.gpucanvas.hidden = false;
+      await initWebGPU(c.el.gpucanvas);
+      logTo(c, 'WebGPU device ready — the guest ships one WGSL shader; the GPU renders every frame');
     } catch (e) {
-      setState('error', `WebGPU init failed: ${e.message}`);
-      $('gpucanvas').style.display = 'none';
+      setState(c, 'error', `WebGPU init failed: ${e.message}`);
+      c.el.gpucanvas.hidden = true;
       return;
     }
   }
@@ -723,31 +699,27 @@ async function runReactor(ex) {
     try {
       wad = await fetchModule(ex.wad);
     } catch (e) {
-      setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the WAD`);
+      setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the WAD`);
       return;
     }
-    log(`fetched ${ex.wad}: ${wad.length}B file (served through the fs capability)`);
+    logTo(c, `fetched ${ex.wad}: ${wad.length}B file (served through the fs capability)`);
   }
-  setState('running',
+  setState(c, 'running',
     ex.wad ? `booting DOOM… (reading the WAD, building the renderer — a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
       : 'running…');
   if (useJit) {
-    // wasm-JIT reactor: the cdylib emits the whole tick(); this JS module compiles + runs it. On any
-    // open/emit failure fall back to the interpreter reactor so the demo still plays.
     try {
-      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad); // wad is null for the non-fs reactors
-      log(`wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
+      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad);
+      logTo(c, `wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
     } catch (e) {
       jitReactor = null;
-      log(`wasm-JIT reactor unavailable (${e.message}); falling back to the interpreter`);
+      logTo(c, `wasm-JIT reactor unavailable (${e.message}); falling back to the interpreter`);
     }
   }
   if (!jitReactor) {
     let opened;
     if (ex.wad) {
       const nameBytes = new TextEncoder().encode('doom1.wad');
-      // Alloc all three buffers BEFORE filling any: svm_alloc may grow (detach) linear memory, so take
-      // one fresh view after the last alloc and write into that.
       const modP = eng.ex.svm_alloc(bytes.length);
       const nameP = eng.ex.svm_alloc(nameBytes.length);
       const wadP = eng.ex.svm_alloc(wad.length);
@@ -766,32 +738,30 @@ async function runReactor(ex) {
       eng.ex.svm_dealloc(p, bytes.length);
     }
     if (opened !== 0) {
-      setState('error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
-      log(`svm_onramp_open failed: ${opened}`);
+      setState(c, 'error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
+      logTo(c, `svm_onramp_open failed: ${opened}`);
+      activeReactorCard = null;
       return;
     }
-    log(`reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
+    logTo(c, `reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
   }
   const tier = jitReactor ? 'wasm-JIT' : 'interpreter';
-  setState('running', `running (${tier}) — arrow keys to steer, Stop to end`);
-  $('run').disabled = true;
-  $('stop').disabled = false;
+  setState(c, 'running', `running (${tier}) — arrow keys to steer, Stop to end`);
+  c.el.run.disabled = true;
+  c.el.stop.disabled = false;
   let frames = 0;
   const t0 = performance.now();
   let fpsFrames = 0;
   let fpsT0 = t0;
   const loop = () => {
-    // One tick: 0 = keep going, 5 = the guest exited, else a trap. The JIT driver runs the emitted
-    // tick and stashes the frame; the interpreter path runs it in-Rust — both fill svm_framebuffer_*.
     const status = jitReactor ? jitReactor.frame() : eng.ex.svm_onramp_frame();
-    presentFrame(eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
+    presentFrame(c, eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
     frames++;
     fpsFrames++;
-    // Surface a live FPS reading each second so the tier's frame rate is visible.
     const now = performance.now();
     if (now - fpsT0 >= 1000) {
       const fps = (fpsFrames * 1000 / (now - fpsT0)).toFixed(1);
-      setState('running', `running (${tier}) — ${fps} fps · arrow keys to steer, Stop to end`);
+      setState(c, 'running', `running (${tier}) — ${fps} fps · arrow keys to steer, Stop to end`);
       fpsFrames = 0;
       fpsT0 = now;
     }
@@ -800,8 +770,6 @@ async function runReactor(ex) {
       return;
     }
     reactorRAF = null;
-    // On a trap, read the Trap variant (the diagnostic export stashes it into the stdout buffer) BEFORE
-    // close() frees the reactor, so the log says *why* it stopped, not just the status code.
     let trapDetail = '';
     if (status !== 0 && status !== 5) {
       const n = jitReactor ? eng.ex.svm_onramp_jit_trap_len() : eng.ex.svm_onramp_trap_len();
@@ -816,41 +784,33 @@ async function runReactor(ex) {
     } else {
       eng.ex.svm_onramp_close();
     }
-    $('run').disabled = broken;
-    $('stop').disabled = true;
+    activeReactorCard = null;
+    c.el.run.disabled = broken;
+    c.el.stop.disabled = true;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    setState(status === 5 ? 'done' : 'error',
+    setState(c, status === 5 ? 'done' : 'error',
       status === 5 ? `guest exited after ${frames} frames · ${secs}s`
         : `reactor trapped: status ${status}${trapDetail ? ` (${trapDetail})` : ''}`);
-    log(`reactor stopped (${tier}): status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
+    logTo(c, `reactor stopped (${tier}): status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
   };
   reactorRAF = requestAnimationFrame(loop);
 }
 
-async function doRun() {
-  if (broken) return;
-  clearError(); // drop any prior parse-error marker before this run
-  stopReactor(); // a fresh Run supersedes any running reactor loop
-  // A pre-built on-ramp module runs single-shot via svm_run_onramp — no in-browser parse, no Workers.
-  const selected = EXAMPLES[$('example').value];
-  if (selected?.kind === 'reactor') return runReactor(selected);
-  if (selected?.kind === 'pg') return runPg(selected);
-  if (selected?.kind === 'module') return runModule(selected);
-  // Leave the terminal states synchronously on click, so an observer (the Playwright smoke) that
-  // clicks Run and polls for done/error never reads the PREVIOUS run's state.
-  setState('running', 'parsing…');
-  const src = getDoc();
-  const mode = $('mode').value;
-  $('result').textContent = '';
-  $('stdout').textContent = '';
-  $('canvas').style.display = 'none';
+// SVM **text** guests: parse+verify inside the sandbox (`svm_parse`), then run across Workers under the
+// card's selected powerbox recipe.
+async function runText(c) {
+  setState(c, 'running', 'parsing…');
+  const src = c.editor.getValue();
+  const mode = c.el.mode.value;
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
 
-  // 1) front end, inside the sandbox: SVM text → parse → verify → encoded module bytes.
   const u8 = () => new Uint8Array(eng.memory.buffer);
   const srcBytes = new TextEncoder().encode(src);
   let guest;
   if (srcBytes.length === 0) {
-    setState('error', 'parse error: empty source');
+    setState(c, 'error', 'parse error: empty source');
     return;
   }
   {
@@ -858,23 +818,21 @@ async function doRun() {
     u8().set(srcBytes, p);
     const ok = eng.ex.svm_parse(p, srcBytes.length);
     eng.ex.svm_dealloc(p, srcBytes.length);
-    // `slice` copies out of the SharedArrayBuffer (the stash may move on the next call).
     const out = u8().slice(eng.ex.svm_parse_ptr(), eng.ex.svm_parse_ptr() + eng.ex.svm_parse_len());
     if (ok !== 1) {
       const msg = new TextDecoder().decode(out);
-      setState('error', msg);
-      markError(msg); // pin the offending line in the editor when we can locate it
+      setState(c, 'error', msg);
+      c.editor.markError(msg); // pin the offending line in the editor when we can locate it
       return;
     }
     guest = out;
   }
-  log(`parsed: ${srcBytes.length}B text → ${guest.length}B module`);
+  logTo(c, `parsed: ${srcBytes.length}B text → ${guest.length}B module`);
 
-  // 2) run it across Workers under the selected powerbox recipe.
   aborter = new AbortController();
-  $('run').disabled = true;
-  $('stop').disabled = false;
-  setState('running', 'running…');
+  c.el.run.disabled = true;
+  c.el.stop.disabled = false;
+  setState(c, 'running', 'running…');
   const opts = {
     jit: mode === 'jit',
     inst: mode === 'inst',
@@ -886,82 +844,206 @@ async function doRun() {
   try {
     const { value, started } = await run(guest, opts);
     const ms = (performance.now() - t0).toFixed(0);
-    $('result').textContent = `${value}`;
-    if (mode === 'io') $('stdout').textContent = readParStdout(eng);
-    setState('done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms`);
-    log(`run → ${value} across ${started} Workers in ${ms}ms`);
+    c.el.result.textContent = `${value}`;
+    if (mode === 'io') c.el.stdout.textContent = readParStdout(eng);
+    setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms`);
+    logTo(c, `run → ${value} across ${started} Workers in ${ms}ms`);
   } catch (e) {
     if (e.message === 'stopped') {
       // Workers were torn down mid-run; shared state (locks, the live-vCPU counter) may be wedged.
       broken = true;
-      setState('stopped', 'stopped — reload the page to run again');
-      log('stopped by user');
+      setState(c, 'stopped', 'stopped — reload the page to run again');
+      logTo(c, 'stopped by user');
+      for (const card of cards) card.el.run.disabled = true;
     } else {
-      setState('error', `run error: ${e.message}`);
-      log(`run error: ${e.message}`);
+      setState(c, 'error', `run error: ${e.message}`);
+      logTo(c, `run error: ${e.message}`);
     }
   } finally {
     aborter = null;
-    $('run').disabled = broken;
-    $('stop').disabled = true;
+    c.el.run.disabled = broken;
+    c.el.stop.disabled = true;
   }
 }
 
-async function main() {
-  mountEditor($('src')); // replace the textarea with the CodeMirror editor before the first setDoc
-  for (const name of Object.keys(EXAMPLES)) {
-    const o = document.createElement('option');
-    o.value = name;
-    o.textContent = name;
-    $('example').appendChild(o);
+// A card's Run: supersede any running reactor, then dispatch by kind.
+async function runDemo(c) {
+  if (broken) return;
+  if (c.editor) c.editor.clearError();
+  stopReactor(); // a fresh Run supersedes any running reactor loop
+  const ex = c.ex;
+  if (ex.kind === 'reactor') return runReactor(c);
+  if (ex.kind === 'pg') return runPg(c);
+  if (ex.kind === 'module') return runModule(c);
+  return runText(c);
+}
+
+// A card's Stop: end a running reactor, or abort a running threaded text run.
+function stopDemo(c) {
+  if (reactorRAF !== null) {
+    stopReactor();
+    c.el.run.disabled = broken;
+    c.el.stop.disabled = true;
+    setState(c, 'stopped', 'stopped');
+  } else {
+    aborter?.abort();
   }
-  loadExample('hello');
-  refreshEditor(); // lay the editor out now that it holds content
-  $('example').addEventListener('change', () => loadExample($('example').value));
-  $('vim').addEventListener('change', (e) => setVim(e.target.checked));
-  $('run').addEventListener('click', doRun);
-  $('stop').addEventListener('click', () => {
-    if (reactorRAF !== null) {
-      stopReactor();
-      $('run').disabled = broken;
-      $('stop').disabled = true;
-      setState('stopped', 'stopped');
-    } else {
-      aborter?.abort();
+}
+
+// ---- DOM: build one card per demo + the sidebar --------------------------------------------------
+const slug = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+const POWERBOX_MODES = [
+  ['plain', 'none (compute only)'],
+  ['io', 'host I/O (stdout)'],
+  ['jit', 'guest JIT (§22)'],
+  ['inst', 'instantiator (§14)'],
+];
+
+function buildCard(name, ex) {
+  const section = el('section', 'demo');
+  section.id = 'demo-' + slug(name);
+  section.dataset.demo = name; // stable hook for tests
+  section.append(el('h2', 'demo-title', name));
+  section.append(el('p', 'desc', ex.desc || ''));
+
+  // SVM text (no `kind`) and editable modules (Lua/SQL/Postgres) get an editor; a fixed C guest or a
+  // reactor gets a lightweight read-only note (its "source" is a pre-built binary).
+  const editable = !ex.kind || !!ex.editable;
+  let editor = null;
+  if (editable) {
+    const ta = el('textarea');
+    ta.value = ex.src || '';
+    const wrap = el('div', 'editor');
+    wrap.appendChild(ta);
+    section.appendChild(wrap);
+    editor = createEditor(ta, ex.lang || 'svm');
+  } else {
+    section.appendChild(el('pre', 'note',
+      ex.kind === 'reactor'
+        ? `Pre-built on-ramp reactor module (${ex.url}). Click Run — the page calls tick() once per animation frame; the arrow keys steer it through the keyboard capability.`
+        : `Pre-built on-ramp module (${ex.url}). Click Run — it executes as a real C/C++ guest via svm_run_onramp; its stdout appears below.`));
+  }
+
+  const controls = el('div', 'controls');
+  let modeSel = null;
+  if (!ex.kind) {
+    modeSel = el('select');
+    for (const [v, label] of POWERBOX_MODES) {
+      const o = el('option', null, label);
+      o.value = v;
+      modeSel.appendChild(o);
     }
-  });
-  // Forward keys to a running reactor guest through the `keyboard` capability (as JS keyCodes — the
+    modeSel.value = ex.mode;
+    const l = el('label', null, 'powerbox ');
+    l.appendChild(modeSel);
+    controls.appendChild(l);
+  }
+  const runBtn = el('button', 'run', 'Run');
+  runBtn.disabled = true;
+  const stopBtn = el('button', 'stop', 'Stop');
+  stopBtn.disabled = true;
+  controls.append(runBtn, stopBtn);
+  let jit = null;
+  if (ex.jit) {
+    const l = el('label', 'jit-label');
+    l.title = 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
+    jit = el('input');
+    jit.type = 'checkbox';
+    jit.checked = true;
+    l.append(jit, ' wasm-JIT');
+    controls.appendChild(l);
+  }
+  const state = el('span', 'state', 'ready');
+  state.dataset.state = 'ready';
+  controls.appendChild(state);
+  section.appendChild(controls);
+
+  const out = el('div', 'output');
+  const result = el('pre', 'result');
+  const canvas = el('canvas', 'canvas');
+  canvas.hidden = true;
+  const gpucanvas = el('canvas', 'gpucanvas');
+  gpucanvas.hidden = true;
+  const stdout = el('pre', 'stdout');
+  const logEl = el('pre', 'log');
+  out.append(el('strong', null, 'result'), result, canvas, gpucanvas,
+    el('strong', null, 'stdout'), stdout, el('strong', null, 'log'), logEl);
+  section.appendChild(out);
+
+  const c = {
+    name, ex, editor,
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit },
+  };
+  runBtn.addEventListener('click', () => runDemo(c));
+  stopBtn.addEventListener('click', () => stopDemo(c));
+  return c;
+}
+
+// The sidebar: one link per demo, scroll-spied so the in-view demo is highlighted, and a global Vim
+// toggle. Clicking a link scrolls its card into view.
+function buildSidebar() {
+  const nav = $('nav-list');
+  for (const c of cards) {
+    const a = el('a', 'nav-link', c.name);
+    a.href = '#' + c.el.section.id;
+    a.dataset.target = c.el.section.id;
+    nav.appendChild(a);
+  }
+  // Scroll-spy: highlight the link whose card is nearest the top of the viewport.
+  const links = new Map([...nav.querySelectorAll('.nav-link')].map((a) => [a.dataset.target, a]));
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const a = links.get(entry.target.id);
+      if (a) a.classList.toggle('active', entry.isIntersecting);
+    }
+  }, { rootMargin: '-45% 0px -45% 0px' }); // a thin band across the vertical middle
+  for (const c of cards) observer.observe(c.el.section);
+}
+
+async function main() {
+  const demosEl = $('demos');
+  for (const [name, ex] of Object.entries(EXAMPLES)) {
+    const c = buildCard(name, ex);
+    cards.push(c);
+    demosEl.appendChild(c.el.section);
+  }
+  buildSidebar();
+  refreshAll(); // lay the editors out now they're in the DOM
+  $('vim').addEventListener('change', (e) => setVimAll(e.target.checked));
+
+  // Forward keys to the running reactor guest through the `keyboard` capability (as JS keyCodes — the
   // guest maps them: bounce steers on the arrows; Doom adds Ctrl fire / Space use / Enter·Esc·Tab
-  // menus / Shift run / the letter keys y·n·etc.). Only while a loop is running. `preventDefault` is
-  // limited to the keys whose default would disrupt play (arrows/Space/Tab scroll or move focus), and
-  // never fires for a browser shortcut (Ctrl/Meta + a letter — e.g. Ctrl+R), so reload etc. still work.
-  const REACTOR_KEYS = new Set([37, 38, 39, 40, 17, 32, 13, 27, 9, 16]); // arrows + Ctrl/Space/Enter/Esc/Tab/Shift
-  for (let c = 65; c <= 90; c++) REACTOR_KEYS.add(c); // A–Z (Doom uses y/n and cheat/menu letters)
-  const SWALLOW = new Set([37, 38, 39, 40, 32, 9]); // keys whose default (scroll/focus) must be suppressed
+  // menus / Shift run / the letter keys). Only while a loop is running. `preventDefault` is limited to
+  // the keys whose default would disrupt play (arrows/Space/Tab scroll or move focus), and never fires
+  // for a browser shortcut (Ctrl/Meta + a letter — e.g. Ctrl+R), so reload etc. still work.
+  const REACTOR_KEYS = new Set([37, 38, 39, 40, 17, 32, 13, 27, 9, 16]);
+  for (let k = 65; k <= 90; k++) REACTOR_KEYS.add(k);
+  const SWALLOW = new Set([37, 38, 39, 40, 32, 9]);
   const forward = (pressed) => (e) => {
     if (reactorRAF === null || !REACTOR_KEYS.has(e.keyCode)) return;
     if (jitReactor) eng.ex.svm_onramp_jit_key(e.keyCode, pressed);
     else eng.ex.svm_onramp_key(e.keyCode, pressed);
-    const shortcut = (e.ctrlKey || e.metaKey) && e.keyCode !== 17; // leave Ctrl+R etc. to the browser
+    const shortcut = (e.ctrlKey || e.metaKey) && e.keyCode !== 17;
     if (SWALLOW.has(e.keyCode) && !shortcut) e.preventDefault();
   };
   window.addEventListener('keydown', forward(1));
   window.addEventListener('keyup', forward(0));
 
   if (!self.crossOriginIsolated) {
-    setState('error', 'no cross-origin isolation (SharedArrayBuffer unavailable) — serve via serve.mjs');
+    setEngineState('error', 'no cross-origin isolation (SharedArrayBuffer unavailable) — serve via serve.mjs');
     return;
   }
   try {
     eng = await loadEngine();
     run = makeRunner(eng);
   } catch (e) {
-    setState('error', `engine load failed: ${e.message}`);
+    setEngineState('error', `engine load failed: ${e.message}`);
     return;
   }
-  log(`engine loaded; shared=${eng.memory.buffer instanceof SharedArrayBuffer}`);
-  $('run').disabled = false;
-  setState('ready', 'ready');
+  for (const c of cards) c.el.run.disabled = false;
+  setEngineState('ready', 'engine ready');
 }
 
-main().catch((e) => setState('error', `fatal: ${e.message}`));
+main().catch((e) => setEngineState('error', `fatal: ${e.message}`));
