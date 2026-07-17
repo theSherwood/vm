@@ -1,9 +1,11 @@
 # POSIX personality — libc as host capabilities
 
-> Status: **design + first spike.** `svm-posix` provides the first ops (`write` / `read` /
-> `malloc` / `free` / `exit`) as a `HostFn` capability, differential-tested on both backends.
-> This doc is the plan the rest of the surface fills in. Update the **ABI table** and the
-> **Status** as ops land.
+> Status: **core surface landed.** `svm-posix` provides ops 0–20 (stdio, `malloc`/`free`,
+> `exit`, the memfs + fd table, cwd, env, argv, and the Stage-1 `exec` surface) as a `HostFn`
+> capability, differential-tested on both backends. A compiled-C shell runs on it
+> (`crates/svm/tests/c_shell.rs`) and dispatches external commands to spawned confined
+> children (`stage1_posix_spawn.rs`; the spawn work is tracked in `STAGE1.md`). Update the
+> **ABI table** and the **Status** as ops land.
 
 ## 1. The thesis: libc is not one thing
 
@@ -117,11 +119,13 @@ only to mark the boundary.
 | 16 | `closedir(dir)` | `-> 0 \| -errno` | dir stream | **done** — `-EBADF` on a stale handle |
 | 17 | `argc()` | `-> n` | host arg vector | **done** — personality ext. (the `sh -c` path; `argv[0]` = program name) |
 | 18 | `argv(i, buf, cap)` | `-> len \| -errno` | host arg vector | **done** — NUL-terminated arg `i`; `-EINVAL`/`-ERANGE` |
+| 19 | `exec_lookup(name, len)` | `-> module \| -1` | host PATH registry (`register_command`) | **done** — Stage 1 exec (STAGE1.md §5); the spawn itself is the shell's `Instantiator` op 13 + `join` |
+| 20 | `exec_stdout()` | `-> stream` | host stdout `Stream` | **done** — the handle the shell re-grants to a child under the name `"stdout"` |
 | — | `fstat/environ` | / `-errno` | memfs + host fd table | todo |
 | — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
 | — | `pipe/dup/dup2/fcntl` | `-> fd \| -errno` | `Pipe` cap + host fd table | todo |
 | — | `time/clock_gettime` | `-> t` | `Clock` cap | todo |
-| — | `fork/execve/waitpid` | Stage 3 | `Instantiator` / clone (§7) | parked |
+| — | `fork/execve/waitpid` | Stage 3 | `Instantiator` / clone (§7) | partial — spawn+wait landed as `Instantiator` op 13 + `join` (Stage 1, STAGE1.md; ops 19/20 above); `fork` itself parked |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
 
 ## 6. Roadmap
@@ -134,11 +138,14 @@ only to mark the boundary.
    (`crates/svm/tests/c_posix.rs`). Bound in the §7 **general form**: `resolve_bound` supplies
    the handle at resolve (`Resolved::CapBound`), so the guest libc has real C signatures and
    no powerbox slot (§4 above; the fixed-`_start` retirement is PROCESS.md S15).
-3. **fs + fd table:** `open`/`read`/`write`/`close`/`stat`/`readdir` over the existing fs ops,
-   with a host-side fd table; a real free-list allocator.
-4. **A first shell:** BusyBox `ash` (fork-less) at Stage 0/2 — `sh -c`, builtins, `ls | grep`
-   via the `Pipe` cap. This is the playground target.
-5. **Signals (L0), env, time**, then Stage 3 (`fork`/`exec`) on top of `Instantiator` / clone.
+3. **fs + fd table (done):** `open`/`read`/`write`/`close`/`stat`/`readdir` over the memfs,
+   with a host-side fd table (ops 5–16 above); a real free-list allocator.
+4. **A first shell (done — a compiled-C shell, not BusyBox):** fork-less at Stage 0 — `sh -c`,
+   builtins, redirection, pipelines (staged through memfs temp files; `ls | grep` via the
+   `Pipe` cap is still open) — `crates/svm/tests/c_shell.rs`. This is the playground target.
+5. **Signals (L0), time** (env landed — ops 11/12), then Stage 3 (`fork`/`exec`) on top of
+   `Instantiator` / clone. The `exec` half landed first as Stage 1 spawn — ops 19/20 plus the
+   shell's own `Instantiator` op 13 + `join` — tracked in `STAGE1.md`; `fork` remains.
 
 Testing follows the repo standard: every op is an interp ↔ bytecode ↔ JIT differential
 (errno paths included), because a `HostFn` dispatches through the same `cap_dispatch_slots`
