@@ -6,7 +6,7 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{BinOp, Block, Func, Inst, IntTy, LoadOp, Memory, Module, Terminator, ValType};
-use svm_opt::optimize_module;
+use svm_opt::{optimize_module, optimize_module_with, OptConfig};
 use svm_verify::verify_module;
 
 fn module(f: Func) -> Module {
@@ -175,9 +175,11 @@ fn join_recomputation_of_a_derived_expression() {
 }
 
 #[test]
-fn impure_loads_at_a_join_are_not_deduped() {
-    // The safety line: a load has a unique value number (it may trap / read changing memory), so GVN
+fn impure_loads_at_a_join_are_not_deduped_by_gvn() {
+    // GVN's safety line: a load has a unique value number (it may trap / read changing memory), so GVN
     // never treats a join recomputation of a load as redundant, even when the address is congruent.
+    // (The *cross-block load* pass — OPT.md Phase 4 — does soundly remove such a reload; that this
+    // diamond is one is asserted at the end via the full pipeline.)
     let ld = |addr: u32| Inst::Load {
         op: LoadOp::I32,
         addr,
@@ -223,17 +225,31 @@ fn impure_loads_at_a_join_are_not_deduped() {
         ],
     };
     let m = module(f);
-    let opt = check_equiv(
+    let args = [
+        vec![Value::I32(1), Value::I64(0)],
+        vec![Value::I32(0), Value::I64(0)],
+    ];
+    // GVN alone (cross-block load elimination off) leaves both loads — its safety line.
+    let gvn_only = optimize_module_with(
         &m,
-        &[
-            vec![Value::I32(1), Value::I64(0)],
-            vec![Value::I32(0), Value::I64(0)],
-        ],
+        &OptConfig {
+            gvn: true,
+            load_elim: false,
+            ..OptConfig::none()
+        },
     );
+    verify_module(&gvn_only).expect("gvn-only re-verifies");
+    assert_eq!(
+        count(&gvn_only, |i| matches!(i, Inst::Load { .. })),
+        2,
+        "GVN itself must not dedup impure loads"
+    );
+    // The full pipeline's cross-block load pass soundly removes the dominated join reload.
+    let opt = check_equiv(&m, &args);
     assert_eq!(
         count(&opt, |i| matches!(i, Inst::Load { .. })),
-        2,
-        "both impure loads must survive GVN"
+        1,
+        "load_elim removes the join reload the diamond makes redundant"
     );
 }
 
