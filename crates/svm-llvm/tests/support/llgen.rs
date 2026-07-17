@@ -15,6 +15,9 @@
 //!   **constexpr** GEPs over a global (`i8` vs `[N x i32]` — the I23 const-GEP-stride path);
 //! - 2-lane (`<2 x i32>`, packed-i64) *and* 128-bit vector min/max, widen/narrow, and width
 //!   conversions (the I23 vec2-minmax path);
+//! - scalar bit-manipulation intrinsics (`ctpop`/`ctlz`/`cttz`/`bswap`/`bitreverse`/`abs`) and
+//!   funnel-shift rotates (`fshl`/`fshr`);
+//! - vector shifts, vector `icmp`+`select` (`<N x i1>` masks), and `shufflevector`;
 //! - control flow — phi-merge diamonds and fixed-bound counted loops (back-edges, phi lowering,
 //!   loop-variant GEP indices); and
 //! - function calls to pure helpers (the call ABI: threaded data-SP, arg passing, scalar return).
@@ -97,6 +100,65 @@ fn sext(v: u64, bits: u32) -> i64 {
         v as i64
     } else {
         ((v << (64 - bits)) as i64) >> (64 - bits)
+    }
+}
+
+// ---- exact oracles for the intrinsic ops (must match the backends bit-for-bit) ----------------
+
+/// `llvm.ctlz(x, is_zero_poison=false)` over a `bits`-wide value: leading zeros, `bits` when zero.
+fn ctlz_bits(v: u64, bits: u32) -> u64 {
+    let m = mask(v, bits);
+    if m == 0 {
+        bits as u64
+    } else {
+        (m.leading_zeros() - (64 - bits)) as u64
+    }
+}
+/// `llvm.cttz(x, is_zero_poison=false)`: trailing zeros, `bits` when zero.
+fn cttz_bits(v: u64, bits: u32) -> u64 {
+    let m = mask(v, bits);
+    if m == 0 {
+        bits as u64
+    } else {
+        m.trailing_zeros() as u64
+    }
+}
+/// `llvm.bswap`: reverse the `bits`-wide byte order (`bits` is a byte multiple: 32 or 64 here).
+fn bswap_bits(v: u64, bits: u32) -> u64 {
+    match bits {
+        32 => (v as u32).swap_bytes() as u64,
+        64 => v.swap_bytes(),
+        _ => unreachable!("bswap only over i32/i64"),
+    }
+}
+/// `llvm.bitreverse`: reverse all `bits` bits.
+fn bitrev_bits(v: u64, bits: u32) -> u64 {
+    match bits {
+        32 => (v as u32).reverse_bits() as u64,
+        64 => v.reverse_bits(),
+        _ => unreachable!("bitreverse only over i32/i64"),
+    }
+}
+/// `llvm.abs(x, is_int_min_poison=false)`: two's-complement absolute value; `abs(INT_MIN)=INT_MIN`.
+fn abs_bits(v: u64, bits: u32) -> u64 {
+    mask(sext(v, bits).wrapping_abs() as u64, bits)
+}
+/// `llvm.fshl(a, b, c)` over `bits`: high `bits` of `(a:b) << (c mod bits)`.
+fn fshl_bits(a: u64, b: u64, c: u32, bits: u32) -> u64 {
+    let c = c % bits;
+    if c == 0 {
+        mask(a, bits)
+    } else {
+        mask((mask(a, bits) << c) | (mask(b, bits) >> (bits - c)), bits)
+    }
+}
+/// `llvm.fshr(a, b, c)` over `bits`: low `bits` of `(a:b) >> (c mod bits)`.
+fn fshr_bits(a: u64, b: u64, c: u32, bits: u32) -> u64 {
+    let c = c % bits;
+    if c == 0 {
+        mask(b, bits)
+    } else {
+        mask((mask(a, bits) << (bits - c)) | (mask(b, bits) >> c), bits)
     }
 }
 
@@ -343,7 +405,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
 
     let steps = 12 + g.u(40);
     for _ in 0..steps {
-        match g.u(19) {
+        match g.u(24) {
             // ---- scalar integer binops (wrapping / bitwise) ----
             0 => {
                 let bits = SCALAR_TYS[g.u(2)];
@@ -664,6 +726,129 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 p.emit(&format!("{d} = call i64 @{}(i64 {a}, i64 {b})", h.name));
                 p.push_scalar(d, 64, h.eval(av, bv));
             }
+            // ---- scalar bit-manipulation intrinsics (ctpop/ctlz/cttz/bswap/bitreverse/abs) ----
+            18 => {
+                let bits = SCALAR_TYS[g.u(2)];
+                let (a, av) = p.any_scalar(g, bits);
+                let m = mask(av, bits);
+                let (nm, r): (&str, u64) = match g.u(6) {
+                    0 => ("ctpop", m.count_ones() as u64),
+                    1 => ("ctlz", ctlz_bits(m, bits)),
+                    2 => ("cttz", cttz_bits(m, bits)),
+                    3 => ("bswap", bswap_bits(m, bits)),
+                    4 => ("bitreverse", bitrev_bits(m, bits)),
+                    _ => ("abs", abs_bits(m, bits)),
+                };
+                let d = p.fresh();
+                // ctlz/cttz take an `is_zero_poison` flag, abs an `is_int_min_poison` flag — both false.
+                match nm {
+                    "ctlz" | "cttz" | "abs" => p.emit(&format!(
+                        "{d} = call i{bits} @llvm.{nm}.i{bits}(i{bits} {a}, i1 false)"
+                    )),
+                    _ => p.emit(&format!(
+                        "{d} = call i{bits} @llvm.{nm}.i{bits}(i{bits} {a})"
+                    )),
+                }
+                p.push_scalar(d, bits, r);
+            }
+            // ---- funnel shift / rotate (fshl/fshr) ----
+            19 => {
+                let bits = SCALAR_TYS[g.u(2)];
+                let (a, av) = p.any_scalar(g, bits);
+                let (b, bv) = p.any_scalar(g, bits);
+                let amt = (g.byte() as u32) % bits;
+                let (nm, r) = if g.byte().is_multiple_of(2) {
+                    ("fshl", fshl_bits(av, bv, amt, bits))
+                } else {
+                    ("fshr", fshr_bits(av, bv, amt, bits))
+                };
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = call i{bits} @llvm.{nm}.i{bits}(i{bits} {a}, i{bits} {b}, i{bits} {amt})"
+                ));
+                p.push_scalar(d, bits, r);
+            }
+            // ---- vector shifts (per-lane amount < lane width, no poison) ----
+            20 => {
+                let s = SHAPES[g.u(3)];
+                let (a, av) = p.any_vec(g, s);
+                let lb = s.lane_bits;
+                let amts: Vec<u32> = (0..s.lanes).map(|_| (g.byte() as u32) % lb).collect();
+                let opc = g.u(3);
+                let r: Vec<u64> = av
+                    .iter()
+                    .zip(&amts)
+                    .map(|(&x, &amt)| match opc {
+                        0 => mask(mask(x, lb) << amt, lb),
+                        1 => mask(x, lb) >> amt,
+                        _ => mask((sext(x, lb) >> amt) as u64, lb),
+                    })
+                    .collect();
+                let op = ["shl", "lshr", "ashr"][opc];
+                let amtvec: Vec<String> = amts.iter().map(|&a| format!("i{lb} {a}")).collect();
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = {op} {} {a}, <{}>",
+                    ty_str_vec(s),
+                    amtvec.join(", ")
+                ));
+                p.push_vec(d, s, r);
+            }
+            // ---- vector icmp + vector select (`<N x i1>` mask feeding a per-lane select) ----
+            21 => {
+                let s = SHAPES[g.u(3)];
+                let (a, av) = p.any_vec(g, s);
+                let (b, bv) = p.any_vec(g, s);
+                let lb = s.lane_bits;
+                let pi = g.u(6);
+                let pred = ["eq", "ne", "slt", "sgt", "ult", "ugt"][pi];
+                let conds: Vec<bool> = av
+                    .iter()
+                    .zip(&bv)
+                    .map(|(&x, &y)| match pi {
+                        0 => x == y,
+                        1 => x != y,
+                        2 => sext(x, lb) < sext(y, lb),
+                        3 => sext(x, lb) > sext(y, lb),
+                        4 => mask(x, lb) < mask(y, lb),
+                        _ => mask(x, lb) > mask(y, lb),
+                    })
+                    .collect();
+                let tv = ty_str_vec(s);
+                let c = p.fresh();
+                p.emit(&format!("{c} = icmp {pred} {tv} {a}, {b}"));
+                let (x, xv) = p.any_vec(g, s);
+                let (y, yv) = p.any_vec(g, s);
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = select <{} x i1> {c}, {tv} {x}, {tv} {y}",
+                    s.lanes
+                ));
+                let r: Vec<u64> = (0..s.lanes as usize)
+                    .map(|i| if conds[i] { xv[i] } else { yv[i] })
+                    .collect();
+                p.push_vec(d, s, r);
+            }
+            // ---- shufflevector: pick each result lane from the a:b concatenation (constant mask) ----
+            22 => {
+                let s = SHAPES[g.u(3)];
+                let (a, av) = p.any_vec(g, s);
+                let (b, bv) = p.any_vec(g, s);
+                let n = s.lanes as usize;
+                let sel: Vec<usize> = (0..n).map(|_| g.u(2 * n)).collect();
+                let maskv: Vec<String> = sel.iter().map(|&i| format!("i32 {i}")).collect();
+                let r: Vec<u64> = sel
+                    .iter()
+                    .map(|&i| if i < n { av[i] } else { bv[i - n] })
+                    .collect();
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = shufflevector {tv} {a}, {tv} {b}, <{n} x i32> <{}>",
+                    maskv.join(", "),
+                    tv = ty_str_vec(s)
+                ));
+                p.push_vec(d, s, r);
+            }
             // ---- build a vector by insertelement from scalars ----
             _ => {
                 let s = SHAPES[g.u(3)];
@@ -754,6 +939,27 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 s.lanes, s.lane_bits
             ));
         }
+    }
+    // Scalar bit-manip / funnel-shift intrinsics (unused declares are harmless).
+    for bits in SCALAR_TYS {
+        m.push_str(&format!("declare i{bits} @llvm.ctpop.i{bits}(i{bits})\n"));
+        m.push_str(&format!(
+            "declare i{bits} @llvm.ctlz.i{bits}(i{bits}, i1)\n"
+        ));
+        m.push_str(&format!(
+            "declare i{bits} @llvm.cttz.i{bits}(i{bits}, i1)\n"
+        ));
+        m.push_str(&format!("declare i{bits} @llvm.bswap.i{bits}(i{bits})\n"));
+        m.push_str(&format!(
+            "declare i{bits} @llvm.bitreverse.i{bits}(i{bits})\n"
+        ));
+        m.push_str(&format!("declare i{bits} @llvm.abs.i{bits}(i{bits}, i1)\n"));
+        m.push_str(&format!(
+            "declare i{bits} @llvm.fshl.i{bits}(i{bits}, i{bits}, i{bits})\n"
+        ));
+        m.push_str(&format!(
+            "declare i{bits} @llvm.fshr.i{bits}(i{bits}, i{bits}, i{bits})\n"
+        ));
     }
     for h in &p.helpers {
         m.push_str(&h.define());
