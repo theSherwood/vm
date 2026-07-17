@@ -690,14 +690,22 @@ the right digits**. Verified guest == native on `0.1+0.2` → `0.300000000000000
 `1e21`, `Math.PI`, `123456789.123456789`, … So no rounding-mode primitive is needed for general JS float
 printing after all.
 
-**Playground REPL — DONE (the build/wiring; a real-browser run is the only unverified step).** A
-`qjs_repl.c` stdin driver (reads JS from the `Stream` cap, evaluates it, prints `print`/`console.log`
-output + the completion value) runs **byte-identical to native** (`demo_quickjs_repl_stdin`). Wired into
-`browser/build-onramp-assets.mjs` (fetch QuickJS + openlibm, compile the engine + shims, `llvm-link -S`,
-translate at `--host-page 65536` → `qjs_repl.svmb`, ~4.3 MB) and registered as a **playground example**
-in `web/play.js`. Boot is milliseconds (no snapshot/restore, unlike Postgres). Interp tier only for now
-(`jit`/`kind:'module'`); the in-browser wasm-JIT tier + a real-browser differential are the remaining
-verification (needs a browser env with GitHub egress to build the asset).
+**Playground REPL — DONE and browser-verified (interp tier).** A `qjs_repl.c` stdin driver (reads JS
+from the `Stream` cap, evaluates it, prints `print`/`console.log` output + the completion value) runs
+**byte-identical to native** (`demo_quickjs_repl_stdin`). Wired into `browser/build-onramp-assets.mjs`
+(fetch QuickJS + openlibm, compile the engine + shims, `llvm-link -S`, translate at `--host-page 65536`
+→ `qjs_repl.svmb`, ~4.3 MB) and registered as a **playground example** in `web/play.js` (with JS syntax
+highlighting — `editor.js`/the CodeMirror bundle now carry the `javascript` mode). **Confirmed in real
+Chromium/V8:** the tab evaluates JS and prints correct output (incl. shortest floats, `0.1+0.2` →
+`0.30000000000000004`) in ~0.6 s for a light program. Boot is milliseconds (no snapshot/restore).
+
+**wasm-JIT tier — an emitter gap, not just a wasmi limit.** Unlike Lua/SQLite (emittable, but `wasmi`
+rejects the giant function while V8 runs it), QuickJS's `_start` is **not emittable at all** by
+`svm-wasmjit` (the prove button returns `status 2 = _start not emittable`) — the module trips an inst
+the wasm tier's v1 subset doesn't cover (`round`'s float ops *are* supported, so it's a different one:
+`Fma`, `i32.extend32_s`, a ref/funcref pattern, …; not yet pinned). So the QuickJS playground tab is
+**interp-tier only** for now; enabling the JIT tier is a follow-up on the `svm-wasmjit` emitter (extend
+the v1 subset to cover the missing op). Confirmed by driving the prove button in Chromium.
 
 **JS-language breadth — wide surface verified; BigInt is the one gap.** `demo_quickjs_breadth_vs_native`
 (`qjs_breadth.c`) runs **regex** (`libregexp`), **exceptions** (`try`/`catch`), **generators**,
@@ -710,18 +718,20 @@ playground, which doesn't use BigInt). *Caveat for local runs:* the spike libm s
 contaminate any path that calls them (e.g. `-7 % 3` → `fmod`); the committed demos avoid libm calls or
 link real openlibm, so CI is clean.
 
-**wasm-JIT tier (browser).** QuickJS's `JS_CallInternal` is a giant hot function — like Lua's
-`luaV_execute` / SQLite's `sqlite3VdbeExec`, `wasmi`'s register allocator rejects it, but V8 (the real
-browser) emits it. So the wasm-JIT tier is verified in the browser (`browser-jit-module-test.mjs`), not
-the native `wasmi` harness — pending a browser env + the openlibm-linked asset.
+**wasm-JIT tier — QuickJS's `_start` is not emittable by `svm-wasmjit` yet** (distinct from the
+Lua/SQLite story: those *emit*, `wasmi` just can't compile the giant function, V8 can). Driving the
+playground's prove button in Chromium returns `status 2 = not emittable` — the module trips an inst
+outside the wasm tier's v1 subset. So the tab is interp-tier only; extending `svm-wasmjit` to emit it
+(near-native speed) is a follow-up. See the Playground-REPL note above.
 
 **Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
 (c) ~~`select` of aggregates~~ **done**; (d) ~~`llvm.round`~~ **done** → ★ **the eval RUNS byte-identical
 to native**; (e) ~~`qjs_repl.c` + playground wiring~~ **done** (`.svmb` asset + `web/play.js` entry;
-shortest-float printing confirmed working — no dtoa slice needed); (f) real-browser verification of the
-playground tab + the wasm-JIT tier (for speed); (g) regex / BigInt / `try`/`catch` breadth; (h) the
-`run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's analog of SQLite's
-sqllogictest.
+shortest-float printing confirmed working — no dtoa slice needed); (f) ~~real-browser verification of the
+playground tab~~ **done** (interp tier, real Chromium/V8); (g) ~~regex / `try`/`catch` / … breadth~~
+**done** (`demo_quickjs_breadth_vs_native`); the open breadth item is **BigInt** (ISSUES.md I25); (h) the
+**`svm-wasmjit` emitter gap** so the JIT tier lights up (speed); (i) the `run-test262.c` harness over an
+embedded slice — the self-validating suite, QuickJS's analog of SQLite's sqllogictest.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

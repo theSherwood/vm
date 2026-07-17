@@ -28,6 +28,7 @@ JS=(
   mode/lua/lua.js
   mode/sql/sql.js
   mode/clike/clike.js
+  mode/javascript/javascript.js
 )
 CSS=(lib/codemirror.css addon/dialog/dialog.css)
 

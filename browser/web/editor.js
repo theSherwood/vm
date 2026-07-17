@@ -32,7 +32,7 @@ CM.defineSimpleMode('svm', {
 });
 
 // CodeMirror mode string for a demo's declared `lang`. SVM text is the default.
-const MODE = { svm: 'svm', lua: 'lua', sql: 'text/x-sql', c: 'text/x-csrc' };
+const MODE = { svm: 'svm', lua: 'lua', sql: 'text/x-sql', c: 'text/x-csrc', js: 'text/javascript' };
 
 const instances = [];
 
