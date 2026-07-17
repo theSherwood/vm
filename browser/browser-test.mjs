@@ -287,30 +287,40 @@ try {
       `b=(${b?.minx},${b?.miny}) live=${a?.n}/${b?.n} ${lifeOk ? 'PASS' : 'FAIL'}`);
   }
 
-  // PostgreSQL in the playground (the `svm_run_pg` path): a whole `postgres --single` boots inside wasm
-  // on the same threads engine, mounts its data image on the `fs` cap, and runs the editor's SQL. The
-  // two large artifacts (module + image) are gitignored / built by the heavy demo pipeline, so this
-  // check SKIPS when they aren't staged (CI without them stays green); when present it's the end-to-end
-  // proof that a real database runs in the browser. Boot is multi-second — a generous timeout.
+  // PostgreSQL in the playground — a whole `postgres --single` boots inside wasm on the same threads
+  // engine, mounts its data image on the `fs` cap, and runs SQL as a **live interactive session**
+  // (`svm_pg_open`/`_query`): the first Run boots to the prompt + runs the default batch; a second Run
+  // sends a NEW query to the *same* backend, proving state persists (the boot-once/query-many payoff).
+  // The two large artifacts are gitignored / built by the heavy demo pipeline, so this SKIPS when they
+  // aren't staged (CI without them stays green). Boot is multi-second — a generous timeout.
   if (existsSync(join(ROOT, 'web/assets/postgres_resolved.svmb')) &&
       existsSync(join(ROOT, 'web/assets/pgdata.img'))) {
     const P = card('PostgreSQL (17.5 — write & run SQL)');
-    await play.click(`${P} .run`);
-    await play.waitForFunction(
-      (s) => ['done', 'error'].includes(document.querySelector(`${s} .state`).dataset.state),
-      P, { timeout: 180_000 },
-    );
-    const pg = {
-      state: await play.$eval(`${P} .state`, (e) => e.dataset.state),
-      status: await play.$eval(`${P} .state`, (e) => e.textContent),
-      stdout: await play.$eval(`${P} .stdout`, (e) => e.textContent),
+    const pgRun = async (timeout) => {
+      const t0 = Date.now();
+      await play.click(`${P} .run`);
+      await play.waitForFunction(
+        (s) => ['done', 'error'].includes(document.querySelector(`${s} .state`).dataset.state),
+        P, { timeout },
+      );
+      return Date.now() - t0;
     };
-    const want = ['PostgreSQL stand-alone backend', 's = "three"', 'count'];
-    const missing = want.filter((w) => !pg.stdout.includes(w));
-    const pgOk = pg.state === 'done' && missing.length === 0;
+    // Run 1: boot + the default CREATE/INSERT/SELECT batch (three rows).
+    const bootMs = await pgRun(180_000);
+    const out1 = await play.$eval(`${P} .stdout`, (e) => e.textContent);
+    const boot = ['PostgreSQL stand-alone backend', 's = "three"', 'count'].filter((w) => !out1.includes(w));
+    // Run 2: a new query on the SAME backend — only works if the table + rows persisted from Run 1.
+    await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror
+      .setValue("INSERT INTO t VALUES (4,'four');\nSELECT count(*), sum(x) FROM t;\n"), P);
+    const q2Ms = await pgRun(30_000);
+    const out2 = await play.$eval(`${P} .stdout`, (e) => e.textContent);
+    const state2 = await play.$eval(`${P} .state`, (e) => e.dataset.state);
+    const persisted = out2.includes('count = "4"') && out2.includes('sum = "10"'); // 1+2+3+4 = 10
+    const faster = q2Ms < bootMs / 2; // the second query reuses the live backend, no re-boot
+    const pgOk = state2 === 'done' && boot.length === 0 && persisted && faster;
     checks.push(pgOk);
-    console.log(`  play/postgres: state=${pg.state} status=${JSON.stringify(pg.status)} ` +
-      `missing=${JSON.stringify(missing)} ${pgOk ? 'PASS' : 'FAIL'}`);
+    console.log(`  play/postgres: boot=${bootMs}ms q2=${q2Ms}ms persisted=${persisted} ` +
+      `missing=${JSON.stringify(boot)} ${pgOk ? 'PASS' : 'FAIL'}`);
   } else {
     console.log('  play/postgres: SKIP (artifacts not staged — run `node build-pg-assets.mjs`)');
   }

@@ -494,10 +494,13 @@ SELECT n, a AS fib FROM fib;
     desc: 'A whole, unmodified PostgreSQL 17.5 --single backend — ~15,000 functions compiled LLVM → ' +
       'SVM IR, verified, and run on the bytecode interpreter inside wasm. Its data directory is an ' +
       'in-memory image mounted on a capability-scoped filesystem — no host filesystem, network, or ' +
-      'ambient authority. Edit the SQL on the left and click Run: each Run is a fresh boot of the ' +
-      'backend (a few seconds), so this is real Postgres running client-side in the sandbox. The two ' +
-      'large artifacts (a ~20 MB module + a ~40 MB data image) download once.',
-    src: `-- Write SQL here, then click Run. Each Run is a fresh postgres --single boot.
+      'ambient authority. It runs as a live **interactive session**: the first Run boots the backend ' +
+      '(a few seconds), then each Run feeds your SQL to the *same* backend on its blocking stdin — so ' +
+      'queries after the first are sub-second and state persists across them (a table you CREATE stays ' +
+      'for the next query), exactly like psql. Click Stop to close the session; the next Run boots ' +
+      'fresh. The two large artifacts (a ~20 MB module + a ~40 MB image) download once.',
+    src: `-- Click Run to send this to the live backend. Run again with new SQL — the session persists
+-- (the table below stays for later queries), and only the first Run pays the boot. Stop resets it.
 CREATE TABLE t (x int, s text);
 INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
 SELECT * FROM t WHERE x > 1 ORDER BY x DESC;
@@ -680,60 +683,100 @@ async function runModule(c) {
 // Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
 // pre-translated+resolved module + the data image, feed the editor's SQL as stdin, mount the image on
 // an in-memory `fs` cap, run to a queried backend, read the captured stdout. A fresh boot per Run.
+// Read the engine's captured stdout buffer (the `svm_pg_*` delta, or a `svm_run_pg` full capture).
+function readEngineStdout() {
+  const p = eng.ex.svm_stdout_ptr();
+  const l = eng.ex.svm_stdout_len();
+  return new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + l));
+}
+
+// PostgreSQL as a **live interactive session** (the `svm_pg_open`/`_query`/`_close` path): the first Run
+// boots one `postgres --single` backend to the `backend>` prompt (a few seconds) and leaves it suspended
+// on its blocking stdin; every Run after feeds the editor's SQL to that *same* backend and resumes it to
+// the next prompt — so queries are sub-second and state persists across them. The output pane is a
+// running transcript; Stop closes the session (`stopDemo`), and the next Run boots fresh.
 async function runPg(c) {
   const ex = c.ex;
-  setState(c, 'running', 'fetching module + image…');
   c.el.result.textContent = '';
-  c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
-  let modBytes, imgBytes;
-  try {
-    // Sequential (not Promise.all) so the two large downloads report progress one at a time into the
-    // shared status line instead of racing over it.
-    modBytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
-    imgBytes = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
-  } catch (e) {
-    setState(c, 'error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
-    logTo(c, `fetch failed: ${e.message}`);
+  // 1) Open the session on the first Run (fetch the artifacts, boot to the prompt).
+  if (!c.pgSession) {
+    setState(c, 'running', 'fetching module + image…');
+    c.el.stdout.textContent = '';
+    let modBytes, imgBytes;
+    try {
+      // Sequential (not Promise.all) so the two large downloads report progress one at a time.
+      modBytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+      imgBytes = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
+    } catch (e) {
+      setState(c, 'error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
+      logTo(c, `fetch failed: ${e.message}`);
+      return;
+    }
+    setState(c, 'running', 'booting postgres… (first Run only — a few seconds; later queries are instant)');
+    c.el.run.disabled = true;
+    await new Promise((r) => setTimeout(r, 30)); // let "booting…" paint before the synchronous boot
+    try {
+      const modP = eng.ex.svm_alloc(modBytes.length);
+      const imgP = eng.ex.svm_alloc(imgBytes.length);
+      const view = new Uint8Array(eng.memory.buffer);
+      view.set(modBytes, modP);
+      view.set(imgBytes, imgP);
+      const t0 = performance.now();
+      const rc = eng.ex.svm_pg_open(modP, modBytes.length, imgP, imgBytes.length);
+      const ms = (performance.now() - t0).toFixed(0);
+      eng.ex.svm_dealloc(modP, modBytes.length);
+      eng.ex.svm_dealloc(imgP, imgBytes.length);
+      c.el.stdout.textContent += readEngineStdout(); // the banner + first prompt
+      if (rc !== 0) {
+        setState(c, 'error', `boot failed: status ${eng.ex.svm_status()} (1=decode 3=trap 6=verify)`);
+        c.el.run.disabled = broken;
+        return;
+      }
+      c.pgSession = true;
+      c.el.stop.disabled = false;
+      logTo(c, `svm_pg_open: backend booted in ${ms}ms`);
+    } catch (e) {
+      setState(c, 'error', `boot error: ${e.message}`);
+      c.el.run.disabled = broken;
+      return;
+    }
+  }
+  // 2) Send the editor's SQL to the live backend as one query.
+  const sql = c.editor.getValue();
+  if (!sql.trim()) {
+    setState(c, 'done', 'session live — type SQL and Run (Stop resets the backend)');
+    c.el.run.disabled = broken;
     return;
   }
-  logTo(c, `fetched ${ex.url}: ${modBytes.length}B module, ${ex.image}: ${imgBytes.length}B image`);
-  const sql = new TextEncoder().encode(c.editor.getValue());
-  setState(c, 'running', 'booting postgres… (a few seconds — the whole backend runs in the sandbox)');
-  c.el.run.disabled = true;
-  // Yield one paint so "booting…" lands before the synchronous, multi-second boot blocks the thread.
-  await new Promise((r) => setTimeout(r, 30));
   try {
-    // Alloc all three before filling: svm_alloc may grow (detach) the linear memory.
-    const modP = eng.ex.svm_alloc(modBytes.length);
-    const imgP = eng.ex.svm_alloc(imgBytes.length);
-    const inP = sql.length ? eng.ex.svm_alloc(sql.length) : 0;
-    const view = new Uint8Array(eng.memory.buffer);
-    view.set(modBytes, modP);
-    view.set(imgBytes, imgP);
-    if (inP) view.set(sql, inP);
+    const text = sql.endsWith('\n') ? sql : sql + '\n';
+    const b = new TextEncoder().encode(text);
+    const p = eng.ex.svm_alloc(b.length);
+    new Uint8Array(eng.memory.buffer).set(b, p);
     const t0 = performance.now();
-    const rv = eng.ex.svm_run_pg(modP, modBytes.length, imgP, imgBytes.length, inP, sql.length);
+    const rc = eng.ex.svm_pg_query(p, b.length);
     const ms = (performance.now() - t0).toFixed(0);
+    eng.ex.svm_dealloc(p, b.length);
+    // Append this query's output delta to the running transcript.
+    c.el.stdout.textContent += readEngineStdout();
+    c.el.stdout.scrollTop = c.el.stdout.scrollHeight;
     const status = eng.ex.svm_status();
-    const sp = eng.ex.svm_stdout_ptr();
-    const sl = eng.ex.svm_stdout_len();
-    const stdout = new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
-    eng.ex.svm_dealloc(modP, modBytes.length);
-    eng.ex.svm_dealloc(imgP, imgBytes.length);
-    if (inP) eng.ex.svm_dealloc(inP, sql.length);
-    c.el.stdout.textContent = stdout;
-    c.el.result.textContent = `${rv}`;
-    if (status === 0 || status === 5) {
-      setState(c, 'done', `booted + ran in ${ms}ms · status ${status}`);
-      logTo(c, `svm_run_pg → ${rv} (status ${status}) in ${ms}ms`);
+    if (rc === 0) {
+      setState(c, 'done', `query ran in ${ms}ms · session live (Stop to reset)`);
+      logTo(c, `svm_pg_query in ${ms}ms`);
+    } else if (status === 5) {
+      // The backend exited (e.g. the SQL issued a shutdown) — the session is over.
+      c.pgSession = false;
+      c.el.stop.disabled = true;
+      setState(c, 'done', 'backend exited — Run boots a fresh session');
     } else {
-      setState(c, 'error', `boot failed: status ${status} (1=decode 3=trap 6=verify)`);
-      logTo(c, `svm_run_pg status ${status}`);
+      setState(c, 'error', `query failed: status ${status}`);
+      logTo(c, `svm_pg_query status ${status}`);
     }
   } catch (e) {
-    setState(c, 'error', `run error: ${e.message}`);
-    logTo(c, `run error: ${e.message}`);
+    setState(c, 'error', `query error: ${e.message}`);
+    logTo(c, `query error: ${e.message}`);
   } finally {
     c.el.run.disabled = broken;
   }
@@ -1248,8 +1291,16 @@ async function runDemo(c) {
   return runText(c);
 }
 
-// A card's Stop: end a running reactor, or abort a running threaded text run.
+// A card's Stop: close a live Postgres session, end a running reactor, or abort a threaded text run.
 function stopDemo(c) {
+  if (c.pgSession) {
+    eng.ex.svm_pg_close();
+    c.pgSession = false;
+    c.el.run.disabled = broken;
+    c.el.stop.disabled = true;
+    setState(c, 'stopped', 'session closed — Run boots a fresh backend');
+    return;
+  }
   if (reactorRAF !== null) {
     stopReactor();
     c.el.run.disabled = broken;

@@ -2016,6 +2016,12 @@ pub enum VcpuEvent {
         /// when the guest passed no quota).
         fuel: u64,
     },
+    /// **Blocking stdin park** (a persistent interactive session, e.g. the browser Postgres console):
+    /// the guest `read` a `Stream{In}` cap whose buffer is exhausted, under [`Host::set_stdin_blocking`].
+    /// The read did **not** complete (nothing written, pc un-advanced); the host pushes more bytes with
+    /// [`Vcpu::push_stdin`] and calls [`run`](Vcpu::run) again, which re-issues the same read — now
+    /// satisfied. No `deliver_*` is needed (unlike the other events, this one carries no pending dst).
+    StdinPark,
 }
 
 /// A §22 JIT op awaiting the host's [`VcpuEvent::JitInstall`]/`JitUninstall`/`JitInvoke` reply — the
@@ -2126,6 +2132,30 @@ impl<'p> Vcpu<'p> {
     ) -> Result<Vcpu<'p>, Trap> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            mm.seed(init_mem);
+            mm.init_data(&prog.data);
+            mm
+        });
+        Vcpu::with_mem(prog, func, args, mem, host)
+    }
+
+    /// Like [`new_root_with_powerbox`](Vcpu::new_root_with_powerbox), but over an **engine-backed
+    /// reservation** (`Mem::with_reservation`) instead of an external `Arc<Region>` — the resumable twin
+    /// of [`compile_and_run_capture_reserved_with_host`], which reserves the same way. This is the
+    /// persistent-backend seam (the browser Postgres console): a single owned-host vCPU that grows its
+    /// heap into the `reserved_log2` tail and stays alive across [`run`](Vcpu::run) parks, so blocking
+    /// stdin ([`set_stdin_blocking`](Vcpu::set_stdin_blocking)) can suspend it between queries. Uses the
+    /// same `DEFAULT_RESERVED_LOG2`-scale window a one-shot `--single` boot uses; pass that.
+    pub fn new_root_reserved_with_powerbox(
+        prog: &'p VcpuProgram,
+        func: u32,
+        args: &[Value],
+        init_mem: &[u8],
+        host: Host,
+        reserved_log2: u8,
+    ) -> Result<Vcpu<'p>, Trap> {
+        let mem = prog.mem_size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation(reserved_log2, sl);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
             mm
@@ -2278,6 +2308,27 @@ impl<'p> Vcpu<'p> {
     /// frame. `None` for a memory-less module (or if already taken).
     pub(crate) fn take_mem(&mut self) -> Option<Mem> {
         self.mem.take()
+    }
+
+    /// Enable **blocking stdin** on this vCPU's owned powerbox (a persistent interactive session — the
+    /// browser Postgres console). A `read` on an exhausted stdin buffer then surfaces
+    /// [`VcpuEvent::StdinPark`] instead of returning EOF; feed more input with [`push_stdin`](Vcpu::push_stdin)
+    /// and call [`run`](Vcpu::run) again. Only meaningful for an owned-host vCPU (not `with_shared_host`).
+    pub fn set_stdin_blocking(&mut self, on: bool) {
+        self.host.set_stdin_blocking(on);
+    }
+
+    /// Append bytes to this vCPU's stdin buffer, then [`run`](Vcpu::run) again to satisfy a pending
+    /// [`VcpuEvent::StdinPark`] (or to preload input before the first `run`).
+    pub fn push_stdin(&mut self, bytes: &[u8]) {
+        self.host.push_stdin(bytes);
+    }
+
+    /// Borrow this vCPU's owned powerbox — e.g. to read `stdout` after a [`run`](Vcpu::run) that parked
+    /// or finished. `None`-safe only for an owned host; a `with_shared_host` vCPU services I/O through
+    /// the shared lock, not here.
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
     }
 
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
@@ -2450,6 +2501,10 @@ impl<'p> Vcpu<'p> {
                         Err(t) => return VcpuEvent::Trapped(t),
                     }
                 }
+                // Blocking-stdin park: the guest read an exhausted stdin under `set_stdin_blocking`.
+                // Nothing to deliver — `pc` was left at the read, so pushing input + `run()` again
+                // re-issues it. Surface to the host, which pumps the session.
+                Ok(VcpuStop::StdinPark) => return VcpuEvent::StdinPark,
             }
         }
     }
@@ -3694,6 +3749,12 @@ enum Outcome {
         cap: usize,
         dst: u32,
     },
+    /// **Blocking stdin park**: a `Stream{In}` `read` found the buffer exhausted under
+    /// [`Host::set_stdin_blocking`]. The read did not complete and `pc` was *not* advanced, so the
+    /// driver re-issues it after more input arrives. Only the resumable [`Vcpu`] driver honours this
+    /// (surfacing [`VcpuEvent::StdinPark`]); the one-shot / scheduler drivers never opt into blocking
+    /// stdin, so it never reaches them.
+    StdinPark,
 }
 
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). A durable run maintains the
@@ -4136,6 +4197,9 @@ enum VcpuStop {
         params: Box<[ValType]>,
         results: Box<[ValType]>,
     },
+    /// Blocking-stdin park (see [`Outcome::StdinPark`]) — the `Vcpu` driver surfaces it as
+    /// [`VcpuEvent::StdinPark`]; no residue, since the read re-issues on resume.
+    StdinPark,
 }
 
 /// How the eval loop reaches the powerbox (THREADS.md 4c-host). The cooperative `drive` owns the host
@@ -4394,6 +4458,8 @@ fn step_vcpu(
                     dst,
                 })
             }
+            // Blocking-stdin park (owned-host session): surface it for the `Vcpu` driver to pump.
+            Outcome::StdinPark => return Ok(VcpuStop::StdinPark),
             Outcome::MemoryNotify { base, count, dst } => {
                 return Ok(VcpuStop::Notify { base, count, dst })
             }
@@ -4813,6 +4879,11 @@ fn drive(
             // wasm-JIT tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`);
             // the native drivers never set the eligibility bitmap, so it cannot occur here.
             Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
+            // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session), never
+            // a scheduler task — same rationale as tier-up above.
+            Ok(VcpuStop::StdinPark) => {
+                unreachable!("blocking stdin not enabled on the scheduler driver")
+            }
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
                 if func as usize >= dom.source.primary().progs.len() {
                     complete(&mut tasks, ti, Err(Trap::Malformed));
@@ -5590,6 +5661,10 @@ fn run_vcpu_parallel<'scope, 'env>(
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
             Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
+            // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session).
+            Ok(VcpuStop::StdinPark) => {
+                unreachable!("blocking stdin not enabled on the native driver")
+            }
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
                 if func as usize >= dom.source.primary().progs.len() {
                     return (Err(Trap::Malformed), mem);
@@ -6761,6 +6836,21 @@ impl Vm {
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let res = host.with(|p| p.cap_dispatch_slots(*type_id, *op, h, &argv, gm))?;
+                    // Blocking-stdin park: a `Stream{In}` `read` (type 0, op 0) whose buffer was empty
+                    // under `Host::set_stdin_blocking` yields here instead of completing. Do NOT write
+                    // results or advance `pc`: persist state at *this* instruction so the driver, after
+                    // pushing more input, re-issues the read on resume. Gated on the stream-read op so
+                    // no other cap.call pays the flag check.
+                    if *type_id == super::iface::STREAM
+                        && *op == 0
+                        && host.with(|p| p.take_stdin_parked())
+                    {
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc;
+                        return Ok(Outcome::StdinPark);
+                    }
                     for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
                         self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
                     }
