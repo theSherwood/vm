@@ -78,11 +78,29 @@ interp == JIT). The libc surface it exposed is in `libc_shim.c`: `strcat`;
 deterministic `gettimeofday`/`clock_gettime`/`localtime_r`; single-threaded
 `pthread_*` no-op stubs (for `Atomics.wait`).
 
-**NEXT (blocking) — `llvm.round`.** `JS_ComputeMemoryUsage` calls C `round()`
-(ties away from zero) → `llvm.round.f64`, which the on-ramp doesn't lower (it's
-distinct from `llvm.roundeven`, and `trunc(x + copysign(0.5,x))` double-rounds at
-the `0.5⁻` boundary). A correct lowering or a bundled guest `round` — its own
-slice.
+**DONE — `llvm.round`** (the last translate gap). `JS_ComputeMemoryUsage` calls C
+`round()` (ties away from zero); synthesized boundary-safely as
+`t=trunc(x); |x-t|>=0.5 ? t+copysign(1,x) : t` (test `llvm_round_ties_away_from_zero`).
+
+## ★ It runs — byte-identical to native
+
+The unmodified QuickJS engine (1175 functions) now **translates, verifies, and
+executes** the driver, with stdout byte-identical to the native `cc` build:
+
+```
+1,2,3,5,7,8,9 | sumfib=17710 | {"a":1,"b":[true,null,"x"]} | abc | 0.3000
+```
+
+`demo_quickjs_eval_vs_native` is green (`#[ignore]`d only for wall-clock — a whole
+JS engine on the tree-walking interpreter takes tens of seconds; the JIT/wasm tier
+is much faster).
+
+**Toward a playground REPL** (beyond this curated demo): (1) **directed-rounding
+dtoa** — a REPL user typing `0.1+0.2` hits QuickJS's shortest `Number→string`
+(`FE_DOWNWARD`/`FE_UPWARD`), which the round-to-nearest-only SVM can't yet honor
+(`toFixed`, used here, is fine); (2) a `qjs_repl.c` stdin driver +
+`browser/build-onramp-assets.mjs` wiring (the SQLite-REPL pattern). Boot is
+milliseconds — no snapshot/restore needed.
 
 **NEXT (semantic) — directed-rounding dtoa.** QuickJS's shortest Number→string
 (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` to find the shortest round-trip

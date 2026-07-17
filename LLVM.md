@@ -592,7 +592,8 @@ Notes:
 
 ### ▶ Active target — QuickJS (a full JS engine; the densest breadth proof)
 
-**Status: SPIKE — promoted from the candidate list (§7) to active work.** Bellard's **QuickJS**
+**Status: ★ RUNS — the curated eval demo executes byte-identical to native** (see "QuickJS RUNS in the
+sandbox" below; harness `demo_quickjs_eval_vs_native`). Bellard's **QuickJS**
 (2024-01-13, MIT) is the strongest self-validating interpreter on the list: NaN-boxing, a bytecode VM
 with **computed-goto** dispatch (`indirectbr`/`blockaddress` — DONE, slices AV+AW), **BigInt** (`libbf`),
 regex (`libregexp`), Unicode tables, and a **test262** runner. "Little is left unproven if it passes."
@@ -658,10 +659,34 @@ result crossing a block edge). The libc surface it exposed was filled in `demos/
 (`strcat`; deterministic `gettimeofday`/`clock_gettime`/`localtime_r`; single-threaded `pthread_*` /
 `pthread_cond_*` no-op stubs for `Atomics.wait`).
 
-**Blocking gap now — `llvm.round.f64`.** `JS_ComputeMemoryUsage` calls C `round()` (round half *away
-from zero*), which lowers to `llvm.round` — distinct from `llvm.roundeven` (half to even) that the
-on-ramp does handle, and with no direct SVM op. A correct lowering (`trunc(x + copysign(0.5, x))` has a
-double-rounding bug at the `0.5⁻` boundary) or a bundled guest `round` is its own small slice.
+**`llvm.round.f64` — DONE, and it was the last translate gap.** `JS_ComputeMemoryUsage` calls C
+`round()` (nearest, ties *away from zero*) → `llvm.round`, distinct from the `llvm.roundeven` (ties to
+even) the on-ramp already handles, with no direct SVM op. Synthesized boundary-safely as
+`t = trunc(x); |x-t| >= 0.5 ? t + copysign(1,x) : t` — `x-t` is exact, so no add-before-round
+double-rounding at `0.5⁻` (the bug in `trunc(x + copysign(0.5,x))`); inf/NaN fall through to `t`. Test
+`llvm_round_ties_away_from_zero` (incl. the `0.5⁻` boundary; interp == JIT).
+
+### ★★★ QuickJS RUNS in the sandbox — byte-identical to native
+
+**With `llvm.round` cleared, the unmodified QuickJS 2024-01-13 engine (1175 functions) translates,
+verifies, and *executes*** — `JS_NewRuntime`/`JS_NewContext`/`JS_Eval` of the driver program (recursion,
+a `sort` closure, `JSON.stringify`, string methods, `toFixed`) produces stdout **byte-identical to the
+native `cc` build**:
+
+```
+1,2,3,5,7,8,9 | sumfib=17710 | {"a":1,"b":[true,null,"x"]} | abc | 0.3000
+```
+
+Ladder-#? equivalent for the breadth lane: a full JS engine — NaN-boxing, a bytecode VM with
+computed-goto dispatch, BigInt (`libbf`), regex, Unicode — runs on the SVM under the powerbox, no
+ambient authority. Harness `demo_quickjs_eval_vs_native` (green; `#[ignore]`d only for wall-clock — a
+whole JS engine on the tree-walker takes tens of seconds).
+
+**Remaining to a *playground* REPL** (not the curated demo): (1) **directed-rounding dtoa** — a REPL
+user typing `0.1+0.2` hits QuickJS's shortest Number→string (`js_ecvt1`, `FE_DOWNWARD`/`FE_UPWARD`),
+which the round-to-nearest-only SVM can't honor (`toFixed` — used by the demo — is fine); (2) a
+`qjs_repl.c` stdin driver + `browser/build-onramp-assets.mjs` wiring (the SQLite-REPL pattern). Boot is
+milliseconds (no snapshot/restore needed, unlike Postgres).
 
 **Semantic follow-up — directed-rounding dtoa.** QuickJS's shortest Number→string (`js_ecvt1`) toggles
 `FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are round-to-nearest only (no rounding-mode op);
@@ -669,13 +694,13 @@ double-rounding bug at the `0.5⁻` boundary) or a bundled guest `round` is its 
 `String(0.1)` needs a rounding-mode primitive or a directed-rounding-free guest dtoa.
 
 **Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
-(c) ~~`select` of aggregates~~ **done**; (d) **`llvm.round`** (the current wall) → the module translates
-(then whatever running the eval surfaces); (e) widen the JS program past `toFixed` + the directed-rounding
-dtoa follow-up; (f) regex / BigInt / `try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host
-unwinding, so likely no EH dependency); (g) the `run-test262.c` harness over an embedded slice — the
-self-validating suite,
-QuickJS's analog of SQLite's sqllogictest. Harness: `demo_quickjs_eval_vs_native` (`#[ignore]`d, now at
-the `llvm.round` wall).
+(c) ~~`select` of aggregates~~ **done**; (d) ~~`llvm.round`~~ **done** → ★ **the curated eval RUNS
+byte-identical to native**; (e) widen the JS program past `toFixed` + the directed-rounding dtoa
+follow-up (needed once a REPL takes arbitrary `Number→string`); (f) regex / BigInt / `try`/`catch` (JS
+exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH dependency); (g) a
+`qjs_repl.c` stdin driver + `browser/build-onramp-assets.mjs` wiring → the **playground** tab; (h) the
+`run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's analog of SQLite's
+sqllogictest.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

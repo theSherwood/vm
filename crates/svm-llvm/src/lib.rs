@@ -14116,6 +14116,7 @@ fn lower_float_intrinsic(
             | "llvm.floor"
             | "llvm.ceil"
             | "llvm.trunc"
+            | "llvm.round"
             | "llvm.rint"
             | "llvm.nearbyint"
             | "llvm.roundeven"
@@ -14281,6 +14282,64 @@ fn lower_float_intrinsic(
         "llvm.ceil" => un(ctx, FUnOp::Ceil)?,
         "llvm.trunc" => un(ctx, FUnOp::Trunc)?,
         "llvm.rint" | "llvm.nearbyint" | "llvm.roundeven" => un(ctx, FUnOp::Nearest)?,
+        // C `round()` — nearest, ties **away from zero** (distinct from `roundeven`'s ties-to-even,
+        // and from JS `Math.round`'s ties-up). No native op; synthesize boundary-safely:
+        //   t = trunc(x);  return |x - t| >= 0.5 ? t + copysign(1, x) : t
+        // `x - t` is exact (|x - t| < 1), so there is no add-before-round double-rounding at `0.5⁻`
+        // (the bug in `trunc(x + copysign(0.5, x))`). inf/NaN fall through: `x - t` is NaN, the `>= 0.5`
+        // is false, so `t` (= inf/NaN) is returned — matching libm.
+        "llvm.round" => {
+            let x = ctx.operand(args[0])?;
+            let t = ctx.push(Inst::FUn {
+                ty,
+                op: FUnOp::Trunc,
+                a: x,
+            });
+            let d = ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Sub,
+                a: x,
+                b: t,
+            });
+            let ad = ctx.push(Inst::FUn {
+                ty,
+                op: FUnOp::Abs,
+                a: d,
+            });
+            let (half, one) = match ty {
+                FloatTy::F32 => (
+                    ctx.push(Inst::ConstF32(0.5f32.to_bits())),
+                    ctx.push(Inst::ConstF32(1.0f32.to_bits())),
+                ),
+                FloatTy::F64 => (
+                    ctx.push(Inst::ConstF64(0.5f64.to_bits())),
+                    ctx.push(Inst::ConstF64(1.0f64.to_bits())),
+                ),
+            };
+            let ge = ctx.push(Inst::FCmp {
+                ty,
+                op: FCmpOp::Ge,
+                a: ad,
+                b: half,
+            });
+            let signed_one = ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Copysign,
+                a: one,
+                b: x,
+            });
+            let adj = ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Add,
+                a: t,
+                b: signed_one,
+            });
+            ctx.push(Inst::Select {
+                cond: ge,
+                a: adj,
+                b: t,
+            })
+        }
         "llvm.minnum" | "llvm.minimum" => bin2(ctx, FBinOp::Min)?,
         "llvm.maxnum" | "llvm.maximum" => bin2(ctx, FBinOp::Max)?,
         "llvm.copysign" => bin2(ctx, FBinOp::Copysign)?,
