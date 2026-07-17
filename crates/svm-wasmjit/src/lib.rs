@@ -1733,20 +1733,87 @@ fn emit_func(
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
-    // Allocate locals: every block's value list, then $next/$ea/$fuel.
-    let mut local_types: Vec<ValType> = Vec::new();
-    let mut local_of: Vec<Vec<u32>> = Vec::with_capacity(f.blocks.len());
-    let mut per_block_types: Vec<Vec<ValType>> = Vec::with_capacity(f.blocks.len());
-    for b in &f.blocks {
-        let tys = block_value_types(m, b)?;
-        let mut idxs = Vec::with_capacity(tys.len());
-        for t in &tys {
-            idxs.push(n_params + local_types.len() as u32);
-            local_types.push(*t);
+    // Allocate locals with a **per-type pool reused across blocks**, then $next/$ea/$fuel/$atomic.
+    //
+    // Values are block-scoped (SSA numbering resets per block; all cross-block dataflow goes through
+    // block params), and the dispatcher runs exactly one block at a time — so when block B executes,
+    // every other block's value locals are dead. Their slots can therefore be shared: a type needs
+    // only `max over blocks of (that type's value count in the block)` locals, not the sum. This is
+    // what keeps a huge function (QuickJS's ~1800-block `JS_CallInternal`) under wasm engines'
+    // per-function local cap — the sum would be hundreds of thousands, the max is a few thousand.
+    //
+    // Sharing is safe because the only cross-block local write, `emit_edge`, pushes **all** branch
+    // args onto the operand stack before storing any target param, so a target param slot that aliases
+    // a source value slot still reads the old value first (the same property that already made a
+    // param-permuting self-branch safe). Within a block each value keeps a distinct slot (assigned by
+    // per-type rank), so no live value is clobbered.
+    let per_block_types: Vec<Vec<ValType>> = f
+        .blocks
+        .iter()
+        .map(|b| block_value_types(m, b))
+        .collect::<Result<_, _>>()?;
+    // Pool size per type = the max count of that type in any single block.
+    const NTYPES: usize = 6; // I32, I64, F32, F64, V128, Ref (the ValType variants)
+    let type_slot = |t: ValType| -> usize {
+        match t {
+            ValType::I32 => 0,
+            ValType::I64 => 1,
+            ValType::F32 => 2,
+            ValType::F64 => 3,
+            ValType::V128 => 4,
+            ValType::Ref => 5,
         }
-        local_of.push(idxs);
-        per_block_types.push(tys);
+    };
+    let mut pool: [u32; NTYPES] = [0; NTYPES];
+    for tys in &per_block_types {
+        let mut per_block = [0u32; NTYPES];
+        for t in tys {
+            per_block[type_slot(*t)] += 1;
+        }
+        for i in 0..NTYPES {
+            pool[i] = pool[i].max(per_block[i]);
+        }
     }
+    // Lay the pools out contiguously; `base[t]` is the first local index (past the wasm params) of
+    // type `t`'s pool.
+    let mut base = [0u32; NTYPES];
+    let mut acc = 0u32;
+    for i in 0..NTYPES {
+        base[i] = acc;
+        acc += pool[i];
+    }
+    let mut local_types: Vec<ValType> = Vec::with_capacity(acc as usize + 4);
+    for (i, &t) in [
+        ValType::I32,
+        ValType::I64,
+        ValType::F32,
+        ValType::F64,
+        ValType::V128,
+        ValType::Ref,
+    ]
+    .iter()
+    .enumerate()
+    {
+        for _ in 0..pool[i] {
+            local_types.push(t);
+        }
+    }
+    // Map each block's values to pool slots: value `v` of type `t` gets `base[t] + (its rank among
+    // same-typed values in the block)`. Reused across blocks — block B's slots overlap block A's.
+    let local_of: Vec<Vec<u32>> = per_block_types
+        .iter()
+        .map(|tys| {
+            let mut used = [0u32; NTYPES];
+            tys.iter()
+                .map(|t| {
+                    let s = type_slot(*t);
+                    let idx = n_params + base[s] + used[s];
+                    used[s] += 1;
+                    idx
+                })
+                .collect()
+        })
+        .collect();
     let next_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I32);
     let ea_l = n_params + local_types.len() as u32;
