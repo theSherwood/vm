@@ -131,6 +131,30 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    the union of two existing, fuzzed decode paths through the same confined-child
    spawn. Existing instantiate suites unchanged.
 
+4c. **op 13 driven by a compiled-C shell** *(done — `crates/svm/tests/c_shell_exec.rs`)*
+   — where 4b's parent was hand-written IR, here a **chibicc shell** (`main(argc,
+   argv)`) parses its own powerbox args, looks the command up via a host fn,
+   seeds the command's `argv` into a 128 KiB carve, lays a `"stdout"` grant record,
+   and drives `instantiate_module_named` (op 13) + `join` through capability
+   imports (`Resolved::CapBound`, the `Instantiator` baked in) — the whole
+   external-command path emitted by the frontend, differential interp==JIT.
+   This surfaced a **latent JIT/interp differential gap** (now fixed, no
+   confinement code touched): the JIT's `lower_instantiator` demanded an
+   *exact-width* Instantiator contract (i32 child handle / i32 `join` arg), but
+   chibicc widens every scalar to an i64 slot (`int __spawn(...)` → `… -> (i64)`),
+   so **no compiled-C program could drive the Instantiator on the JIT** — every
+   op-13/op-1/op-5/op-8/op-11 call fell to a `CapFault` the interpreter never
+   raised. The interpreter already tolerated the width (it reads args as i64 slots
+   and coerces each result to the declared type, `slot_to_val`); the JIT now
+   mirrors that with `slot_i64`/`slot_i32`/`result_as` coercions and a
+   width-tolerant shape gate (scalar-int, arg-count) across every Instantiator arm.
+   A non-scalar shape, too-few args, or unknown op still lowers to a runtime
+   `CapFault` (never a compile-time rejection). Guarded portably by the
+   `wide` arm of `stage1_exec_stdout.rs` (i64-declared op-13 result + join arg,
+   hand-IR, no chibicc). *Follow-up:* folding this into the full `c_shell.rs`
+   builtin dispatch (its personality-heap-at-`win/2` layout vs. a 128 KiB command
+   carve).
+
 ### Power 2 — the endpoint direction (deferred, S9)
 
 Op 13 is **forwarding** (capability model "Power 1"): a parent hands a child a
