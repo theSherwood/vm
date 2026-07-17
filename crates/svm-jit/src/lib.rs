@@ -7006,10 +7006,22 @@ fn lower_instantiator(
         13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
         _ => None,
     };
+    // Width-tolerant shape check (matches the interpreter, which reads every arg as an i64 slot and
+    // coerces each result to the *declared* sig type): a call is admitted when its arg count covers
+    // the op's contract prefix and every prefix arg + every result is a scalar int — i32 **or** i64.
+    // The exact-width `== *need` / `== res` was too strict: a chibicc guest widens all scalars to i64
+    // (`int __spawn(...)` → `… -> (i64)`), so op 13's i32-result contract (and op 1/9/10/12's i32
+    // child arg) never matched, and every compiled-C driver of the Instantiator fell to a CapFault
+    // that the interpreter never raised. The per-arg coercions below (`slot_i64`/`slot_i32`/
+    // `result_as`) reconcile the declared widths with each thunk's fixed ABI, so relaxing the gate
+    // introduces no ABI mismatch. A non-scalar (or too-few args, or an unknown op) still lowers to an
+    // unconditional runtime CapFault — never a compile-time rejection of a verified module.
+    let is_scalar_int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
     let shape_ok = contract.is_some_and(|(need, res)| {
         sig.params.len() >= need.len()
-            && sig.params[..need.len()] == *need
-            && sig.results.as_slice() == res
+            && sig.params[..need.len()].iter().all(is_scalar_int)
+            && sig.results.len() == res.len()
+            && sig.results.iter().all(is_scalar_int)
     });
     if !shape_ok {
         emit_trap_set(b, lower, TrapKind::CapFault);
@@ -7031,16 +7043,20 @@ fn lower_instantiator(
             //             size_log2:i64, fuel:i64, trap_out:i64) -> child_handle:i32. op 0 is a
             // **self** child (module = -1); op 5 (`instantiate_module`, §14 separate-module child)
             // passes a host-granted `Module` handle as its first arg and shifts the rest by one.
-            let h = get(vals, handle)?; // the Instantiator handle (resolved for authority)
+            let h0 = get(vals, handle)?; // the Instantiator handle (resolved for authority)
+            let h = slot_i32(b, h0);
             let (modh, a0) = if op == 5 {
-                (get(vals, *args.first().ok_or(JitError::Malformed)?)?, 1)
+                (
+                    slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?),
+                    1,
+                )
             } else {
                 (b.ins().iconst(I64, -1), 0)
             };
-            let entry = get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?;
-            let off = get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?;
-            let size_log2 = get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?;
-            let fuel = get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?;
+            let entry = slot_i64(b, get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?);
+            let off = slot_i64(b, get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?);
+            let size_log2 = slot_i64(b, get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?);
+            let fuel = slot_i64(b, get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I32, I64, I64, I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7056,13 +7072,14 @@ fn lower_instantiator(
                 ],
             );
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
         }
         1 => {
             // join(nursery, child_handle:i32, trap_out:i64) -> result:i64. The cap.call's handle
             // operand (the Instantiator) is unused here — the child handle is the first arg, and the
             // nursery owns the child table for this run.
-            let child = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7074,7 +7091,8 @@ fn lower_instantiator(
                 .ins()
                 .call_indirect(tref, thunk, &[nursery, child, trap_out]);
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
         }
         2 | 4 | 6 | 7 => {
             // coro_spawn(nursery, mem_base, handle:i32, module:i64, entry:i64, off:i64,
@@ -7082,16 +7100,19 @@ fn lower_instantiator(
             // §14 co-fiber spawn. ops 2/4 are **self** children (module = -1); ops 6/7
             // (`spawn[_demand]_coroutine_module`) pass a `Module` handle first and shift the rest.
             // ops 4/7 demand-page the child's window for fault-driven yield.
-            let h = get(vals, handle)?;
+            let h = slot_i32(b, get(vals, handle)?);
             let (modh, a0) = if op >= 6 {
-                (get(vals, *args.first().ok_or(JitError::Malformed)?)?, 1)
+                (
+                    slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?),
+                    1,
+                )
             } else {
                 (b.ins().iconst(I64, -1), 0)
             };
-            let entry = get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?;
-            let off = get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?;
-            let size_log2 = get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?;
-            let fuel = get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?;
+            let entry = slot_i64(b, get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?);
+            let off = slot_i64(b, get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?);
+            let size_log2 = slot_i64(b, get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?);
+            let fuel = slot_i64(b, get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?);
             let demand = b.ins().iconst(I32, if op == 4 || op == 7 { 1 } else { 0 });
             let mut tsig = module.make_signature();
             for t in [I64, I64, I32, I64, I64, I64, I64, I64, I32, I64] {
@@ -7108,7 +7129,8 @@ fn lower_instantiator(
                 ],
             );
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
         }
         3 => {
             // coro_resume(nursery, mem_base, handle:i32, child:i32, value:i64, status_out:*i64,
@@ -7117,9 +7139,9 @@ fn lower_instantiator(
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
-            let h = get(vals, handle)?;
-            let child = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
-            let value = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
+            let h = slot_i32(b, get(vals, handle)?);
+            let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let value = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I32, I32, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7135,7 +7157,9 @@ fn lower_instantiator(
             emit_trap_propagate(b, lower);
             let value_out = b.inst_results(call)[0];
             let status64 = b.ins().stack_load(I64, ss, 0);
-            let status = b.ins().ireduce(I32, status64);
+            let status32 = b.ins().ireduce(I32, status64);
+            let status = result_as(b, status32, sig.results[0]);
+            let value_out = result_as(b, value_out, sig.results[1]);
             vals.push(status);
             vals.push(value_out);
         }
@@ -7143,7 +7167,7 @@ fn lower_instantiator(
             // S3 lifecycle: poll / detach / kill (nursery, child:i32, trap_out:i64) -> status:i32.
             // The cap.call's handle operand (the Instantiator) is unused — the child handle is arg 0,
             // and the nursery owns the child table (as for `join`).
-            let child = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7160,21 +7184,21 @@ fn lower_instantiator(
                 .ins()
                 .call_indirect(tref, thunk, &[nursery, child, trap_out]);
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
         }
         8 => {
             // S2 instantiate_granted(nursery, mem_base, handle:i32, grant_handle:i32, entry:i64,
             //   off:i64, size_log2:i64, fuel:i64, trap_out:i64) -> child_handle:i32. Like `instantiate`
             // (op 0) but re-grants a coordinate-free cap (arg 0) into the child's powerbox; the child
             // is a same-module child so there is no `Module` handle.
-            let h = get(vals, handle)?; // the Instantiator handle (resolved for authority)
-                                        // The grant handle rides an i64 slot in the guest sig; the thunk takes it as i32.
-            let grant64 = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
-            let grant = b.ins().ireduce(I32, grant64);
-            let entry = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
-            let off = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
-            let size_log2 = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
-            let fuel = get(vals, *args.get(4).ok_or(JitError::Malformed)?)?;
+            let h = slot_i32(b, get(vals, handle)?); // the Instantiator handle (resolved for authority)
+                                                     // The grant handle rides an i64 slot in the guest sig; the thunk takes it as i32.
+            let grant = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let entry = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
+            let off = slot_i64(b, get(vals, *args.get(2).ok_or(JitError::Malformed)?)?);
+            let size_log2 = slot_i64(b, get(vals, *args.get(3).ok_or(JitError::Malformed)?)?);
+            let fuel = slot_i64(b, get(vals, *args.get(4).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I32, I32, I64, I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7190,21 +7214,22 @@ fn lower_instantiator(
                 ],
             );
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
         }
         11 => {
             // S2 instantiate_named(nursery, mem_base, mem_size:i64, handle:i32, grants_ptr:i64,
             //   grants_n:i64, entry:i64, off:i64, size_log2:i64, fuel:i64, trap_out:i64) -> handle:i32.
             // Like op 8 but the child's caps come from a grant-record list in the window (`mem_size`
             // bounds the host-side reads); no positional grant arg, same-module child.
-            let h = get(vals, handle)?;
+            let h = slot_i32(b, get(vals, handle)?);
             let mem_size = b.ins().iconst(I64, lower.mapped as i64);
-            let grants_ptr = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
-            let grants_n = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
-            let entry = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
-            let off = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
-            let size_log2 = get(vals, *args.get(4).ok_or(JitError::Malformed)?)?;
-            let fuel = get(vals, *args.get(5).ok_or(JitError::Malformed)?)?;
+            let grants_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let grants_n = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
+            let entry = slot_i64(b, get(vals, *args.get(2).ok_or(JitError::Malformed)?)?);
+            let off = slot_i64(b, get(vals, *args.get(3).ok_or(JitError::Malformed)?)?);
+            let size_log2 = slot_i64(b, get(vals, *args.get(4).ok_or(JitError::Malformed)?)?);
+            let fuel = slot_i64(b, get(vals, *args.get(5).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7221,22 +7246,23 @@ fn lower_instantiator(
                 ],
             );
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
         }
         13 => {
             // STAGE1 instantiate_module_named(nursery, mem_base, mem_size, handle:i32, module:i64,
             //   grants_ptr:i64, grants_n:i64, entry:i64, off:i64, size_log2:i64, fuel:i64,
             //   trap_out:i64) -> handle:i32. Op 5's leading `Module` handle then op 11's grant-list
             // args — runs a foreign module with a by-name granted powerbox (the shell "exec").
-            let h = get(vals, handle)?;
+            let h = slot_i32(b, get(vals, handle)?);
             let mem_size = b.ins().iconst(I64, lower.mapped as i64);
-            let modh = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
-            let grants_ptr = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
-            let grants_n = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
-            let entry = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
-            let off = get(vals, *args.get(4).ok_or(JitError::Malformed)?)?;
-            let size_log2 = get(vals, *args.get(5).ok_or(JitError::Malformed)?)?;
-            let fuel = get(vals, *args.get(6).ok_or(JitError::Malformed)?)?;
+            let modh = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let grants_ptr = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
+            let grants_n = slot_i64(b, get(vals, *args.get(2).ok_or(JitError::Malformed)?)?);
+            let entry = slot_i64(b, get(vals, *args.get(3).ok_or(JitError::Malformed)?)?);
+            let off = slot_i64(b, get(vals, *args.get(4).ok_or(JitError::Malformed)?)?);
+            let size_log2 = slot_i64(b, get(vals, *args.get(5).ok_or(JitError::Malformed)?)?);
+            let fuel = slot_i64(b, get(vals, *args.get(6).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7255,7 +7281,8 @@ fn lower_instantiator(
                 ],
             );
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
         }
         // Unknown ops were rejected by the shape check above (→ runtime CapFault, matching the
         // interpreter's default arm) — this match only sees contract-validated ops.
@@ -7266,6 +7293,49 @@ fn lower_instantiator(
 
 fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {
     vals.get(i as usize).copied().ok_or(JitError::Malformed)
+}
+
+/// Widen a fetched cap.call arg to the `i64` slot an Instantiator thunk param takes — the JIT analogue
+/// of the interpreter reading every arg as `Reg::i64()` off a **sign-extended** slot (`from_i32`). A
+/// chibicc-emitted call already passes i64 (passthrough); a frontend that declares a slot arg `i32`
+/// gets sign-extended, matching the interp exactly. Keeps the two backends in lockstep even though the
+/// verifier only checks a cap.call against its *declared* sig (§3c), not the host op's contract.
+fn slot_i64(b: &mut FunctionBuilder, v: Value) -> Value {
+    if b.func.dfg.value_type(v) == I32 {
+        b.ins().sextend(I64, v)
+    } else {
+        v
+    }
+}
+
+/// Narrow a fetched cap.call arg to the `i32` a handle/child thunk param takes. chibicc widens every
+/// scalar to i64, but handles cross as i32 (the host table masks them); an already-i32 value passes
+/// through. Mirrors the interpreter's `get_i32` on the same slot.
+fn slot_i32(b: &mut FunctionBuilder, v: Value) -> Value {
+    if b.func.dfg.value_type(v) == I64 {
+        b.ins().ireduce(I32, v)
+    } else {
+        v
+    }
+}
+
+/// Coerce a thunk result to the guest's *declared* result type — the JIT analogue of the interpreter's
+/// `slot_to_val(ty, slot)`. The thunks return canonical widths (an i32 child handle / status, an i64
+/// join value); a chibicc sig declares i64 for an `int`-returning call, so **sign-extend** the i32 up
+/// (a spawn yields a small non-negative handle or a negative errno — sign-extension matches both the
+/// interp's i64 slot and C's `(int)`→`long`). Narrows the reverse case for completeness.
+fn result_as(b: &mut FunctionBuilder, v: Value, declared: ValType) -> Value {
+    let want = clif_ty(declared);
+    let have = b.func.dfg.value_type(v);
+    if have == want {
+        v
+    } else if want == I64 && have == I32 {
+        b.ins().sextend(I64, v)
+    } else if want == I32 && have == I64 {
+        b.ins().ireduce(I32, v)
+    } else {
+        v
+    }
 }
 
 /// The §4 confinement lowering (invariant I1, **branchless confinement**, D63): bounds-test the

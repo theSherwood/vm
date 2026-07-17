@@ -99,8 +99,15 @@ fn args_blob(argv: &[&[u8]]) -> Vec<u8> {
 /// The "shell" parent `(Instantiator, Module, stdout)`: lay a grant record naming `"stdout"`, seed the
 /// args blob into the command's carge at `POWERBOX_ARGS_BASE`, `instantiate_module_named` (op 13) the
 /// command re-granting `stdout` by name, `join`, and return the command's status.
-fn parent_src(argv: &[&[u8]]) -> String {
+///
+/// `wide` selects the declared width of op 13's child-handle result (and the matching `join` arg): the
+/// canonical contract shape is i32, but a chibicc-style frontend widens every scalar to an i64 slot, so
+/// both backends must accept an i64-declared `cap.call 6 13`/`6 1` and coerce. `wide == true` exercises
+/// that path with hand-IR (no chibicc toolchain needed), guarding the JIT's `slot_i32`/`result_as`
+/// coercions against the interpreter's slot-width tolerance.
+fn parent_src(argv: &[&[u8]], wide: bool) -> String {
     // Grant record at window 0: {name_off=100, name_len=6, handle=stdout, flags=0}; "stdout" at 100.
+    let (chty, jarg) = if wide { ("i64", "i64") } else { ("i32", "i32") };
     let blob = args_blob(argv);
     let seed: String = blob
         .iter()
@@ -149,8 +156,8 @@ block0(vinst: i32, vmod: i32, vout: i32):
   off = i64.const {CARVE}
   sl = i64.const 17
   qz = i64.const 0
-  ch = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (me, gp, gn, ent, off, sl, qz)
-  r = cap.call 6 1 (i32) -> (i64) vinst (ch)
+  ch = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> ({chty}) vinst (me, gp, gn, ent, off, sl, qz)
+  r = cap.call 6 1 ({jarg}) -> (i64) vinst (ch)
   return r
 }}
 "#
@@ -165,8 +172,12 @@ fn grant_hooks() -> GrantChildHooks {
     }
 }
 
-fn run_interp(cmd: &svm_ir::Module, argv: &[&[u8]]) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
-    let parent = parse_module(&parent_src(argv)).expect("parse parent");
+fn run_interp(
+    cmd: &svm_ir::Module,
+    argv: &[&[u8]],
+    wide: bool,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let parent = parse_module(&parent_src(argv, wide)).expect("parse parent");
     verify_module(&parent).expect("verify parent");
     let mut host = Host::new();
     let ih = host.grant_instantiator(0, WIN as u64);
@@ -185,8 +196,8 @@ fn run_interp(cmd: &svm_ir::Module, argv: &[&[u8]]) -> (Result<Vec<Value>, Trap>
     (res, host.stdout_bytes())
 }
 
-fn run_jit(cmd: &svm_ir::Module, argv: &[&[u8]]) -> (JitOutcome, Vec<u8>) {
-    let parent = parse_module(&parent_src(argv)).expect("parse parent");
+fn run_jit(cmd: &svm_ir::Module, argv: &[&[u8]], wide: bool) -> (JitOutcome, Vec<u8>) {
+    let parent = parse_module(&parent_src(argv, wide)).expect("parse parent");
     verify_module(&parent).expect("verify parent");
     let mut host = Host::new();
     let ih = host.grant_instantiator(0, WIN as u64);
@@ -215,29 +226,36 @@ fn shell_execs_command_with_inherited_stdout() {
     let cmd = svm_run::resolve_capability_imports(parse_module(&child_ir(CMD)).expect("parse cmd"))
         .expect("resolve");
     verify_module(&cmd).expect("verify cmd");
+    // Each argv runs with both the canonical i32-declared op-13/join shape and the i64-widened shape a
+    // chibicc frontend emits — both must agree interp==JIT.
     for argv in [
         &[b"echo".as_slice(), b"hi"][..],
         &[b"prog".as_slice(), b"a", b"bb"][..],
     ] {
-        let (ir, iout) = run_interp(&cmd, argv);
-        let (jo, jout) = run_jit(&cmd, argv);
-        let expect: Vec<u8> = argv
-            .iter()
-            .flat_map(|a| [a, b"\n".as_slice()].concat())
-            .collect();
-        assert_eq!(
-            ir.expect("interp run ok"),
-            vec![Value::I64(argv.len() as i64)],
-            "interp: exec status = argc for {argv:?}"
-        );
-        assert_eq!(
-            iout, expect,
-            "interp: command echoed argv to inherited stdout"
-        );
-        assert!(
-            matches!(jo, JitOutcome::Returned(ref s) if s == &[argv.len() as i64]),
-            "jit: exec status = argc for {argv:?}, got {jo:?}"
-        );
-        assert_eq!(jout, iout, "jit: inherited-stdout bytes must match interp");
+        for wide in [false, true] {
+            let (ir, iout) = run_interp(&cmd, argv, wide);
+            let (jo, jout) = run_jit(&cmd, argv, wide);
+            let expect: Vec<u8> = argv
+                .iter()
+                .flat_map(|a| [a, b"\n".as_slice()].concat())
+                .collect();
+            assert_eq!(
+                ir.expect("interp run ok"),
+                vec![Value::I64(argv.len() as i64)],
+                "interp: exec status = argc for {argv:?} (wide={wide})"
+            );
+            assert_eq!(
+                iout, expect,
+                "interp: command echoed argv to inherited stdout (wide={wide})"
+            );
+            assert!(
+                matches!(jo, JitOutcome::Returned(ref s) if s == &[argv.len() as i64]),
+                "jit: exec status = argc for {argv:?} (wide={wide}), got {jo:?}"
+            );
+            assert_eq!(
+                jout, iout,
+                "jit: inherited-stdout bytes must match interp (wide={wide})"
+            );
+        }
     }
 }
