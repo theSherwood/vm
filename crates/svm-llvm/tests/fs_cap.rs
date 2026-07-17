@@ -16,8 +16,8 @@
 use svm_run::{fs, Backend, Limits, Outcome, RunConfig, Value};
 
 fn instance() -> svm_run::Instance {
-    let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fs_probe.bc");
-    let t = svm_llvm::translate_bc_path(bc).expect("translate fs probe");
+    let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fs_probe.ll");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate fs probe");
     svm_run::instantiate(t.module).expect("instantiate")
 }
 

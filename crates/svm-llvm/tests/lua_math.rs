@@ -8,7 +8,7 @@
 //! failing `assert`, so a clean **exit 0** means every assert held — identical to native Lua.
 //! Byte-for-byte the same outcome on the tree-walker, bytecode, and JIT.
 //!
-//! The fixture (`tests/fixtures/lua/lua_math.bc`) links the core + those libraries with the guest libc
+//! The fixture (`tests/fixtures/lua/lua_math.ll`) links the core + those libraries with the guest libc
 //! shim, guest `libm`, guest `strtod` (incl. correctly-rounded **hex** floats), the guest runtime
 //! `snprintf`, and fdlibm inverse-trig/`modf` (`lua_testsuite_trig.c`) — see the fixtures README.
 //! Getting `math.lua` fully green drove two on-ramp fixes: **NaN-correct `fcmp`** (ordered/unordered)
@@ -20,9 +20,9 @@ use svm_run::{Backend, Limits, Outcome, RunConfig, Value};
 fn run(backend: Backend) -> svm_run::Run {
     let bc = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lua/lua_math.bc"
+        "/tests/fixtures/lua/lua_math.ll"
     );
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua math.lua bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua math.lua bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {

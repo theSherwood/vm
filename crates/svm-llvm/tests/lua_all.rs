@@ -23,8 +23,8 @@
 use svm_run::{fs, Backend, Limits, Outcome, RunConfig, Value};
 
 fn run(backend: Backend) -> svm_run::Run {
-    let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lua/lua_all.bc");
-    let t = svm_llvm::translate_bc_path(bc).expect("translate Lua all.lua suite");
+    let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lua/lua_all.ll");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate Lua all.lua suite");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {
