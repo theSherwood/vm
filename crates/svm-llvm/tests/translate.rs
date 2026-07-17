@@ -3375,12 +3375,12 @@ fn run_sqllogictest(max_scripts: usize) {
     let inc = format!("-I{}", amalg.display());
     let pid = std::process::id();
 
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_slt.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_slt.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-fno-vectorize",
             "-fno-slp-vectorize",
         ])
@@ -3411,7 +3411,7 @@ fn run_sqllogictest(max_scripts: usize) {
         }
     }
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate sqllogictest runner");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate sqllogictest runner");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
     svm_verify::verify_module(&module).expect("verify");
 
@@ -4021,12 +4021,12 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
     let tmp = std::env::temp_dir();
 
     // Guest bitcode (single translation unit — no llvm-link; the on-ramp synthesizes libc).
-    let bc = tmp.join(format!("svm_ring_{pid}.bc"));
+    let bc = tmp.join(format!("svm_ring_{pid}.ll"));
     let bc_ok = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4059,7 +4059,7 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
     let native = Command::new(&exe).output().expect("native ring run");
     assert!(native.status.success(), "native ring run failed");
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate ring guest");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate ring guest");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4136,12 +4136,12 @@ fn demo_sqlite_fs_cap_vs_native() {
     let pid = std::process::id();
 
     // Guest bitcode (-DSVM_GUEST → SQLITE_OS_OTHER + the capability VFS).
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_sqlite_fs.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_sqlite_fs.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4190,7 +4190,7 @@ fn demo_sqlite_fs_cap_vs_native() {
         .expect("native verify");
     assert!(oracle_verify.status.success(), "native verify failed");
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate sqlite_fs bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate sqlite_fs bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4286,12 +4286,12 @@ fn demo_pg_oscap_vs_native() {
     let pid = std::process::id();
 
     // Guest bitcode: os_probe.c `#include`s os_shim.c under -DSVM_GUEST (single TU, no llvm-link).
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_oscap.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_oscap.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4326,7 +4326,7 @@ fn demo_pg_oscap_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_oscap bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_oscap bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4531,12 +4531,12 @@ fn demo_pg_procstub() {
     // fixed expected report. Pure — runs on the bare powerbox.
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/proc_probe.c");
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_pg_proc.bc", std::process::id()));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_pg_proc.ll", std::process::id()));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4552,7 +4552,7 @@ fn demo_pg_procstub() {
             return;
         }
     }
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_proc bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_proc bitcode");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
     svm_verify::verify_module(&module).expect("verify");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
@@ -4599,12 +4599,12 @@ fn demo_pg_stdio_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/stdio_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stdio.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stdio.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4638,7 +4638,7 @@ fn demo_pg_stdio_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_stdio bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_stdio bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4684,12 +4684,12 @@ fn demo_pg_stream_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/stream_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stream.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stream.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4723,7 +4723,7 @@ fn demo_pg_stream_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_stream bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_stream bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4771,12 +4771,12 @@ fn demo_pg_fprintf_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/fprintf_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_fprintf.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_fprintf.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4810,7 +4810,7 @@ fn demo_pg_fprintf_vs_native() {
     assert!(oracle.status.success(), "native oracle failed");
     let _ = std::fs::remove_dir_all(&nat_root);
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_fprintf bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_fprintf bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -4871,12 +4871,12 @@ fn demo_pg_sscanf_vs_native() {
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/postgres/sscanf_probe.c");
     let pid = std::process::id();
-    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_sscanf.bc"));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_sscanf.ll"));
     let status = Command::new("clang")
         .args([
             "-O2",
             "-emit-llvm",
-            "-c",
+            "-S",
             "-DSVM_GUEST",
             "-fno-vectorize",
             "-fno-slp-vectorize",
@@ -4912,7 +4912,7 @@ fn demo_pg_sscanf_vs_native() {
     let oracle = child.wait_with_output().expect("native pg_sscanf run");
     assert!(oracle.status.success(), "native oracle failed");
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_sscanf bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_sscanf bitcode");
     let inst = svm_run::instantiate(t.module).expect("instantiate");
     let config = || svm_run::RunConfig {
         limits: svm_run::Limits {
@@ -7245,19 +7245,19 @@ int main(void) {
 /// Compile a freestanding C++ snippet to legalized LLVM-18 bitcode: `-fno-exceptions -fno-rtti`
 /// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA and auto-vectorization (the on-ramp
 /// ingests the SIMD output). Returns `None` (skip) if `clang++` is unavailable.
-fn compile_cpp_to_bc(name: &str, src: &str) -> Option<PathBuf> {
-    compile_cpp_to_bc_flags(name, src, &["-fno-exceptions", "-fno-rtti"])
+fn compile_cpp_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    compile_cpp_to_ll_flags(name, src, &["-fno-exceptions", "-fno-rtti"])
 }
 
-/// Like [`compile_cpp_to_bc`] but with caller-chosen flags — used by the EH tests, which keep
+/// Like [`compile_cpp_to_ll`] but with caller-chosen flags — used by the EH tests, which keep
 /// exceptions on (drop `-fno-exceptions`) so `invoke`/`landingpad`/`__cxa_*` reach the on-ramp.
-fn compile_cpp_to_bc_flags(name: &str, src: &str, extra: &[&str]) -> Option<PathBuf> {
+fn compile_cpp_to_ll_flags(name: &str, src: &str, extra: &[&str]) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let cc = dir.join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_cpp_{}_{}.bc", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_cpp_{}_{}.ll", std::process::id(), name));
     std::fs::write(&cc, src).expect("write C++ source");
     let status = Command::new("clang++")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args(["-O2", "-emit-llvm", "-S"])
         .args(extra)
         .arg(&cc)
         .arg("-o")
@@ -7276,7 +7276,7 @@ fn compile_cpp_to_bc_flags(name: &str, src: &str, extra: &[&str]) -> Option<Path
 /// assert identical stdout + exit. The program is a powerbox program (`extern "C" int main`, output
 /// via `extern "C" write`), exactly like the C corpus demos.
 fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
-    let Some(bc) = compile_cpp_to_bc(name, src) else {
+    let Some(bc) = compile_cpp_to_ll(name, src) else {
         return;
     };
     check_cpp_bc_vs_native(name, &bc, stdin);
@@ -7286,7 +7286,7 @@ fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
 /// exceptions *on* (only `-fno-rtti`), so `invoke`/`landingpad`/`resume` + the `__cxa_*` runtime
 /// reach the on-ramp. The native oracle links the default (exceptions-on) `clang++`.
 fn check_cpp_eh_vs_native(name: &str, src: &str, stdin: &[u8]) {
-    let Some(bc) = compile_cpp_to_bc_flags(name, src, &["-fno-rtti"]) else {
+    let Some(bc) = compile_cpp_to_ll_flags(name, src, &["-fno-rtti"]) else {
         return;
     };
     check_cpp_bc_vs_native(name, &bc, stdin);
@@ -7319,7 +7319,7 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
     };
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
-    let t = svm_llvm::translate_bc_path(bc).expect("translate C++ bitcode");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate C++ bitcode");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
@@ -7350,10 +7350,10 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
 /// a "terminate called…" stderr line, which is not byte-comparable to a guest trap, so this asserts the
 /// clean fault (a `Err` from the powerbox run) rather than diffing against native.
 fn check_cpp_eh_terminates(name: &str, src: &str) {
-    let Some(bc) = compile_cpp_to_bc_flags(name, src, &["-fno-rtti"]) else {
+    let Some(bc) = compile_cpp_to_ll_flags(name, src, &["-fno-rtti"]) else {
         return;
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate C++ bitcode");
+    let t = svm_llvm::translate_ll_path(&bc).expect("translate C++ bitcode");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
