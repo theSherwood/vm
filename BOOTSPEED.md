@@ -132,6 +132,16 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
   there for the next `SELECT`) — a real `psql`-style session. This closes the *per-query* boot cost; the
   **one** remaining latency is the first boot, whose lever is snapshot/restore of the post-boot state
   (freeze/thaw — deferred; the session makes it much less pressing, since you pay it once per page).
+- **✅ Session persists across page reloads.** The database now survives a refresh. The `fs` cap is
+  mounted through `svm_fs::mem_fs_seeded_shared`, which hands the host a `MemFsHandle` onto the live data
+  dir; `svm_pg_snapshot` serializes it back to an `svm_fs::encode_image` blob, which `play.js` stores in
+  IndexedDB after each query and re-mounts on the next visit (`svm_pg_open` boots from the saved image
+  instead of the pristine one, and Postgres runs its own startup recovery over it). A `CREATE TABLE` +
+  `INSERT` is still there after a reload; `\reset` in the console wipes the saved image. Proven three
+  ways: a `svm-fs` unit test (the snapshot mechanism), `browser/tests/pg_snapshot_roundtrip.rs` (the
+  native round-trip through real Postgres recovery), and `browser/pg_snapshot_test.mjs` (the same
+  round-trip through the shipping wasm artifact). This is orthogonal to freeze/thaw of the *post-boot*
+  state above — it persists the *data dir*, not the booted process image.
 
 ## Reproducing the measurements
 

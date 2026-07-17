@@ -521,10 +521,14 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
       'ambient authority. It runs as a live **interactive session**: the first Run boots the backend ' +
       '(a few seconds), then each Run feeds your SQL to the *same* backend on its blocking stdin — so ' +
       'queries after the first are sub-second and state persists across them (a table you CREATE stays ' +
-      'for the next query), exactly like psql. Click Stop to close the session; the next Run boots ' +
-      'fresh. The two large artifacts (a ~20 MB module + a ~40 MB image) download once.',
+      'for the next query), exactly like psql. **Your database also survives a page reload:** after each ' +
+      'query the data directory is snapshotted into your browser (IndexedDB), and the next visit boots ' +
+      'from that snapshot — Postgres runs its own crash recovery over it. Run `\\reset` to wipe the ' +
+      'saved database and start fresh; Stop just closes the live backend (Run reopens it). The two large ' +
+      'artifacts (a ~20 MB module + a ~40 MB image) download once.',
     src: `-- Click Run to send this to the live backend. Run again with new SQL — the session persists
--- (the table below stays for later queries), and only the first Run pays the boot. Stop resets it.
+-- (the table below stays for later queries), and only the first Run pays the boot.
+-- Your data survives a page reload too: reload, then Run to resume. Type \\reset + Run to wipe it.
 CREATE TABLE t (x int, s text);
 INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
 SELECT * FROM t WHERE x > 1 ORDER BY x DESC;
@@ -714,6 +718,91 @@ function readEngineStdout() {
   return new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + l));
 }
 
+// ---- persistent Postgres storage (IndexedDB) -----------------------------------------------------
+// The live backend's data dir is an in-memory `mem_fs`; on its own it evaporates when the page unloads.
+// After each query we snapshot that fs (`svm_pg_snapshot` → an `svm_fs` data image) and stash the image
+// in IndexedDB; the next session boots from the saved image instead of the pristine one — so a table you
+// CREATE (and its rows) survive a full page reload, recovered by Postgres' own startup recovery over the
+// snapshot. Keyed per module URL so distinct builds don't collide. All best-effort: any storage failure
+// just logs and the session keeps running in memory.
+const PG_DB = 'svm-pg';
+const PG_STORE = 'sessions';
+const pgKey = (c) => c.ex.url;
+function pgIdb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(PG_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(PG_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function pgLoad(key) {
+  try {
+    const db = await pgIdb();
+    return await new Promise((resolve, reject) => {
+      const r = db.transaction(PG_STORE, 'readonly').objectStore(PG_STORE).get(key);
+      r.onsuccess = () => resolve(r.result || null);
+      r.onerror = () => reject(r.error);
+    });
+  } catch {
+    return null; // no IndexedDB (private mode, etc.) ⇒ fall back to the pristine image
+  }
+}
+async function pgSave(key, bytes) {
+  const db = await pgIdb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PG_STORE, 'readwrite');
+    tx.objectStore(PG_STORE).put(bytes, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function pgClear(key) {
+  try {
+    const db = await pgIdb();
+    await new Promise((resolve) => {
+      const tx = db.transaction(PG_STORE, 'readwrite');
+      tx.objectStore(PG_STORE).delete(key);
+      tx.oncomplete = resolve;
+      tx.onerror = resolve;
+    });
+  } catch {
+    /* nothing to clear */
+  }
+}
+// Snapshot the live session's data dir and persist it, **coalescing** concurrent saves: at most one IDB
+// write is in flight; a query that lands mid-write just marks the card dirty and re-saves once it drains
+// (so a burst of queries collapses to one trailing write of the latest state). The snapshot bytes are
+// copied straight out of wasm memory before the async write, so a later `memory.grow` can't detach them.
+function persistPg(c) {
+  if (!c.pgSession) return;
+  let bytes;
+  try {
+    if (eng.ex.svm_pg_snapshot() !== 0) return;
+    const p = eng.ex.svm_pg_snapshot_ptr();
+    const l = eng.ex.svm_pg_snapshot_len();
+    if (!p || !l) return;
+    bytes = new Uint8Array(eng.memory.buffer, p, l).slice(); // detach from the wasm buffer
+  } catch (e) {
+    logTo(c, `snapshot failed: ${e.message}`);
+    return;
+  }
+  if (c.pgSaving) {
+    c.pgDirty = true;
+    return;
+  }
+  c.pgSaving = true;
+  pgSave(pgKey(c), bytes)
+    .catch((e) => logTo(c, `session save failed: ${e.message}`))
+    .finally(() => {
+      c.pgSaving = false;
+      if (c.pgDirty) {
+        c.pgDirty = false;
+        persistPg(c);
+      }
+    });
+}
+
 // PostgreSQL as a **live interactive session** (the `svm_pg_open`/`_query`/`_close` path): the first Run
 // boots one `postgres --single` backend to the `backend>` prompt (a few seconds) and leaves it suspended
 // on its blocking stdin; every Run after feeds the editor's SQL to that *same* backend and resumes it to
@@ -723,23 +812,46 @@ async function runPg(c) {
   const ex = c.ex;
   c.el.result.textContent = '';
   c.el.canvas.hidden = true;
-  // 1) Open the session on the first Run (fetch the artifacts, boot to the prompt).
+  // `\reset` (a bare meta-command in the editor): drop the saved database and close any live session, so
+  // the next Run boots from the pristine image. The way back to a clean slate once a session persists.
+  if (c.editor.getValue().trim() === '\\reset') {
+    await pgClear(pgKey(c));
+    if (c.pgSession) {
+      eng.ex.svm_pg_close();
+      c.pgSession = false;
+      c.el.stop.disabled = true;
+    }
+    setState(c, 'done', 'saved database cleared — the next Run boots a fresh cluster');
+    logTo(c, 'reset: cleared the saved session');
+    c.el.run.disabled = broken;
+    return;
+  }
+  // 1) Open the session on the first Run. Prefer a **saved** snapshot (a prior session's data dir,
+  //    persisted in IndexedDB) over the pristine image, so a page reload resumes where you left off.
   if (!c.pgSession) {
     setState(c, 'running', 'fetching module + image…');
     c.el.stdout.textContent = '';
-    let modBytes, imgBytes;
+    let modBytes, imgBytes, restored = false;
     try {
       // Sequential (not Promise.all) so the two large downloads report progress one at a time.
       modBytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
-      imgBytes = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
+      const saved = await pgLoad(pgKey(c));
+      if (saved) {
+        imgBytes = saved instanceof Uint8Array ? saved : new Uint8Array(saved);
+        restored = true;
+      } else {
+        imgBytes = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
+      }
     } catch (e) {
       setState(c, 'error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
       logTo(c, `fetch failed: ${e.message}`);
       return;
     }
-    setState(c, 'running', 'booting postgres… (first Run only — a few seconds; later queries are instant)');
+    setState(c, 'running', restored
+      ? 'restoring your saved database… (first Run only — a few seconds)'
+      : 'booting postgres… (first Run only — a few seconds; later queries are instant)');
     c.el.run.disabled = true;
-    await new Promise((r) => setTimeout(r, 30)); // let "booting…" paint before the synchronous boot
+    await new Promise((r) => setTimeout(r, 30)); // let the status paint before the synchronous boot
     try {
       const modP = eng.ex.svm_alloc(modBytes.length);
       const imgP = eng.ex.svm_alloc(imgBytes.length);
@@ -753,13 +865,18 @@ async function runPg(c) {
       eng.ex.svm_dealloc(imgP, imgBytes.length);
       c.el.stdout.textContent += readEngineStdout(); // the banner + first prompt
       if (rc !== 0) {
+        // A saved image that won't boot is likely corrupt — drop it so the next Run starts clean.
+        if (restored) {
+          await pgClear(pgKey(c));
+          logTo(c, 'saved session failed to boot — cleared it; Run again for a fresh database');
+        }
         setState(c, 'error', `boot failed: status ${eng.ex.svm_status()} (1=decode 3=trap 6=verify)`);
         c.el.run.disabled = broken;
         return;
       }
       c.pgSession = true;
       c.el.stop.disabled = false;
-      logTo(c, `svm_pg_open: backend booted in ${ms}ms`);
+      logTo(c, restored ? `svm_pg_open: restored saved session in ${ms}ms` : `svm_pg_open: backend booted in ${ms}ms`);
     } catch (e) {
       setState(c, 'error', `boot error: ${e.message}`);
       c.el.run.disabled = broken;
@@ -769,7 +886,7 @@ async function runPg(c) {
   // 2) Send the editor's SQL to the live backend as one query.
   const sql = c.editor.getValue();
   if (!sql.trim()) {
-    setState(c, 'done', 'session live — type SQL and Run (Stop resets the backend)');
+    setState(c, 'done', 'session live — type SQL and Run (state persists across reloads · `\\reset` clears it)');
     c.el.run.disabled = broken;
     return;
   }
@@ -787,13 +904,16 @@ async function runPg(c) {
     c.el.stdout.scrollTop = c.el.stdout.scrollHeight;
     const status = eng.ex.svm_status();
     if (rc === 0) {
-      setState(c, 'done', `query ran in ${ms}ms · session live (Stop to reset)`);
+      setState(c, 'done', `query ran in ${ms}ms · session live · saved (reload to resume)`);
       logTo(c, `svm_pg_query in ${ms}ms`);
+      persistPg(c); // snapshot the (possibly mutated) data dir so it survives a reload
     } else if (status === 5) {
-      // The backend exited (e.g. the SQL issued a shutdown) — the session is over.
+      // The backend exited (e.g. the SQL issued a shutdown) — the session is over. Persist its final
+      // state first, so even a clean shutdown is resumable.
+      persistPg(c);
       c.pgSession = false;
       c.el.stop.disabled = true;
-      setState(c, 'done', 'backend exited — Run boots a fresh session');
+      setState(c, 'done', 'backend exited — Run reopens your saved database');
     } else {
       setState(c, 'error', `query failed: status ${status}`);
       logTo(c, `svm_pg_query status ${status}`);
@@ -1322,7 +1442,8 @@ function stopDemo(c) {
     c.pgSession = false;
     c.el.run.disabled = broken;
     c.el.stop.disabled = true;
-    setState(c, 'stopped', 'session closed — Run boots a fresh backend');
+    // Stop closes the *live* backend but keeps the saved snapshot, so Run reopens the same database.
+    setState(c, 'stopped', 'session closed — Run reopens your saved database (`\\reset` for a clean one)');
     return;
   }
   if (reactorRAF !== null) {
