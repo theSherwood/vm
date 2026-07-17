@@ -1805,7 +1805,7 @@ const QUICKJS_OPENLIBM_EXTRA: &[&str] = &["s_asinh", "e_acosh", "e_atanh", "s_lo
 /// **▶ QuickJS eval — the full-JS-engine breadth target (SPIKE, in progress).** Wires the whole
 /// differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the
 /// `demos/quickjs/qjs_eval.c` driver + the guest libm + the libc/stdio shims to bitcode,
-/// `llvm-link` into one module, then translate → verify → run vs a native `cc` oracle. The libc
+/// `llvm-link -S` into one `.ll` module, then translate → verify → run vs a native `cc` oracle. The libc
 /// waist is now shimmed (printf engine + `strtod` + `libc_shim.c`); it is **ignored** because the
 /// interpreter core (`JS_CallInternal`) uses a **dynamic `alloca`** (runtime-sized operand stack)
 /// the on-ramp doesn't yet lower, and general Number→string needs directed-rounding dtoa — see
@@ -1831,7 +1831,7 @@ fn demo_quickjs_eval_vs_native() {
     let cflags = [
         "-O2",
         "-emit-llvm",
-        "-c",
+        "-S",
         "-fno-vectorize",
         "-fno-slp-vectorize",
         "-DNDEBUG",
@@ -1839,11 +1839,11 @@ fn demo_quickjs_eval_vs_native() {
         "-DCONFIG_VERSION=\"2024-01-13\"",
         "-DASSEMBLER=0",
     ];
-    // Compile QuickJS TUs + driver + the guest-libm set, each → bitcode.
+    // Compile QuickJS TUs + driver + the guest-libm set, each → textual `.ll`.
     let qjs_tus = ["quickjs", "libregexp", "libunicode", "cutils", "libbf"];
     let mut bcs: Vec<PathBuf> = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{tag}.bc"));
+        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{tag}.ll"));
         let mut cmd = Command::new("clang");
         cmd.args(cflags);
         for i in &incs {
@@ -1899,19 +1899,15 @@ fn demo_quickjs_eval_vs_native() {
             }
         }
     }
-    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_linked.bc"));
-    let link_ok = Command::new("llvm-link-18")
+    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_linked.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests it.
+    let link_ok = Command::new("llvm-link")
+        .arg("-S")
         .args(&bcs)
         .arg("-o")
         .arg(&linked)
         .status()
-        .or_else(|_| {
-            Command::new("llvm-link")
-                .args(&bcs)
-                .arg("-o")
-                .arg(&linked)
-                .status()
-        })
         .map(|s| s.success())
         .unwrap_or(false);
     if !link_ok {
@@ -1951,7 +1947,7 @@ fn demo_quickjs_eval_vs_native() {
         "native quickjs oracle produced no output"
     );
     // Guest: translate → resolve caps → verify → run under the powerbox, diff stdout vs the oracle.
-    let t = svm_llvm::translate_bc_path(&linked).expect("translate quickjs");
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate quickjs");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify quickjs module");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run quickjs");
