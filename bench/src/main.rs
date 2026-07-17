@@ -50,6 +50,7 @@
 //! This is a watch-it-over-time regression harness, not a statistical benchmark. Run with:
 //!   cargo run --release                          # from bench/, human table
 //!   cargo run --release -- --from-wasm           # SVM IR transpiled from the WAT (same bytes as wasm)
+//!   cargo run --release -- --optimize            # run svm-opt over the SVM IR before the SVM lanes
 //!   cargo run --release -- --csv                 # machine-readable line per kernel
 //!   cargo run --release -- --save-baseline FILE  # record the current ratios
 //!   cargo run --release -- --check FILE           # rerun + flag any ratio regression
@@ -1546,10 +1547,46 @@ struct Ratios {
     jit_vs_native: Option<f64>,
 }
 
+/// Run the svm-opt AOT optimizer over `m`, re-verifying the result, and return the optimized module
+/// **and the entry function's new index**. The optimizer runs dead-function elimination, which can drop
+/// (e.g. an unused `main`) and renumber functions, so the caller's original `entry` index would be
+/// stale afterward. To keep it findable we tag the entry as an export before optimizing (a root DFE
+/// must preserve) and resolve its new index by that tag. A verify failure falls back to the unoptimized
+/// module with a note (and the original entry), so a kernel is never silently miscompiled — the
+/// cross-check below would also catch a wrong result.
+fn optimize_ir(m: &svm_ir::Module, entry: u32, name: &str) -> (svm_ir::Module, u32) {
+    const TAG: &str = "__bench_entry";
+    let mut tagged = m.clone();
+    tagged.exports.push(svm_ir::Export {
+        name: TAG.into(),
+        func: entry,
+    });
+    let opt = svm_opt::optimize_module(&tagged);
+    match svm_verify::verify_module(&opt) {
+        Ok(()) => {
+            let e = opt
+                .resolve_export(TAG)
+                .expect("entry export survives optimization");
+            (opt, e)
+        }
+        Err(e) => {
+            eprintln!(
+                "note: --optimize keeps `{name}` unoptimized (svm-opt output failed verify: {e:?})"
+            );
+            (m.clone(), entry)
+        }
+    }
+}
+
 /// Time one kernel, taking the **best (min)** of `reps` passes per engine. Cross-checks every
 /// engine agrees on the result first, so we never benchmark a miscompile.
-fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
+fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     let m = svm_text::parse_module(&k.ir).expect("parse our IR text");
+    let (m, entry) = if optimize {
+        optimize_ir(&m, k.entry, &k.name)
+    } else {
+        (m, k.entry)
+    };
     // wasm32 bytes come either pre-compiled (the `irreducible` kernel's clang output) or by
     // assembling the hand-written WAT.
     let wasm32 = match &k.wasm32_bytes {
@@ -1569,8 +1606,8 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
         Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
     });
     let svm = |n: i64| match k.mode {
-        Mode::Compute => svm_call(&m, k.entry, &k.lead_args, n),
-        Mode::HostCall => svm_call_host(&m, k.entry, &k.lead_args, n),
+        Mode::Compute => svm_call(&m, entry, &k.lead_args, n),
+        Mode::HostCall => svm_call_host(&m, entry, &k.lead_args, n),
     };
     let inst = |wasm: &[u8]| match k.mode {
         Mode::Compute => wasm_entry(engine, wasm),
@@ -1612,7 +1649,7 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
     if interp.is_some() {
         assert_eq!(
             ours,
-            interp_call(&m, k.entry, &k.lead_args, n_small),
+            interp_call(&m, entry, &k.lead_args, n_small),
             "kernel `{}`: svm vs interp disagree",
             k.name
         );
@@ -1662,10 +1699,10 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
         // span, since it is ~100–1000× slower; per-iteration cost is span-independent). ---
         if raw.interp_ns.is_some() {
             let ib = per_call(pc_interp, || {
-                black_box(interp_call(&m, k.entry, &k.lead_args, N_INTERP_BIG));
+                black_box(interp_call(&m, entry, &k.lead_args, N_INTERP_BIG));
             });
             let is = per_call(pc_interp, || {
-                black_box(interp_call(&m, k.entry, &k.lead_args, N_INTERP_SMALL));
+                black_box(interp_call(&m, entry, &k.lead_args, N_INTERP_SMALL));
             });
             let v = (ib - is) * 1e9 / (N_INTERP_BIG - N_INTERP_SMALL) as f64;
             raw.interp_ns = Some(raw.interp_ns.unwrap().min(v));
@@ -1863,8 +1900,19 @@ fn print_table(results: &[(Resolved, Raw)]) {
     );
     println!(
         "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
-        "kernel", "native", "jit", "interp", "i/jit", "jit/nat", "wasm32", "ratio", "wasm64",
-        "ratio", "svm", "wasm32", "ratio"
+        "kernel",
+        "native",
+        "jit",
+        "interp",
+        "i/jit",
+        "jit/nat",
+        "wasm32",
+        "ratio",
+        "wasm64",
+        "ratio",
+        "svm",
+        "wasm32",
+        "ratio"
     );
     println!(
         "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
@@ -1929,6 +1977,10 @@ fn main() {
     // `--from-wasm`: get each compute kernel's SVM IR by transpiling its WAT (the same bytes Wasmtime
     // runs) instead of using the hand-written IR — the apples-to-apples comparison.
     let from_wasm = args.iter().any(|a| a == "--from-wasm");
+    // `--optimize`: run the svm-opt AOT optimizer over each kernel's SVM IR before the SVM lanes
+    // (jit + interp), so the Wasmtime-relative ratios reflect the optimizer. Pairs with `--from-wasm`
+    // for the cleanest apples-to-apples: the same wasm bytes → transpiled IR → svm-opt → JIT vs Wasmtime.
+    let optimize = args.iter().any(|a| a == "--optimize");
     // `--fast-cap`: route HostCall kernels through the §9/D45 devirtualized fast path (vs the generic
     // thunk) so the two can be compared head-to-head.
     FAST_CAP.store(args.iter().any(|a| a == "--fast-cap"), Ordering::Relaxed);
@@ -1966,7 +2018,7 @@ fn main() {
     let results: Vec<(Resolved, Raw)> = resolve_kernels(from_wasm)
         .into_iter()
         .map(|k| {
-            let raw = measure(&engine, &k, reps);
+            let raw = measure(&engine, &k, reps, optimize);
             (k, raw)
         })
         .collect();

@@ -23,6 +23,11 @@ svm-jit = { path = "../crates/svm-jit" }
 # The reference interpreter — the `interp` lane: the *same* IR the JIT runs, executed by the
 # tree-walking oracle (`crates/svm/src/bin/bench.rs` tracks it too). Apples-to-apples with the JIT.
 svm-interp = { path = "../crates/svm-interp" }
+# The AOT IR optimizer, for `--optimize`: run svm-opt over each kernel's IR before the SVM lanes,
+# so the Wasmtime-relative ratios reflect the optimizer (OPT.md Phase 5 follow-up). Re-verified with
+# svm-verify (a bad optimize falls back to the unoptimized IR, so a kernel never silently miscompiles).
+svm-opt = { path = "../crates/svm-opt" }
+svm-verify = { path = "../crates/svm-verify" }
 # The wasm→IR transpiler, for `--from-wasm`: run the *same* wasm bytes on SVM (transpiled to IR)
 # and on Wasmtime — the apples-to-apples comparison, instead of hand-paired IR/WAT.
 svm-wasm = { path = "../crates/svm-wasm" }
