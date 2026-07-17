@@ -81,7 +81,12 @@ Each is a vendored third-party C library, compiled through the frontend, verifie
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c
 ```
 `-cc1` runs the compiler in-process (no gcc-style driver subprocess); `--emit-ir`
-dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Build with
+dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Two more
+flags: `-g` also emits the SVM debug-info section (file/line table, function names,
+structured types, `debug.var` — `DEBUGGING.md` §6), and `--child-entry` emits function 0
+with the §14 child ABI (`(i64 starter) -> (i64 status)`) so a compiled-C command is
+spawnable as an `instantiate_module` child — a shell "exec" (`STAGE1.md`;
+`crates/svm/tests/stage1_exec_command.rs`). Build with
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 
@@ -108,6 +113,13 @@ functions, parameters, **recursion**, **function pointers** (indirect calls via
 (passed/returned by value, whole-aggregate assignment), **varargs**; **`printf`** and `exit`
 over the powerbox; **`malloc`/`free`/`calloc`/`realloc`** (guest allocator, heap grows via the
 Memory cap). All verify and run identically on interp + JIT, and match native `cc`.
+An unmodified **`main(argc, argv)`** also runs: the synthetic `_start` parses the §3e args
+buffer (`POWERBOX_ARGS_BASE`) into a real `argv[]` and calls it (`STAGE1.md`;
+`crates/svm/tests/stage1_argv_main.rs`). And a guest **definition** of `write`/`read`/`exit`
+shadows the builtin (the builtins apply only to declared-but-undefined names) — which is how
+a personality libc owns those names over §7 imports; real compiled C runs on the POSIX
+personality this way (PROCESS.md S15(b); `crates/svm/tests/c_posix.rs` / `c_shell.rs`,
+`POSIX.md`).
 
 Anything unsupported is a **hard `error_tok`** (with the AST node kind), by design — we never
 emit IR we can't stand behind.
@@ -115,7 +127,9 @@ emit IR we can't stand behind.
 **Remaining minor gaps** (none block "C runs"): narrow-scalar (`char`/`short`/`_Bool`) SSA
 promotion (they stay in memory so store-truncation keeps happening); `volatile` is not honored
 (chibicc discards the qualifier — no regression vs the old memory path); `fd`→stream mapping
-(stderr is not yet distinguished from stdout); float varargs beyond `double`; `%`-width/precision
+in the raw powerbox builtin (`write`/`read` still ignore the fd — always the std stream; the
+POSIX-personality path does map fds, incl. a distinct stderr and an fd table — `POSIX.md`);
+float varargs beyond `double`; `%`-width/precision
 in the mini-printf; and free-list reclamation in the guest allocator.
 
 ---
@@ -147,10 +161,14 @@ real SSA value threaded as a block parameter of every block, exactly like the da
 - **Blocks resolve by label name** in `svm-text` (appearance order = index), so we emit
   blocks sequentially with **forward label references** (`br block7(v0)` before block 7
   exists) — no buffering needed. The **entry block must be first** (index 0).
-- **Functions are ordered with `main` first** (so `main` is function index 0, what the
-  harness runs); `call` targets a function by this index (`funcs[]` / `func_index`).
-- **The harness passes the initial data-SP** (`SP0 = 16`) as `main`'s `v0`. The low
-  `[0,16)` window bytes are reserved so `&local` (= `sp + offset ≥ 16`) is never `NULL`.
+- **Functions are ordered with `main` first**, behind a synthetic **`_start`** (function 0,
+  `emit_start`) when `main` exists — so real functions begin at `start_off` (1) and `main` is
+  function index 1; `call` targets a function by this index (`funcs[]` / `func_index`).
+- **The harness runs `_start` with no arguments** — the powerbox is bound **by name**, not
+  positionally (`export "_start" 0`; PROCESS.md S15(c)): `_start` resolves only the caps the
+  program actually uses via `cap.self.resolve` and stashes the handles in the reserved low
+  window bytes (`RESERVED_BYTES` = 32). It then calls `main` with the initial data-SP baked
+  to `data_end` (the end of globals/BSS), so `&local` (= `sp + offset`) is never `NULL`.
 
 ### SSA promotion (the §3d "reverse" pass — `prepare_func`/`scan`/`undo_compound` + threading)
 - **Which locals promote:** a local that is a **full-width scalar** (`int`/`long`/`enum`/
@@ -262,7 +280,9 @@ it traps `IndirectCallType` on both backends (I2; see
 - `open_block`/`open_merge` + `cvals()`/`cparams()` — block headers and branch args that
   carry the data-SP **and the promoted locals** (`MERGE_VAL = npromo+1` is the carried
   result/switch-value slot, after the promoted ones).
-- `codegen_ir` — orders funcs (main first), runs `prepare_func`, emits `memory`, emits funcs.
+- `codegen_ir` — orders funcs (main first, after the synthetic `_start`), runs `prepare_func`,
+  emits `memory` + data segments, `emit_start` (by-name powerbox resolution, argv parsing,
+  the `--child-entry` ABI), emits funcs, then the `-g` debug-info section.
 
 **chibicc AST facts learned (save you time):**
 - `Obj` = function or variable; `Node` = AST node; `Type` (`TypeKind`, `->kind`, `->size`,
