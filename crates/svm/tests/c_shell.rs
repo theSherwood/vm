@@ -88,9 +88,13 @@ fn resolver(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
 const SHIM: &str = r#"
 long __px_write(int cap, long fd, long buf, long len);
 long __px_read(int cap, long fd, long buf, long len);
+long __px_open(int cap, long path, long len, long flags);
+long __px_close(int cap, long fd);
+long __px_unlink(int cap, long path, long len);
 long __px_getcwd(int cap, long buf, long size);
 long __px_chdir(int cap, long path, long len);
 long __px_getenv(int cap, long name, long len);
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long overwrite);
 void __px_exit(int cap, int code);
 long __px_opendir(int cap, long path, long len);
 long __px_readdir(int cap, long dir, long namebuf, long namecap);
@@ -102,9 +106,13 @@ static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
 long write(long fd, void *buf, long n) { return __px_write(0, fd, (long)buf, n); }
 long read(long fd, void *buf, long n) { return __px_read(0, fd, (long)buf, n); }
+long open(char *path, long flags) { return __px_open(0, (long)path, slen(path), flags); }
+long close(long fd) { return __px_close(0, fd); }
+long unlink(char *path) { return __px_unlink(0, (long)path, slen(path)); }
 char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 ? buf : 0; }
 long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
 char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
+long setenv_(char *name, char *val) { return __px_setenv(0, (long)name, slen(name), (long)val, slen(val), 1); }
 void exit(int code) { __px_exit(0, code); }
 /* A DIR is just the personality's stream handle (a long); readdir writes the next name. */
 long opendir(char *path) { return __px_opendir(0, (long)path, slen(path)); }
@@ -115,44 +123,564 @@ int argc_(void) { return (int)__px_argc(0); }
 long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap); }
 "#;
 
-/// The Stage-0 shell itself (guest code). `run_line` executes one command line (builtins only —
-/// `echo` with `$VAR`, `pwd`, `cd`, `ls`, `exit`; unknown → `<cmd>: not found`), tokenizing it into a
-/// command and a single argument on the first space. `main` supports two invocations: `sh -c "…"`
-/// (read via the personality's `argc`/`argv`) runs a single line; otherwise it's a read-eval loop
-/// over stdin. `exit` calls the personality `exit` (terminal).
+/// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
+/// redirects (pointing globals `in_fd`/`out_fd` at the targets via `open`, restored after), then
+/// `exec_line` tokenizes the remainder into `argv[]`, sets a shell variable for a lone `NAME=VALUE`,
+/// then expands `$NAME`/`$?` tokens (shell vars shadow the environment) and glob tokens (`*`/`?`
+/// matched against the memfs, `dir/name` results, literal if no match) before running one builtin —
+/// `echo`, `export`, `pwd`, `cd`, `cat`, `wc`, `grep` (`-v`/`-c`), `head`/`tail` (`-n N`), `sort`, `uniq`, `rm`,
+/// `ls`, `true`/`false`, `test`/`[ … ]`, `exit`; unknown → `<cmd>: not found`. Every command yields an exit status
+/// (`grep` no-match → 1, unknown → 127, `test` per its predicate); the last is kept in `last_status`
+/// and surfaced as `$?`. The text filters (`cat`/`wc`/`grep`/`head`/`tail`) read a path arg or the
+/// redirected `in_fd`; together with `>`/`>>` and `rm` (`unlink`) this exercises the real file
+/// surface (`open`/`read`/`write`/`close`/`unlink`). `run_list` (splitting on `;`/`&&`/`||`, short-
+/// circuiting on `$?`) sits above `run_pipeline` (splitting on `|`, staging each stage's stdout
+/// through a memfs temp the next stage reads as stdin) above `run_line`. `run_top` routes a line to
+/// the single-line `if COND; then …; [else …;] fi` construct (`run_if`) or to a command list. `main`
+/// supports two invocations: `sh -c "…"` (read via the personality's `argc`/`argv`) runs one line;
+/// otherwise it's a read-eval loop over stdin. `exit` calls the personality `exit`.
 const SHELL_MAIN: &str = r#"
+#define O_WRONLY 1
+#define O_CREAT  0100
+#define O_TRUNC  01000
+#define O_APPEND 02000
 static char cwd[256];
+/* Current stdio for the command in flight: `out_fd` is 1 unless a `>`/`>>` redirect is active,
+   `in_fd` is 0 unless a `<` redirect is active. run_line points them at files and restores them. */
+static long out_fd = 1;
+static long in_fd = 0;
+/* Exit status of the last command, surfaced as `$?` and consumed by `&&`/`||`. 0 = success. */
+static int last_status = 0;
 static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }
-static void puts_(char *s) { write(1, s, slen(s)); }
+static void puts_(char *s) { write(out_fd, s, slen(s)); }
 
-static void run_line(char *line) {
-  int sp = 0; while (line[sp] && line[sp] != ' ') sp++;
-  char *cmd = line, *arg = 0;
-  if (line[sp] == ' ') { line[sp] = 0; arg = line + sp + 1; }
-  if (line[0] == 0) return;
+/* Emit a non-negative count in decimal (wc's output). */
+static void put_num(long n) {
+  static char b[24]; int i = 24;
+  if (n == 0) { puts_("0"); return; }
+  while (n > 0) { b[--i] = '0' + (int)(n % 10); n /= 10; }
+  write(out_fd, b + i, 24 - i);
+}
+
+/* Read source for a filter: an explicit path (caller must close), else the current in_fd. */
+static long src_fd(char *path, int *close_it) {
+  if (path) { *close_it = 1; return open(path, 0); }   /* O_RDONLY */
+  *close_it = 0; return in_fd;
+}
+
+/* Parse a non-negative decimal prefix (head/tail counts). */
+static long atoi_(char *s) {
+  long v = 0; int i = 0;
+  while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+  return v;
+}
+
+/* Substring test: does `hay` contain `needle`? An empty needle matches. */
+static int contains(char *hay, char *needle) {
+  for (int i = 0; hay[i]; i++) {
+    int j = 0; while (needle[j] && hay[i + j] == needle[j]) j++;
+    if (needle[j] == 0) return 1;
+  }
+  return needle[0] == 0;
+}
+
+/* Byte-wise string compare (for sort/uniq): <0, 0, >0. */
+static int scmp(char *a, char *b) {
+  int i = 0; while (a[i] && a[i] == b[i]) i++;
+  return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
+}
+
+/* Bounded string copy (dst holds up to 255 bytes + NUL). */
+static void scpy(char *d, char *s) {
+  int i = 0; while (s[i] && i < 255) { d[i] = s[i]; i++; } d[i] = 0;
+}
+
+/* Read one newline-delimited line from fd into buf (NUL-terminated, newline dropped); returns its
+   length, or -1 at EOF with nothing read. One byte per read keeps it correct across any source. */
+static long read_line(long fd, char *buf, long lim) {
+  long n = 0; char c;
+  for (;;) {
+    long r = read(fd, &c, 1);
+    if (r <= 0) { if (n == 0) return -1; break; }
+    if (c == '\n') break;
+    if (n < lim - 1) buf[n++] = c;
+  }
+  buf[n] = 0;
+  return n;
+}
+
+/* Split `line` into space-separated tokens (runs of spaces collapse), writing pointers into argv and
+   returning the count (capped at MAXARGS). Mutates `line` in place with NUL terminators. The cap is
+   generous so glob expansion (which grows argv) has room. */
+#define MAXARGS 64
+static int tokenize(char *line, char **argv) {
+  int argc = 0, i = 0;
+  for (;;) {
+    while (line[i] == ' ') i++;
+    if (line[i] == 0 || argc >= MAXARGS) break;
+    argv[argc++] = line + i;
+    while (line[i] && line[i] != ' ') i++;
+    if (line[i] == ' ') line[i++] = 0;
+  }
+  return argc;
+}
+
+/* Shell variables (distinct from the personality environment until `export`ed). A tiny flat table:
+   name/value pairs in fixed storage, linear-scanned. */
+#define NVARS 32
+static char var_name[NVARS][32];
+static char var_val[NVARS][128];
+static int nvars = 0;
+static char *get_var(char *name) {
+  for (int i = 0; i < nvars; i++)
+    if (streq(var_name[i], name)) return var_val[i];
+  return 0;
+}
+static void set_var(char *name, char *val) {
+  int slot = -1;
+  for (int i = 0; i < nvars; i++)
+    if (streq(var_name[i], name)) { slot = i; break; }
+  if (slot < 0) { if (nvars >= NVARS) return; slot = nvars++; }
+  int i = 0; while (name[i] && i < 31) { var_name[slot][i] = name[i]; i++; } var_name[slot][i] = 0;
+  int j = 0; while (val[j] && j < 127) { var_val[slot][j] = val[j]; j++; } var_val[slot][j] = 0;
+}
+
+/* Format a non-negative integer into one of a few rotating static buffers (for `$?` expansion). */
+static char *itoa_(long n) {
+  static char ring[4][24]; static int k = 0;
+  char *b = ring[k]; k = (k + 1) & 3;
+  char t[24]; int ti = 0;
+  if (n == 0) t[ti++] = '0';
+  while (n > 0) { t[ti++] = '0' + (int)(n % 10); n /= 10; }
+  int bi = 0; while (ti > 0) b[bi++] = t[--ti]; b[bi] = 0;
+  return b;
+}
+
+/* Expand one token: `$?` → last status, `$NAME` → shell var then environment (empty if unset), else
+   the token unchanged. Returned pointers stay valid for the command's duration. */
+static char *expand(char *tok) {
+  if (tok[0] != '$') return tok;
+  char *name = tok + 1;
+  if (streq(name, "?")) return itoa_(last_status);
+  char *v = get_var(name);
+  if (v) return v;
+  v = getenv(name);
+  return v ? v : "";
+}
+
+/* Evaluate `test`/`[ … ]` and return a shell status (0 = true). Supports: a lone non-empty string;
+   unary `-f`/`-d`/`-e` (file / dir / either exists), `-z`/`-n` (empty / non-empty); and binary
+   `=`/`!=` (string) and `-eq`/`-ne`/`-lt`/`-gt` (numeric). Anything else is false. */
+static int do_test(int argc, char **argv) {
+  int top = argc;
+  if (streq(argv[0], "[") && top > 1 && streq(argv[top - 1], "]")) top--;   /* drop the closing `]` */
+  char **a = argv + 1;
+  int n = top - 1;
+  if (n == 1) return a[0][0] ? 0 : 1;
+  if (n == 2) {
+    if (streq(a[0], "-f")) { long fd = open(a[1], 0); if (fd >= 0) { close(fd); return 0; } return 1; }
+    if (streq(a[0], "-d")) { long d = opendir(a[1]); if (d >= 0) { closedir(d); return 0; } return 1; }
+    if (streq(a[0], "-e")) {
+      long fd = open(a[1], 0); if (fd >= 0) { close(fd); return 0; }
+      long d = opendir(a[1]); if (d >= 0) { closedir(d); return 0; }
+      return 1;
+    }
+    if (streq(a[0], "-z")) return a[1][0] ? 1 : 0;
+    if (streq(a[0], "-n")) return a[1][0] ? 0 : 1;
+    return 1;
+  }
+  if (n == 3) {
+    if (streq(a[1], "=")) return streq(a[0], a[2]) ? 0 : 1;
+    if (streq(a[1], "!=")) return streq(a[0], a[2]) ? 1 : 0;
+    if (streq(a[1], "-eq")) return atoi_(a[0]) == atoi_(a[2]) ? 0 : 1;
+    if (streq(a[1], "-ne")) return atoi_(a[0]) != atoi_(a[2]) ? 0 : 1;
+    if (streq(a[1], "-lt")) return atoi_(a[0]) < atoi_(a[2]) ? 0 : 1;
+    if (streq(a[1], "-gt")) return atoi_(a[0]) > atoi_(a[2]) ? 0 : 1;
+    return 1;
+  }
+  return 1;
+}
+
+/* Glob match with `*` (any run, incl. empty) and `?` (one char). Iterative with backtracking. */
+static int fnmatch_(char *p, char *s) {
+  char *star = 0, *ss = 0;
+  while (*s) {
+    if (*p == '?' || *p == *s) { p++; s++; }
+    else if (*p == '*') { star = p++; ss = s; }
+    else if (star) { p = star + 1; s = ++ss; }
+    else return 0;
+  }
+  while (*p == '*') p++;
+  return *p == 0;
+}
+
+/* Expand a glob token into matching absolute paths, appending pointers (into `store`) to `out`. The
+   token is split at its last `/` into a directory (default: cwd) and a pattern; each directory entry
+   matching the pattern yields `dir/name`. Returns the number of matches appended. */
+static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *sn, int cap) {
+  int last = -1;
+  for (int i = 0; tok[i]; i++) if (tok[i] == '/') last = i;
+  static char dir[256]; char *pat;
+  if (last < 0) { getcwd(dir, 256); pat = tok; }
+  else if (last == 0) { dir[0] = '/'; dir[1] = 0; pat = tok + 1; }
+  else { int k = 0; while (k < last && k < 255) { dir[k] = tok[k]; k++; } dir[k] = 0; pat = tok + last + 1; }
+  long d = opendir(dir);
+  if (d < 0) return 0;
+  static char name[256]; int matched = 0;
+  while (readdir(d, name, 256) > 0) {
+    if (!fnmatch_(pat, name)) continue;
+    if (*oc >= cap || *sn >= 64) break;
+    char *g = store[*sn];
+    int p = 0, k = 0;
+    while (dir[k] && p < 254) g[p++] = dir[k++];
+    if (p == 0 || g[p - 1] != '/') g[p++] = '/';
+    k = 0; while (name[k] && p < 255) g[p++] = name[k++];
+    g[p] = 0;
+    out[(*oc)++] = g; (*sn)++; matched++;
+  }
+  closedir(d);
+  return matched;
+}
+
+/* Execute one command after redirection has been stripped. `line` is tokenized into argv; builtins
+   read their input from a path argument or, absent one, the (possibly redirected) in_fd. Returns the
+   command's exit status (0 = success). */
+static int exec_line(char *line) {
+  char *argv[MAXARGS];
+  int argc = tokenize(line, argv);
+  if (argc == 0) return 0;
+  /* A lone `NAME=VALUE` (identifier before `=`) sets a shell variable, expanding the RHS. */
+  if (argc == 1) {
+    char *t = argv[0]; int eq = -1;
+    for (int j = 0; t[j]; j++) {
+      char c = t[j];
+      if (c == '=') { eq = j; break; }
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) break;
+    }
+    if (eq > 0) { t[eq] = 0; set_var(t, expand(t + eq + 1)); return 0; }
+  }
+  /* Expand `$`-tokens in place before dispatch. */
+  for (int i = 0; i < argc; i++) argv[i] = expand(argv[i]);
+  /* Glob-expand any token containing `*`/`?` against the memfs; a token with no match stays literal
+     (bash's default nullglob-off). Rebuild argv from the expansion. */
+  {
+    static char gstore[64][256];
+    char *gbuf[MAXARGS];
+    int gn = 0, ac2 = 0;
+    for (int i = 0; i < argc && ac2 < MAXARGS; i++) {
+      char *tok = argv[i];
+      int has = 0;
+      for (int j = 0; tok[j]; j++) if (tok[j] == '*' || tok[j] == '?') { has = 1; break; }
+      if (!has) { gbuf[ac2++] = tok; continue; }
+      int m = glob_expand(tok, gbuf, &ac2, gstore, &gn, MAXARGS);
+      if (m == 0 && ac2 < MAXARGS) gbuf[ac2++] = tok;
+    }
+    for (int i = 0; i < ac2; i++) argv[i] = gbuf[i];
+    argc = ac2;
+  }
+  if (argc == 0) return 0;
+  char *cmd = argv[0];
+  char *arg = argc > 1 ? argv[1] : 0;
+  int st = 0;
   if (streq(cmd, "echo")) {
-    if (arg && arg[0] == '$') { char *v = getenv(arg + 1); if (v) puts_(v); }
-    else if (arg) puts_(arg);
+    for (int i = 1; i < argc; i++) {
+      puts_(argv[i]);
+      if (i + 1 < argc) puts_(" ");
+    }
     puts_("\n");
+  } else if (streq(cmd, "export")) {
+    for (int i = 1; i < argc; i++) {
+      char *e = argv[i]; int eq = -1;
+      for (int j = 0; e[j]; j++) if (e[j] == '=') { eq = j; break; }
+      if (eq >= 0) { e[eq] = 0; char *v = expand(e + eq + 1); set_var(e, v); setenv_(e, v); }
+      else { char *v = get_var(e); setenv_(e, v ? v : ""); }
+    }
+  } else if (streq(cmd, "true")) {
+    st = 0;
+  } else if (streq(cmd, "false")) {
+    st = 1;
+  } else if (streq(cmd, "test") || streq(cmd, "[")) {
+    st = do_test(argc, argv);
   } else if (streq(cmd, "pwd")) {
     if (getcwd(cwd, 256)) puts_(cwd);
     puts_("\n");
   } else if (streq(cmd, "cd")) {
     if (arg) chdir(arg);
+  } else if (streq(cmd, "cat")) {
+    static char buf[256];
+    long r;
+    if (argc > 1) {
+      for (int ai = 1; ai < argc; ai++) {          /* concatenate each file argument */
+        long fd = open(argv[ai], 0);
+        if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 1; }
+        else { while ((r = read(fd, buf, 256)) > 0) write(out_fd, buf, r); close(fd); }
+      }
+    } else {
+      while ((r = read(in_fd, buf, 256)) > 0) write(out_fd, buf, r);   /* no args: stream in_fd */
+    }
+  } else if (streq(cmd, "wc")) {
+    int ci; long fd = src_fd(arg, &ci);
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
+    else {
+      static char buf[256];
+      long r, lines = 0, words = 0, bytes = 0; int inword = 0;
+      while ((r = read(fd, buf, 256)) > 0) {
+        for (long i = 0; i < r; i++) {
+          char c = buf[i]; bytes++;
+          if (c == '\n') lines++;
+          if (c == ' ' || c == '\n' || c == '\t') inword = 0;
+          else { if (!inword) words++; inword = 1; }
+        }
+      }
+      if (ci) close(fd);
+      put_num(lines); puts_(" "); put_num(words); puts_(" "); put_num(bytes); puts_("\n");
+    }
+  } else if (streq(cmd, "grep")) {
+    int ai = 1, inv = 0, cnt = 0;       /* -v: invert match; -c: print only the match count */
+    while (ai < argc && argv[ai][0] == '-') {
+      if (streq(argv[ai], "-v")) inv = 1;
+      else if (streq(argv[ai], "-c")) cnt = 1;
+      ai++;
+    }
+    long matches = 0;
+    if (ai < argc) {
+      char *pat = argv[ai++];
+      int ci; long fd = src_fd(ai < argc ? argv[ai] : 0, &ci);
+      if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 2; }
+      else {
+        static char lb[256];
+        while (read_line(fd, lb, 256) >= 0) {
+          int m = contains(lb, pat);
+          if (inv) m = !m;
+          if (m) { matches++; if (!cnt) { puts_(lb); puts_("\n"); } }
+        }
+        if (ci) close(fd);
+      }
+    }
+    if (cnt) { put_num(matches); puts_("\n"); }
+    if (st == 0 && matches == 0) st = 1;   /* grep: no match is exit 1 */
+  } else if (streq(cmd, "head")) {
+    int ai = 1; long n = 10;
+    if (argc > ai && streq(argv[ai], "-n") && argc > ai + 1) { n = atoi_(argv[ai + 1]); ai += 2; }
+    int ci; long fd = src_fd(argc > ai ? argv[ai] : 0, &ci);
+    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 1; }
+    else {
+      static char lb[256];
+      for (long k = 0; k < n && read_line(fd, lb, 256) >= 0; k++) { puts_(lb); puts_("\n"); }
+      if (ci) close(fd);
+    }
+  } else if (streq(cmd, "tail")) {
+    int ai = 1; long n = 10;
+    if (argc > ai && streq(argv[ai], "-n") && argc > ai + 1) { n = atoi_(argv[ai + 1]); ai += 2; }
+    if (n > 16) n = 16;   /* the ring holds at most 16 lines */
+    int ci; long fd = src_fd(argc > ai ? argv[ai] : 0, &ci);
+    if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 1; }
+    else {
+      static char ring[16][256];
+      long count = 0;
+      while (read_line(fd, ring[count % 16], 256) >= 0) count++;
+      if (ci) close(fd);
+      long start = count > n ? count - n : 0;
+      for (long k = start; k < count; k++) { puts_(ring[k % 16]); puts_("\n"); }
+    }
+  } else if (streq(cmd, "sort")) {
+    int ci; long fd = src_fd(arg, &ci);
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
+    else {
+      static char buf[64][256]; int n = 0;
+      while (n < 64 && read_line(fd, buf[n], 256) >= 0) n++;
+      if (ci) close(fd);
+      for (int i = 1; i < n; i++) {          /* insertion sort (n <= 64) */
+        static char key[256]; scpy(key, buf[i]);
+        int j = i - 1;
+        while (j >= 0 && scmp(buf[j], key) > 0) { scpy(buf[j + 1], buf[j]); j--; }
+        scpy(buf[j + 1], key);
+      }
+      for (int i = 0; i < n; i++) { puts_(buf[i]); puts_("\n"); }
+    }
+  } else if (streq(cmd, "uniq")) {
+    int ci; long fd = src_fd(arg, &ci);
+    if (fd < 0) { puts_(arg); puts_(": not found\n"); st = 1; }
+    else {
+      static char cur[256], prev[256]; int have = 0;
+      while (read_line(fd, cur, 256) >= 0)
+        if (!have || scmp(cur, prev) != 0) { puts_(cur); puts_("\n"); scpy(prev, cur); have = 1; }
+      if (ci) close(fd);
+    }
+  } else if (streq(cmd, "rm")) {
+    for (int i = 1; i < argc; i++)
+      if (unlink(argv[i]) < 0) { puts_(argv[i]); puts_(": not found\n"); st = 1; }
   } else if (streq(cmd, "ls")) {
     char *dir = arg ? arg : (getcwd(cwd, 256), cwd);
     long d = opendir(dir);
-    if (d < 0) { puts_(dir); puts_(": not found\n"); }
+    if (d < 0) { puts_(dir); puts_(": not found\n"); st = 1; }
     else {
       static char name[128];
       while (readdir(d, name, 128) > 0) { puts_(name); puts_("\n"); }
       closedir(d);
     }
   } else if (streq(cmd, "exit")) {
-    exit(0);
+    exit(argc > 1 ? (int)atoi_(argv[1]) : last_status);
   } else {
-    puts_(cmd); puts_(": not found\n");
+    puts_(cmd); puts_(": not found\n"); st = 127;
   }
+  return st;
+}
+
+/* Strip `< file`, `> file`, and `>> file` redirects out of the line, pointing in_fd/out_fd at the
+   targets (or the caller-supplied `def_in`/`def_out` when a stream is not explicitly redirected) for
+   the duration of the command, then restore stdio. An explicit redirect wins over the default — so a
+   pipe stage that also redirects behaves like bash. `def_in`/`def_out` fds are owned by the caller
+   and are not closed here. Multiple redirects on one line are honored (`wc < in > out`). */
+static int run_line_io(char *line, long def_in, long def_out) {
+  long ifd = def_in, ofd = def_out, ci = -1, co = -1;
+  int cmd_end = -1, i = 0, st = 1;
+  while (line[i]) {
+    char op = line[i];
+    if (op != '<' && op != '>') { i++; continue; }
+    if (cmd_end < 0) cmd_end = i;
+    line[i++] = 0;                       /* terminate the token to the left of the operator */
+    int append = 0;
+    if (op == '>' && line[i] == '>') { append = 1; i++; }
+    while (line[i] == ' ') i++;          /* skip spaces before the filename */
+    char *target = line + i;
+    while (line[i] && line[i] != ' ' && line[i] != '<' && line[i] != '>') i++;
+    char save = line[i]; line[i] = 0;    /* terminate the filename for open() */
+    if (op == '<') {
+      long fd = open(target, 0);         /* O_RDONLY */
+      if (fd < 0) { puts_(target); puts_(": not found\n"); goto done; }
+      ifd = fd; ci = fd;
+    } else {
+      long flags = append ? (O_WRONLY | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_TRUNC);
+      long fd = open(target, flags);
+      if (fd < 0) { puts_(target); puts_(": cannot open\n"); goto done; }
+      ofd = fd; co = fd;
+    }
+    line[i] = save;                      /* restore so scanning continues past the filename */
+    if (save == 0) break;
+  }
+  if (cmd_end >= 0) { int e = cmd_end; while (e > 0 && line[e - 1] == ' ') line[--e] = 0; }
+  in_fd = ifd; out_fd = ofd;
+  st = exec_line(line);
+done:
+  if (ci >= 0) close(ci);
+  if (co >= 0) close(co);
+  in_fd = 0; out_fd = 1;
+  return st;
+}
+
+/* A command with its own redirects but default stdin/stdout. */
+static int run_line(char *line) { return run_line_io(line, 0, 1); }
+
+/* Run a pipeline `A | B | C`: each stage's stdout is staged into a fresh memfs temp file that the
+   next stage reads as stdin. Not real concurrent processes — the playground has no fork yet — but it
+   reproduces pipeline *semantics* (each stage sees the previous stage's full output) end to end on
+   the personality's file surface. The exit status is the last stage's. A stage may still carry its
+   own `<`/`>` redirects, which override the pipe. Temp files are unlinked when the pipeline ends. */
+static int run_pipeline(char *seg) {
+  char *stages[8];
+  int ns = 0, i = 0, start = 0;
+  for (;;) {
+    char c = seg[i];
+    if (c == '|' && ns < 7) { seg[i] = 0; stages[ns++] = seg + start; start = i + 1; i++; }
+    else if (c == 0) { stages[ns++] = seg + start; break; }
+    else i++;
+  }
+  if (ns == 1) return run_line(stages[0]);
+  static char tmp[8];                    /* "/.pipeN" — one name per producing stage */
+  tmp[0] = '/'; tmp[1] = '.'; tmp[2] = 'p'; tmp[3] = 'i'; tmp[4] = 'p'; tmp[5] = 'e'; tmp[7] = 0;
+  long prev_in = 0;                      /* stage 0 reads real stdin */
+  int st = 0;
+  for (int s = 0; s < ns; s++) {
+    long def_out = 1, tmpfd = -1;
+    if (s + 1 < ns) {
+      tmp[6] = '0' + s;
+      tmpfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC);
+      def_out = tmpfd;
+    }
+    st = run_line_io(stages[s], prev_in, def_out);
+    if (tmpfd >= 0) close(tmpfd);
+    if (prev_in > 0) close(prev_in);     /* done reading the previous stage's temp */
+    if (s + 1 < ns) { tmp[6] = '0' + s; prev_in = open(tmp, 0); }   /* next stage reads it */
+  }
+  if (prev_in > 0) close(prev_in);
+  for (int s = 0; s + 1 < ns; s++) { tmp[6] = '0' + s; unlink(tmp); }
+  return st;
+}
+
+/* Run a list of commands joined by `;`, `&&`, `||`, short-circuiting on `last_status`: `&&` runs the
+   next segment only after success (0), `||` only after failure, `;` always. A skipped segment leaves
+   `last_status` unchanged so it propagates down a chain, matching bash. Returns the final status. */
+static int run_list(char *line) {
+  int i = 0, start = 0, skip = 0;
+  for (;;) {
+    char c = line[i];
+    int is_semi = c == ';';
+    int is_and = c == '&' && line[i + 1] == '&';
+    int is_or = c == '|' && line[i + 1] == '|';
+    if (c == 0 || is_semi || is_and || is_or) {
+      char save = c; line[i] = 0;
+      if (!skip) last_status = run_pipeline(line + start);
+      if (save == 0) break;
+      if (is_and) skip = last_status != 0;
+      else if (is_or) skip = last_status == 0;
+      else skip = 0;                     /* `;` starts a fresh short-circuit context */
+      i += is_semi ? 1 : 2;
+      start = i;
+    } else {
+      i++;
+    }
+  }
+  return last_status;
+}
+
+static char *ltrim(char *s) { while (*s == ' ') s++; return s; }
+/* Does `w` start with the whole word `kw` (followed by a space or end)? */
+static int kw_is(char *w, char *kw) {
+  int i = 0; while (kw[i]) { if (w[i] != kw[i]) return 0; i++; }
+  return w[i] == 0 || w[i] == ' ';
+}
+
+/* Single-line `if COND; then BODY…; [else BODY…;] fi`. Split on `;` into segments: the first holds
+   `if COND`, later ones begin with `then`/`else` (whose remainder is the first body command) or are
+   further body commands, ending at `fi`. Evaluate COND with run_list, then run the taken branch's
+   commands. Returns the branch's status (0 when no branch runs). */
+static int run_if(char *line) {
+  char *seg[32]; int ns = 0, i = 0, start = 0;
+  for (;;) {
+    char c = line[i];
+    if (c == ';' || c == 0) {
+      line[i] = 0;
+      if (ns < 32) seg[ns++] = line + start;
+      if (c == 0) break;
+      start = i + 1;
+    }
+    i++;
+  }
+  char *cond = ltrim(ltrim(seg[0]) + 2);   /* drop leading "if" */
+  char *thenb[16]; int nt = 0;
+  char *elseb[16]; int ne = 0;
+  int mode = 0;                            /* 1 = collecting then-body, 2 = else-body */
+  for (int s = 1; s < ns; s++) {
+    char *w = ltrim(seg[s]);
+    if (kw_is(w, "fi")) break;
+    if (kw_is(w, "then")) { mode = 1; char *b = ltrim(w + 4); if (b[0] && nt < 16) thenb[nt++] = b; }
+    else if (kw_is(w, "else")) { mode = 2; char *b = ltrim(w + 4); if (b[0] && ne < 16) elseb[ne++] = b; }
+    else if (mode == 1 && nt < 16) thenb[nt++] = w;
+    else if (mode == 2 && ne < 16) elseb[ne++] = w;
+  }
+  int rc = 0;
+  if (run_list(cond) == 0) { for (int k = 0; k < nt; k++) rc = run_list(thenb[k]); }
+  else { for (int k = 0; k < ne; k++) rc = run_list(elseb[k]); }
+  return rc;
+}
+
+/* Top-level line dispatch: an `if …` line runs the conditional construct, everything else is a
+   command list. */
+static int run_top(char *line) {
+  char *t = ltrim(line);
+  if (kw_is(t, "if")) return run_if(t);
+  return run_list(line);
 }
 
 int main(void) {
@@ -161,8 +689,7 @@ int main(void) {
   if (argc_() >= 3) {
     static char flag[8];
     if (getarg(1, flag, 8) > 0 && streq(flag, "-c") && getarg(2, cmd, 256) > 0) {
-      run_line(cmd);
-      return 0;
+      return run_top(cmd);
     }
   }
   /* Otherwise: a read-eval loop over stdin. */
@@ -177,7 +704,7 @@ int main(void) {
       if (n < 255) line[n++] = c;
     }
     line[n] = 0;
-    run_line(line);
+    last_status = run_top(line);
   }
 }
 "#;
@@ -299,4 +826,467 @@ fn stage0_shell_dash_c_runs_one_command() {
     );
     assert_eq!(iout, b"/home/user\n", "interp: sh -c ran the argv command");
     assert_eq!(jout, iout, "jit: sh -c output must match interp");
+}
+
+/// I/O redirection + `cat` end to end (S7 item 3): `echo … > f` opens/truncates a memfs file and
+/// writes there instead of stdout (so the redirected lines are absent from captured stdout); `>>`
+/// appends; `cat f` reads it back to stdout. Only the final `cat`s reach stdout, proving the
+/// `open`/`write`/`read`/`close` round-trip through the personality on both backends.
+#[test]
+fn stage0_shell_redirection_and_cat() {
+    let (iout, jout) = run_shell(
+        b"echo first > /out\n\
+          echo second >> /out\n\
+          cat /out\n\
+          echo only-stdout\n\
+          cat /missing\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"first\nsecond\nonly-stdout\n/missing: not found\n",
+        "interp: `>`/`>>` divert to the file; only the cats + bare echo hit stdout"
+    );
+    assert_eq!(jout, iout, "jit: redirection/cat output must match interp");
+}
+
+/// A truncating redirect (`>`) replaces the file's prior contents rather than appending: after two
+/// separate `>` writes, `cat` sees only the second. Confirms `O_TRUNC` on re-open.
+#[test]
+fn stage0_shell_redirect_truncates() {
+    let (iout, jout) = run_shell(
+        b"echo one > /f\n\
+          echo two > /f\n\
+          cat /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"two\n",
+        "interp: the second `>` truncated the first write"
+    );
+    assert_eq!(jout, iout, "jit: truncation output must match interp");
+}
+
+/// Input redirection (`<`) + `wc` (S7 item 3, cont.): write a two-line file, then `wc < /f` reads it
+/// through the redirected `in_fd` and reports `lines words bytes`; `cat < /f` streams the same file
+/// back to stdout. Proves `<` binds a file to the command's input and that arg-less `cat`/`wc`
+/// consume it. `wc` with an explicit path arg matches the redirected form.
+#[test]
+fn stage0_shell_input_redirection_and_wc() {
+    let (iout, jout) = run_shell(
+        b"echo hello world > /f\n\
+          echo again >> /f\n\
+          wc < /f\n\
+          wc /f\n\
+          cat < /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    // "hello world\nagain\n" = 2 lines, 3 words, 18 bytes.
+    assert_eq!(
+        iout, b"2 3 18\n2 3 18\nhello world\nagain\n",
+        "interp: `< /f` feeds wc/cat; path arg and redirect agree"
+    );
+    assert_eq!(
+        jout, iout,
+        "jit: input-redirection/wc output must match interp"
+    );
+}
+
+/// Both redirections at once: `wc < in > out` reads one file and writes the counts to another, so
+/// nothing reaches stdout; `cat out` then reveals the diverted result. Exercises the multi-redirect
+/// path in `run_line`.
+#[test]
+fn stage0_shell_input_and_output_redirection() {
+    let (iout, jout) = run_shell(
+        b"echo a b c > /in\n\
+          wc < /in > /out\n\
+          cat /out\n",
+        &[],
+        &[],
+        &[],
+    );
+    // "a b c\n" = 1 line, 3 words, 6 bytes; the wc line itself is diverted to /out.
+    assert_eq!(
+        iout, b"1 3 6\n",
+        "interp: wc's output went to /out, surfaced by cat"
+    );
+    assert_eq!(
+        jout, iout,
+        "jit: combined-redirection output must match interp"
+    );
+}
+
+/// `grep` over a redirected file: only lines containing the pattern survive. Exercises the argv
+/// tokenizer (pattern in argv[1], file via `<`) and line-buffered reading (`read_line`).
+#[test]
+fn stage0_shell_grep_filters_lines() {
+    let (iout, jout) = run_shell(
+        b"echo alpha > /f\n\
+          echo beta >> /f\n\
+          echo alps >> /f\n\
+          grep al < /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"alpha\nalps\n",
+        "interp: grep keeps lines containing `al`"
+    );
+    assert_eq!(jout, iout, "jit: grep output must match interp");
+}
+
+/// `grep -v` inverts the match and `grep -c` prints only the count. Both read the redirected file.
+#[test]
+fn stage0_shell_grep_flags() {
+    let (iout, jout) = run_shell(
+        b"echo alpha > /f\n\
+          echo beta >> /f\n\
+          echo alps >> /f\n\
+          grep -v al < /f\n\
+          grep -c al < /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    // -v al → lines without "al" → "beta"; -c al → count of matching lines → 2.
+    assert_eq!(
+        iout, b"beta\n2\n",
+        "interp: grep -v inverts, grep -c counts"
+    );
+    assert_eq!(jout, iout, "jit: grep-flags output must match interp");
+}
+
+/// `head -n N` / `tail -n N` with an explicit path argument select the first / last N lines of a
+/// six-line file. Exercises `-n` flag parsing (`atoi_`) and tail's ring buffer.
+#[test]
+fn stage0_shell_head_and_tail() {
+    let (iout, jout) = run_shell(
+        b"echo l1 > /f\n\
+          echo l2 >> /f\n\
+          echo l3 >> /f\n\
+          echo l4 >> /f\n\
+          echo l5 >> /f\n\
+          echo l6 >> /f\n\
+          head -n 2 /f\n\
+          tail -n 2 /f\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"l1\nl2\nl5\nl6\n",
+        "interp: head -n 2 → first two, tail -n 2 → last two"
+    );
+    assert_eq!(jout, iout, "jit: head/tail output must match interp");
+}
+
+/// `rm` removes a memfs file (`unlink`, op 8): after `rm /f`, `cat /f` reports not-found, and
+/// removing an absent file reports not-found too. Multi-arg `rm` deletes each argument.
+#[test]
+fn stage0_shell_rm_removes_files() {
+    let (iout, jout) = run_shell(
+        b"echo x > /a\n\
+          echo y > /b\n\
+          rm /a /b\n\
+          cat /a\n\
+          rm /gone\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"/a: not found\n/gone: not found\n",
+        "interp: rm unlinks; cat of a removed/absent file is not-found"
+    );
+    assert_eq!(jout, iout, "jit: rm output must match interp");
+}
+
+/// `echo` now joins multiple argv tokens with single spaces (argv tokenizer), collapsing the runs of
+/// spaces in the source line. A `$VAR` token still expands mid-line.
+#[test]
+fn stage0_shell_echo_joins_argv() {
+    let (iout, jout) = run_shell(
+        b"echo  a   b    c\n\
+          echo hi $WHO !\n",
+        &[("WHO", "bob")],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"a b c\nhi bob !\n",
+        "interp: argv tokens rejoin with single spaces; $WHO expands"
+    );
+    assert_eq!(jout, iout, "jit: echo-join output must match interp");
+}
+
+/// Exit status via `$?`: `true`/`false` set 0/1, an unknown command sets 127, `grep` with no match
+/// sets 1, and `echo $?` reports the previous command's status. Proves `exec_line` returns a status
+/// that `main` threads into `last_status`.
+#[test]
+fn stage0_shell_exit_status() {
+    let (iout, jout) = run_shell(
+        b"true\n\
+          echo $?\n\
+          false\n\
+          echo $?\n\
+          nope\n\
+          echo $?\n\
+          echo hit > /f\n\
+          grep zzz < /f\n\
+          echo $?\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"0\n1\nnope: not found\n127\n1\n",
+        "interp: $? tracks true/false/unknown/grep-miss"
+    );
+    assert_eq!(jout, iout, "jit: exit-status output must match interp");
+}
+
+/// `test` / `[ … ]`: string equality, numeric comparison, and file/dir predicates over the memfs.
+/// Each result is read back through `$?`.
+#[test]
+fn stage0_shell_test_builtin() {
+    let (iout, jout) = run_shell(
+        b"test a = a\n\
+          echo $?\n\
+          [ 3 -gt 5 ]\n\
+          echo $?\n\
+          echo hi > /f\n\
+          test -f /f\n\
+          echo $?\n\
+          test -d /nodir\n\
+          echo $?\n\
+          [ -n hello ]\n\
+          echo $?\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"0\n1\n0\n1\n0\n",
+        "interp: test string/numeric/-f/-d/-n predicates"
+    );
+    assert_eq!(jout, iout, "jit: test-builtin output must match interp");
+}
+
+/// Command sequencing: `;` runs unconditionally; `&&` runs the next only after success; `||` only
+/// after failure. Short-circuiting is driven by `$?` and threaded through `run_list`.
+#[test]
+fn stage0_shell_sequencing_and_short_circuit() {
+    let (iout, jout) = run_shell(
+        b"echo a ; echo b\n\
+          true && echo yes\n\
+          false && echo no\n\
+          false || echo fallback\n\
+          true || echo skip\n\
+          false && echo x || echo y\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"a\nb\nyes\nfallback\ny\n",
+        "interp: ; always, && on success, || on failure, with chaining"
+    );
+    assert_eq!(jout, iout, "jit: sequencing output must match interp");
+}
+
+/// Pipelines: a multi-stage `cat FILE | grep P | wc` streams each stage's full output into the next
+/// via memfs temps, and the final stage's result reaches stdout. Also checks a per-stage redirect
+/// inside a pipeline (`| grep P > out`) overrides the pipe. This is the shell's process-driven core
+/// (emulated in-process, no fork yet).
+#[test]
+fn stage0_shell_pipelines() {
+    let (iout, jout) = run_shell(
+        b"echo apple > /f\n\
+          echo apricot >> /f\n\
+          echo banana >> /f\n\
+          echo cherry >> /f\n\
+          cat /f | grep ap | wc\n\
+          cat /f | grep ap > /hits\n\
+          cat /hits\n",
+        &[],
+        &[],
+        &[],
+    );
+    // grep ap → "apple\napricot\n" (2 lines, 2 words, 14 bytes); the redirected pipeline writes the
+    // same two lines to /hits, surfaced by cat.
+    assert_eq!(
+        iout, b"2 2 14\napple\napricot\n",
+        "interp: pipeline stages chain; a stage redirect overrides the pipe"
+    );
+    assert_eq!(jout, iout, "jit: pipeline output must match interp");
+}
+
+/// A pipeline reading real (redirected) stdin at its head: `grep b < /f | wc -l`-style chain, here
+/// `cat < /f | tail -n 1` — the first stage consumes the `<` file, the last emits to stdout.
+#[test]
+fn stage0_shell_pipeline_from_stdin_redirect() {
+    let (iout, jout) = run_shell(
+        b"echo one > /f\n\
+          echo two >> /f\n\
+          echo three >> /f\n\
+          cat < /f | tail -n 1\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"three\n",
+        "interp: `<` feeds stage 0; tail -n 1 ends the pipe"
+    );
+    assert_eq!(
+        jout, iout,
+        "jit: pipeline-from-stdin output must match interp"
+    );
+}
+
+/// Shell variables: `NAME=VALUE` sets a shell var, `$NAME` (a whole token) expands it in any argument
+/// position (not just echo), a shell var shadows an environment var of the same name, and a `$NAME`
+/// RHS composes. An unset variable token expands to nothing (an empty line here).
+#[test]
+fn stage0_shell_variables() {
+    let (iout, jout) = run_shell(
+        b"X=hello\n\
+          echo $X world\n\
+          Y=$X\n\
+          echo $Y\n\
+          echo $UNSET\n\
+          echo $X > /vf\n\
+          cat /vf\n\
+          WHO=shellvar\n\
+          echo $WHO\n",
+        &[("WHO", "envvar")],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"hello world\nhello\n\nhello\nshellvar\n",
+        "interp: assignment, expansion everywhere, shadowing, unset->empty"
+    );
+    assert_eq!(jout, iout, "jit: variable output must match interp");
+}
+
+/// `export` promotes a shell variable into the personality environment (`setenv`). Both
+/// `export NAME=VALUE` and `export NAME` (of an existing shell var) make the value observable —
+/// expansion confirms it round-trips.
+#[test]
+fn stage0_shell_export_to_env() {
+    let (iout, jout) = run_shell(
+        b"export FOO=fooval\n\
+          echo $FOO\n\
+          BAR=barval\n\
+          export BAR\n\
+          echo $BAR\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"fooval\nbarval\n",
+        "interp: export NAME=VALUE and export NAME both reach env"
+    );
+    assert_eq!(jout, iout, "jit: export output must match interp");
+}
+
+/// `sort` and `uniq` as a pipeline: `cat f | sort | uniq` orders the lines and collapses adjacent
+/// duplicates — the canonical Unix idiom, here proving three-stage piping of real filters.
+#[test]
+fn stage0_shell_sort_uniq_pipeline() {
+    let (iout, jout) = run_shell(
+        b"echo banana > /f\n\
+          echo apple >> /f\n\
+          echo cherry >> /f\n\
+          echo apple >> /f\n\
+          echo banana >> /f\n\
+          cat /f | sort | uniq\n",
+        &[],
+        &[],
+        &[],
+    );
+    // sorted: apple, apple, banana, banana, cherry → uniq → apple, banana, cherry.
+    assert_eq!(
+        iout, b"apple\nbanana\ncherry\n",
+        "interp: sort orders, uniq collapses adjacent dups, over a 3-stage pipe"
+    );
+    assert_eq!(jout, iout, "jit: sort/uniq output must match interp");
+}
+
+/// Globbing: `*` expands against the memfs into sorted `dir/name` matches, feeding multi-file
+/// builtins (`echo`, `cat`, `rm`); a pattern with no match stays literal (nullglob-off). Exercises
+/// `fnmatch_` + `glob_expand` driving `opendir`/`readdir`.
+#[test]
+fn stage0_shell_globbing() {
+    let (iout, jout) = run_shell(
+        b"echo one > /a1\n\
+          echo two > /a2\n\
+          echo three > /b1\n\
+          echo /a*\n\
+          cat /a*\n\
+          echo /z*\n\
+          rm /a*\n\
+          cat /a1\n",
+        &[],
+        &[],
+        &[],
+    );
+    // `/a*` → /a1 /a2 (sorted); cat concatenates both; `/z*` has no match so stays literal; rm /a*
+    // removes both, so the final cat misses.
+    assert_eq!(
+        iout, b"/a1 /a2\none\ntwo\n/z*\n/a1: not found\n",
+        "interp: glob expands, feeds cat/rm, and is literal on no match"
+    );
+    assert_eq!(jout, iout, "jit: globbing output must match interp");
+}
+
+/// Single-line `if/then/else/fi`: the condition's exit status picks the branch, both the taken and
+/// not-taken branches behave, and multiple body commands run. Uses `test -f` over the memfs and a
+/// multi-command then-body.
+#[test]
+fn stage0_shell_if_then_else() {
+    let (iout, jout) = run_shell(
+        b"echo hi > /f\n\
+          if test -f /f; then echo present; echo again; else echo absent; fi\n\
+          if test -f /nope; then echo present; else echo absent; fi\n\
+          if false; then echo t; fi\n\
+          if true; then echo taken; fi\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        iout, b"present\nagain\nabsent\ntaken\n",
+        "interp: if picks the branch by $?, runs multi-command bodies, no-else is a no-op"
+    );
+    assert_eq!(jout, iout, "jit: if/then/else output must match interp");
+}
+
+/// `if` composes with the rest of the shell: the condition can be a pipeline (`grep` sets the status)
+/// and a body command can redirect. Proves `run_if` delegates each part back through `run_list`.
+#[test]
+fn stage0_shell_if_with_pipeline_condition() {
+    let (iout, jout) = run_shell(
+        b"echo apple > /f\n\
+          echo banana >> /f\n\
+          if cat /f | grep ban; then echo found > /r; else echo missing > /r; fi\n\
+          cat /r\n",
+        &[],
+        &[],
+        &[],
+    );
+    // grep prints its match (to stdout) and succeeds, so the then-branch writes "found" to /r.
+    assert_eq!(
+        iout, b"banana\nfound\n",
+        "interp: pipeline condition drives if; redirected body writes the result"
+    );
+    assert_eq!(jout, iout, "jit: if-with-pipeline output must match interp");
 }
