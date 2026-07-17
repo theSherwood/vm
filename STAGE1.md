@@ -48,12 +48,18 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 
 ## Slice plan
 
-1. **Spawn/wait spike** *(this slice)* — a differential (interp+JIT) test
-   proving the core: a parent seeds `argv` bytes into a child's carve,
-   `instantiate_module`s it, `join`s, and the child's return (a function of the
-   seeded bytes) is the parent's result — with the child's output also readable
-   from the shared carve. No shell yet; this de-risks the mechanism and pins the
-   ABI (`stage1_spawn_wait.rs`).
+1. **Spawn/wait spike** *(done — `stage1_spawn_wait.rs`)* — a differential
+   (interp+JIT) test proving the core: a parent seeds `argv` bytes into a child's
+   carve, `instantiate_module`s it, `join`s, and the child's return (a function
+   of the seeded bytes) is the parent's result — with the child's output also
+   readable from the shared carve. No shell yet; de-risks the mechanism.
+   - **argv[] vector ABI** *(done — `stage1_argv_vector.rs`)* — pins the real
+     `main(argc, argv)` marshalling: `argc` (i32), an `argv[]` pointer array, and
+     a string blob laid in the child's carve. An applet reads `argc`, follows
+     `argv[1]`'s pointer to its bytes, and echoes them to the granted stdout —
+     proving pointer-array *indirection* (the output tracks `argv[1]`, not a flat
+     read), status = `argc`, differential interp==JIT. This is the layout the
+     personality's `spawn` will lay down.
 2. **stdio-inherited child** *(done — `stage1_stdio_child.rs`)* — a same-module
    BusyBox-applet child inherits a granted `stdout` (`instantiate_named`, op 11)
    and echoes its parent-seeded `argv` to it: a real external `echo` — argv in,
