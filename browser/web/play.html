@@ -90,6 +90,13 @@
                   padding: 0.45rem 0.6rem; margin: 0; min-height: 1.2rem; max-height: 12rem; overflow: auto;
                   font: 0.8rem/1.5 ui-monospace, monospace; }
       .dbg-vars .bpname { color: var(--accent); }
+      /* Thread selector (multithreaded sessions): one chip per live vCPU; the focused one is filled, the
+         thread that hit the stop is marked ● in its label. */
+      .dbg-threads { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.45rem; }
+      .dbg-threads .thr { padding: 0.1rem 0.5rem; font-size: 0.72rem; border: 1px solid var(--border);
+                          border-radius: 999px; background: none; color: var(--muted); cursor: pointer; }
+      .dbg-threads .thr:hover { border-color: var(--accent); color: var(--fg); }
+      .dbg-threads .thr.sel { background: var(--accent); border-color: var(--accent); color: var(--bg); }
       /* Per-variable watchpoint (data breakpoint) toggle: a hollow ● that fills when armed; dimmed and
          non-interactive for a variable with no watchable window address (an SSA-promoted scalar). */
       .dbg-vars .wp { border: 0; background: none; cursor: pointer; padding: 0 0.3rem 0 0;

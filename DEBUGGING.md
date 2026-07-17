@@ -220,8 +220,17 @@ different things depending on which pair you compare:
   tree-walker `attach_scheduled` oracle (`crates/svm/tests/bytecode_debug_threads.rs`: a worker
   breakpoint fires once per spawned thread on distinct vCPUs, `select_task` inspects another thread
   mid-stop, single-step advances the stopped thread, and the determinate result matches all three
-  engines) and at the DAP level (`dap_over_bytecode_multithreaded_*`). *Next:* the playground panel's
-  thread selector (the browser consumer), then scheduled reverse + cross-thread watchpoints.
+  engines) and at the DAP level (`dap_over_bytecode_multithreaded_*`).
+
+  **The playground panel consumes it (slice 7, browser half).** `browser/web/play.js`'s Variables pane
+  grows a **thread selector** — one chip per live vCPU from DAP `threads`, the stopped thread marked ●
+  and focused by default; clicking another chip issues a per-thread `stackTrace` (`select_task`) and
+  re-renders its stack **without resuming**, while Step/Continue still drive the stopped thread. A new
+  demo card ("Debugger (SVM — threads)") spawns two workers that atomically bump a shared counter with a
+  breakpoint pre-placed in the worker, so Debug stops in each worker in turn. `browser-play-editor-
+  test.mjs` drives it in real Chromium (three thread chips, the stopped one selected + marked, focusing
+  another thread mid-stop, Continue past the first worker). *Next:* scheduled reverse (re-execute to a
+  global `turn`) + cross-thread watchpoints under the scheduler, then depth-aware step-over/out.
 
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
