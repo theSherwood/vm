@@ -177,12 +177,17 @@ different things depending on which pair you compare:
   controls (Chromium-verified: run forward to i=4, reverse back to i=5). A checkpoint ladder to bound
   the replay cost is a future optimization — the debugged programs here are small.
 
-  **Direction — the remaining gaps are all bytecode-engine work, never tree-walker delegation.** The
-  tree-walker is the differential oracle only; it is far too slow to sit on any user-facing path, so
-  watch/multithread must each be built *on the bytecode engine*:
-  - **Watchpoints** (`set_watchpoint`) — a per-op watched-range check in `DebugRun`'s single-op loop,
-    using the effective address the confinement-masking already computes; kept off the `run_fast`
-    hot path.
+  **Watchpoints landed on the bytecode engine (slice 5).** `DebugRun` gained a `set_watchpoints`
+  replace-API + a per-op check (`watch_hit_before`) that computes the op-about-to-run's effective
+  address via the interpreter's `access_of` and stops *before* an op that touches a watched range —
+  skipped entirely when none are armed. `BytecodeBackend` owns stable `WatchId`s (via the new
+  `WatchId::from_raw`) and re-applies the set after a `seek` rebuild; `run_until_stop` reports
+  `StopReason::Watchpoint`, and `supports_watch` is now `true`.
+  `dap_over_bytecode_watchpoint_matches_the_tree_walker` proves a write data breakpoint on `[0,8)`
+  stops the store on the same line, reason "data breakpoint", on both engines.
+
+  **Direction — the one remaining gap is bytecode-engine work, never tree-walker delegation.** The
+  tree-walker is the differential oracle only (far too slow for any user-facing path):
   - **Multithreading** (`threads`/`select_task`/`stopped_task`) — the largest: a deterministic
     cooperative multi-vCPU **debug scheduler** for the bytecode VM (fibers, controlled interleaving),
     distinct from the real-Web-Worker production mode. Wanted eventually; sequenced last.
