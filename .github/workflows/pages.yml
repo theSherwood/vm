@@ -27,6 +27,13 @@ permissions:
   pages: write
   id-token: write
 
+env:
+  # The Postgres the playground ships. One source of truth on purpose: it keys the build-input cache
+  # *and* is read by build-pg-assets.mjs. If those two ever disagree, a bump would hit the old
+  # version's cached bitcode + cluster, skip the rebuild, and ship the old Postgres — silently.
+  # Keep in step with the same var in ci.yml, which shares this cache key.
+  SVM_PG_VER: "17.5"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -40,8 +47,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
       # Three workspaces: `browser` (the wasm engine), the root (svm-run's `prep_svmb`/`build_image`),
-      # and the workspace-excluded `crates/svm-llvm` (`svm-llvm-translate`). The latter two are the
-      # Postgres regenerate half below — uncached, they cold-build in release on every run.
+      # and the workspace-excluded `crates/svm-llvm` (`svm-llvm-translate`). The latter two build the
+      # Postgres regenerate half below; caching them is what keeps a warm run's re-translate at ~30s
+      # instead of a release rebuild of the translator on every run.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -84,11 +92,11 @@ jobs:
           path: |
             /tmp/svm_pg_cache/postgres_shimmed.bc
             /tmp/svm_pg_cache/pgdata
-          key: pg-inputs-v1-17.5-${{ hashFiles('crates/svm-run/demos/postgres/**') }}
+          key: pg-inputs-v1-${{ env.SVM_PG_VER }}-${{ hashFiles('crates/svm-run/demos/postgres/**') }}
+      # SVM_PG_VER comes from the workflow env above — the same value that keyed the cache.
       - name: build + stage Postgres artifacts
         working-directory: browser
         env:
-          SVM_PG_VER: "17.5"
           SVM_PG_CACHE: /tmp/svm_pg_cache
         run: node build-pg-assets.mjs
 
