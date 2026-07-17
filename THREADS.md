@@ -2,8 +2,20 @@
 
 Tracks making SVM-in-wasm run with **real parallelism** (multiple OS threads / Web Workers over one
 shared memory), *without* losing the cooperative single-worker model we already have. Companion to
-`BROWSER.md` (the interpreter-as-wasm-guest port, which today runs concurrency cooperatively on one
-thread). Living doc: update the **Plan** tracker as work lands; fold into `DESIGN.md` once it closes.
+`BROWSER.md` (the interpreter-as-wasm-guest port, which ran concurrency cooperatively on one thread
+when this doc opened). Living doc: update the **Plan** tracker as work lands; fold into `DESIGN.md`
+once it closes.
+
+> **Plan complete; later threads work is tracked elsewhere.** Every item below is landed — both
+> modes live natively and across real Web Workers (spawn/join + futex + atomics, §22 JIT, §14
+> children, shared-`Host` I/O, the playground). Threads-touching work since then lives in its
+> owning docs: **per-Worker wasm-JIT tier-up** of the parallel driver's vCPUs
+> (`Vcpu::with_jit_eligible` → `VcpuEvent::TierUp`; `vcpu_tierup.rs`, `threads-spawn.mjs
+> SVM_TIERUP=1` → 4000 with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14
+> per-Worker codegen and the `VcpuReactor` frame loop over the resumable vCPU) in `BROWSER.md`;
+> `VcpuEvent::StdinPark` (exhausted interactive stdin parks a resumable vCPU instead of spinning)
+> in `BOOTSPEED.md`; the native-side futex extensions (canonical-key `FutexKey::{Anon,Region}`,
+> the cross-domain futex for async §14 children) in `PROCESS.md`.
 
 ---
 
@@ -334,8 +346,8 @@ property, so in practice:
     **9 Workers** (1 root + 8 spawned) → **4000**, and the futex kernel on **2 Workers** → **987654**,
     stable across repeats.
 
-  Remaining `4c-host` / `4c-domain` (`cap.call` under a shared `Host`; §14/§22 domain-mutating events) are
-  unchanged below — orthogonal to the threading model, each its own project.
+  The `4c-host` / `4c-domain` follow-ons this left open (`cap.call` under a shared `Host`; §14/§22
+  domain-mutating events) have since landed — see their checked entries above.
 
 ### Known wrinkles — all resolved in `4c-wasm`
 
