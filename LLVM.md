@@ -699,6 +699,22 @@ in `web/play.js`. Boot is milliseconds (no snapshot/restore, unlike Postgres). I
 (`jit`/`kind:'module'`); the in-browser wasm-JIT tier + a real-browser differential are the remaining
 verification (needs a browser env with GitHub egress to build the asset).
 
+**JS-language breadth — wide surface verified; BigInt is the one gap.** `demo_quickjs_breadth_vs_native`
+(`qjs_breadth.c`) runs **regex** (`libregexp`), **exceptions** (`try`/`catch`), **generators**,
+**`Map`/`Set`**, **closures**, **destructuring + spread**, **string methods**, **`JSON` round-trip**,
+**`Object`/`Array` higher-order methods**, **`Date`**, and **integer `Math`** — all byte-identical to
+native. The **one known gap is BigInt** (`libbf` miscompiled — `(7n).toString()` is wrong, `6n*7n`
+hangs); the common primitives it uses (`clz`/`ctz`/shifts/128-bit multiply) are individually verified
+correct, so it's a subtler `libbf` pattern — **ISSUES.md I25**, a dedicated slice (not blocking the
+playground, which doesn't use BigInt). *Caveat for local runs:* the spike libm shim's stub `fmod`/`sin`/…
+contaminate any path that calls them (e.g. `-7 % 3` → `fmod`); the committed demos avoid libm calls or
+link real openlibm, so CI is clean.
+
+**wasm-JIT tier (browser).** QuickJS's `JS_CallInternal` is a giant hot function — like Lua's
+`luaV_execute` / SQLite's `sqlite3VdbeExec`, `wasmi`'s register allocator rejects it, but V8 (the real
+browser) emits it. So the wasm-JIT tier is verified in the browser (`browser-jit-module-test.mjs`), not
+the native `wasmi` harness — pending a browser env + the openlibm-linked asset.
+
 **Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
 (c) ~~`select` of aggregates~~ **done**; (d) ~~`llvm.round`~~ **done** → ★ **the eval RUNS byte-identical
 to native**; (e) ~~`qjs_repl.c` + playground wiring~~ **done** (`.svmb` asset + `web/play.js` entry;
