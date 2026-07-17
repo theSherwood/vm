@@ -16670,6 +16670,35 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
     }
 
+    // `select` between two **aggregate** values (a small by-value struct — e.g. QuickJS selecting
+    // between two 16-byte `JSValue`s: `select i1 %c, {i64,i64} %a, {i64,i64} %b`). Lower field-wise —
+    // one scalar `Select` per field over the shared condition — and record the result in the `agg`
+    // table. Runs after `lower_i128`/`lower_mask`, so i128 and `<N x i1>`-mask selects are already
+    // handled; only true when the operands are struct aggregates (`agg_fields` is `None` for a scalar,
+    // which falls through to the scalar `Select` arm that would otherwise `ctx.operand` the struct and
+    // fail with "value … not available in block").
+    if let I::Select(x) = instr {
+        if let Some(a) = ctx.agg_fields(&x.true_value) {
+            let a = a?;
+            let b = ctx.agg_fields(&x.false_value).ok_or_else(|| {
+                Error::Unsupported("select: aggregate/scalar operand mismatch".into())
+            })??;
+            if a.len() != b.len() {
+                return unsup("select: mismatched aggregate field counts");
+            }
+            let cond = ctx.operand(&x.condition)?;
+            let fields: Vec<ValIdx> = a
+                .iter()
+                .zip(&b)
+                .map(|(&av, &bv)| ctx.push(Inst::Select { cond, a: av, b: bv }))
+                .collect();
+            if let Some(&vid) = ctx.s.name2id.get(&x.dest) {
+                ctx.agg.insert(vid, fields);
+            }
+            return Ok(());
+        }
+    }
+
     // No-result instructions (effects only): handle and return early.
     if let I::Store(st) = instr {
         // A `store atomic` (seq-cst): a native `iN.atomic.store` for i32/i64, or the narrow path for

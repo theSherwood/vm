@@ -5913,6 +5913,48 @@ fn frameaddress_is_downward_stack_proxy() {
 }
 
 #[test]
+fn select_of_aggregate() {
+    // A `select` between two **aggregate** values — `select i1 %c, {i64,i64} %a, {i64,i64} %b` — is how
+    // QuickJS picks between two 16-byte `JSValue`s (blocked `js_array_iterator_next`). Aggregates live
+    // field-wise in the `agg` side-table, so the scalar `select` arm `ctx.operand`ed them and failed
+    // ("value not available in block"); the aggregate arm now lowers one scalar `Select` per field. The
+    // result crosses a block edge (`entry` → `next`), so this also exercises the `agg_layout` cross-block
+    // fan-out (`block_params`/`branch_args`). `@truth` returns 1 → the `{10,20}` operand wins; 10+20=30.
+    let ll = "define i64 @main() {\n\
+        entry:\n  \
+        %a0 = insertvalue {i64, i64} undef, i64 10, 0\n  \
+        %a = insertvalue {i64, i64} %a0, i64 20, 1\n  \
+        %b0 = insertvalue {i64, i64} undef, i64 30, 0\n  \
+        %b = insertvalue {i64, i64} %b0, i64 40, 1\n  \
+        %c = call i1 @truth()\n  \
+        %s = select i1 %c, {i64, i64} %a, {i64, i64} %b\n  \
+        br label %next\n\
+        next:\n  \
+        %f0 = extractvalue {i64, i64} %s, 0\n  \
+        %f1 = extractvalue {i64, i64} %s, 1\n  \
+        %r = add i64 %f0, %f1\n  \
+        ret i64 %r\n}\n\
+        define i1 @truth() {\n\
+        entry:\n  \
+        ret i1 1\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate select-aggregate .ll");
+    svm_verify::verify_module(&t.module).expect("verify select-aggregate");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run select-aggregate");
+    assert_eq!(
+        r,
+        vec![Value::I64(30)],
+        "select picks {{10,20}} (cond true), crossing a block edge: 10+20 = 30"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0], 30, "JIT select-aggregate = 30"),
+        other => panic!("JIT select-aggregate: unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn vector_shift_per_lane_amount() {
     // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
     // Postgres' `simd.h`). svm-ir's `VShift` takes one scalar count for all lanes, so the on-ramp

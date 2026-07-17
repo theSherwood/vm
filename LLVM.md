@@ -648,11 +648,20 @@ depth; the large base cancels out of the check's arithmetic, leaving "overflow w
 since `JS_UpdateStackTop` exceeds `stack_size`"). The result is only compared, never dereferenced; level
 > 0 (parent-frame unwinders) fails closed. Test `frameaddress_is_downward_stack_proxy` (interp == JIT).
 
-**Blocking gap now — SSA value liveness (`js_array_iterator_next`).** Past the whole stack-check surface,
-the translator fail-closes with `value … not available in block` — a value used in a block where the
-block-argument / liveness pass didn't thread it (a cross-block SSA case the on-ramp's block-local
-conversion doesn't yet cover). A translator slice on the liveness/`block_params` path, unrelated to the
-call ABI.
+**`select` of aggregates — DONE.** Past the stack-check surface the translator fail-closed in
+`js_array_iterator_next` with `value not available in block`: a `select i1 %c, {i64,i64} %a, {i64,i64} %b`
+choosing between two 16-byte `JSValue`s. Aggregates live field-wise in the `agg` side-table, so the
+scalar `select` arm `ctx.operand`ed the struct and missed. Now lowered field-wise (one scalar `Select`
+per field, over the shared condition, recorded in `agg`); the result crosses block edges via the
+type-classified `agg_layout` fan-out already in the scan. Test `select_of_aggregate` (interp == JIT,
+result crossing a block edge). The libc surface it exposed was filled in `demos/quickjs/libc_shim.c`
+(`strcat`; deterministic `gettimeofday`/`clock_gettime`/`localtime_r`; single-threaded `pthread_*` /
+`pthread_cond_*` no-op stubs for `Atomics.wait`).
+
+**Blocking gap now — `llvm.round.f64`.** `JS_ComputeMemoryUsage` calls C `round()` (round half *away
+from zero*), which lowers to `llvm.round` — distinct from `llvm.roundeven` (half to even) that the
+on-ramp does handle, and with no direct SVM op. A correct lowering (`trunc(x + copysign(0.5, x))` has a
+double-rounding bug at the `0.5⁻` boundary) or a bundled guest `round` is its own small slice.
 
 **Semantic follow-up — directed-rounding dtoa.** QuickJS's shortest Number→string (`js_ecvt1`) toggles
 `FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are round-to-nearest only (no rounding-mode op);
@@ -660,12 +669,13 @@ call ABI.
 `String(0.1)` needs a rounding-mode primitive or a directed-rounding-free guest dtoa.
 
 **Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
-(c) **SSA value-liveness** (the current wall — `value not available in block`) → the module translates;
-(d) widen the JS program past `toFixed` + the directed-rounding dtoa follow-up; (e) regex / BigInt /
-`try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH
-dependency); (f) the `run-test262.c` harness over an embedded slice — the self-validating suite,
+(c) ~~`select` of aggregates~~ **done**; (d) **`llvm.round`** (the current wall) → the module translates
+(then whatever running the eval surfaces); (e) widen the JS program past `toFixed` + the directed-rounding
+dtoa follow-up; (f) regex / BigInt / `try`/`catch` (JS exceptions ride QuickJS's own bytecode, not host
+unwinding, so likely no EH dependency); (g) the `run-test262.c` harness over an embedded slice — the
+self-validating suite,
 QuickJS's analog of SQLite's sqllogictest. Harness: `demo_quickjs_eval_vs_native` (`#[ignore]`d, now at
-the liveness wall).
+the `llvm.round` wall).
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

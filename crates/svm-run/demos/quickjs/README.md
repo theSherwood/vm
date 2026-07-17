@@ -71,10 +71,18 @@ lowers to the downward proxy `FRAME_ADDR_BASE - sp` (decreases with depth; the
 base cancels out of the check's arithmetic). Test
 `frameaddress_is_downward_stack_proxy` (interp == JIT).
 
-**NEXT (blocking) — SSA value liveness.** Past the stack-check surface, the
-translator fail-closes in `js_array_iterator_next` with `value not available in
-block` — a value used in a block the block-argument/liveness pass didn't thread
-it into. A translator slice on the liveness / `block_params` path.
+**DONE — `select` of aggregates.** `js_array_iterator_next` does
+`select i1 %c, {i64,i64} %a, {i64,i64} %b` (choosing between two `JSValue`s);
+now lowered field-wise into the `agg` side-table (test `select_of_aggregate`,
+interp == JIT). The libc surface it exposed is in `libc_shim.c`: `strcat`;
+deterministic `gettimeofday`/`clock_gettime`/`localtime_r`; single-threaded
+`pthread_*` no-op stubs (for `Atomics.wait`).
+
+**NEXT (blocking) — `llvm.round`.** `JS_ComputeMemoryUsage` calls C `round()`
+(ties away from zero) → `llvm.round.f64`, which the on-ramp doesn't lower (it's
+distinct from `llvm.roundeven`, and `trunc(x + copysign(0.5,x))` double-rounds at
+the `0.5⁻` boundary). A correct lowering or a bundled guest `round` — its own
+slice.
 
 **NEXT (semantic) — directed-rounding dtoa.** QuickJS's shortest Number→string
 (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` to find the shortest round-trip

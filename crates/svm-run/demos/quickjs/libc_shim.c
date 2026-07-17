@@ -54,6 +54,101 @@ long strtol(const char *s, char **end, int base) {
 }
 long __isoc23_strtol(const char *s, char **end, int base) { return strtol(s, end, base); }
 
+/* --- string ops the on-ramp does not synthesize --------------------------------------------------
+ * (it already provides strlen/strcpy/strcmp/strncmp/strchr/strrchr/strspn/strcspn/memchr/bcmp). */
+char *strcat(char *dst, const char *src) {
+    char *d = dst;
+    while (*d) d++;
+    while ((*d++ = *src++)) {
+    }
+    return dst;
+}
+
+/* --- time: deterministic stubs (fixed epoch) --------------------------------------------------
+ * QuickJS's Date / timing reads the wall clock; a differential-vs-native demo must be deterministic
+ * (like SQLite's fixed-clock OS_OTHER VFS), and the driver's output does not depend on the time. A
+ * real clock would need a host time capability. struct layouts match the x86-64 Linux ABI. */
+struct __shim_timeval {
+    long tv_sec;
+    long tv_usec;
+};
+struct __shim_timespec {
+    long tv_sec;
+    long tv_nsec;
+};
+int gettimeofday(struct __shim_timeval *tv, void *tz) {
+    (void)tz;
+    if (tv) {
+        tv->tv_sec = 0;
+        tv->tv_usec = 0;
+    }
+    return 0;
+}
+int clock_gettime(int clk, struct __shim_timespec *ts) {
+    (void)clk;
+    if (ts) {
+        ts->tv_sec = 0;
+        ts->tv_nsec = 0;
+    }
+    return 0;
+}
+struct __shim_tm {
+    int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst;
+    long tm_gmtoff;
+    const char *tm_zone;
+};
+struct __shim_tm *localtime_r(const long *t, struct __shim_tm *out) {
+    (void)t;
+    if (out) {
+        out->tm_sec = out->tm_min = out->tm_hour = 0;
+        out->tm_mday = 1; /* the epoch: 1970-01-01 00:00:00 UTC, Thursday */
+        out->tm_mon = 0;
+        out->tm_year = 70;
+        out->tm_wday = 4;
+        out->tm_yday = 0;
+        out->tm_isdst = 0;
+        out->tm_gmtoff = 0;
+        out->tm_zone = 0;
+    }
+    return out;
+}
+
+/* --- pthreads: single-threaded no-op stubs -----------------------------------------------------
+ * Referenced by QuickJS's Atomics.wait/notify (js_atomics_*), which a single-threaded eval never
+ * exercises; the symbols must exist for translation. A single guest vCPU means no contention. */
+int pthread_mutex_lock(void *m) {
+    (void)m;
+    return 0;
+}
+int pthread_mutex_unlock(void *m) {
+    (void)m;
+    return 0;
+}
+int pthread_cond_init(void *c, void *a) {
+    (void)c;
+    (void)a;
+    return 0;
+}
+int pthread_cond_destroy(void *c) {
+    (void)c;
+    return 0;
+}
+int pthread_cond_signal(void *c) {
+    (void)c;
+    return 0;
+}
+int pthread_cond_wait(void *c, void *m) {
+    (void)c;
+    (void)m;
+    return 0;
+}
+int pthread_cond_timedwait(void *c, void *m, const void *t) {
+    (void)c;
+    (void)m;
+    (void)t;
+    return 0;
+}
+
 /* --- misc ------------------------------------------------------------------------------------- */
 void abort(void) {
     exit(134); /* 128 + SIGABRT */
