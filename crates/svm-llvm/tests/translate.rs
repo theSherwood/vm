@@ -5856,8 +5856,13 @@ fn struct_constant_return() {
     svm_verify::verify_module(&t.module).expect("verify struct-const-return");
     let full = vec![Value::I64(t.entry_sp as i64)];
     let mut fuel = 1_000_000u64;
-    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run struct-const-return");
-    assert_eq!(r, vec![Value::I32(6)], "JS_EXCEPTION-shaped {{0,6}}, field 1 = 6");
+    let r =
+        svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run struct-const-return");
+    assert_eq!(
+        r,
+        vec![Value::I32(6)],
+        "JS_EXCEPTION-shaped {{0,6}}, field 1 = 6"
+    );
 }
 
 #[test]
