@@ -11,8 +11,10 @@
 //! Scope note: we mirror only the **subset the on-ramp consumes**. Where `llvm-ir` carries extra
 //! fields the translator never reads (instruction `nuw`/`nsw`/`exact` flags, calling conventions,
 //! call/parameter attributes), we omit them — the translator's `..`/named-field matches don't need
-//! them and dropping them keeps us free of `llvm-ir`'s attribute/CC types. The pin is **LLVM 18**, so
-//! the LLVM-18 shape is what we model (opaque pointers; explicit `loaded_ty`/`function_ty`).
+//! them and dropping them keeps us free of `llvm-ir`'s attribute/CC types. We model the **opaque-pointer
+//! LLVM shape** (LLVM 15+: opaque pointers, explicit `loaded_ty`/`function_ty`); the textual reader is
+//! **version-tolerant** across producers (validated on LLVM 18 through 22 — unknown function/param
+//! attributes are inert for the subset we translate), so there is no fixed LLVM-version pin (I24).
 
 use std::collections::HashMap;
 use std::sync::Arc;

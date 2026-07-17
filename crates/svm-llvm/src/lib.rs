@@ -340,10 +340,42 @@ fn extern_stub_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<svm_ir::Fu
     Ok(svm_ir::FuncType { params, results })
 }
 
-/// Translate a legalized LLVM bitcode file (`*.bc`). Needs `llvm-dis` on `PATH` (the bitcode is
-/// disassembled to text and read by the in-house `.ll` reader); a disassembly failure is an
-/// [`Error::Parse`]. A `-g` build feeds both §6 debug-info halves from the same text: per-instruction
-/// `!DILocation` source lines and the structured `!DILocalVariable`/DI-type graph ([`ll::debug`]).
+/// The `llvm-dis` to shell for [`translate_bc_path`]. A newer `llvm-dis` reads **older** bitcode too
+/// (LLVM's bitcode reader is backward-compatible), so preferring the highest version on `PATH` lets
+/// the on-ramp consume bitcode from any producer up to that LLVM — lifting the implicit LLVM-18 pin
+/// (I24). The `.ll` **text** path ([`translate_ll_path`]) is already version-tolerant (our in-house
+/// reader), so a modern producer can skip `llvm-dis` entirely by emitting `-emit-llvm -S` / `--emit=
+/// llvm-ir`; this only matters for a `.bc` input. An explicit `SVM_LLVM_DIS` wins (pinning/testing).
+/// Probed once and cached.
+fn best_llvm_dis() -> &'static str {
+    use std::sync::OnceLock;
+    static DIS: OnceLock<String> = OnceLock::new();
+    DIS.get_or_init(|| {
+        if let Ok(p) = std::env::var("SVM_LLVM_DIS") {
+            return p;
+        }
+        // Newest first; a versioned binary that answers `--version` is present and usable.
+        for v in (18..=30).rev() {
+            let name = format!("llvm-dis-{v}");
+            let ok = std::process::Command::new(&name)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return name;
+            }
+        }
+        "llvm-dis".to_string()
+    })
+}
+
+/// Translate a legalized LLVM bitcode file (`*.bc`). Shells the newest `llvm-dis` on `PATH`
+/// ([`best_llvm_dis`]) to disassemble to text, then reads it with the in-house version-tolerant `.ll`
+/// reader; a disassembly failure is an [`Error::Parse`]. Prefer [`translate_ll_path`] on a `.ll` text
+/// input (no `llvm-dis`, no version coupling). A `-g` build feeds both §6 debug-info halves from the
+/// same text: per-instruction `!DILocation` source lines and the structured
+/// `!DILocalVariable`/DI-type graph ([`ll::debug`]).
 pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     translate_bc_path_with_options(path, TranslateOptions::default())
 }
@@ -359,7 +391,7 @@ pub fn translate_bc_path_with_options(
     // Disassemble the bitcode to textual `.ll` out-of-process (`llvm-dis`, an ordinary build-time tool
     // like `clang` — §Q2's out-of-process decision) and route through the in-house textual reader. No
     // libLLVM is linked into this crate; full-width `i128` and version-tolerance come for free.
-    let out = std::process::Command::new("llvm-dis")
+    let out = std::process::Command::new(best_llvm_dis())
         .arg(path)
         .arg("-o")
         .arg("-")
