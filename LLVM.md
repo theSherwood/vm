@@ -682,23 +682,28 @@ computed-goto dispatch, BigInt (`libbf`), regex, Unicode — runs on the SVM und
 ambient authority. Harness `demo_quickjs_eval_vs_native` (green; `#[ignore]`d only for wall-clock — a
 whole JS engine on the tree-walker takes tens of seconds).
 
-**Remaining to a *playground* REPL** (not the curated demo): (1) **directed-rounding dtoa** — a REPL
-user typing `0.1+0.2` hits QuickJS's shortest Number→string (`js_ecvt1`, `FE_DOWNWARD`/`FE_UPWARD`),
-which the round-to-nearest-only SVM can't honor (`toFixed` — used by the demo — is fine); (2) a
-`qjs_repl.c` stdin driver + `browser/build-onramp-assets.mjs` wiring (the SQLite-REPL pattern). Boot is
-milliseconds (no snapshot/restore needed, unlike Postgres).
+**Shortest Number→string works — the directed-rounding concern was a false alarm.** A REPL user typing
+`0.1+0.2` hits QuickJS's shortest Number→string (`js_ecvt1`), which toggles `FE_DOWNWARD`/`FE_UPWARD`
+around a `snprintf("%e")`. That `%e` is *our* correctly-rounded bignum dtoa (`__vm_fmt_sci`), which
+ignores `fesetround` and always rounds to nearest — **and QuickJS's shortest search still converges to
+the right digits**. Verified guest == native on `0.1+0.2` → `0.30000000000000004`, `1/3`, `String(0.1)`,
+`1e21`, `Math.PI`, `123456789.123456789`, … So no rounding-mode primitive is needed for general JS float
+printing after all.
 
-**Semantic follow-up — directed-rounding dtoa.** QuickJS's shortest Number→string (`js_ecvt1`) toggles
-`FE_DOWNWARD`/`FE_UPWARD`, but SVM float ops are round-to-nearest only (no rounding-mode op);
-`toFixed`/`toPrecision` use `FE_TONEAREST` (honored), so the current driver is unaffected, but general
-`String(0.1)` needs a rounding-mode primitive or a directed-rounding-free guest dtoa.
+**Playground REPL — DONE (the build/wiring; a real-browser run is the only unverified step).** A
+`qjs_repl.c` stdin driver (reads JS from the `Stream` cap, evaluates it, prints `print`/`console.log`
+output + the completion value) runs **byte-identical to native** (`demo_quickjs_repl_stdin`). Wired into
+`browser/build-onramp-assets.mjs` (fetch QuickJS + openlibm, compile the engine + shims, `llvm-link -S`,
+translate at `--host-page 65536` → `qjs_repl.svmb`, ~4.3 MB) and registered as a **playground example**
+in `web/play.js`. Boot is milliseconds (no snapshot/restore, unlike Postgres). Interp tier only for now
+(`jit`/`kind:'module'`); the in-browser wasm-JIT tier + a real-browser differential are the remaining
+verification (needs a browser env with GitHub egress to build the asset).
 
 **Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
-(c) ~~`select` of aggregates~~ **done**; (d) ~~`llvm.round`~~ **done** → ★ **the curated eval RUNS
-byte-identical to native**; (e) widen the JS program past `toFixed` + the directed-rounding dtoa
-follow-up (needed once a REPL takes arbitrary `Number→string`); (f) regex / BigInt / `try`/`catch` (JS
-exceptions ride QuickJS's own bytecode, not host unwinding, so likely no EH dependency); (g) a
-`qjs_repl.c` stdin driver + `browser/build-onramp-assets.mjs` wiring → the **playground** tab; (h) the
+(c) ~~`select` of aggregates~~ **done**; (d) ~~`llvm.round`~~ **done** → ★ **the eval RUNS byte-identical
+to native**; (e) ~~`qjs_repl.c` + playground wiring~~ **done** (`.svmb` asset + `web/play.js` entry;
+shortest-float printing confirmed working — no dtoa slice needed); (f) real-browser verification of the
+playground tab + the wasm-JIT tier (for speed); (g) regex / BigInt / `try`/`catch` breadth; (h) the
 `run-test262.c` harness over an embedded slice — the self-validating suite, QuickJS's analog of SQLite's
 sqllogictest.
 

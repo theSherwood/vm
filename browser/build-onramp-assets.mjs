@@ -132,6 +132,83 @@ if (ensureAmalgamation()) {
   console.log('  – sqlite_repl skipped (amalgamation fetch failed — offline?)');
 }
 
+// 2b) QuickJS (interactive) — Bellard's QuickJS 2024-01-13 with a driver (`qjs_repl.c`) that reads a
+//     JS program from **stdin**, evaluates it (print/console.log + the completion value), and prints.
+//     Multi-TU, mirroring the `demo_quickjs_eval_vs_native` test: the engine + a guest libm (openlibm,
+//     for the address-taken Math functions) + the reused printf/strtod/libc shims, `llvm-link`ed into
+//     one `.ll`, then translated. Fetched-and-cached (QuickJS from bellard.org, openlibm from GitHub);
+//     skipped offline.
+const QJS_VER = '2024-01-13';
+const QJS_CACHE = '/tmp/svm_quickjs_cache';
+const QJS_DIR = join(QJS_CACHE, `quickjs-${QJS_VER}`);
+const OL_VER = '0.8.5';
+const OL_CACHE = '/tmp/svm_openlibm_cache';
+const OL_DIR = join(OL_CACHE, `openlibm-${OL_VER}`);
+// The openlibm double set QuickJS's `Math` object takes the address of (kept in sync with the
+// svm-llvm test's OPENLIBM_SRCS + QUICKJS_OPENLIBM_EXTRA).
+const OPENLIBM_SRCS = [
+  'e_log', 'e_log10', 'e_log2', 'e_exp', 's_exp2', 'e_pow', 's_sin', 's_cos', 's_tan',
+  'k_sin', 'k_cos', 'k_tan', 'e_rem_pio2', 'k_rem_pio2', 'e_asin', 'e_acos', 's_atan',
+  'e_atan2', 'e_sinh', 'e_cosh', 's_tanh', 's_cbrt', 'e_fmod', 's_scalbn', 's_copysign',
+  's_fabs', 'k_exp', 's_expm1', 's_asinh', 'e_acosh', 'e_atanh', 's_log1p', 'e_hypot',
+];
+function ensureQuickJS() {
+  if (existsSync(join(QJS_DIR, 'quickjs.c'))) return true;
+  mkdirSync(QJS_CACHE, { recursive: true });
+  try {
+    const tar = join(QJS_CACHE, `quickjs-${QJS_VER}.tar.xz`);
+    execFileSync('curl', ['-sfL', '--max-time', '120', '-o', tar,
+      `https://bellard.org/quickjs/quickjs-${QJS_VER}.tar.xz`], { stdio: 'inherit' });
+    execFileSync('tar', ['xf', tar, '-C', QJS_CACHE], { stdio: 'inherit' });
+    return existsSync(join(QJS_DIR, 'quickjs.c'));
+  } catch { return false; }
+}
+function ensureOpenlibm() {
+  if (existsSync(join(OL_DIR, 'src', 'e_log.c'))) return true;
+  mkdirSync(OL_CACHE, { recursive: true });
+  try {
+    const tgz = join(OL_CACHE, 'openlibm.tar.gz');
+    execFileSync('curl', ['-sfL', '--max-time', '120', '-o', tgz,
+      `https://github.com/JuliaMath/openlibm/archive/refs/tags/v${OL_VER}.tar.gz`], { stdio: 'inherit' });
+    execFileSync('tar', ['xf', tgz, '-C', OL_CACHE], { stdio: 'inherit' });
+    return existsSync(join(OL_DIR, 'src', 'e_log.c'));
+  } catch { return false; }
+}
+function buildQuickJS() {
+  const svmb = join(ASSETS, 'qjs_repl.svmb');
+  const demos = join(REPO, 'crates', 'svm-run', 'demos');
+  const cflags = ['-O2', '-emit-llvm', '-S', '-c', '-fno-vectorize', '-fno-slp-vectorize',
+    '-DNDEBUG', '-D_GNU_SOURCE', `-DCONFIG_VERSION="${QJS_VER}"`, '-DASSEMBLER=0'];
+  const incs = [QJS_DIR, OL_DIR, join(OL_DIR, 'include'), join(OL_DIR, 'src'), join(OL_DIR, 'amd64')]
+    .map((i) => `-I${i}`);
+  const lls = [];
+  const cc = (src, tag) => {
+    const out = join(ASSETS, `qjs_${tag}.ll`);
+    execFileSync('clang', [...cflags, ...incs, src, '-o', out], { stdio: 'inherit' });
+    lls.push(out);
+  };
+  for (const tu of ['quickjs', 'libregexp', 'libunicode', 'cutils', 'libbf']) cc(join(QJS_DIR, `${tu}.c`), tu);
+  cc(join(demos, 'quickjs', 'qjs_repl.c'), 'repl');
+  cc(join(demos, 'postgres', 'printf_shim.c'), 'printf_shim');
+  cc(join(demos, 'strtod', 'strtod.c'), 'strtod');
+  cc(join(demos, 'quickjs', 'libc_shim.c'), 'libc_shim');
+  for (const s of OPENLIBM_SRCS) cc(join(OL_DIR, 'src', `${s}.c`), s);
+  const linked = join(ASSETS, 'qjs_repl_linked.ll');
+  execFileSync('llvm-link', ['-S', ...lls, '-o', linked], { stdio: 'inherit' });
+  execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
+  console.log(`  ✓ qjs_repl.svmb (${size} B)`);
+}
+if (ensureQuickJS() && ensureOpenlibm()) {
+  try {
+    buildQuickJS();
+  } catch (e) {
+    console.log(`  ✗ qjs_repl: ${e.message}`);
+  }
+} else {
+  console.log('  – qjs_repl skipped (quickjs/openlibm fetch failed — offline?)');
+}
+
 // 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math/coroutine/io/os libraries + a guest
 //    snprintf, with a harness that reads a Lua chunk from **stdin** and runs it. The page pipes the
 //    editor's text in as stdin, so the user writes and runs their own Lua. io.write/os.date/coroutine

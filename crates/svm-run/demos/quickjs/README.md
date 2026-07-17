@@ -95,12 +95,26 @@ executes** the driver, with stdout byte-identical to the native `cc` build:
 JS engine on the tree-walking interpreter takes tens of seconds; the JIT/wasm tier
 is much faster).
 
-**Toward a playground REPL** (beyond this curated demo): (1) **directed-rounding
-dtoa** — a REPL user typing `0.1+0.2` hits QuickJS's shortest `Number→string`
-(`FE_DOWNWARD`/`FE_UPWARD`), which the round-to-nearest-only SVM can't yet honor
-(`toFixed`, used here, is fine); (2) a `qjs_repl.c` stdin driver +
-`browser/build-onramp-assets.mjs` wiring (the SQLite-REPL pattern). Boot is
-milliseconds — no snapshot/restore needed.
+## Playground REPL — `qjs_repl.c`
+
+`qjs_repl.c` reads a JS program from **stdin** (the `Stream` capability),
+evaluates it, and prints `print`/`console.log` output plus the completion value
+— a full JS REPL in the sandbox. Runs **byte-identical to native**
+(`demo_quickjs_repl_stdin`), including shortest float printing: `0.1+0.2` →
+`0.30000000000000004`, `Math.PI` → `3.141592653589793`, etc.
+
+The **directed-rounding dtoa concern turned out to be a false alarm**: QuickJS's
+shortest `Number→string` (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` around a
+`snprintf("%e")` that, here, is the correctly-rounded bignum dtoa (`__vm_fmt_sci`)
+— it ignores `fesetround` and always rounds to nearest, yet QuickJS's shortest
+search still converges to the right digits. No rounding-mode primitive needed.
+
+Wired into the browser playground: `browser/build-onramp-assets.mjs` fetches
+QuickJS + openlibm, compiles the engine + shims, `llvm-link -S`s them, and
+translates to `qjs_repl.svmb` at `--host-page 65536` (~4.3 MB); `web/play.js`
+registers it as a "JavaScript (QuickJS — write & run JS)" example. Boot is
+milliseconds. Remaining: a real-browser run + the in-browser wasm-JIT tier (for
+speed) — needs a browser env with GitHub egress to build the asset.
 
 **NEXT (semantic) — directed-rounding dtoa.** QuickJS's shortest Number→string
 (`js_ecvt1`) toggles `FE_DOWNWARD`/`FE_UPWARD` to find the shortest round-trip

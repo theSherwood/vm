@@ -1811,15 +1811,19 @@ const QUICKJS_OPENLIBM_EXTRA: &[&str] = &["s_asinh", "e_acosh", "e_atanh", "s_lo
 /// byte-identical to native. **`#[ignore]`d only for wall-clock**: it fetches openlibm and runs a
 /// whole JS engine on the tree-walking interpreter (tens of seconds). Run by hand:
 /// `cargo test --test translate demo_quickjs_eval_vs_native -- --ignored --nocapture`.
-#[test]
-#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
-fn demo_quickjs_eval_vs_native() {
+///
+/// Shared harness: build the linked QuickJS module for `driver_rel` (a `demos/quickjs/*.c` driver),
+/// run it under the powerbox with `stdin`, and assert stdout byte-matches the native `cc` oracle
+/// (fed the same stdin). Used by both the `qjs_eval` (built-in program) and `qjs_repl` (JS from
+/// stdin) tests. Skips cleanly when QuickJS/openlibm/clang are unavailable.
+fn quickjs_diff(driver_rel: &str, stdin: &[u8]) {
     let (Some(qjs), Some(ol)) = (fetch_quickjs(), fetch_openlibm()) else {
         return;
     };
     let pid = std::process::id();
     let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../svm-run/demos/quickjs/qjs_eval.c");
+        .join("../svm-run/demos/quickjs")
+        .join(driver_rel);
     let incs = [
         format!("-I{}", qjs.display()),
         format!("-I{}", ol.display()),
@@ -1839,11 +1843,14 @@ fn demo_quickjs_eval_vs_native() {
         "-DCONFIG_VERSION=\"2024-01-13\"",
         "-DASSEMBLER=0",
     ];
+    // Per-driver discriminator so the two QuickJS tests don't collide on temp files under parallel
+    // `--ignored` runs.
+    let disc = driver_rel.replace(['.', '/', '\\'], "_");
     // Compile QuickJS TUs + driver + the guest-libm set, each → textual `.ll`.
     let qjs_tus = ["quickjs", "libregexp", "libunicode", "cutils", "libbf"];
     let mut bcs: Vec<PathBuf> = Vec::new();
     let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
-        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{tag}.ll"));
+        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_{tag}.ll"));
         let mut cmd = Command::new("clang");
         cmd.args(cflags);
         for i in &incs {
@@ -1899,7 +1906,7 @@ fn demo_quickjs_eval_vs_native() {
             }
         }
     }
-    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_linked.ll"));
+    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_linked.ll"));
     // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
     // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests it.
     let link_ok = Command::new("llvm-link")
@@ -1914,8 +1921,8 @@ fn demo_quickjs_eval_vs_native() {
         eprintln!("note: skipping quickjs (llvm-link unavailable)");
         return;
     }
-    // Native oracle: the same driver + engine + guest libm, no system `-lm`.
-    let exe = std::env::temp_dir().join(format!("qjsbc_{pid}_native"));
+    // Native oracle: the same driver + engine + guest libm, no system `-lm`. Fed the same stdin.
+    let exe = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_native"));
     let mut cc = Command::new("cc");
     cc.args([
         "-O2",
@@ -1941,22 +1948,55 @@ fn demo_quickjs_eval_vs_native() {
             return;
         }
     }
-    let native = Command::new(&exe).output().expect("run native quickjs");
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native quickjs");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native quickjs")
+    };
     assert!(
         native.status.success() && !native.stdout.is_empty(),
         "native quickjs oracle produced no output"
     );
-    // Guest: translate → resolve caps → verify → run under the powerbox, diff stdout vs the oracle.
+    // Guest: translate → resolve caps → verify → run under the powerbox with the same stdin, diff.
     let t = svm_llvm::translate_ll_path(&linked).expect("translate quickjs");
     let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
     svm_verify::verify_module(&module).expect("verify quickjs module");
-    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run quickjs");
+    let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run quickjs");
     assert_eq!(
         run.stdout,
         native.stdout,
         "quickjs: guest {:?} vs native {:?}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+/// **▶ QuickJS eval — the full JS engine RUNS byte-identical to native.** The `qjs_eval.c` driver's
+/// built-in program (recursion + a `sort` closure + `JSON.stringify` + string methods + `toFixed`).
+/// `#[ignore]`d only for wall-clock (a whole JS engine on the tree-walker + an openlibm fetch).
+#[test]
+#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
+fn demo_quickjs_eval_vs_native() {
+    quickjs_diff("qjs_eval.c", b"");
+}
+
+/// **▶ QuickJS REPL — evaluate JS piped in on stdin** (the playground driver, `qjs_repl.c`): the
+/// engine reads a program from the `Stream` capability, evaluates it, and prints `print`/`console.log`
+/// output plus the completion value — byte-identical to native over a JS program exercising a closure
+/// sort, `JSON.stringify`, and shortest float formatting (`0.1+0.2` → `0.30000000000000004`).
+#[test]
+#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
+fn demo_quickjs_repl_stdin() {
+    quickjs_diff(
+        "qjs_repl.c",
+        b"console.log('sum', [1,2,3,4].reduce((a,b)=>a+b,0));\n\
+          print([5,3,8,1].sort((a,b)=>a-b).join(','));\n\
+          JSON.stringify({pi: Math.PI, f: 0.1+0.2});",
     );
 }
 
