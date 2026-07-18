@@ -457,6 +457,44 @@ block0(sp: i64, arg: i64):
 `,
   },
 
+  'Debugger (SVM — fibers / generators)': {
+    debug: true,
+    bp: 18, // a breakpoint pre-placed on line 19 (0-based 18), inside the fiber body
+    mode: 'plain',
+    desc: 'Debugging §12 fibers (cooperative coroutines / generators) on the bytecode engine. The root ' +
+      'cont.new’s a fiber, then cont.resume’s it twice: the fiber runs, suspends a value back, and on ' +
+      'the second resume finishes — the root sums the two (→ 36). A breakpoint sits inside the fiber ' +
+      '(line 19): press Debug and the debugger follows cont.resume *into* the fiber and stops there, its ' +
+      'own frame live. Step walks the fiber; Continue runs the suspend/resume handoff. ◀◀ Reverse ' +
+      'replays across the switches too. The debugger tracks the active continuation as it switches ' +
+      'between the root and the fiber, right here in the sandbox.',
+    src: `; A generator fiber. The root creates it (cont.new) and resumes it twice; the
+; fiber suspends 11 back, then on the next resume returns 25 — the root sums
+; them (→ 36). The breakpoint on line 19 fires once cont.resume enters the fiber.
+func () -> (i64) {
+block0():
+  mk = ref.func 1
+  z = i64.const 0
+  gen = cont.new mk z
+  a = i64.const 10
+  s0, v0 = cont.resume gen a
+  b = i64.const 20
+  s1, v1 = cont.resume gen b
+  sum = i64.add v0 v1
+  return sum
+}
+func (i64, i64) -> (i64) {
+block0(sp: i64, arg: i64):
+  one = i64.const 1
+  bumped = i64.add arg one
+  got = suspend bumped
+  five = i64.const 5
+  out = i64.add got five
+  return out
+}
+`,
+  },
+
   // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
   //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------

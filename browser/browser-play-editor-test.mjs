@@ -379,6 +379,26 @@ try {
     wnCard, { timeout: 10_000 });
   ok('wait/notify card: the handoff finished after resuming');
 
+  // The fibers card: a generator. A breakpoint inside the fiber fires only once cont.resume switches
+  // the debugged continuation into it — the debugger follows into the fiber and highlights its line;
+  // Continue runs the suspend/resume handoff to completion.
+  const fbCard = card('Debugger (SVM — fibers / generators)');
+  await page.click(`${fbCard} .debug`);
+  await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
+    fbCard, { timeout: 20_000 });
+  const fbPaused = await page.evaluate((sel) => ({
+    stopLine: !!document.querySelector(`${sel} .cm-stop-line`),
+    // The stop is inside the fiber body (line 19) — the frame header names the line.
+    vars: document.querySelector(`${sel} .dbg-vars`).textContent,
+  }), fbCard);
+  fbPaused.stopLine && /line 19\b/.test(fbPaused.vars)
+    ? ok('fibers card: cont.resume stepped into the fiber — stopped inside it (line 19)')
+    : fail(`fibers paused: ${JSON.stringify(fbPaused)}`);
+  await page.click(`${fbCard} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => /finished/.test(document.querySelector(`${sel} .state`).textContent),
+    fbCard, { timeout: 10_000 });
+  ok('fibers card: the generator finished (36) after resuming');
+
   // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.
   await page.selectOption('#theme', 'dark');
   const themed = await page.evaluate(() => ({
