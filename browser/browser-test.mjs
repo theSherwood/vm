@@ -305,17 +305,21 @@ try {
       );
       return Date.now() - t0;
     };
-    // Run 1: boot + the default CREATE/INSERT/SELECT batch (three rows).
+    // Run 1: boot + the default CREATE/INSERT/SELECT batch (three rows). Results are rendered as
+    // psql-style tables (pg-format.js), so we assert on the grid — the `three` value cell and the
+    // `(2 rows)` footer of the first SELECT — not the raw `printtup` debug strings.
     const bootMs = await pgRun(180_000);
     const out1 = await play.$eval(`${P} .stdout`, (e) => e.textContent);
-    const boot = ['PostgreSQL stand-alone backend', 's = "three"', 'count'].filter((w) => !out1.includes(w));
+    const boot = ['PostgreSQL stand-alone backend', 'three', '(2 rows)'].filter((w) => !out1.includes(w));
     // Run 2: a new query on the SAME backend — only works if the table + rows persisted from Run 1.
     await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror
       .setValue("INSERT INTO t VALUES (4,'four');\nSELECT count(*), sum(x) FROM t;\n"), P);
     const q2Ms = await pgRun(30_000);
     const out2 = await play.$eval(`${P} .stdout`, (e) => e.textContent);
     const state2 = await play.$eval(`${P} .state`, (e) => e.dataset.state);
-    const persisted = out2.includes('count = "4"') && out2.includes('sum = "10"'); // 1+2+3+4 = 10
+    // In the grid the aggregates are bare cells: count = 4, sum = 1+2+3+4 = 10 (word-boundary matched so
+    // padding doesn't matter), under the `count`/`sum` header, with a `(1 row)` footer.
+    const persisted = /\b4\b/.test(out2) && /\b10\b/.test(out2) && out2.includes('count') && out2.includes('(1 row)');
     const faster = q2Ms < bootMs / 2; // the second query reuses the live backend, no re-boot
     const pgOk = state2 === 'done' && boot.length === 0 && persisted && faster;
     checks.push(pgOk);

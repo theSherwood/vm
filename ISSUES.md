@@ -13,6 +13,33 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
+
+**Where:** the gating `build · test · fmt · clippy` job (ubuntu-latest), during `cargo test --workspace`'s
+**link** step for `svm-jit`'s test binaries (`bulk_mem`, `bench`, `specialize`) and `svm-capi` (lib test).
+
+**Symptom.** The bundled LLVM linker crashes mid-link:
+
+```
+collect2: fatal error: ld terminated with signal 7 [Bus error], core dumped
+  ... rust-lld ... libLLVM ... llvm::parallelFor(...) ...
+error: could not compile `svm-jit` (test "bulk_mem") due to 1 previous error
+```
+
+with an LLVM crash backtrace (a `PLEASE submit a bug report to llvm-project` note). Exit 101.
+
+**Why it's a flake, not our code.** A SIGBUS *inside the linker* is a runner-level fault (a truncated
+`mmap`/page-in of an object file under memory/disk pressure — `svm-jit` pulls in the large Cranelift +
+Wasmtime rlibs, the heaviest link in the tree), not a miscompile. The failing run's only change vs. the
+prior green run was a `.mjs` file in the **detached** `browser` workspace, which cannot affect
+main-workspace linking; every other job compiling the same workspace (windows, macOS, real-browser)
+linked fine on the same commit. Distinct from the macOS-launch SIGBUS entry below (that one crashes a
+*test binary at launch*; this crashes the *linker at build time*, on Linux).
+
+**Fix sketch.** Transient — re-run the job (a fresh commit / "Re-run failed jobs" clears it). If it
+recurs, reduce link-time memory: cap the linker's parallelism or split the heaviest test binaries. Log
+recurrences here to judge whether it needs a durable mitigation vs. staying a re-run-and-move-on flake.
+
 ### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — found by the QuickJS breadth harness (2026-07-17)
 
 **Where:** the LLVM on-ramp on Bellard's QuickJS 2024-01-13, the `libbf` bignum path (BigInt).
