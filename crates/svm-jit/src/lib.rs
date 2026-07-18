@@ -3418,6 +3418,12 @@ impl CompiledModule {
         if let Some(p) = prev_rt {
             fiber_rt::set_current(p);
         }
+        // S1c: join every async §14 child OS thread before freeing the window — a child copies to/from
+        // the parent window, so none may outlive it (mirrors the vCPU `join_all` just below).
+        #[cfg(fiber_rt)]
+        if let Some(n) = &(*this)._nursery {
+            n.join_children();
+        }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]
         if let Some(d) = &(*this).domain {

@@ -87,6 +87,55 @@ impl Child {
             joined: false,
         }
     }
+
+    /// A child whose OS thread is **still running** (the async path): the empty cell the thread fills on
+    /// completion.
+    fn pending(done: std::sync::Arc<ChildDone>) -> Child {
+        Child {
+            done,
+            joined: false,
+        }
+    }
+}
+
+/// S1c — spawn `code` on its **own OS thread** in the child's own guarded window: the thread arms its
+/// detect-and-kill recovery ([`mem::install_guard`]), runs [`crate::run_child_code`] (which allocates a
+/// fresh `2^child_size_log2` window, seeds it from the carve, runs the child confined, and copies back),
+/// and publishes `(result, trap)` into `done`. Returns the `JoinHandle` the nursery joins at teardown so
+/// no child thread outlives the parent window. This is the concurrency primitive: `instantiate` returns
+/// immediately, so a parent can spawn a second child (or its own work) while this one runs.
+fn spawn_child_on_thread(
+    code: std::sync::Arc<crate::ChildCode>,
+    sub_base: u64,
+    child_size_log2: u8,
+    parent_mem_base: *mut u8,
+    args: Vec<i64>,
+    n_results: usize,
+    done: std::sync::Arc<ChildDone>,
+) -> std::thread::JoinHandle<()> {
+    struct SendPtr(*mut u8);
+    // SAFETY: `parent_mem_base` is the parent window, which outlives every child (`join_children` runs
+    // before it frees). The child thread touches only its **own** carve `[sub_base, +size)` for copy-in
+    // / copy-back — disjoint from siblings and from the parent's live data — so crossing the pointer to
+    // the thread races nothing (`ChildCode` is `Send + Sync`; the carve model is the disjointness the
+    // guest owns, exactly like sibling `thread.spawn` accesses to one window).
+    unsafe impl Send for SendPtr {}
+    let base = SendPtr(parent_mem_base);
+    std::thread::Builder::new()
+        .name("svm-child".into())
+        .spawn(move || {
+            let base = base; // move the wrapper into the thread
+            mem::install_guard();
+            // SAFETY: `code` is a live `Arc<ChildCode>` held by this closure; the carve is committed
+            // parent memory the Instantiator bounded; `args` matches the entry arity (caller-checked).
+            let (r, t) = unsafe {
+                crate::run_child_code(&code, sub_base, child_size_log2, base.0, &args, n_results)
+            };
+            let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
+            *st = Some((r, t));
+            done.cv.notify_all();
+        })
+        .expect("spawn a §14 child OS thread")
 }
 
 /// The per-run §14 nesting runtime, baked into the module's `Instantiator` `cap.call` sites. Holds
@@ -108,6 +157,11 @@ pub(crate) struct Nursery {
     /// `resume`, where the parent's own epoch checks can't fire).
     epoch_addr: usize,
     children: Mutex<Vec<Child>>,
+    /// S1c: the OS threads spawned for **async** non-durable children (each runs `run_child_code` in the
+    /// child's own guarded window and fills its completion cell). Tracked so the run **joins them all at
+    /// teardown** ([`Nursery::join_children`]) before the parent window is freed — no child thread may
+    /// outlive the window it copies to/from. Empty on a run with only synchronous children.
+    child_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// §14 co-fiber children (`spawn_coroutine`): suspended native continuations driven inline by
     /// `resume`, by handle (slot). `None` once finished (a later resume is an inert `CapFault`). The
     /// `Box` is taken out for the duration of a switch (so a re-entrant/concurrent resume of the same
@@ -286,6 +340,7 @@ impl Nursery {
             resolve_module,
             epoch_addr,
             children: Mutex::new(Vec::new()),
+            child_threads: Mutex::new(Vec::new()),
             coros: Mutex::new(Vec::new()),
             durable: AtomicBool::new(false),
             my_task,
@@ -373,6 +428,21 @@ impl Nursery {
             children.push(Child::finished(0, 0));
         }
         children[slot] = Child::finished(result, trap);
+    }
+
+    /// S1c — join every async child OS thread. Called at run **teardown**, before the parent window is
+    /// freed, so no child thread outlives the memory it copies to/from. A well-behaved child has already
+    /// finished (a `join`/`detach` waited on it, or it ran to completion and the run is ending); a still-
+    /// running **detached** child blocks here exactly as a detached `thread.spawn` vCPU does at
+    /// `Domain::join_all` — the run's contract is that every vCPU/child is joined before the window dies.
+    pub(crate) fn join_children(&self) {
+        let handles: Vec<std::thread::JoinHandle<()>> = {
+            let mut g = self.child_threads.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *g)
+        };
+        for h in handles {
+            let _ = h.join();
+        }
     }
 
     /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field: the nesting
@@ -549,16 +619,16 @@ pub(crate) unsafe extern "C" fn instantiate(
     let nargs = child_funcs[entry as usize].params.len();
     let args = vec![0i64; nargs];
 
-    let (result, trap, unwound) = if durable {
+    // Durable children stay **synchronous** (their baked per-child nursery + freeze residue can't ride
+    // the cached OS-thread path yet): re-compile + run inline, record the outcome (and any freeze
+    // unwind), and return the join slot.
+    if durable {
         // §4 depth-2: reserve this child's subtree-unique domain task id (shared counter, instantiate
         // order), stamped as its nursery's `my_task` so a grandchild it records carries a non-zero
         // `parent_task`. The child inherits the **shared** residue sink + counter, so its descendants'
-        // freeze residue coalesces at the root. Durable children are **not** cached (their baked
-        // per-child nursery makes the code un-shareable) — they keep the per-call compile+run path.
+        // freeze residue coalesces at the root.
         let child_task = rt.next_child_task();
-        // Re-compile the child as a top-level guest over its own window, seeded from the parent's
-        // sub-region `[base+off, … + child_size)` and copied back on completion (the §14 superset).
-        match crate::compile_child_and_run(
+        let (result, trap, unwound) = match crate::compile_child_and_run(
             child_funcs,
             entry as FuncIdx,
             base + off,
@@ -573,79 +643,89 @@ pub(crate) unsafe extern "C" fn instantiate(
             rt.task_counter(),
             &[], // a live `instantiate` re-attaches no frozen residue (that is the thaw path)
         ) {
-            Ok(rt) => rt,
+            Ok(outcome) => outcome,
             Err(_) => {
                 // A child we cannot compile (fibers/threads, or a backend error) is a CapFault, not a
                 // silent success — the guest learns its nesting request was refused.
                 *trap_out = TrapKind::CapFault as i64;
                 return 0;
             }
+        };
+        let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = children.len();
+        children.push(Child::finished(result, trap));
+        drop(children);
+        // §4 freeze export: the child left its carve `UNWINDING` — record its re-attach residue into the
+        // shared subtree sink tagged with this nursery's task, so a thaw re-creates the child domain.
+        if unwound {
+            rt.push_frozen_nested(crate::FrozenNested {
+                parent_task: rt.my_task(),
+                slot,
+                carve_off: base + off,
+                size_log2: size_log2 as u8,
+                entry: entry as u32,
+            });
         }
-    } else {
-        // PROCESS.md S1: the common (non-durable) path — compile once per `(module, entry, size)`,
-        // cache the position-independent code, and run it in the carve. A repeat spawn of the same
-        // child (any offset) hits the cache and skips the whole Cranelift compile.
-        let key: ChildCodeKey = (
-            child_funcs.as_ptr() as usize,
-            child_funcs.len(),
-            entry as u32,
-            size_log2 as u8,
-        );
-        let code = {
-            let mut cache = rt.child_code.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(c) = cache.get(&key) {
-                std::sync::Arc::clone(c)
-            } else {
-                match crate::compile_nondurable_child(
-                    child_funcs,
-                    entry as FuncIdx,
-                    size_log2 as u8,
-                    rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
-                ) {
-                    Ok(cc) => {
-                        let a = std::sync::Arc::new(cc);
-                        cache.insert(key, std::sync::Arc::clone(&a));
-                        a
-                    }
-                    Err(_) => {
-                        // Un-compilable child (fibers/threads/setjmp, or a backend error) → CapFault.
-                        *trap_out = TrapKind::CapFault as i64;
-                        return 0;
-                    }
+        return slot as i32;
+    }
+
+    // PROCESS.md S1c — the common (non-durable) path is **asynchronous**: compile once per
+    // `(module, entry, size)` (cached, position-independent), then run the child on its **own OS thread
+    // in its own guarded window** and return immediately. `join`/`poll` resolve through the child's
+    // completion cell; the thread is joined at run teardown (`join_children`). This is what lets two
+    // children run concurrently — a pipeline — where the synchronous path serialized them.
+    let key: ChildCodeKey = (
+        child_funcs.as_ptr() as usize,
+        child_funcs.len(),
+        entry as u32,
+        size_log2 as u8,
+    );
+    let code = {
+        let mut cache = rt.child_code.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cache.get(&key) {
+            std::sync::Arc::clone(c)
+        } else {
+            match crate::compile_nondurable_child(
+                child_funcs,
+                entry as FuncIdx,
+                size_log2 as u8,
+                rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
+            ) {
+                Ok(cc) => {
+                    let a = std::sync::Arc::new(cc);
+                    cache.insert(key, std::sync::Arc::clone(&a));
+                    a
+                }
+                Err(_) => {
+                    // Un-compilable child (fibers/threads/setjmp, or a backend error) → CapFault.
+                    *trap_out = TrapKind::CapFault as i64;
+                    return 0;
                 }
             }
-        };
-        let n_results = child_funcs[entry as usize].results.len();
-        let (r, t) = crate::run_child_code(
-            &code,
-            base + off,
-            size_log2 as u8,
-            mem_base as *mut u8,
-            &args,
-            n_results,
-        );
-        (r, t, false) // non-durable never unwinds under a freeze
+        }
     };
-
+    let n_results = child_funcs[entry as usize].results.len();
+    let done = std::sync::Arc::new(ChildDone {
+        state: Mutex::new(None),
+        cv: Condvar::new(),
+    });
+    let handle = spawn_child_on_thread(
+        code,
+        base + off,
+        size_log2 as u8,
+        mem_base as *mut u8,
+        args,
+        n_results,
+        std::sync::Arc::clone(&done),
+    );
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
-    children.push(Child::finished(result, trap));
-    // §4 freeze export: the child left its carve `UNWINDING` — it unwound mid-run under a freeze
-    // instead of completing. Record its re-attach residue into the **shared** subtree sink, tagged with
-    // **this** nursery's task (`my_task`) as `parent_task` (`0` for the root's direct child; a
-    // grandchild recorded here by the child's nursery carries the child's id). Its continuation lives in
-    // the carve (the frozen window image); this is what a thaw needs to re-create the child domain. The
-    // `slot` is the child's join-table index — the handle the guest holds — so a thaw resolves the
-    // reloaded handle to the re-attached child.
-    if unwound {
-        rt.push_frozen_nested(crate::FrozenNested {
-            parent_task: rt.my_task(),
-            slot,
-            carve_off: base + off,
-            size_log2: size_log2 as u8,
-            entry: entry as u32,
-        });
-    }
+    children.push(Child::pending(done));
+    drop(children);
+    rt.child_threads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(handle);
     slot as i32
 }
 
@@ -1087,10 +1167,11 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
         }
     };
     drop(children);
-    // Park on the completion cell until the child finishes. Today the child ran synchronously at
-    // `instantiate`, so the cell is already `Some` and this returns without waiting; the OS-thread spawn
-    // that fills it from another thread is where this actually parks (with a bounded re-check so a §5
-    // host interrupt on the parent's `epoch_addr` still unwinds a waiter — the child bakes that cell).
+    // Park on the completion cell until the child's OS thread fills it (S1c async children). A durable
+    // or op-8/11/13 child ran synchronously, so its cell is already `Some` and this returns without
+    // waiting; an async op-0/5 child parks here until its thread publishes the outcome, with a bounded
+    // re-check so a §5 host interrupt on the parent's `epoch_addr` still unwinds a waiter (the child
+    // bakes that same cell, so it unwinds too).
     let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
     let (result, trap) = loop {
         if let Some(outcome) = *st {
@@ -1116,11 +1197,12 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
     }
 }
 
-/// PROCESS.md S3 `poll(child) -> 0 running | 1 returned | 2 trapped` (JIT). A JIT child runs
-/// **synchronously** at `instantiate`, so it is always *done* by the time the parent polls — hence
-/// `1` (clean) or `2` (trapped), never `0` (the running state is interpreter-only until JIT async
-/// children, S1c). Non-destructive: the slot + its result stay for a later `join`. A forged / already-
-/// joined handle is a `CapFault` (matching this runtime's `join`).
+/// PROCESS.md S3 `poll(child) -> 0 running | 1 returned | 2 trapped` (JIT). An **async** op-0/5 child
+/// (S1c) runs on its own OS thread, so `poll` reports the live cell state: `0` while its thread is still
+/// executing, then `1` (clean) / `2` (trapped) once it publishes an outcome. A synchronous child
+/// (durable, or op-8/11/13) is already done, so it never reads `0`. Non-destructive: the slot + its
+/// result stay for a later `join`. A forged / already-joined handle is a `CapFault` (matching this
+/// runtime's `join`).
 ///
 /// # Safety
 /// As [`join`]: `rt`/`trap_out` are the baked nursery + run trap cell, valid for the call.
@@ -1143,9 +1225,9 @@ pub(crate) unsafe extern "C" fn poll(rt: *const Nursery, handle: i32, trap_out: 
     }
 }
 
-/// PROCESS.md S3 `detach(child) -> 0` (JIT). Drop the parent's join claim; the child already ran to
-/// completion synchronously, so a later `join` is inert. A forged / already-joined handle is a
-/// `CapFault`.
+/// PROCESS.md S3 `detach(child) -> 0` (JIT). Drop the parent's join claim; a later `join` is then inert.
+/// The child's OS thread (if still running) is joined at run teardown (`join_children`), so a detached
+/// async child never outlives the window. A forged / already-joined handle is a `CapFault`.
 ///
 /// # Safety
 /// As [`join`].
@@ -1164,10 +1246,11 @@ pub(crate) unsafe extern "C" fn detach(rt: *const Nursery, handle: i32, trap_out
     }
 }
 
-/// PROCESS.md S3 `kill(child) -> 0` (JIT). On the JIT a child has already finished by the time the
-/// parent gets control (synchronous `instantiate`), so kill is a harmless success — there is no
-/// running subtree to interrupt (that arrives with JIT async children, S1c). A forged / already-joined
-/// handle is a `CapFault`.
+/// PROCESS.md S3 `kill(child) -> 0` (JIT). Acknowledges the request as a success. A synchronous child is
+/// already finished; an **async** op-0/5 child (S1c) still runs on its own thread — it is reached only by
+/// the run-wide §5 kill-path (the parent's `epoch_addr` cell, which the child bakes), not yet by a
+/// per-child targeted interrupt (deferred: that lands with the confinement-codegen kill point). A forged
+/// / already-joined handle is a `CapFault`.
 ///
 /// # Safety
 /// As [`join`].
