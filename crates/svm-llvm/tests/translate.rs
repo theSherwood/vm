@@ -2012,6 +2012,113 @@ fn demo_quickjs_breadth_vs_native() {
     quickjs_diff("qjs_breadth.c", b"");
 }
 
+/// **▶ QuickJS BigInt — the `libbf` path runs byte-identical to native** (ISSUES.md I25, the last
+/// JS-surface gap). Isolates `libbf` from the whole engine: compiles only `libbf.c` + `cutils.c` + the
+/// `bf_probe.c` driver + the reused libc/printf shims, and diffs the printed BigInt results (literal
+/// `toString`, `+`, `*`) against native `cc`. The uncalled libm decls `libbf` carries are trap-stubbed
+/// (`stub_unresolved_externs`), so no openlibm fetch is needed — the integer BigInt path never calls
+/// them. Was garbage/hung before the i128-large-constant fix (`i128_parts` dropped the high limb);
+/// `#[ignore]`d only for wall-clock (fetches QuickJS, runs the engine on the interpreter).
+#[test]
+#[ignore = "runs green; slow — fetches QuickJS + compiles libbf on the interpreter"]
+fn demo_quickjs_bigint_vs_native() {
+    let Some(qjs) = fetch_quickjs() else { return };
+    let pid = std::process::id();
+    let demos = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos");
+    let driver = demos.join("quickjs/bf_probe.c");
+    let inc = format!("-I{}", qjs.display());
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-S",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-DNDEBUG",
+        "-D_GNU_SOURCE",
+        "-DCONFIG_VERSION=\"2024-01-13\"",
+        "-DASSEMBLER=0",
+    ];
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = std::env::temp_dir().join(format!("bfbc_{pid}_{tag}.ll"));
+        let mut cmd = Command::new("clang");
+        cmd.args(cflags).arg(&inc).arg(&src).arg("-o").arg(&out);
+        matches!(cmd.status(), Ok(s) if s.success()).then_some(out)
+    };
+    let mut bcs = Vec::new();
+    let tus = [
+        (qjs.join("libbf.c"), "libbf"),
+        (qjs.join("cutils.c"), "cutils"),
+        (driver.clone(), "driver"),
+        (demos.join("postgres/printf_shim.c"), "printf_shim"),
+        (demos.join("strtod/strtod.c"), "strtod"),
+        (demos.join("quickjs/libc_shim.c"), "libc_shim"),
+    ];
+    for (src, tag) in &tus {
+        match compile(src.clone(), tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping bigint (clang failed on {tag})");
+                return;
+            }
+        }
+    }
+    let linked = std::env::temp_dir().join(format!("bfbc_{pid}_linked.ll"));
+    let link_ok = Command::new("llvm-link")
+        .arg("-S")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !link_ok {
+        eprintln!("note: skipping bigint (llvm-link unavailable)");
+        return;
+    }
+    // Native oracle: same driver + libbf + cutils, real libm.
+    let exe = std::env::temp_dir().join(format!("bfbc_{pid}_native"));
+    let ok = Command::new("cc")
+        .args([
+            "-O2",
+            "-D_GNU_SOURCE",
+            "-DCONFIG_VERSION=\"2024-01-13\"",
+            "-DASSEMBLER=0",
+        ])
+        .arg(&inc)
+        .arg(&driver)
+        .arg(qjs.join("libbf.c"))
+        .arg(qjs.join("cutils.c"))
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("note: skipping bigint (cc unavailable)");
+        return;
+    }
+    let native = Command::new(&exe).output().expect("run native bigint");
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native bigint oracle produced no output"
+    );
+    // Guest: translate (stub the uncalled libm decls) → resolve caps → verify → run, diff.
+    let opts = svm_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = svm_llvm::translate_ll_path_with_options(&linked, opts).expect("translate bigint");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify bigint module");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run bigint");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "bigint: guest vs native BigInt results diverge",
+    );
+}
+
 /// Like [`check_demo_vs_native`] but threads `extra` clang flags into the on-ramp's **`.ll`** compile
 /// only — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
 /// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
@@ -10495,6 +10602,39 @@ fn i128_add_sub_carry() {
                 Value::I64(bh as i64),
                 Value::I64(bl as i64),
             ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// A **large i128 constant** (≥ 2⁶⁴) used as an arithmetic operand — the I25 miscompile. The on-ramp
+/// split an i128 constant into `(lo, hi)` with `hi` hardcoded to `0`, silently dropping the high 64
+/// bits: `2^126 - x` came out `(low(x)-flavored garbage)` instead of the real value. libbf's
+/// `udiv1norm` folds exactly this (`2^126` as a subtrahend), so BigInt division — and thus `bf_atof`,
+/// `(7n).toString()`, `6n*7n` — produced garbage / hung. Here `2^126 - x` must match a `u128` oracle,
+/// which it can't if the constant's high limb is zeroed.
+#[test]
+fn i128_large_constant_operand() {
+    let src = "unsigned long f(unsigned long xh, unsigned long xl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)xh << 64) | xl;\n\
+        \x20 unsigned __int128 num = ((unsigned __int128)1) << 126;\n\
+        \x20 unsigned __int128 a = num - x;\n\
+        \x20 return (unsigned long)(a >> 64) ^ (unsigned long)a;\n\
+        }\n";
+    for (xh, xl) in [
+        (0u64, 0u64),
+        (0u64, 0x8000_0000_0000_0000u64), // borrow into the high word (the udiv1norm shape)
+        (0x4000_0000_0000_0000u64, 0u64), // cancels the constant's high limb exactly
+        (0x1234_5678u64, 0x9abc_def0u64),
+        (u64::MAX, u64::MAX),
+    ] {
+        let x = ((xh as u128) << 64) | xl as u128;
+        let a = (1u128 << 126).wrapping_sub(x);
+        let want = ((a >> 64) as u64) ^ (a as u64);
+        check(
+            "i128_large_const",
+            src,
+            &[Value::I64(xh as i64), Value::I64(xl as i64)],
             &[Value::I64(want as i64)],
         );
     }

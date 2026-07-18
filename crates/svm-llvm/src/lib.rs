@@ -15130,12 +15130,12 @@ impl<'a> BlockCtx<'a> {
                     .map(|v| self.operand(&Operand::ConstantOperand(v.clone())))
                     .collect(),
                 // A constant i128 φ incoming (e.g. the entry edge of `phi i128 [0, entry], [next, loop]`):
-                // materialize its `(lo, hi)` pair, mirroring `i128_parts`. `llvm-ir` 0.11.3 holds the
-                // value in a `u64`, so the high word is always 0 here (a ≥2⁶⁴ / negative i128 constant
-                // fails the bitcode parse upstream — see ISSUES.md I14 — so it never reaches us).
+                // materialize its `(lo, hi)` pair, mirroring `i128_parts`. The textual `.ll` reader holds
+                // the full 128-bit `value` (`u128`), so split out **both** limbs — hardcoding `hi = 0`
+                // dropped the high word of any constant ≥ 2⁶⁴ (the I25 miscompile; see `i128_parts`).
                 Constant::Int { bits: 128, value } if ftys.len() == 2 => {
                     let lo = self.const_i64(*value as i64);
-                    let hi = self.const_i64(0);
+                    let hi = self.const_i64((*value >> 64) as i64);
                     Ok(vec![lo, hi])
                 }
                 // A constant `<N x i1>` **mask** φ incoming (the mask analog of the cases above): its
@@ -16191,8 +16191,12 @@ fn i128_parts(ctx: &mut BlockCtx, op: &Operand) -> Result<(ValIdx, ValIdx), Erro
     }
     if let Operand::ConstantOperand(c) = op {
         if let Constant::Int { bits: 128, value } = c.as_ref() {
+            // Split the full 128-bit constant into its low/high `i64` limbs. Hardcoding `hi = 0` here
+            // (the old code) silently dropped the high 64 bits of any constant ≥ 2⁶⁴ — a miscompile:
+            // e.g. libbf's `udiv1norm` folds `2^126` as an i128 subtrahend, and a zero high limb turned
+            // BigInt division (and thus `bf_atof`, `(7n).toString()`) into garbage (ISSUES.md I25).
             let lo = ctx.const_i64(*value as i64);
-            let hi = ctx.const_i64(0);
+            let hi = ctx.const_i64((*value >> 64) as i64);
             return Ok((lo, hi));
         }
     }
