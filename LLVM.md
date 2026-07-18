@@ -712,14 +712,16 @@ module JIT path (`svm_onramp_jit_run_*` → `compile_module_reactor` rooted at `
 (`browser-jit-module-test.mjs`): stdout byte-identical across tiers, **~6×** faster (a
 fib+sort+loop+regex script: 80.4 s → 12.9 s). The playground JS tab's "wasm-JIT" toggle now runs it.
 
-**JS-language breadth — wide surface verified; BigInt is the one gap.** `demo_quickjs_breadth_vs_native`
+**JS-language breadth — the full surface, BigInt included, runs byte-identical.** `demo_quickjs_breadth_vs_native`
 (`qjs_breadth.c`) runs **regex** (`libregexp`), **exceptions** (`try`/`catch`), **generators**,
 **`Map`/`Set`**, **closures**, **destructuring + spread**, **string methods**, **`JSON` round-trip**,
 **`Object`/`Array` higher-order methods**, **`Date`**, and **integer `Math`** — all byte-identical to
-native. The **one known gap is BigInt** (`libbf` miscompiled — `(7n).toString()` is wrong, `6n*7n`
-hangs); the common primitives it uses (`clz`/`ctz`/shifts/128-bit multiply) are individually verified
-correct, so it's a subtler `libbf` pattern — **ISSUES.md I25**, a dedicated slice (not blocking the
-playground, which doesn't use BigInt). *Caveat for local runs:* the spike libm shim's stub `fmod`/`sin`/…
+native. **BigInt (`libbf`) — ★ DONE** (was the one gap): `(7n).toString()`/`6n*7n` gave garbage/hung
+because the translator dropped the **high 64 bits of a large i128 constant** (`i128_parts` hardcoded
+`hi=0`), which broke libbf's `udiv1norm` divide-by-invariant (it folds `2^126` as an i128 subtrahend)
+→ `bf_div` → `bf_atof` (the literal parse). Fixed in `i128_parts`; covered by `i128_large_constant_operand`
+(hand-C, interp+JIT) and `demo_quickjs_bigint_vs_native` (the real `libbf` path vs native). See ISSUES.md
+I25. *Caveat for local runs:* the spike libm shim's stub `fmod`/`sin`/…
 contaminate any path that calls them (e.g. `-7 % 3` → `fmod`); the committed demos avoid libm calls or
 link real openlibm, so CI is clean.
 
@@ -733,7 +735,8 @@ emitted wasm; "Prove interp ≡ JIT" confirms identical stdout.
 to native**; (e) ~~`qjs_repl.c` + playground wiring~~ **done** (`.svmb` asset + `web/play.js` entry;
 shortest-float printing confirmed working — no dtoa slice needed); (f) ~~real-browser verification of the
 playground tab~~ **done** (interp tier, real Chromium/V8); (g) ~~regex / `try`/`catch` / … breadth~~
-**done** (`demo_quickjs_breadth_vs_native`); the open breadth item is **BigInt** (ISSUES.md I25); (h)
+**done** (`demo_quickjs_breadth_vs_native`); ~~the open breadth item is **BigInt**~~ **done** (ISSUES.md
+I25 — an i128-large-constant translator bug, now fixed; the full JS surface runs byte-identical); (h)
 ~~the **`svm-wasmjit` emitter gap** so the JIT tier lights up (speed)~~ **done** — QuickJS emits and
 runs ~6× the interpreter, byte-identical (atomics + `cap.self.resolve` outlining + pooled locals; see
 the "wasm-JIT tier — ★ DONE" note); (i) the `run-test262.c` harness over an embedded slice — the
