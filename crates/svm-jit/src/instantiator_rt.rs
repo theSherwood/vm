@@ -17,7 +17,7 @@ use crate::{mem, CapThunk, TrapKind};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use svm_ir::{Data, Func, FuncIdx, ValType};
 
 /// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
@@ -57,13 +57,36 @@ const YIELDER_HANDLE: i32 = 256;
 /// per live coroutine; a reservation the OS refuses surfaces as a trap, never an abort.
 const CORO_STACK: usize = 1 << 18;
 
-/// One spawned child's outcome: its `i64` result and trap cell (`0` = clean), plus whether it has
-/// been `join`ed (a second join is inert — `ThreadFault`, matching the interpreter).
-#[derive(Clone, Copy)]
+/// One spawned child's **completion cell** (S1c): `(result, trap)` once the child has finished (`trap`
+/// `0` = clean), or `None` while it is still running. A child runs **synchronously** at `instantiate`
+/// **today**, so the cell is `Some` before `instantiate` returns and `join`/`poll` never observe `None`;
+/// this is the shape the OS-thread child spawn fills from the child's *own* thread, at which point
+/// `join` parks on `cv` and `poll` reports *running* (`0`). `Arc` so `join` can clone it and drop the
+/// `children` lock before parking (no lock held across a wait).
+struct ChildDone {
+    state: Mutex<Option<(i64, i64)>>,
+    cv: Condvar,
+}
+
+/// One spawned child's join-table entry: its completion cell plus whether it has been `join`ed (a
+/// second join is inert — `CapFault`, matching the interpreter's once-only join).
 struct Child {
-    result: i64,
-    trap: i64,
+    done: std::sync::Arc<ChildDone>,
     joined: bool,
+}
+
+impl Child {
+    /// A child whose outcome is **already known** (the synchronous path): a cell pre-filled with
+    /// `(result, trap)`.
+    fn finished(result: i64, trap: i64) -> Child {
+        Child {
+            done: std::sync::Arc::new(ChildDone {
+                state: Mutex::new(Some((result, trap))),
+                cv: Condvar::new(),
+            }),
+            joined: false,
+        }
+    }
 }
 
 /// The per-run §14 nesting runtime, baked into the module's `Instantiator` `cap.call` sites. Holds
@@ -347,17 +370,9 @@ impl Nursery {
     pub(crate) fn seed_child_result(&self, slot: usize, result: i64, trap: i64) {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         while children.len() <= slot {
-            children.push(Child {
-                result: 0,
-                trap: 0,
-                joined: false,
-            });
+            children.push(Child::finished(0, 0));
         }
-        children[slot] = Child {
-            result,
-            trap,
-            joined: false,
-        };
+        children[slot] = Child::finished(result, trap);
     }
 
     /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field: the nesting
@@ -614,11 +629,7 @@ pub(crate) unsafe extern "C" fn instantiate(
 
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
-    children.push(Child {
-        result,
-        trap,
-        joined: false,
-    });
+    children.push(Child::finished(result, trap));
     // §4 freeze export: the child left its carve `UNWINDING` — it unwound mid-run under a freeze
     // instead of completing. Record its re-attach residue into the **shared** subtree sink, tagged with
     // **this** nursery's task (`my_task`) as `parent_task` (`0` for the root's direct child; a
@@ -773,11 +784,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
     };
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
-    children.push(Child {
-        result,
-        trap,
-        joined: false,
-    });
+    children.push(Child::finished(result, trap));
     slot as i32
 }
 
@@ -910,11 +917,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     };
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
-    children.push(Child {
-        result,
-        trap,
-        joined: false,
-    });
+    children.push(Child::finished(result, trap));
     slot as i32
 }
 
@@ -1058,11 +1061,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     };
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
-    children.push(Child {
-        result,
-        trap,
-        joined: false,
-    });
+    children.push(Child::finished(result, trap));
     slot as i32
 }
 
@@ -1077,20 +1076,43 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
     let rt = &*rt;
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = handle as usize;
-    match children.get_mut(slot) {
+    let done = match children.get_mut(slot) {
         Some(c) if !c.joined => {
             c.joined = true;
-            if c.trap != 0 {
-                *trap_out = c.trap; // a child trap propagates to the parent on join
-                0
-            } else {
-                c.result
-            }
+            c.done.clone() // clone the cell + drop the `children` lock before parking
         }
         _ => {
             *trap_out = TrapKind::CapFault as i64; // forged or already-joined handle
-            0
+            return 0;
         }
+    };
+    drop(children);
+    // Park on the completion cell until the child finishes. Today the child ran synchronously at
+    // `instantiate`, so the cell is already `Some` and this returns without waiting; the OS-thread spawn
+    // that fills it from another thread is where this actually parks (with a bounded re-check so a §5
+    // host interrupt on the parent's `epoch_addr` still unwinds a waiter — the child bakes that cell).
+    let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
+    let (result, trap) = loop {
+        if let Some(outcome) = *st {
+            break outcome;
+        }
+        // §5 kill-path: the host set the parent's interrupt cell — stop waiting and return; the parent's
+        // guest code traps `OutOfFuel` at its next epoch poll (as `thread.join` does). The child bakes
+        // the same cell, so it unwinds too.
+        if epoch_fired(rt.epoch_addr) {
+            return 0;
+        }
+        st = done
+            .cv
+            .wait_timeout(st, std::time::Duration::from_millis(20))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    };
+    if trap != 0 {
+        *trap_out = trap; // a child trap propagates to the parent on join
+        0
+    } else {
+        result
     }
 }
 
@@ -1107,10 +1129,11 @@ pub(crate) unsafe extern "C" fn poll(rt: *const Nursery, handle: i32, trap_out: 
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     match children.get(handle as usize) {
         Some(c) if !c.joined => {
-            if c.trap != 0 {
-                2
-            } else {
-                1
+            let st = c.done.state.lock().unwrap_or_else(|e| e.into_inner());
+            match *st {
+                None => 0,             // still running (the OS-thread child hasn't finished)
+                Some((_, 0)) => 1,     // returned cleanly
+                Some((_, _trap)) => 2, // trapped
             }
         }
         _ => {
@@ -1158,6 +1181,14 @@ pub(crate) unsafe extern "C" fn kill(rt: *const Nursery, handle: i32, trap_out: 
             0
         }
     }
+}
+
+/// Whether the §5 kill-path interrupt cell at `addr` has fired (`0` ⇒ no kill-path armed) — so a
+/// `join` parked on a still-running child stops waiting and lets the parent unwind. Mirrors
+/// `os_thread_rt::epoch_fired`; a wrong read only affects a wakeup, never confinement.
+fn epoch_fired(addr: usize) -> bool {
+    addr != 0
+        && unsafe { (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed) != 0 }
 }
 
 /// The `Yielder` interface id (iface 7), in lockstep with `svm_interp::iface::YIELDER`.
