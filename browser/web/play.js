@@ -382,9 +382,11 @@ debug.var 0 "count" fixed 0 "long" 0
       'the worker (line 20): press Debug and it stops in the first worker. The Variables pane grows a ' +
       'thread selector — one chip per live vCPU (the one that hit the stop is marked ●). Click another ' +
       'thread to inspect its stack without resuming; Step/Continue always drive the stopped thread. ' +
-      'Continue again to catch the second worker, then finish (→ 2). A deterministic cooperative debug ' +
-      'scheduler runs the interleaving right here in the sandbox — DEBUGGING.md Milestone B on the ' +
-      'bytecode engine. (Reverse and data breakpoints are single-threaded only, so they are off here.)',
+      'Continue again to catch the second worker, then finish (→ 2). Because the schedule is ' +
+      'deterministic, ◀◀ Reverse walks *backward* to the previous worker breakpoint (replay to an ' +
+      'earlier global turn), and a data breakpoint fires in whichever thread touches the range. A ' +
+      'cooperative debug scheduler runs the whole interleaving right here in the sandbox — DEBUGGING.md ' +
+      'Milestone B on the bytecode engine.',
     src: `; The root spawns two worker vCPUs; each atomically bumps a shared counter,
 ; then the root joins them and returns the total (→ 2). A breakpoint is pre-
 ; placed in the worker — press Debug, then use the thread selector that appears.

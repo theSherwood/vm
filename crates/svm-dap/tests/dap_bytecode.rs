@@ -931,14 +931,13 @@ fn dap_over_bytecode_multithreaded_breakpoint_per_thread() {
 }
 
 #[test]
-fn dap_over_bytecode_multithreaded_gates_reverse() {
-    // The scheduled bytecode engine is forward-only this slice, so `supports_reverse` is `false` and
-    // the server rejects `stepBack` cleanly (rather than time-travelling) — the same clean-fail path a
-    // forward-only backend already uses. (The single-vCPU bytecode engine keeps reverse; that's the
-    // `dap_over_bytecode_reverse_matches_the_tree_walker` case.)
+fn dap_over_bytecode_multithreaded_reverse_continue() {
+    // Reverse debugging on the scheduled engine (deterministic replay to a global `turn`): run forward
+    // through both workers' breakpoints, then `reverseContinue` back to the *previous* one — landing on
+    // the earlier worker's breakpoint, an earlier turn.
     let mut s = DapServer::new();
     s.handle(&req(1, "initialize", Json::obj(vec![])));
-    let launch = s.handle(&req(
+    s.handle(&req(
         2,
         "launch",
         Json::obj(vec![
@@ -947,16 +946,120 @@ fn dap_over_bytecode_multithreaded_gates_reverse() {
             ("engine", Json::s("bytecode")),
         ]),
     ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(18))])]),
+            ),
+        ]),
+    ));
+    // Forward: the first worker, then the second (a distinct DAP thread).
+    let cfg = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let tid_a = event(&cfg, "stopped")
+        .and_then(|e| e.get("body")?.get("threadId")?.as_i64())
+        .unwrap();
+    let cont = s.handle(&req(5, "continue", Json::obj(vec![])));
+    let tid_b = event(&cont, "stopped")
+        .and_then(|e| e.get("body")?.get("threadId")?.as_i64())
+        .unwrap();
+    assert_ne!(tid_a, tid_b, "forward reached the second worker");
+
+    // reverseContinue → back to the previous breakpoint (the first worker).
+    let rev = s.handle(&req(6, "reverseContinue", Json::obj(vec![])));
     assert_eq!(
-        response(&launch).get("success"),
+        response(&rev).get("success"),
         Some(&Json::Bool(true)),
-        "multithreaded launch succeeds"
+        "reverseContinue is supported on the scheduled engine"
     );
-    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
-    let back = s.handle(&req(4, "stepBack", Json::obj(vec![])));
+    let stop = event(&rev, "stopped").expect("reverse lands on a stop");
     assert_eq!(
-        response(&back).get("success"),
-        Some(&Json::Bool(false)),
-        "stepBack is rejected on the forward-only scheduled engine"
+        stop.get("body").unwrap().get("reason").unwrap().as_str(),
+        Some("breakpoint")
+    );
+    assert_eq!(
+        stop.get("body").unwrap().get("threadId").unwrap().as_i64(),
+        Some(tid_a),
+        "reverse landed on the earlier worker's breakpoint"
+    );
+    // The stopped thread's stack is live at the worker's load line again.
+    let st = s.handle(&req(
+        7,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid_a))]),
+    ));
+    let line = response(&st)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("line")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_eq!(line, 18, "back at the worker's load line");
+}
+
+#[test]
+fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
+    // A data breakpoint on the raced window range [0, 8) fires in whichever worker's store touches it,
+    // over DAP — the cross-thread watch reaching a DAP client on the scheduled bytecode engine.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(RACY_COUNTER)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    // Arm a write watch on [0, 8) directly (dataId = "addr:len") *before* configurationDone runs the
+    // guest; the server reports it verified.
+    let arm = s.handle(&req(
+        3,
+        "setDataBreakpoints",
+        Json::obj(vec![(
+            "breakpoints",
+            Json::Arr(vec![Json::obj(vec![
+                ("dataId", Json::s("0:8")),
+                ("accessType", Json::s("write")),
+            ])]),
+        )]),
+    ));
+    let verified = response(&arm)
+        .get("body")
+        .and_then(|b| b.get("breakpoints"))
+        .and_then(|b| b.as_array())
+        .and_then(|a| a.first())
+        .and_then(|b| b.get("verified"))
+        .cloned();
+    assert_eq!(
+        verified,
+        Some(Json::Bool(true)),
+        "the cross-thread data breakpoint arms on the scheduled engine"
+    );
+    // Run → a worker's store to [0, 8) trips it, reason "data breakpoint", in a spawned worker.
+    let cont = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let stop = event(&cont, "stopped").expect("the store trips the watch");
+    assert_eq!(
+        stop.get("body").unwrap().get("reason").unwrap().as_str(),
+        Some("data breakpoint")
+    );
+    assert!(
+        stop.get("body")
+            .unwrap()
+            .get("threadId")
+            .unwrap()
+            .as_i64()
+            .unwrap()
+            >= 2,
+        "tripped inside a spawned worker, not the root"
     );
 }

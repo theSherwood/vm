@@ -3766,9 +3766,9 @@ pub fn module_spawns_threads(m: &Module) -> bool {
 /// The outcome of one [`ScheduledDebugRun`] pump — the multi-vCPU counterpart of a `DebugRun` stop.
 #[derive(Debug)]
 pub enum SchedStop {
-    /// A breakpoint fired in some thread; that thread is now the stopped + focused one
-    /// ([`stopped_task`](ScheduledDebugRun::stopped_task)).
-    Break(super::IrPc),
+    /// A stop fired in some thread; that thread is now the stopped + focused one
+    /// ([`stopped_task`](ScheduledDebugRun::stopped_task)). `reason` says why.
+    Break { pc: super::IrPc, reason: SchedBreak },
     /// The root vCPU finished — the run's result (or trap).
     Finished(Result<Vec<Value>, Trap>),
     /// No thread is runnable and the root hasn't finished: a `memory.wait`/deadlock the debug
@@ -3777,6 +3777,18 @@ pub enum SchedStop {
     /// A thread reached an op outside the debug scheduler's subset — `memory.wait`/`notify`, fibers,
     /// `instantiate`, coroutines, tier-up. This program can't be debugged multithreaded here.
     Declined,
+}
+
+/// Why a [`SchedStop::Break`] fired — mapped to the DAP stop reason by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedBreak {
+    /// A pc in the run-shared breakpoint set (in whichever thread reached it).
+    Breakpoint,
+    /// A window watchpoint: the about-to-run op touches `[addr, addr+len)` with a matching kind. The
+    /// stop is *before* the access applies.
+    Watchpoint { addr: u64, write: bool },
+    /// A single-step / step-over / step-out landed the stepping thread at its target.
+    Step,
 }
 
 /// One scheduled vCPU under the multi-vCPU debugger.
@@ -3809,10 +3821,11 @@ struct DbgTask {
 /// set fires in **whichever** vCPU reaches it (stopping *before* the op), `stopped_task` reports which,
 /// and `select_task` focuses read-inspection (backtrace / `read_var` / `read_window`) on any live thread
 /// while stopped in another. The schedule is a reproducible lowest-index-runnable, one-op-per-turn pick
-/// (the debuggable analogue of the production `drive`), so the interleaving is deterministic. Reverse
-/// debugging and cross-thread watchpoints stay single-vCPU-only for now (a later slice) — the DAP
-/// backend gates them off in scheduled mode. Anything outside the `spawn`/`join` subset (`memory.wait`,
-/// fibers, `instantiate`, coroutines) surfaces as [`SchedStop::Declined`].
+/// (the debuggable analogue of the production `drive`), so the interleaving is deterministic — which is
+/// what makes **reverse debugging** (`tick`-replay to a global `turn`) and **cross-thread watchpoints**
+/// (the per-op seam checks the armed ranges in whichever thread) sound. Stepping is depth-aware
+/// (in/over/out). Anything outside the `spawn`/`join` subset (`memory.wait`, fibers, `instantiate`,
+/// coroutines) surfaces as [`SchedStop::Declined`].
 pub struct ScheduledDebugRun {
     source: std::sync::Arc<ModuleSource>,
     table: SharedSlots,
@@ -3822,7 +3835,16 @@ pub struct ScheduledDebugRun {
     fn_block_base: Vec<Vec<u32>>,
     fn_block_types: Vec<Vec<Vec<ValType>>>,
     debug: Option<DebugInfo>,
+    /// The IR functions, for computing the effective address of the op about to run when a watchpoint
+    /// is armed (`watch_hit_before`). `Arc` so a reverse `seek` rebuild is cheap.
+    funcs: std::sync::Arc<[Func]>,
     breakpoints: Vec<super::IrPc>,
+    /// Run-shared window watchpoints (DEBUGGING.md W2, cross-thread): `(addr, len, kind)`. Empty in the
+    /// common case, so the per-op `access_of` computation is skipped entirely.
+    watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// Set when `drive` stopped *before* an op that hits a watchpoint (the access hasn't applied yet);
+    /// taken by the backend to report `StopReason::Watchpoint`.
+    last_watch: Option<(u64, bool)>,
     /// The task index paused on a breakpoint (stepping drives it); `None` while running.
     stopped: Option<usize>,
     /// The task `select_task` focuses read-inspection on; reset to the stopped thread on each stop.
@@ -3964,7 +3986,10 @@ impl ScheduledDebugRun {
             fn_block_base,
             fn_block_types,
             debug: m.debug_info.clone(),
+            funcs: std::sync::Arc::from(m.funcs.clone()),
             breakpoints: Vec::new(),
+            watchpoints: Vec::new(),
+            last_watch: None,
             stopped: None,
             focus: 0,
             turn: 0,
@@ -3976,17 +4001,45 @@ impl ScheduledDebugRun {
         self.breakpoints = bps;
     }
 
-    /// Drive the cooperative schedule until a breakpoint fires (in some thread), the root finishes, no
-    /// thread is runnable (`Blocked`), or a thread hits an unsupported op (`Declined`). Resumable — the
-    /// previously stopped thread steps one op past its breakpoint before the scan resumes.
+    /// Replace the run-shared **watchpoints** (DEBUGGING.md W2, cross-thread): each `(addr, len, kind)`
+    /// makes the schedule stop *before* any op — in whichever thread — that accesses `[addr, addr+len)`
+    /// with a matching read/write kind.
+    pub fn set_watchpoints(&mut self, ranges: Vec<(u64, u64, super::WatchKind)>) {
+        self.watchpoints = ranges;
+    }
+
+    /// Take the `(addr, write)` of the watchpoint the last stop fired on (cleared by the read), so the
+    /// backend can report `StopReason::Watchpoint`. `None` if the last stop was a breakpoint / step.
+    pub fn take_watch_hit(&mut self) -> Option<(u64, bool)> {
+        self.last_watch.take()
+    }
+
+    /// Drive the cooperative schedule until a breakpoint/watchpoint fires (in some thread), the root
+    /// finishes, no thread is runnable (`Blocked`), or a thread hits an unsupported op (`Declined`).
+    /// Resumable — the previously stopped thread steps one op past its stop before the scan resumes.
     pub fn run_until_stop(&mut self, fuel: &mut u64) -> SchedStop {
+        self.drive(fuel, None)
+    }
+
+    /// The unified scheduler pump. `step` selects the mode:
+    /// - `None` — a plain resume (`continue`/`reverseContinue`): run the **lowest-index** runnable
+    ///   thread one op per turn, stopping on any thread's breakpoint or watchpoint.
+    /// - `Some((st, max))` — step thread `st`: run **`st`** by preference (falling back to the lowest
+    ///   runnable only while `st` is blocked, so a step *over* a `join` can't deadlock), stopping the
+    ///   moment `st` reaches a call depth `<= max` at an instruction (`max = None` ⇒ any depth = one
+    ///   instruction = step-*in*). Another thread's breakpoint/watchpoint still interrupts a step.
+    fn drive(&mut self, fuel: &mut u64, step: Option<(usize, Option<usize>)>) -> SchedStop {
         let Self {
             source,
             table,
             mem,
             host,
             tasks,
+            funcs,
             breakpoints,
+            watchpoints,
+            last_watch,
+            fn_block_base,
             stopped,
             focus,
             turn,
@@ -3997,21 +4050,51 @@ impl ScheduledDebugRun {
             if let DbgTaskState::Done(res) = &tasks[0].state {
                 return SchedStop::Finished(res.clone());
             }
-            let Some(ti) = tasks
-                .iter()
-                .position(|t| matches!(t.state, DbgTaskState::Runnable))
-            else {
-                return SchedStop::Blocked;
+            // Prefer the stepping thread while it is runnable (so a step stays on it and a step-over
+            // runs its own call), else the lowest-index runnable thread (unblocks a stepped `join`).
+            let ti = match step {
+                Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
+                _ => match tasks
+                    .iter()
+                    .position(|t| matches!(t.state, DbgTaskState::Runnable))
+                {
+                    Some(i) => i,
+                    None => return SchedStop::Blocked,
+                },
             };
-            // Breakpoint check *before* the op — but not on the thread we just reported (it must make
-            // progress off its current op first, so a loop-body breakpoint re-fires each iteration).
+            // Pre-op stop checks (breakpoint / watchpoint), skipped for a thread that just reported (it
+            // must make progress off its current op first, so a loop-body stop re-fires each iteration).
             if !tasks[ti].at_bp {
                 if let Some(pc) = tasks[ti].vm.cur_ir_pc(source) {
                     if breakpoints.contains(&pc) {
                         tasks[ti].at_bp = true;
                         *stopped = Some(ti);
                         *focus = ti;
-                        return SchedStop::Break(pc);
+                        return SchedStop::Break {
+                            pc,
+                            reason: SchedBreak::Breakpoint,
+                        };
+                    }
+                    if !watchpoints.is_empty() && pc.module == 0 {
+                        if let Some((addr, write)) = watch_hit_before(
+                            &tasks[ti].vm,
+                            mem,
+                            funcs,
+                            fn_block_base,
+                            watchpoints,
+                            pc.func,
+                            pc.block,
+                            pc.inst,
+                        ) {
+                            *last_watch = Some((addr, write));
+                            tasks[ti].at_bp = true;
+                            *stopped = Some(ti);
+                            *focus = ti;
+                            return SchedStop::Break {
+                                pc,
+                                reason: SchedBreak::Watchpoint { addr, write },
+                            };
+                        }
                     }
                 }
             }
@@ -4043,72 +4126,132 @@ impl ScheduledDebugRun {
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
-        }
-    }
-
-    /// Single-step the **stopped** thread to its next instruction location (skipping terminators),
-    /// keeping the schedule fixed — the multithreaded counterpart of `DebugRun::step`. If that thread
-    /// finishes or blocks mid-step, control returns to the scheduler.
-    pub fn step(&mut self, fuel: &mut u64) -> SchedStop {
-        let Some(ti) = self.stopped else {
-            return self.run_until_stop(fuel);
-        };
-        self.stopped = None;
-        self.tasks[ti].at_bp = false;
-        loop {
-            if !matches!(self.tasks[ti].state, DbgTaskState::Runnable) {
-                return self.finish_or_continue(fuel);
-            }
-            let outcome = {
-                let Self {
-                    source,
-                    table,
-                    mem,
-                    host,
-                    tasks,
-                    ..
-                } = self;
-                tasks[ti]
-                    .vm
-                    .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
-            };
-            self.turn += 1;
-            match outcome {
-                Ok(Outcome::Suspended) => {}
-                Ok(Outcome::ThreadJoin { handle, dst }) => {
-                    dbg_join(&mut self.tasks, ti, handle, dst)
-                }
-                Ok(Outcome::ThreadSpawn { func, sp, arg, dst }) => {
-                    if let Err(t) = dbg_spawn(&mut self.tasks, ti, func, sp, arg, dst, &self.source)
-                    {
-                        dbg_complete(&mut self.tasks, ti, Err(t));
+            // Post-op step target: the stepping thread reached a qualifying call depth at an instruction.
+            if let Some((st, max_depth)) = step {
+                if ti == st && matches!(tasks[st].state, DbgTaskState::Runnable) {
+                    let depth = tasks[st].vm.stack.len() + 1;
+                    if max_depth.is_none_or(|m| depth <= m) {
+                        if let Some(pc) = tasks[st].vm.cur_ir_pc(source) {
+                            *stopped = Some(st);
+                            *focus = st;
+                            return SchedStop::Break {
+                                pc,
+                                reason: SchedBreak::Step,
+                            };
+                        }
                     }
                 }
-                Ok(Outcome::Done(vals)) => {
-                    dbg_complete(&mut self.tasks, ti, Ok(vals));
-                    return self.finish_or_continue(fuel);
-                }
-                Ok(_) => return SchedStop::Declined,
-                Err(t) => {
-                    dbg_complete(&mut self.tasks, ti, Err(t));
-                    return self.finish_or_continue(fuel);
-                }
-            }
-            if let Some(pc) = self.tasks[ti].vm.cur_ir_pc(&self.source) {
-                self.stopped = Some(ti);
-                self.focus = ti;
-                return SchedStop::Break(pc);
             }
         }
     }
 
-    /// The root's result if it has finished, else keep driving the schedule (used when the stepped
-    /// thread finished/blocked mid-step).
-    fn finish_or_continue(&mut self, fuel: &mut u64) -> SchedStop {
-        if let DbgTaskState::Done(res) = &self.tasks[0].state {
-            return SchedStop::Finished(res.clone());
+    /// Step the stopped thread until its call depth is `<= max_depth` (`None` ⇒ any = one instruction),
+    /// keeping other threads frozen unless the stepped thread blocks. The shared driver for the stepping
+    /// verbs — mirrors `DebugRun::step_to`.
+    fn step_to(&mut self, max_depth: Option<usize>, fuel: &mut u64) -> SchedStop {
+        let Some(st) = self.stopped else {
+            return self.run_until_stop(fuel);
+        };
+        self.tasks[st].at_bp = true; // step *off* the current op first, then seek the next stop
+        self.drive(fuel, Some((st, max_depth)))
+    }
+
+    /// **Step** one instruction — descends into a call — the multithreaded counterpart of
+    /// `DebugRun::step`. Drives the stopped thread; other threads stay frozen.
+    pub fn step(&mut self, fuel: &mut u64) -> SchedStop {
+        self.step_to(None, fuel)
+    }
+
+    /// **Step over** the next source op: run any call it makes to completion (schedule advances only if
+    /// the stepped thread blocks), landing at the next op at the same call depth.
+    pub fn step_over(&mut self, fuel: &mut u64) -> SchedStop {
+        let max = self.stopped.map(|s| self.tasks[s].vm.stack.len() + 1);
+        self.step_to(max, fuel)
+    }
+
+    /// **Step out** — run until the stepped thread's current function returns (one call depth shallower).
+    pub fn step_out(&mut self, fuel: &mut u64) -> SchedStop {
+        let max = self
+            .stopped
+            .map(|s| (self.tasks[s].vm.stack.len() + 1).saturating_sub(1));
+        self.step_to(max, fuel)
+    }
+
+    /// Advance the schedule by exactly one visible op (the raw time quantum for replay-based reverse
+    /// `seek` — DEBUGGING.md W1), honoring **no** breakpoint/watch/step checks: the lowest-index runnable
+    /// thread runs one op, `turn` ticks. Returns `false` once the root has finished (or the schedule can
+    /// no longer advance — blocked/unsupported). Because the debug schedule is deterministic (pure
+    /// compute, one-op-per-turn, lowest-index pick), replaying `t` ticks from a fresh session reproduces
+    /// the exact state at global turn `t`.
+    pub fn tick(&mut self, fuel: &mut u64) -> bool {
+        if matches!(self.tasks[0].state, DbgTaskState::Done(_)) {
+            return false;
         }
-        self.run_until_stop(fuel)
+        let Self {
+            source,
+            table,
+            mem,
+            host,
+            tasks,
+            turn,
+            ..
+        } = self;
+        let Some(ti) = tasks
+            .iter()
+            .position(|t| matches!(t.state, DbgTaskState::Runnable))
+        else {
+            return false; // no runnable thread (blocked) — can't advance
+        };
+        let outcome = tasks[ti]
+            .vm
+            .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1);
+        tasks[ti].at_bp = false;
+        *turn += 1;
+        match outcome {
+            Ok(Outcome::Suspended) => {}
+            Ok(Outcome::Done(vals)) => dbg_complete(tasks, ti, Ok(vals)),
+            Ok(Outcome::ThreadSpawn { func, sp, arg, dst }) => {
+                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+            Ok(Outcome::ThreadJoin { handle, dst }) => dbg_join(tasks, ti, handle, dst),
+            Ok(_) => return false, // an unsupported op — stop the replay here
+            Err(t) => dbg_complete(tasks, ti, Err(t)),
+        }
+        !matches!(tasks[0].state, DbgTaskState::Done(_))
+    }
+
+    /// The current global turn (visible ops replayed so far) — the reverse-`seek` coordinate.
+    pub fn op_turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
+    /// focused thread becomes the one about to run (lowest-index runnable), or none once the run finished.
+    pub fn locate(&mut self) {
+        let next = self
+            .tasks
+            .iter()
+            .position(|t| matches!(t.state, DbgTaskState::Runnable));
+        self.stopped = next;
+        self.focus = next.unwrap_or(0);
+    }
+
+    /// After a `seek` landed exactly on a breakpoint op, arm the stopped thread's skip so a forward
+    /// resume steps past it instead of immediately re-reporting the same stop.
+    pub fn arm_breakpoint_skip(&mut self) {
+        if let Some(st) = self.stopped {
+            self.tasks[st].at_bp = true;
+        }
+    }
+
+    /// The run's result once the root has finished (`None` while still running).
+    pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
+        match &self.tasks[0].state {
+            DbgTaskState::Done(r) => Some(r),
+            _ => None,
+        }
     }
 
     /// Every live (not-yet-finished) vCPU — one DAP thread each. The stopped thread is among them.
