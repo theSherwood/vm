@@ -413,6 +413,49 @@ block0(sp: i64, inc: i64):
 `,
   },
 
+  'Debugger (SVM — wait / notify)': {
+    debug: true,
+    bp: 27, // a breakpoint pre-placed on line 28 (0-based 27), the worker's read *after* the futex wait
+    mode: 'plain',
+    desc: 'A futex handoff, debugged on the multithreaded bytecode engine. The root (producer) stores a ' +
+      'value into mem[8], sets a flag and atomic.notify’s mem[0], then joins; the worker (consumer) ' +
+      'atomic.wait’s on mem[0] until woken, then reads mem[8] (→ 987654). A breakpoint is pre-placed on ' +
+      'the worker’s read (line 28) — press Debug: the worker parks on the wait, the root’s notify wakes ' +
+      'it, and the debugger stops at the read. The thread selector shows both vCPUs; the debug scheduler ' +
+      'drives the whole wait/notify handoff deterministically right here in the sandbox.',
+    src: `; A futex handoff. The root stores 987654 to mem[8], flags + notifies mem[0],
+; and joins. The worker waits on mem[0], then reads mem[8]. A breakpoint sits
+; on the worker's read (line 28) — it fires once the root's notify wakes it.
+memory 16
+func () -> (i64) {
+block0():
+  a8 = i64.const 8
+  val = i64.const 987654
+  i64.atomic.store.release a8 val
+  sp = i64.const 0
+  h = thread.spawn 1 sp sp
+  a0 = i64.const 0
+  one = i32.const 1
+  i32.atomic.store.release a0 one
+  a0n = i64.const 0
+  n1 = i32.const 1
+  woke = atomic.notify a0n n1
+  r = thread.join h
+  return r
+}
+func (i64, i64) -> (i64) {
+block0(sp: i64, arg: i64):
+  a0 = i64.const 0
+  exp = i32.const 0
+  tmo = i64.const 1000000000
+  st = i32.atomic.wait a0 exp tmo
+  a8 = i64.const 8
+  got = i64.atomic.load.acquire a8
+  return got
+}
+`,
+  },
+
   // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
   //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------

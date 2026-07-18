@@ -3800,6 +3800,13 @@ enum DbgTaskState {
         slot: usize,
         dst: u32,
     },
+    /// Parked on `memory.wait` at futex key `key` until `memory.notify` or the logical `clock` reaches
+    /// `deadline`; the status (`WAIT_WOKEN` / `WAIT_TIMED_OUT`) lands at `dst`.
+    BlockedWait {
+        key: u64,
+        deadline: u64,
+        dst: u32,
+    },
     /// Finished — result (or trap) retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
 }
@@ -3824,8 +3831,9 @@ struct DbgTask {
 /// (the debuggable analogue of the production `drive`), so the interleaving is deterministic — which is
 /// what makes **reverse debugging** (`tick`-replay to a global `turn`) and **cross-thread watchpoints**
 /// (the per-op seam checks the armed ranges in whichever thread) sound. Stepping is depth-aware
-/// (in/over/out). Anything outside the `spawn`/`join` subset (`memory.wait`, fibers, `instantiate`,
-/// coroutines) surfaces as [`SchedStop::Declined`].
+/// (in/over/out), and **`memory.wait`/`notify`** park/wake threads (a stuck set advances a logical
+/// `clock` to the earliest wait deadline, exactly as the production `drive`). Anything still outside the
+/// subset (fibers, `instantiate`, coroutines) surfaces as [`SchedStop::Declined`].
 pub struct ScheduledDebugRun {
     source: std::sync::Arc<ModuleSource>,
     table: SharedSlots,
@@ -3849,8 +3857,12 @@ pub struct ScheduledDebugRun {
     stopped: Option<usize>,
     /// The task `select_task` focuses read-inspection on; reset to the stopped thread on each stop.
     focus: usize,
-    /// Global count of visible ops executed across all vCPUs — the scheduled-mode logical clock.
+    /// Global count of visible ops executed across all vCPUs — the scheduled-mode logical clock and the
+    /// reverse-`seek` coordinate.
     turn: u64,
+    /// The `memory.wait` deadline clock (advanced only when the whole run is stuck-waiting, to the
+    /// earliest deadline). Separate from `turn`: it measures futex timeout time, not ops.
+    clock: u64,
 }
 
 /// Mark task `ti` done and wake any joiner parked on it (delivering its result / propagating a trap) —
@@ -3941,6 +3953,85 @@ fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32) {
     }
 }
 
+/// `memory.wait`: park the caller on futex key `base` until a `notify` or the deadline, unless the
+/// value already changed (the compare-under-lock analogue). Mirrors `drive`'s `Wait`.
+#[allow(clippy::too_many_arguments)]
+fn dbg_wait(
+    tasks: &mut [DbgTask],
+    ti: usize,
+    mem: &Option<Mem>,
+    clock: u64,
+    base: u64,
+    expected: u64,
+    width: u32,
+    timeout: u64,
+    dst: u32,
+) {
+    let cur = mem
+        .as_ref()
+        .map(|m| m.atomic_value(base, width))
+        .unwrap_or(0);
+    if cur != expected {
+        tasks[ti].vm.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+    } else {
+        tasks[ti].state = DbgTaskState::BlockedWait {
+            key: base,
+            deadline: clock.saturating_add(timeout),
+            dst,
+        };
+    }
+}
+
+/// `memory.notify`: wake up to `count` waiters on `base` (lowest task index first, deterministic); the
+/// woken count lands at `dst`. Mirrors `drive`'s `Notify`.
+fn dbg_notify(tasks: &mut [DbgTask], ti: usize, base: u64, count: i32, dst: u32) {
+    let want = count as u32;
+    let mut woken = 0u32;
+    for t in tasks.iter_mut() {
+        if woken >= want {
+            break;
+        }
+        if let DbgTaskState::BlockedWait { key, dst: wdst, .. } = t.state {
+            if key == base {
+                t.vm.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
+                t.state = DbgTaskState::Runnable;
+                woken += 1;
+            }
+        }
+    }
+    tasks[ti].vm.set(dst, Reg::from_i32(woken as i32));
+}
+
+/// Pick the next thread to run: the lowest-index runnable one. If none is runnable, advance the futex
+/// `clock` to the earliest `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`),
+/// then retry. `None` only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`.
+fn dbg_pick_runnable(tasks: &mut [DbgTask], clock: &mut u64) -> Option<usize> {
+    loop {
+        if let Some(i) = tasks
+            .iter()
+            .position(|t| matches!(t.state, DbgTaskState::Runnable))
+        {
+            return Some(i);
+        }
+        let next = tasks
+            .iter()
+            .filter_map(|t| match t.state {
+                DbgTaskState::BlockedWait { deadline, .. } => Some(deadline),
+                _ => None,
+            })
+            .min()?;
+        *clock = (*clock).max(next);
+        for t in tasks.iter_mut() {
+            if let DbgTaskState::BlockedWait { deadline, dst, .. } = t.state {
+                if deadline <= *clock {
+                    t.vm.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
+                    t.state = DbgTaskState::Runnable;
+                }
+            }
+        }
+    }
+}
+
 impl ScheduledDebugRun {
     /// Open a multithreaded debug session on `m`'s `func(args)`. `None` if the module is outside the
     /// bytecode engine's subset (`compile_module` declines it).
@@ -3993,6 +4084,7 @@ impl ScheduledDebugRun {
             stopped: None,
             focus: 0,
             turn: 0,
+            clock: 0,
         })
     }
 
@@ -4043,6 +4135,7 @@ impl ScheduledDebugRun {
             stopped,
             focus,
             turn,
+            clock,
             ..
         } = self;
         *stopped = None;
@@ -4051,13 +4144,11 @@ impl ScheduledDebugRun {
                 return SchedStop::Finished(res.clone());
             }
             // Prefer the stepping thread while it is runnable (so a step stays on it and a step-over
-            // runs its own call), else the lowest-index runnable thread (unblocks a stepped `join`).
+            // runs its own call), else the lowest-index runnable thread (advancing the futex clock to
+            // wake a waiter when the set is stuck; unblocks a stepped `join`/`wait`).
             let ti = match step {
                 Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
-                _ => match tasks
-                    .iter()
-                    .position(|t| matches!(t.state, DbgTaskState::Runnable))
-                {
+                _ => match dbg_pick_runnable(tasks, clock) {
                     Some(i) => i,
                     None => return SchedStop::Blocked,
                 },
@@ -4119,7 +4210,21 @@ impl ScheduledDebugRun {
                     *turn += 1;
                     dbg_join(tasks, ti, handle, dst);
                 }
-                // Fibers / wait / notify / instantiate / coroutine / tier-up — outside this slice.
+                Ok(Outcome::MemoryWait {
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                }) => {
+                    *turn += 1;
+                    dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst);
+                }
+                Ok(Outcome::MemoryNotify { base, count, dst }) => {
+                    *turn += 1;
+                    dbg_notify(tasks, ti, base, count, dst);
+                }
+                // Fibers / instantiate / coroutine / tier-up — outside this slice.
                 Ok(_) => return SchedStop::Declined,
                 Err(t) => {
                     *turn += 1;
@@ -4194,13 +4299,11 @@ impl ScheduledDebugRun {
             host,
             tasks,
             turn,
+            clock,
             ..
         } = self;
-        let Some(ti) = tasks
-            .iter()
-            .position(|t| matches!(t.state, DbgTaskState::Runnable))
-        else {
-            return false; // no runnable thread (blocked) — can't advance
+        let Some(ti) = dbg_pick_runnable(tasks, clock) else {
+            return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
         let outcome = tasks[ti]
             .vm
@@ -4216,6 +4319,16 @@ impl ScheduledDebugRun {
                 }
             }
             Ok(Outcome::ThreadJoin { handle, dst }) => dbg_join(tasks, ti, handle, dst),
+            Ok(Outcome::MemoryWait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            }) => dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst),
+            Ok(Outcome::MemoryNotify { base, count, dst }) => {
+                dbg_notify(tasks, ti, base, count, dst)
+            }
             Ok(_) => return false, // an unsupported op — stop the replay here
             Err(t) => dbg_complete(tasks, ti, Err(t)),
         }

@@ -362,6 +362,23 @@ try {
     : fail(`threads reverse: landed on ${reversedThread}, expected the earlier worker (not ${secondThread})`);
   await page.click(`${thCard} .dbg-controls button[data-cmd="stop"]`);
 
+  // The wait/notify card: a futex handoff. The worker parks on atomic.wait until the root's notify
+  // wakes it; a breakpoint after the wait fires only once woken — proving wait/notify drive under the
+  // debug scheduler. Then Continue finishes the handoff.
+  const wnCard = card('Debugger (SVM — wait / notify)');
+  await page.click(`${wnCard} .debug`);
+  await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
+    wnCard, { timeout: 20_000 });
+  const wnStopped = await page.evaluate((sel) =>
+    document.querySelector(`${sel} .dbg-threads .thr.sel`)?.dataset.thread, wnCard);
+  wnStopped && wnStopped !== '1'
+    ? ok(`wait/notify card: the worker woke and stopped after the wait (thread ${wnStopped})`)
+    : fail(`wait/notify paused: selected ${wnStopped}, expected a worker (not the root, 1)`);
+  await page.click(`${wnCard} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => /finished/.test(document.querySelector(`${sel} .state`).textContent),
+    wnCard, { timeout: 10_000 });
+  ok('wait/notify card: the handoff finished after resuming');
+
   // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.
   await page.selectOption('#theme', 'dark');
   const themed = await page.evaluate(() => ({

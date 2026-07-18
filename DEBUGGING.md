@@ -255,11 +255,24 @@ different things depending on which pair you compare:
     playground panel's existing ◀◀ Reverse / data-breakpoint controls now light up for the threads demo
     (browser-verified: Reverse walks back to the earlier worker).
 
+  **`memory.wait`/`notify` under the debug scheduler (slice 11).** The scheduled engine now parks a
+  thread on `atomic.wait` (`DbgTaskState::BlockedWait`) and wakes it on `atomic.notify` (lowest task
+  index first), with a stuck set advancing a separate futex `clock` to the earliest wait deadline —
+  mirroring the production `drive` exactly, folded into the shared `drive`/`tick` pump (so it composes
+  with breakpoints, watchpoints, stepping, and reverse). A futex handoff is therefore fully debuggable
+  (was `SchedStop::Declined`): `bytecode_scheduled_wait_notify_completes` matches the tree-walker oracle
+  and the M:N executor, `bytecode_breakpoint_after_a_wait_fires_once_woken` proves the worker actually
+  parked and was woken, and `dap_over_bytecode_multithreaded_wait_notify` drives it over DAP. A
+  "Debugger (SVM — wait / notify)" playground demo (browser-verified: the worker stops after the wait,
+  woken by the root's notify, then finishes). Fibers/coroutines are the only remaining `Declined` ops.
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines (single-vCPU + scheduled) now cover the full `Inspector` forward/reverse/
-  watch surface. Remaining: `memory.wait`/`notify` + fibers/coroutines under the debug scheduler (they
-  surface as `SchedStop::Declined` today), and a checkpoint ladder to bound reverse-replay cost.
+  watch surface plus `thread.spawn`/`join`/`wait`/`notify`. Remaining: **fibers/coroutines** under the
+  debug scheduler (they need the `VTask`/fiber-registry machinery neither bytecode debug path carries
+  yet — a larger slice; `SchedStop::Declined` today), and a checkpoint ladder to bound reverse-replay
+  cost (a perf optimization — today's small debugged programs replay from turn 0 cheaply).
 
 ---
 
