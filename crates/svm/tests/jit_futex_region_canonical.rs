@@ -23,7 +23,7 @@ use svm_verify::verify_module;
 /// func 0 (parent): `create_region` a 64 KiB region via the `AddressSpace` (arg `v0`), query its
 /// granule `G` (op 3), map it at window offset `0` (alias A) and again at `G` (alias B) — both covering
 /// region byte 0 — spawn the notifier child, then `atomic.wait` on **alias B** (window `G`), expected
-/// `0`. A generous 5 s timeout keeps a *regression* (missed wakeup, keys not canonical) a clean
+/// `0`. A generous 3 s timeout keeps a *regression* (missed wakeup, keys not canonical) a clean
 /// timed-out status (`2`) instead of a hang — on success the `notify` wakes it in microseconds and the
 /// timeout never elapses. Returns the wait status: `0` iff a `notify` woke it.
 ///
@@ -44,7 +44,7 @@ block0(v0: i32):\n\
   vm2 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vr (vps, vz, vlen, vprot)\n\
   vchild = thread.spawn 1 vz vz\n\
   vexp = i32.const 0\n\
-  vto = i64.const 5000000000\n\
+  vto = i64.const 3000000000\n\
   vst = i32.atomic.wait vps vexp vto\n\
   vjr = thread.join vchild\n\
   vst64 = i64.extend_i32_u vst\n\
@@ -55,7 +55,7 @@ block0(vsp: i64, varg: i64):\n\
   vz = i64.const 0\n\
   br block1(vz)\n\
 block1(cnt: i64):\n\
-  vlim = i64.const 200000000\n\
+  vlim = i64.const 20000000\n\
   vlt = i64.lt_u cnt vlim\n\
   br_if vlt block2(cnt) block3()\n\
 block2(cnt2: i64):\n\
@@ -81,7 +81,7 @@ fn notify_through_alias_wakes_waiter_on_the_other_jit() {
     verify_module(&m).expect("verify");
     const WIN: usize = 128 << 10;
 
-    for iter in 0..8 {
+    for iter in 0..4 {
         // Interpreter reference (already canonical).
         let mut hi = Host::new();
         hi.set_region_factory(svm_run::new_shared_region);

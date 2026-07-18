@@ -11613,7 +11613,14 @@ impl Host {
                         let region_off = *args.get(1).unwrap_or(&0) as u64;
                         let len = *args.get(2).unwrap_or(&0) as u64;
                         let prot = *args.get(3).unwrap_or(&0) as i32;
-                        let backing_id = backing.os_fd().map(|fd| fd as u64);
+                        // The backing's OS identity, stable across every alias of one region: the
+                        // memfd on unix, the section HANDLE on Windows (`MapViewOfFile3`). Either makes
+                        // two aliases key on the same `(backing, offset)` — a software-only region (no
+                        // OS handle) can't be canonicalized on the JIT, so it stays `Anon`.
+                        let backing_id = backing
+                            .os_fd()
+                            .map(|fd| fd as u64)
+                            .or_else(|| backing.os_section().map(|s| s as u64));
                         let r = mem.map_region(win_off, region_off, len, prot, region, backing);
                         // S1b/S1c: on a successful map of an OS-fd-backed region, tell the JIT futex
                         // registry which pages now alias which region bytes (a no-op on the interp).
