@@ -20,6 +20,8 @@ path = "src/main.rs"
 svm-ir = { path = "../crates/svm-ir" }
 svm-text = { path = "../crates/svm-text" }
 svm-jit = { path = "../crates/svm-jit" }
+# svm-encode: decode a prebuilt `.svmb` (the QuickJS engine) for the `jsbench` peval experiment.
+svm-encode = { path = "../crates/svm-encode" }
 # The reference interpreter — the `interp` lane: the *same* IR the JIT runs, executed by the
 # tree-walking oracle (`crates/svm/src/bin/bench.rs` tracks it too). Apples-to-apples with the JIT.
 svm-interp = { path = "../crates/svm-interp" }
