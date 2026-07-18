@@ -215,11 +215,21 @@ interp↔JIT differential oracle — only program *output* is. Do not later try 
 two backends retain identically; that would be "fixing" a non-bug and is impossible in
 general (the interp has no spill words to match).
 
+The newer tiers keep the same shape (BROWSER.md): the **bytecode engine** realizes `gc.roots` on
+its own tier — it scans the whole vCPU continuation (active frames, resume-chain ancestors, parked
+fibers, suspended coroutines; `svm-interp/src/bytecode.rs`), and a module combining `gc.roots` with
+`thread.spawn` falls back to the reference interp, since only the calling vCPU's continuation is
+scannable there. The **wasm-JIT** tier does not realize it at all: `gc.roots` is outside its v1
+subset, so `gc.roots`-bearing functions fail closed onto the interpreter (natively the op thunks
+into a runtime stack-walk; on wasm even a thunk cannot see JITted locals).
+
 ### 3.3. Soundness preconditions (caller obligations svm cannot cheaply enforce)
 
 - `gc.roots` is sound **only under STW** — svm does the range-check; the guest
-  guarantees no concurrent mutation. Optional cheap sanity assert: svm may refuse if
-  any *other* vCPU of the domain currently holds a RUNNING fiber.
+  guarantees no concurrent mutation. The cheap sanity assert is enforced on the JIT:
+  the scan refuses (`FiberFault`) if any *other* vCPU of the domain currently holds a
+  RUNNING fiber (`svm-jit/src/fiber_rt.rs`); the interp scans the shared registry
+  without it.
 - It is **authority-TCB, not escape-TCB** (§2a): only the powerbox holder can call it;
   a forged handle is inert (§3c). It cannot break escape-freedom.
 
@@ -269,10 +279,16 @@ general (the interp has no spill words to match).
    region scanned has its roots already flushed to memory — parked fibers (the suspend spilled
    their registers), running resume-chain ancestors + the calling fiber (whole-stack superset),
    and the root computation's OS-stack frames `[root_low, root_entry_sp)`. Roots a caller holds
-   *only* in unspilled callee-saved registers of its own frame are out of scope (a register-flush
-   shim is a future follow-up); the call boundary into the thunk forces the `gc.roots` caller to
-   spill, so its own roots are covered. Scanning a running fiber's / another vCPU's stack assumes
-   a stop-the-world safepoint, exactly as the interpreter scans the shared registry. Backend-uniform
+   *only* in unspilled callee-saved registers of its own frame were a real gap — the Tail ABI
+   *preserves* those registers across the call, so the thunk boundary did **not** force the caller
+   to spill them (audited and A/B-demonstrated: 13 of 17 roots reported without the fix). Closed by
+   construction: the JIT now reaches the scan only through a **register-flush trampoline**
+   (`fiber_rt::svm_gc_roots_flush`, one naked variant per target) that spills every callee-saved
+   register onto the scanned stack before the walk runs (`crates/svm-jit/GC_ROOTS_AUDIT.md`; A/B
+   test in `crates/svm/tests/gc_roots.rs`). Scanning a running fiber's / another vCPU's stack assumes
+   a stop-the-world safepoint, exactly as the interpreter scans the shared registry — and the JIT
+   enforces the §3.3 sanity assert (refuses, `FiberFault`, if another vCPU holds a RUNNING fiber).
+   Backend-uniform
    *semantics* per §3.2 (a sound superset of the live roots, not bit-identical candidate sets).
 5. **`gc.roots` tagged-pointer payload mask** — a 5th operand `mask` (top-byte-strip only) so a guest
    tagging pointers in the high byte recovers bare offsets; `mask = ~0` is the untagged default

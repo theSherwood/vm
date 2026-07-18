@@ -2,7 +2,7 @@
 
 Tracks building a **powerful, generic IR→IR AOT optimizer** that runs **outside svm (host-side
 tooling) and inside svm (guest-side, in-sandbox)** — the successor to the cleanup optimizer that
-lives in `svm-peval` today (`optimize_module`, DESIGN.md §20c). Companion to `DESIGN.md`
+lived in `svm-peval` (`optimize_module`, DESIGN.md §20c; moved here in Phase 0). Companion to `DESIGN.md`
 §20a/§20c and `PEVAL_BENCH.md`. Living doc: update the **Plan** tracker as work lands; fold into
 `DESIGN.md` once it closes.
 
@@ -10,7 +10,7 @@ lives in `svm-peval` today (`optimize_module`, DESIGN.md §20c). Companion to `D
 
 ## Goal & shape
 
-`svm-peval` already contains a generic, closed-module, semantics-preserving optimizer — constant
+`svm-peval` already contained a generic, closed-module, semantics-preserving optimizer — constant
 folding (bit-exact with the interpreter, floats + all v128 lane ops), branch resolution,
 dead-block elimination, dead-value elimination, block merging, dead block-param elimination, and
 copy-prop/algebraic identities, iterated to fixpoint. The goal here is to grow that into a real
@@ -21,7 +21,7 @@ The value is *not* uniform across backends, and that shapes which passes are wor
 
 | Payoff | Why |
 |---|---|
-| **Cross-function transforms** | Cranelift optimizes per function; nothing in the pipeline inlines, devirtualizes constant-index `call_indirect`, or drops dead functions. Highest leverage for the JIT path. |
+| **Cross-function transforms** | Cranelift optimizes per function; nothing else in the pipeline inlined, devirtualized constant-index `call_indirect`, or dropped dead functions — landed as Phase 3 (devirt + inline + DFE + const_prop). Highest leverage for the JIT path. |
 | **Interpreter backends** | The tree-walker and bytecode engine run the IR as-is — every pass pays off directly. The bytecode engine is the *only* execution path in the browser build (§21). |
 | **Compile time** | Smaller IR JITs faster (peval corpus: residuals compile 4–13× faster). Guest-side `Jit.compile` is metered, so shrinking IR before compiling is a real in-sandbox win. |
 | **Peval residual quality** | The specializer leans on the generic optimizer for cleanup; cases like `stack: chained expr` (73% of interpreter bytes kept) show headroom for GVN / load-forwarding. |
@@ -76,8 +76,8 @@ consequences are the legality rules every pass must obey:
 All of this is encoded once, in a shared **per-`Inst` effects table** (pure / can-trap /
 reads-mem / writes-mem / host-observable / control), living next to the `Inst` enum in `svm-ir`
 so new instructions *must* classify. Every pass consults the table; no pass carries its own
-opinion about purity. (Today this exists piecemeal as `is_removable_if_dead` + scattered match
-arms.)
+opinion about purity. (Landed — Phase 1a: `Inst::effects` in `svm-ir`, `removable_if_dead`
+derived from it.)
 
 ## Architecture  [SETTLED — decision recorded below]
 
@@ -119,7 +119,7 @@ tracked enhancement, not a blocker.
 - [x] **Phase 0 — carve-out.** Created `crates/svm-opt` (`no_std + alloc`, `forbid(unsafe_code)`,
   optional `libm`); moved `optimize_module` + fold/remap machinery out of `svm-peval`; re-pointed
   `svm-peval` / `svm-run`. Pure refactor, no behavior change; all existing tests green.
-- [ ] **Phase 1 — infrastructure.**
+- [x] **Phase 1 — infrastructure.**
   - [x] **(a) The per-`Inst` effects/trap table in `svm-ir`** ([`Inst::effects`] → [`Effects`]:
     `can_trap` / `reads_mem` / `writes_mem` / `side_effect`; `is_pure` + `removable_if_dead`
     derived). Exhaustive match, no wildcard, so a new `Inst` variant must be classified to compile.
@@ -138,15 +138,16 @@ tracked enhancement, not a blocker.
     (`from_ssa(to_ssa(f)) == f`), pinned by hand-built shapes (params/`br_table`/loops/multi-result
     `call`), an interpreter behavioral check, a 5000-case randomized structural test, and the
     `opt_ssa_roundtrip` cargo-fuzz target (reuses `irgen` → round-trip identity + interp-vs-JIT
-    differential on the lowered module). Cross-block-use lowering (param threading) is deferred to the
-    first Phase 2 pass that needs it — today every value is used only in its defining block.
+    differential on the lowered module). Cross-block-use lowering (param threading) was deferred to the
+    first pass that needed it — since landed with GVN (`crate::thread`).
   - [x] (d) `OptConfig` (pass toggles) — landed once something concrete demanded it: the **ablation
     benchmark** (`OPT_BENCH.md`), which needs to disable one pass at a time to attribute a size/speed
     delta to it. `OptConfig { sccp, reassociate, gvn, licm, local_cse, jump_thread }` (all default
     on) + `optimize_module_with` / `optimize_func_with`; `optimize_module` is the `all()` pipeline
-    unchanged. Only the six global/analysis passes toggle — the always-on intra-block canonicalization
-    is the shared substrate and the honest "no optimization" baseline. Budgets stay deferred to the
-    first budgeted pass (inliner / unroller), where a size/fuel budget actually bites.
+    unchanged. Only the global/analysis passes toggle (six then; every Phase 3/4 pass has since added
+    its own — twelve now) — the always-on intra-block canonicalization is the shared substrate and the
+    honest "no optimization" baseline. Budgets landed with the first budgeted pass, the Phase 3
+    inliner (module-wide instruction budget + `MAX_CALLEE_INSTS`).
 - [x] **Phase 2 — global scalar passes.**
   - [x] **SCCP** (`svm_opt::sccp`): sparse conditional constant propagation on the internal SSA
     form — a `Top ⊒ Const ⊒ Bottom` lattice propagated across the CFG (through block-parameter phis
@@ -229,9 +230,10 @@ tracked enhancement, not a blocker.
     threading so multi-hop chains collapse a hop per iteration. Tests (`tests/jump_thread.rs`):
     correlated branch threaded + forwarder eliminated, behavior preserved; covered by the `opt_sccp`
     fuzz target (whole pipeline, gen → verify → optimize → re-verify + interp differential).
-- [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
+- [x] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
-  (export/table-aware, rule 5 above).
+  (export/table-aware, rule 5 above). All landed (below), plus interprocedural constant
+  propagation beyond the plan.
   - [x] **Dead-function elimination** (`svm_opt::interproc::dead_func_elim`): the first module-level
     pass. Call-graph reachability closure from the roots (entry `func 0` + every named export) over
     `call`/`return_call`/`thread.spawn`/`ref.func` edges (the static-funcidx sites
@@ -379,7 +381,7 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   still ~1.4× (it remains the dominant interp-path run-time pass). A GVN variant of the same cost concern
   is deferred until a corpus case demands it.
 - [x] **Broaden the ablation corpus + measure the full pass set.** The harness now leaves out **all
-  eleven** togglable passes (was six) and adds two cases so the Phase-3/4 passes have a shape that
+  twelve** togglable passes (was six; `const_prop` joined with its Phase 3 entry) and adds two cases so the Phase-3/4 passes have a shape that
   exercises them: a **memory** case (a redundant same-address load for `mem`, a diamond-join reload
   for `load_elim`) and an **interproc** case (a constant `call_indirect` → `devirt` → `inline` → `dfe`,
   nearly halving the module). `OPT_BENCH.md` regenerated; the interprocedural passes turn out to be the
@@ -416,7 +418,9 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   result, simpler code.)
 - [ ] Debug-info (line map) preservation through transforms.
 - [ ] Loop unrolling / peeling under `OptConfig` budgets.
-- [ ] Interprocedural constant propagation (beyond what inlining exposes).
+- [x] Interprocedural constant propagation (beyond what inlining exposes). Landed
+  (`svm_opt::interproc::const_prop`, Phase 3 above) — reaches callees too big to inline, plus the
+  const-funcref-callback cascade through devirt.
 
 ## Open questions
 
@@ -425,5 +429,7 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   every new instruction to be classified before it compiles.
 - Whether `svm-run` grows a standalone optimize-only mode (`decode → optimize → verify →
   encode`, no specialization) for AOT pipelines — cheap, probably Phase 0/2 boundary.
-- How much of the specializer's CFG-cleanup entanglement moves vs stays: `specialize` calls the
-  optimizer for residual cleanup; the seam is the `svm-opt` public API. Settle during Phase 0.
+- ~~How much of the specializer's CFG-cleanup entanglement moves vs stays.~~ **Resolved
+  (Phase 0):** the optimizer + fold/remap machinery moved wholesale; `svm-peval` depends on
+  `svm-opt` and re-exports the fold helpers (`crates/svm-peval/src/lib.rs`) — the seam is the
+  `svm-opt` public API, as expected.

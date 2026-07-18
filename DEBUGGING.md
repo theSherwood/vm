@@ -171,6 +171,21 @@ different things depending on which pair you compare:
   `browser-dap-test.mjs` drives a full initialize→launch→breakpoint→variables→terminate conversation
   in real Chromium on the bytecode engine.
 
+  **Playground debug panel landed (slice 3) + auto debug-info for hand-written text (slice 3b).**
+  The playground gained a "Debugger (SVM)" card driving the slice-2 wire end-to-end in the page: a
+  CodeMirror breakpoint gutter + stopped-line highlight (`editor.js`), and a `play.js` DAP session
+  (initialize → launch `"engine":"bytecode"` → `setBreakpoints` from the gutter →
+  `configurationDone`, then Continue / Step Over / Step In / Step Out / Stop) rendering each stop's
+  named locals in a Variables pane — Chromium-verified by the editor smoke (pause at the pre-placed
+  breakpoint with `i=5/acc=0`, Continue to `i=4/acc=5`, Stop restores the editor). And a
+  hand-written SVM program needs no explicit `debug` section: `svm-text::parse_module_debug`
+  synthesizes one from the source itself — a line table (each instruction → its source line) plus
+  block-scoped SSA value names (params from the header, results visible once assigned); an explicit
+  `debug` section still wins verbatim, and plain `parse_module` stays byte-for-byte unchanged.
+  `svm-dap` launches through it, so breakpoints bind by line and values read back by name for any
+  playground program out of the box (tests: `svm-text` synthesis, `dap_bytecode.rs`; the Chromium
+  smoke drives the auto-debugged demo).
+
   **Reverse debugging landed on the bytecode engine (slice 4).** `DebugRun` gained an **op clock**
   (`op_clock`) and a raw one-op `tick`; `BytecodeBackend` implements `seek(t)` by rebuilding a fresh
   `DebugRun` and replaying `t` ops (the run is pure compute, so replay is deterministic), `step_back`
@@ -756,9 +771,11 @@ backtrace mis-renders a kill message, never affects confinement. The capture sta
 in the fault handler (no allocation — a fixed thread-local buffer; symbolization is deferred to the
 host in normal context).
 
-**Progress:** Stages 0–3 **done** + the interp↔JIT **differential oracle** wired — the JIT trap-time
-backtrace is live for both memory faults *and* explicit-check traps, attributed across spawned vCPUs,
-folded into the host's kill message, and validated frame-for-frame against the interpreter. **Memory
+**Progress:** Stages 0–5 **done** + the interp↔JIT **differential oracle** wired — the JIT trap-time
+backtrace is live for both memory faults *and* explicit-check traps, attributed across spawned vCPUs
+**and** per fiber under migration (Stage 4), reporting the true multi-vCPU trap *origin* on both
+engines (Stage 5), folded into the host's kill message, and validated frame-for-frame against the
+interpreter. **Memory
 faults now capture cross-platform** — unix via the SIGSEGV/SIGBUS handler, Windows via the Vectored
 Exception Handler (it walks the faulting `CONTEXT`'s `Rbp` chain in `mem.rs`, validated by
 `memfault_kill_message_carries_a_source_backtrace` on the `windows-latest` CI job). This closes Pillar
@@ -777,8 +794,9 @@ Trap-time backtraces are now **fully cross-platform**: the capture state + frame
 explicit-trap helper live in a shared `trap_capture.c`, and `emit_trap` threads the trapping frame
 pointer in via Cranelift `get_frame_pointer` (sidestepping MSVC's missing `__builtin_frame_address`),
 so div-by-zero / `unreachable` / `OutOfFuel` / indirect-call-type traps capture on **unix and Windows**
-(ISSUES I5 — landed, pending `windows-latest` CI confirmation). Remaining: per-fiber naming under
-work-stealing migration (ISSUES I6, S4 cosmetic).
+(ISSUES I5 — **resolved**, `windows-latest` confirmed green). Per-fiber naming under work-stealing
+migration (ISSUES I6) landed as Stage 4 above (`svm_set_current_fiber` / `last_trap_fiber()`,
+`jit_per_fiber_trap.rs`).
 
 ---
 
@@ -1060,8 +1078,8 @@ chain). Both correlate by the same source-line `scope` field the consumer resolv
 guest (wasm or `-O0` LLVM) with an inner-block `int x` shadowing an outer one resolves to the inner
 shadow inside the block and the outer after it, exactly as chibicc does (the LLVM lane verifies it at
 runtime; the wasm lane structurally, since a bare `WindowVia` frame read needs `__stack_pointer`
-setup the direct call doesn't do). *Not yet:* the JIT/DWARF tier for gdb/lldb on native code — scoped
-below.
+setup the direct call doesn't do). The JIT/DWARF tier for gdb/lldb on native code has since landed
+through Stage 4 (Stage 5 DAP-over-JIT remains) — scoped below.
 
 ### Scoping — the JIT/DWARF tier (gdb/lldb on native JIT'd code)
 
@@ -1142,7 +1160,8 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     (`crates/svm/examples/gdb_attach.rs`) for the repro harness + the exact `gdb --batch` invocation.
     *Effort: high.*
 - [~] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars). — register vars
-  done; memory/CFA forms pending Stage 4.** The §6 core already carries the inputs (`DebugInfo::vars:
+  done; CFA/spill forms landed with Stage 4's 4b; only the guest-window memory forms
+  (`Window`/`WindowVia`/`Fixed`) remain deferred.** The §6 core already carries the inputs (`DebugInfo::vars:
   Vec<VarInfo>` with a neutral `VarLoc`, and `DebugInfo::types: Vec<TypeDef>`), so this is purely a
   JIT-side *emit* problem — no IR/text change. ✅ **`print x` confirmed under gdb 15.1** (a JIT'd
   register-resident local reads back with its value + type).
@@ -1250,14 +1269,15 @@ DWARF variable locations) finally land — they are stages here, not separate wo
   like the rest of the waist — a malformed DWARF mis-renders, never escapes. Keep it off the
   verifier/runtime hot path.
 
-**Progress:** Stages 0–1 **built** (source-loc threading + `symbolize`); **Stage 2 built** — 2a/2b
-(the `.debug_line` and `.debug_info`/`.debug_abbrev` emitters) plus 2c (the in-memory ELF wrapper +
-GDB JIT registration: `gdb::build_elf` / `CompiledModule::{elf_object, register_with_gdb}` and the
-`__jit_debug_descriptor`/`__jit_debug_register_code` interface), all round-tripped through the
-readers / asserted against the descriptor state in CI. The "set a breakpoint on a `.c` line in gdb"
-milestone is **confirmed** — a real gdb 15.1 binds `break compute.c:3` to the live JIT'd address and
-stops there (repro: the `gdb_attach` example). **Next: Stage 3** — W6-JIT value locations +
-`DW_TAG_variable` DIEs (inspect source vars in gdb). Each stage is independently shippable.
+**Progress:** Stages 0–4 **built** — source-loc threading + `symbolize` (0–1); the
+`.debug_line`/`.debug_info`/`.debug_abbrev` emitters + the in-memory ELF wrapper + GDB JIT
+registration (2), with the "set a breakpoint on a `.c` line in gdb" milestone **confirmed** — a real
+gdb 15.1 binds `break compute.c:3` to the live JIT'd address and stops there (repro: the
+`gdb_attach` example); value locations + type/variable DIEs with `print` of register **and** spilled
+variables confirmed under gdb 15.1 (3, 4b); and `.debug_frame` CFI — `bt` across guest frames with
+source — plus the fiber-rooted backtrace of a suspended fiber (4a/4c). **Remaining: Stage 5**
+(DAP-over-JIT, the two-engine question above) and the guest-window-memory variable forms deferred
+from 3c/4b. Each stage is independently shippable.
 
 ---
 
@@ -1329,8 +1349,9 @@ executed `trace` tids, and replay forces them through `Dpor::pick`. Tests (`conc
 the racy lost-update counter): a `→ 1` witness is found and replays deterministically 5×, the
 serial `→ 2` witness replays, and an impossible outcome returns `None`. Full workspace green.
 
-*Not yet:* CLI verbs over these functions; stepping a witness interleaving (needs the
-multithreaded `Inspector` — Milestone B, the `Policy` scheduler seam); the DRF-or-trap tier.
+*Not yet:* CLI verbs over these functions; the DRF-or-trap tier. (Stepping a witness interleaving
+has since landed — Milestone B's `attach_scheduled` replays a `Witness::plan` with breakpoints and
+watchpoints composing, `debug_witness_stepping.rs`; see §4.)
 
 ---
 

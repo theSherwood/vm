@@ -1,8 +1,10 @@
 # File-backed mmap in the sandbox — design & goals
 
-**Status:** design (pre-implementation). The LMDB slice (LLVM.md BL) shipped a *working* file-mmap
-over the existing `HostFn` fs capability by **emulation**; this doc decides what the *first-class*
-story should be before we build more.
+**Status:** shipped through slice 3a — durability + crash proof (§4c/§4d), the zero-copy bridge
+(§4b/§5.2), and the two-offset ring mapping (§4e) are all landed; §7 tracks the deliberately
+deferred gaps (G1–G5), none of which has been picked up. The LMDB slice (LLVM.md BL) shipped a
+*working* file-mmap over the existing `HostFn` fs capability by **emulation**; this doc decided the
+*first-class* story and tracked it to landing.
 
 ## 1. What we are actually trying to prove
 

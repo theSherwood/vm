@@ -9,6 +9,14 @@ Tracks the design and implementation of compiling the SVM **bytecode interpreter
 > *to* wasm. The two never meet — a guest could even be wasm transpiled by `svm-wasm`, then run by
 > this interpreter-in-wasm.
 
+> **Related browser work documented elsewhere.** The browser platform this doc built is now the
+> venue for work tracked in other docs: the real-language demos that run on it — Lua, SQLite,
+> DOOM, the QuickJS REPL, and the persistent PostgreSQL session — live in `LLVM.md` (the on-ramp
+> doc) and `crates/svm-run/demos/*/README.md`; the in-playground DAP debug panel (breakpoints /
+> step / variables / reverse) in `DEBUGGING.md`; the WebGPU capability seam (`browser/src/webgpu.rs`,
+> `browser-webgpu-test.mjs`) in `LLVM.md`. This doc stays scoped to the engine-in-wasm port and the
+> wasm-JIT tier.
+
 It is a living document: update the **Status** and the **Phase tracker** as work lands. Fold into
 `DESIGN.md` and drop this file once the work closes (repo convention, cf. `WASM.md`).
 
@@ -56,7 +64,9 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
 ## Status
 
 **Viability: PROVEN. Production entry: landed; runtime-validated on wasm32 (Node) and wasm64
-(Wasmtime).** All reproduced (not argued):
+(Wasmtime). The wasm-JIT tier (§ below) has since landed too** — hot guest compute runs on emitted
+wasm in the browser, ~16–112× over the interpreter-in-wasm, oracle-gated byte-identical. All
+reproduced (not argued):
 
 1. **Compiles to `wasm64`.** Both `svm-interp` and the `svm-browser` entry `cdylib` build clean for
    `wasm64-unknown-unknown` via `-Z build-std`. The `std::thread`/`Instant`/`page_size` references
@@ -126,12 +136,12 @@ wasmtime run --invoke run_dynlink   -W memory64=y "$W"   # 777 (compile_linked r
 wasmtime run --invoke run_durable   -W memory64=y "$W"   # 2001 (durable NORMAL run; freeze/thaw differ in corpus)
 wasmtime run --invoke run_float     -W memory64=y "$W"   # 4611686018427387904 (sqrt(4.0)=2.0, bit-exact)
 
-# Full differential (14 feature families, 185 cases) vs native ground truth — byte-identical
+# Full differential (14 feature families, 187 cases) vs native ground truth — byte-identical
 cargo run --bin gencorpus                                # native ground truth → corpus.json
-node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm   # wasm32 (Node): 185/185
-# wasm64 (Wasmtime embedding): the same 185 cases byte-fed through the production target
+node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm   # wasm32 (Node): 187/187
+# wasm64 (Wasmtime embedding): the same 187 cases byte-fed through the production target
 cargo run --manifest-path wt/Cargo.toml --release -- \
-  target/wasm64-unknown-unknown/release/svm_browser.wasm                 # wasm64: 185/185
+  target/wasm64-unknown-unknown/release/svm_browser.wasm                 # wasm64: 187/187
 
 # Live host imports — guest console/clock bound to real wasm imports (default build is import-free)
 cargo build --release --lib --target wasm32-unknown-unknown --features live
@@ -211,7 +221,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `svm_alloc` buffers, so a small Wasmtime-embedding harness (`svm-wt`, deps `wasmtime` + `serde_json`,
   no SVM crates) loads the **wasm64** module, `svm_alloc`s + writes each corpus module/stdin/window,
   calls the exports, reads results/streams/snapshots back, and compares to the *same* `corpus.json`.
-  **185/185 match on wasm64** — byte-identical to wasm32 and native, including the 128 KiB durability
+  **187/187 match on wasm64** — byte-identical to wasm32 and native, including the 128 KiB durability
   snapshots and the 2 MiB echo. So the full differential now runs on **both** targets, not probe-only
   on the production one.
 - [x] **cfg-gate `lib.rs` for wasm.** `page_size` is now native-only (`target.'cfg(not(wasm))'`)
@@ -222,7 +232,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
 - [x] **Differential check (14 feature families, wasm32 + wasm64).** `gencorpus` (host) encodes a
   corpus + computes the **native** result per case; `corpus.mjs` (wasm32, Node) and `browser/wt`
-  (wasm64, Wasmtime) run the same modules through the wasm exports and compare. **185/185 match**, zero
+  (wasm64, Wasmtime) run the same modules through the wasm exports and compare. **187/187 match**, zero
   host imports.
   *Compute/concurrency* (37): i64 arith+branches, multi-function `call`, memory store/load,
   divide-by-zero → `STATUS_TRAP`, **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` =
@@ -382,10 +392,13 @@ in session discussion; collected here so the next slice has a home to be picked 
   result struct would drop the statics and the call-order contracts ("call `len` first").
   Same slice: the `--features live` path still uses fixed scratch buffers — the one entry the
   `svm_alloc`/`svm_dealloc` ABI conversion skipped.
-- [ ] **A real-language playground tab.** The playground takes SVM text; the repo already runs Lua
-  on SVM through the `svm-llvm` on-ramp (official `coroutine.lua` + debug library green). Wiring a
-  Lua (or C via `frontend/chibicc`) tab needs the frontend path available to the browser —
-  pre-compiled modules first, in-wasm compilation later.
+- [x] **A real-language playground tab.** Landed, well past the original ask — the "pre-compiled
+  modules first" half: the playground's demo sidebar now runs C reactor guests (bounce / life /
+  mandelzoom), **DOOM**, an editable **Lua** evaluator, a **SQLite** REPL, a **QuickJS** REPL
+  (editor JS piped as stdin, JS syntax highlighting), and a persistent **PostgreSQL** session
+  (boot once, query many; survives page reloads via a data-dir snapshot) — all compiled through
+  the `svm-llvm` on-ramp and tracked in `LLVM.md` / `crates/svm-run/demos/*`, not here. The
+  "in-wasm compilation later" half (compiling C/Lua *inside the browser*) remains open.
 - [ ] **wasm64 in the browser (external: V8 table64).** Blocked on V8 shipping 64-bit tables
   (tracked under **Status** #3); the browser path stays wasm32 until then. When it lands: unify
   wasm64 with the threads build (`+atomics` + memory64 in one target) so the browser gets the native
@@ -395,19 +408,26 @@ in session discussion; collected here so the next slice has a home to be picked 
   `memory access out of bounds` pageerror), never reproducing on re-run and never on Node. Diagnose
   (suspect: a stale view or an init race visible only under a cold Worker spin-up) or, failing
   that, make the CI lane retry once so a known flake doesn't red a PR.
-- [ ] **wasm-JIT tier** — compile SVM IR to wasm at the explicit compile points and run hot compute
-  near-natively in the browser. The largest remaining browser project; full design + slice plan
-  below (§ "wasm-JIT tier"). Highest leverage *after* the real-language playground tab makes browser
-  guests compute-hot. **The `svm-wasmjit` cross-engine bench row now measures it** (next to
+- [x] **wasm-JIT tier** — compile SVM IR to wasm at the explicit compile points and run hot compute
+  near-natively in the browser. Was the largest remaining browser project; **landed through all
+  eight slices** of the plan below (§ "wasm-JIT tier"): emitter core, browser linking, mixed
+  tiering, per-Worker threads tier-up, §22/§14 codegen, the long tail (scalar floats,
+  `call_indirect`, non-relaxed SIMD), the DOOM reactor with cap-call outlining, and single-shot
+  module runs (Lua/SQLite). **The `svm-wasmjit` cross-engine bench row measures it** (next to
   `svm-bytecode-wasm`, same driver, same MISCOMPILE cross-check): **~16–112× over interp-in-wasm**,
   landing at or below native Cranelift `svm-jit` — the projected number, confirmed and cross-checked
-  (`bench/cross-engine/README.md` § "SVM-in-wasm, the JIT tier").
+  (`bench/cross-engine/README.md` § "SVM-in-wasm, the JIT tier"). The remaining loose ends are
+  itemized in the slice notes: cross-tier `call_indirect` (the trampoline), relaxed SIMD + scalar
+  `Fma`, §22 Model B2 (`install` + shared-table funcrefs), guest-*compiled* units crossing Workers,
+  nested VM-in-VM on the emitted tier, and deopt (a genuine no-op until `cap.call` joins the
+  emitted subset).
 
 ## wasm-JIT tier — design & implementation plan
 
 Compile SVM IR to WebAssembly in the browser (the v86 move: generate wasm bytes at runtime, compile
 with `new WebAssembly.Module`, dispatch through a funcref table) so hot guest compute runs on V8's
-optimizing tiers instead of the bytecode dispatch loop. Assessed 2026-07; not started.
+optimizing tiers instead of the bytecode dispatch loop. Assessed 2026-07; since **implemented** —
+the slice plan below records what landed (all eight slices) and what was measured along the way.
 
 ### Why, and how much
 
@@ -524,7 +544,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
 
 ### Slice plan (each its own PR, oracle-gated like everything above)
 
-1. **[in progress] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
+1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any
    browser/JS exists. Landed as **`crates/svm-wasmjit`** (`compile_module(&svm_ir::Module) →
    Vec<u8>`, `svm-ir`-only runtime dep, `#![forbid(unsafe_code)]`, module-granular
@@ -541,7 +561,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    kinds* over an arg sweep incl. `i64::MIN/-1`, guard-crossing addresses, and fuel exhaustion; 15
    kernels green, plus a `fail_closed` test pinning the refused families (float/fiber/thread/tailcall).
    Remaining for this slice's PR: none — browser wiring is slice 2.
-2. **[in progress] Browser linking.** Landed: the cdylib FFI `svm_wasmjit_compile(mod_ptr, mod_len)`
+2. **[landed] Browser linking.** Landed: the cdylib FFI `svm_wasmjit_compile(mod_ptr, mod_len)`
    emits a wasm module for a JIT-eligible SVM module (via `svm_wasmjit::compile_module_shared`) and
    stashes the bytes (`svm_wasmjit_ptr`/`_len`), returning `0` — the fail-closed signal to stay on
    the interpreter — for anything the emitter refuses. The JS linker (`web/wasmjit.js`,
@@ -563,7 +583,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    per-Worker instantiation are deferred to the tiering (3) and threads (4) slices, where a
    mixed-tier guest actually needs the engine to call emitted code mid-run. AOT-at-`svm_par_compile`
    likewise moves to slice 3 (it belongs with the eligibility/partitioning analysis).
-3. **[in progress] Tiering + deopt.** Landed natively: `analyze(m)` classifies each function
+3. **[landed] Tiering + deopt.** Landed natively: `analyze(m)` classifies each function
    **in-subset** (the JIT emits it), an **interp leaf** (all-integer signature, memory-free, a true
    leaf, no concurrency/caps — the engine runs it), or neither, and decides `mixed_ok` (func 0
    in-subset, everything reachable in-subset-or-leaf, nothing reachable suspends — a JITted frame
@@ -716,7 +736,8 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    bench's **whole** bundled module is now emittable, so **every** kernel gets an `svm-wasmjit` row —
    `vadd` at **~0.3 ns/iter** (~108× over interpreter-in-wasm, ~3× off native Cranelift SIMD), and
    `call_indirect` too (its whole-module requirement finally met).
-   Remaining for the slice: a playground toggle.
+   The playground toggle has since landed — the per-demo interp/JIT toggle with "prove it" parity
+   (`play.js`, playground Phase 3) — so nothing remains for this slice.
 7. **[landed] Reactor (whole-`tick`-on-wasm) — DOOM in the playground.** The Doom demo runs its entire
    per-frame `tick()` on the emitted wasm tier (`svm_onramp_jit_*` FFI + `web/wasmjit-reactor.js`),
    over the cdylib's shared window, with the ~24 genuine I/O helpers (`cap.call` display/timer,
@@ -781,9 +802,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    A full **relooper** — structured `loop`/`block` + direct branches for reducible CFGs — was built and
    verified (differential-clean; Lua is 100% reducible, so `luaV_execute` *was* structured) and made
    **no difference** in an A/B: Lua's 5M-loop ran 16.9 s (relooper) vs 16.8 s (dispatcher). Control-flow
-   shape is irrelevant to V8 here; the cost is the giant function itself. So the relooper was reverted,
-   and a playground toggle for the module demos waits on a lever that actually moves the needle (light
-   scripts also run net *slower* under the JIT — the emit/setup overhead isn't repaid).
+   shape is irrelevant to V8 here; the cost is the giant function itself. So the relooper was reverted.
+   (The per-demo wasm-JIT toggle for the module demos has since landed anyway — `play.js`, proven by
+   `browser-play-editor-test.mjs` — with the caveat above still true: light scripts run net *slower*
+   under the JIT, since the emit/setup overhead isn't repaid.)
 
    **Why "the giant function" is slow — a tier-up probe settles it (do not re-run the false leads).** It
    was tempting to blame the giant function on two things: that V8's optimizer *declines* functions that
@@ -825,7 +847,7 @@ partitioning is per-function anyway). Revisit fibers when JSPI / core stack-swit
   didn't disturb engine semantics.
 - **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 187/187
   differential vs native on wasm32), `browser/wt` (wasm64 via a Wasmtime embedding), and
-  `node browser/live.mjs` (host-import demo, `--features live`). The 16 embedded `--invoke` probes under
+  `node browser/live.mjs` (host-import demo, `--features live`). The 17 embedded `--invoke` probes under
   **Reproduce** spot-check each feature on wasm64 directly.
 - **Runs in a real browser:** `node browser/browser-test.mjs` (Chromium via Playwright) — cross-origin
   isolated, the powerbox prints `"hello, powerbox!"`, one guest's vCPUs run across real Web Workers

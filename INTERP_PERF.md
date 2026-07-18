@@ -205,6 +205,13 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   - *Finding:* the residual mem cost is **per-op interpreter overhead** (per-op fuel + budget check),
     not the memory access itself — that is Phase-3 territory (move fuel to back-edges), which would
     lift *all* kernels including `mem`.
+- **[done] Bulk memory (`memory.copy`/`fill`) through the D62 fast path.** The bytecode engine
+  previously shared the tree-walker's scalar snapshot copy; new `mem_copy_fast`/`mem_fill_fast` do
+  the same whole-span confinement + per-page prot scan as the oracle, then one bulk
+  `Region::copy_within`/`fill` (overlap-safe memmove / memset in `svm-mem`, which isolates the
+  audited `unsafe`) instead of the scalar loop — same single-threaded-cooperative contract as
+  `read_word`/`write_word`. The tree-walker keeps the scalar `mem_copy`/`mem_fill` as the
+  independent oracle; the `svm-mem` Mapped/Shared-vs-Paged differential fuzzers cover the new ops.
 - **Success:** memory kernel drops toward the software floor; escape_oracle + shared_region +
   address_space still byte-identical.
 
@@ -490,8 +497,13 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               asserts the bytecode location trace is **identical** to driving the tree-walker
               `Inspector` with `seek(0), seek(1), …` (which enumerates executed-instruction locations) —
               across straight line, branches, loops (back-edges revisit `IrPc`s), cross-frame calls,
-              and a trap — plus result equality. (Full Inspector parity — watchpoints, backtrace,
-              cap-call stops, time-travel — is follow-on; this lands the location model.)
+              and a trap — plus result equality. (Follow-on status: **backtrace** landed
+              (`run_with_host_fast_traced`, gated by `bytecode_traced.rs`), and **reverse debugging**
+              (seek/stepBack by deterministic replay) + **watchpoints** (per-op effective-address
+              check) landed on the bytecode engine via the `svm-dap` `Debuggee` backend seam over
+              `DebugRun` (`crates/svm-dap/src/backend.rs`), both with `dap_over_bytecode_*`
+              tree-walker-parity tests. Still tree-walker-only: cap-call stops and multithreaded
+              debug — a debug run reaching a seam op falls back.)
         - [x] **1c-7** — §GC `gc.roots` (conservative root enumeration). **Correctness criterion is
               soundness, not bit-identity**: GC.md §3.2 says the backends legitimately over-approximate
               differently (the JIT scans raw native control-stack words, the tree-walker per-block
@@ -570,7 +582,14 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
                   residue); restore+re-freeze is byte-identical; and the REWINDING thaw (fibers
                   re-seeded) reproduces the result and ends NORMAL.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
+  - [x] A/B interpreter baseline (tree-walker vs bytecode, four kernels) in `svm-bench`.
   - [x] Lock-free `check_prot` fast path (`prot_dirty` flag) + `read_le`/`write_le` `has_regions`
         hoist. Tree-walker memory kernel ~176 → ~147 ns (~17%); all oracle suites byte-identical.
-- [ ] **Phase 3** — per-op seam overhead (fuel-at-back-edges if provably safe; debug/preempt hoist).
+  - [x] Width-specialized scalar load/store + inlined common-case confinement (bytecode mem kernel
+        ~82 → ~71 ns, ~13%).
+  - [x] Bulk memory (`memory.copy`/`fill`) through the D62 fast path
+        (`mem_copy_fast`/`mem_fill_fast`).
+- [x] **Phase 3** — investigated, closed as **not worth it** (see the Phase 3 section): per-op
+      control overhead measured at only ~2–3%; fuel-at-back-edges is a dead end (the `budget = 1`
+      op-stepping is load-bearing for the debug seam); decision — keep per-op fuel/budget.
 - [ ] **Phase 4** — (stretch) fully flat bytecode + threaded dispatch.

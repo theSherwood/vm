@@ -428,6 +428,14 @@ by `jit_pure_child_freeze_thaw_round_trips`. **Separate-module** children (the d
 fails closed on `mod_mem = Some`; needs the module resolver wired onto `_durable_nested` + a per-child
 module digest for a host-supplied re-grant at thaw) are the remaining §14 gap.
 
+*(The §14 surface itself has since grown — PROCESS.md's S-slices. The grant-carrying instantiate
+forms (S2 `instantiate_granted` / `instantiate_named`, Stage-1 `instantiate_module_named`) **fail
+closed (`-EINVAL`) under a durable JIT run** — a granted child's separate powerbox host has no freeze
+story yet, the same exclusion as the separate-module child (`svm-jit/src/instantiator_rt.rs`). And
+`cap.self.attest` (S6) stamps a nested child `freeze_exposed = durable`, adding one follow-up here: a
+durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently
+defaults it (PROCESS.md O14).)*
+
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
 shared edge (consistent-cut). Decide as a `SharedRegion` constraint: either a durable
@@ -520,6 +528,17 @@ and `fuzz/fuzz_targets/diff.rs`). Equivalence is continuously tested, not assert
 The §5 residue is drained identically on both backends, so no backend ever decodes a
 native stack.
 
+**Landed — the equivalence surface is now wider than the original two backends.** The
+**bytecode engine** runs the same instrumented IR through its own durable-capture entry,
+including the fiber freeze driver + thaw seeding, checked **byte-for-byte** against the
+tree-walker oracle and the §12 codec (`crates/svm/tests/bytecode_durable.rs`,
+`bytecode_durable_fibers.rs`, `bytecode_durable_fibers_freeze.rs`). And the engine's **wasm
+port** proves the same single-fiber freeze/thaw *in wasm*: a NORMAL run, an UNWINDING freeze
+to a 128 KiB snapshot byte-identical to native, and a REWINDING thaw fed that snapshot back —
+via the browser differential corpus and the self-contained `run_durable` probe
+(`browser/src/lib.rs`; BROWSER.md — wasm64 `run_durable() == 2001` under Wasmtime). So a
+frozen artifact is portable across four execution venues of the same IR.
+
 ---
 
 ## 8. Alternatives considered
@@ -610,15 +629,18 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   capture + re-establish landed on both backends, both directions** (§12.6 / `durable_prot_capture.rs`).
   The page-protection story is complete; a `Backed` (§13 shared-region) page stays out of scope
   (D-region). *(escape-TCB touch — restore.)*
-- **[~] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
+- **[x] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
   residue, freeze/thaw choreography against the D57 migratable-fiber ownership protocol.
   **Highest risk** — concurrency seam (loom-check, like the futex glue). **Design in §12.8**;
   **D-fiber-cont RESOLVED (option A).** **Sub-phase 3.1 (one interp fiber) is complete** —
   per-fiber shadow regions + shadow-SP swap, both thaw arms, the freeze driver, and the
   Section-2 residue codec give an end-to-end single-fiber `freeze → serialize → restore → thaw`
   on the interpreter (§12.8, `svm-durable/tests/fiber.rs` + `svm-snapshot/tests/roundtrip.rs`).
-  Remaining: 3.2 multi-vCPU + per-context layout, 3.3 JIT parity (replicate the swap in the JIT
-  fiber-switch path). (Dispatch table is a no-op — §12.4.) Single-vCPU durability is a coherent MVP.
+  **3.2–3.4 have since landed too:** multi-vCPU + per-context layout on the interp
+  (`svm-durable/tests/multivcpu.rs`), JIT parity for fibers and spawned vCPUs
+  (`durable_fibers_jit.rs`, `durable_multivcpu_jit.rs`), and the 3.4 closers — nested spawns +
+  child-owned fibers, both backends (§12.8 "Slice 3.4", staging A–D all DONE). (Dispatch table
+  is a no-op — §12.4.) The *concurrent* STW continued under Phase 4 Slice A below.
 - **[~] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
   durability quality + cheap clone. Off critical path. **Slice A (async STW) landed:** 4A.1–4A.4
   (back-edge polls, JIT parity, async `request_freeze`, the loom quiesce model) and **4A.5
@@ -1361,13 +1383,16 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 
 **Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** + the **blocked-in-`thread.join` freeze** + **B.2**
 (full nested concurrent spawns) + the **blocked-in-`thread.wait` freeze** (bounded + fail-closed) +
-**B.1′** (concurrent child-fiber *mid-resume-chain*, verified) are **landed** (the first three merged,
-all-platform CI green; the rest on `claude/durable-next-slices-tracker`). The remaining queue — **lift
-the `atomic.wait` thaw fail-closed** (concurrent-thaw rework: **design + 3-stage plan now written** under
-*"Concurrent thaw"* below; stage 1 = per-context thaw-state relocation, `FORMAT_VERSION` v6→v7; the §4 nested residue is v7→v8), then
-**4A.6 / 4A.7** — is detailed in the *"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes below.
+**B.1′** (concurrent child-fiber *mid-resume-chain*, verified) are **landed and merged to main**
+(all-platform CI green; the `claude/durable-next-slices-tracker` branch is fully merged — every
+durable suite lives in the main tree). The former remaining queue has landed too: the **`atomic.wait`
+thaw fail-closed lift** (concurrent-thaw rework — stages 1–3 all LANDED under *"Concurrent thaw"*
+below; `durable_concurrent_jit.rs`) and **4A.6 / 4A.7** (`svm-durable/tests/vcpu_recycle.rs`; the
+`Blocking` fail-closed, both backends) — details in the *"Phase 4 Slice A.5 — per-context
+shadow-SP"* follow-up notes below.
 
-**Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
+**Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings — **since
+landed** as its own slice: `Host::drain_non_durable`, §12.5 / the phase tracker), CoW clone,
 full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
 
 ##### Phase 4 Slice A.5 design — per-context shadow-SP (retires the shared-SP lock)
@@ -1433,7 +1458,9 @@ path end-to-end. (c) **Relocation + format bump landed** — each context's shad
 `shadow_region_base(ctx) + 0` (frames at `+8`), `durable.shadow_base` returns that region base on all
 three engines (tree-walker, bytecode, Cranelift JIT), the legacy global `SHADOW_SP_OFF` is retired, and
 `FORMAT_VERSION` is bumped 4 → 5. Cross-backend byte-identity (`durable_jit`) + every durable suite
-green. Stage (i) is **done**; stage (ii) (real concurrent children + the join barrier) is next. The
+green. Stage (i) is **done**; stages (ii)–(iii) (real concurrent children + the coordinator wait —
+shipped as `run_inner`'s `join_all`, with the loom-verified barrier retained `cfg(loom)`-only) have
+**since landed too** — see the stage-(ii) follow-up notes below. The
 original site map is retained below for reference:
 
 - **Layout.** Put each context's SP word at **`shadow_region_base(ctx) + 0`** (the region's first 8
