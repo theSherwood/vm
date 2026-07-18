@@ -437,3 +437,92 @@ fn bytecode_scheduled_tick_replays_deterministically() {
     assert_eq!(b.stopped_task(), who, "same about-to-run thread");
     assert_eq!(b.frame_pc(0), pc, "same pc");
 }
+
+// A futex handoff (from `bytecode_threads.rs`): the root seeds mem[8], spawns a worker, sets a flag +
+// `atomic.notify`s mem[0], joins; the worker `atomic.wait`s on mem[0] then reads mem[8] → 987654. The
+// worker parks on the wait until the root's notify wakes it — exercising `memory.wait`/`notify` under
+// the debug scheduler.
+const FUTEX_HANDOFF: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 8
+  v1 = i64.const 987654
+  i64.atomic.store.release v0 v1
+  v2 = i64.const 0
+  v3 = thread.spawn 1 v2 v2
+  v4 = i64.const 0
+  v5 = i32.const 1
+  i32.atomic.store.release v4 v5
+  v6 = i64.const 0
+  v7 = i32.const 1
+  v8 = atomic.notify v6 v7
+  v9 = thread.join v3
+  return v9
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
+  v1 = i64.const 0
+  v2 = i32.const 0
+  v3 = i64.const 1000000000
+  v4 = i32.atomic.wait v1 v2 v3
+  v5 = i64.const 8
+  v6 = i64.atomic.load.acquire v5
+  return v6
+}
+"#;
+
+/// `memory.wait`/`notify` drive under the debug scheduler: the worker parks on the wait, the root's
+/// notify wakes it, and the run completes with the handed-off value — matching the tree-walker oracle
+/// and the production M:N executor (was `SchedStop::Declined` before this slice).
+#[test]
+fn bytecode_scheduled_wait_notify_completes() {
+    let m = parse_module(FUTEX_HANDOFF).unwrap();
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    let mut fuel = 50_000_000u64;
+    let bc = drive_to_end(&mut sd, &mut fuel);
+    assert_eq!(bc, Ok(vec![Value::I64(987654)]), "the futex handoff value");
+
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
+    let tw = loop {
+        match insp.run_until_stop() {
+            Stop::Finished(r) => break r,
+            Stop::Break { .. } => continue,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    };
+    assert_eq!(bc, tw, "scheduled ≡ tree-walker across wait/notify");
+    let mut f = 50_000_000u64;
+    assert_eq!(bc, run(&m, 0, &[], &mut f), "scheduled ≡ the M:N executor");
+}
+
+/// A breakpoint placed *after* the worker's `atomic.wait` fires — proving the worker actually parked and
+/// was woken by the root's `notify` under the debugger (the wait didn't spuriously fall through).
+#[test]
+fn bytecode_breakpoint_after_a_wait_fires_once_woken() {
+    let m = parse_module(FUTEX_HANDOFF).unwrap();
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    // func 1, block 0, inst 5 = `v6 = i64.atomic.load.acquire v5` — the op after the wait (inst 3) and
+    // the const (inst 4).
+    let after_wait = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 5,
+    };
+    sd.set_breakpoints(vec![after_wait]);
+    let mut fuel = 50_000_000u64;
+    match sd.run_until_stop(&mut fuel) {
+        SchedStop::Break { pc, .. } => {
+            assert_eq!(pc, after_wait, "the woken worker reached the load")
+        }
+        other => panic!("expected the worker to wake and hit the breakpoint, got {other:?}"),
+    }
+    // The stopped thread is the spawned worker (task 1), not the root.
+    assert_eq!(sd.stopped_task(), Some(1));
+    // Continue → the guest finishes with the handed-off value.
+    match sd.run_until_stop(&mut fuel) {
+        SchedStop::Finished(r) => assert_eq!(r, Ok(vec![Value::I64(987654)])),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}

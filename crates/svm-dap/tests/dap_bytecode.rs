@@ -1063,3 +1063,87 @@ fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
         "tripped inside a spawned worker, not the root"
     );
 }
+
+// A futex handoff: the root seeds mem[8], spawns a worker, sets a flag + `atomic.notify`s mem[0], joins;
+// the worker `atomic.wait`s on mem[0] then reads mem[8] (→ 987654). The worker's read-after-wait is
+// line 26 (leading newline = line 1). Drives `memory.wait`/`notify` on the scheduled engine over DAP.
+const FUTEX_HANDOFF: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 8
+  v1 = i64.const 987654
+  i64.atomic.store.release v0 v1
+  v2 = i64.const 0
+  v3 = thread.spawn 1 v2 v2
+  v4 = i64.const 0
+  v5 = i32.const 1
+  i32.atomic.store.release v4 v5
+  v6 = i64.const 0
+  v7 = i32.const 1
+  v8 = atomic.notify v6 v7
+  v9 = thread.join v3
+  return v9
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
+  v1 = i64.const 0
+  v2 = i32.const 0
+  v3 = i64.const 1000000000
+  v4 = i32.atomic.wait v1 v2 v3
+  v5 = i64.const 8
+  v6 = i64.atomic.load.acquire v5
+  return v6
+}
+"#;
+
+#[test]
+fn dap_over_bytecode_multithreaded_wait_notify() {
+    // A breakpoint after the worker's `atomic.wait` (line 26) fires only once the root's `notify` wakes
+    // it — proving `memory.wait`/`notify` drive under the scheduled engine over DAP — then the guest
+    // finishes with the handed-off value.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(FUTEX_HANDOFF)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(26))])]),
+            ),
+        ]),
+    ));
+    let cfg = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let stop = event(&cfg, "stopped").expect("the woken worker stops after the wait");
+    assert_eq!(
+        stop.get("body").unwrap().get("reason").unwrap().as_str(),
+        Some("breakpoint")
+    );
+    assert!(
+        stop.get("body")
+            .unwrap()
+            .get("threadId")
+            .unwrap()
+            .as_i64()
+            .unwrap()
+            >= 2,
+        "stopped inside the spawned worker (woken by notify)"
+    );
+    // Continue → the join completes and the guest terminates.
+    let done = s.handle(&req(5, "continue", Json::obj(vec![])));
+    assert!(
+        event(&done, "terminated").is_some(),
+        "the futex handoff finished"
+    );
+}
