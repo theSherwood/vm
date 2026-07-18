@@ -373,6 +373,44 @@ debug.var 0 "count" fixed 0 "long" 0
 `,
   },
 
+  'Debugger (SVM — threads)': {
+    debug: true,
+    bp: 19, // a breakpoint pre-placed on line 20 (0-based 19), the worker's atomic increment
+    mode: 'plain',
+    desc: 'The DAP debugger going multithreaded, on the bytecode engine. The root spawns two worker ' +
+      'vCPUs that each atomically bump a shared counter, then joins them. A breakpoint is pre-placed in ' +
+      'the worker (line 20): press Debug and it stops in the first worker. The Variables pane grows a ' +
+      'thread selector — one chip per live vCPU (the one that hit the stop is marked ●). Click another ' +
+      'thread to inspect its stack without resuming; Step/Continue always drive the stopped thread. ' +
+      'Continue again to catch the second worker, then finish (→ 2). A deterministic cooperative debug ' +
+      'scheduler runs the interleaving right here in the sandbox — DEBUGGING.md Milestone B on the ' +
+      'bytecode engine. (Reverse and data breakpoints are single-threaded only, so they are off here.)',
+    src: `; The root spawns two worker vCPUs; each atomically bumps a shared counter,
+; then the root joins them and returns the total (→ 2). A breakpoint is pre-
+; placed in the worker — press Debug, then use the thread selector that appears.
+memory 16
+func () -> (i64) {
+block0():
+  sp = i64.const 0
+  one = i64.const 1
+  h0 = thread.spawn 1 sp one
+  h1 = thread.spawn 1 sp one
+  j0 = thread.join h0
+  j1 = thread.join h1
+  addr = i64.const 0
+  total = i64.atomic.load addr
+  return total
+}
+func (i64, i64) -> (i64) {
+block0(sp: i64, inc: i64):
+  addr = i64.const 0
+  old = i64.atomic.rmw.add addr inc
+  z = i64.const 0
+  return z
+}
+`,
+  },
+
   // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
   //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
@@ -1316,6 +1354,8 @@ let dapClient = null; // the active DAP client while a session runs (else null)
 let dapCard = null; // the card the session belongs to
 let dapWatch = new Set(); // source-variable names armed as data breakpoints (watchpoints) this session
 let dapScopeRef = 0; // the paused frame's Locals `variablesReference` (what `dataBreakpointInfo` scopes to)
+let dapStopped = 1; // the DAP threadId that hit the current stop (stepping always drives this thread)
+let dapThread = 1; // the DAP threadId currently being inspected (select a thread to view its stack)
 
 // The DAP source a breakpoint request targets — the program's own `debug.file 0 "…"` if it declares
 // one, else the name the engine's auto debug info uses (svm-text's AUTO_DEBUG_FILE = "source.svm"), so
@@ -1334,14 +1374,20 @@ function dapSyncBreakpoints(c) {
   });
 }
 
-// Render the paused frame + its named locals into the card's Variables pane, and highlight the source
-// line (frame.line is 1-based; 0 ⇒ an unmapped op, so no highlight). Each memory-located variable gets
-// a ● watch toggle (a data breakpoint); a promoted SSA scalar has no window address, so its toggle is
-// disabled — the server honestly reports a null `dataId` for it. Re-arms the active watch set each stop.
+// Render the inspected thread's paused frame + its named locals into the card's Variables pane, and
+// highlight its source line (frame.line is 1-based; 0 ⇒ an unmapped op, so no highlight). For a
+// multithreaded (`thread.spawn`) guest a thread selector lists every live vCPU — clicking one focuses
+// its stack (`select_task`, via a per-thread `stackTrace`) without resuming; the thread that hit the
+// stop is marked ●, and stepping always drives *it*. Each memory-located variable gets a ● watch
+// toggle (a data breakpoint); a promoted SSA scalar has no window address, so its toggle is disabled.
 function dapShowStop(c) {
-  const frame = dapClient.send('stackTrace', { threadId: 1 }).response.body.stackFrames[0];
+  // Live threads (one per vCPU). A single-vCPU guest reports just thread 1, so the bar is hidden.
+  const threads = dapClient.send('threads', {}).response.body.threads;
+  if (!threads.some((t) => t.id === dapThread)) dapThread = dapStopped; // inspected thread went away
+  const frame = dapClient.send('stackTrace', { threadId: dapThread }).response.body.stackFrames[0];
   if (!frame) return;
   if (frame.line > 0) c.editor.setStopLine(frame.line - 1);
+  else c.editor.clearStopLine();
   const scope = dapClient.send('scopes', { frameId: frame.id }).response.body.scopes[0];
   dapScopeRef = scope.variablesReference;
   const vars = dapClient.send('variables', { variablesReference: dapScopeRef }).response.body.variables;
@@ -1358,8 +1404,25 @@ function dapShowStop(c) {
       return `<div>${toggle} <span class="bpname">${v.name}</span> = ${v.value}${v.type ? ` <em>${v.type}</em>` : ''}</div>`;
     })
     .join('');
-  c.el.dbgVars.innerHTML = `<div>${frame.name} · line ${frame.line}</div>${rows}`;
+  const bar = threads.length > 1
+    ? `<div class="dbg-threads">${threads
+        .map((t) => {
+          const sel = t.id === dapThread ? ' sel' : '';
+          const mark = t.id === dapStopped ? ' ●' : '';
+          return `<button class="thr${sel}" data-thread="${t.id}" title="Inspect ${t.name} (● = stopped here)">${t.name}${mark}</button>`;
+        })
+        .join('')}</div>`
+    : '';
+  c.el.dbgVars.innerHTML = `${bar}<div>${frame.name} · line ${frame.line}</div>${rows}`;
   dapArmWatches(); // (re)arm the watched set against this stop's addresses
+}
+
+// Focus a different thread's stack (multithreaded sessions) and re-render — no resume; stepping still
+// drives the stopped thread.
+function dapSelectThread(c, id) {
+  if (dapCard !== c || !dapClient) return;
+  dapThread = id;
+  dapShowStop(c);
 }
 
 // Arm the current watch set as DAP data breakpoints: mint a fresh `dataId` for each watched variable
@@ -1391,8 +1454,14 @@ function dapHandle(c, reply) {
   }
   const stopped = reply.events.find((e) => e.event === 'stopped');
   if (stopped) {
+    // Focus follows the thread that hit the stop (stepping drives it); the user can then select another.
+    dapStopped = stopped.body.threadId || 1;
+    dapThread = dapStopped;
     dapShowStop(c);
-    setState(c, 'running', `paused (${stopped.body.reason}) — Step / Continue, Stop to end`);
+    const where = dapClient.send('threads', {}).response.body.threads.length > 1
+      ? `paused (${stopped.body.reason}) in thread-${dapStopped - 1} — Step / Continue, Stop to end`
+      : `paused (${stopped.body.reason}) — Step / Continue, Stop to end`;
+    setState(c, 'running', where);
   }
 }
 
@@ -1405,13 +1474,15 @@ function startDebug(c) {
   dapClient = createDapClient(eng.ex, eng.memory);
   dapCard = c;
   dapWatch = new Set();
+  dapStopped = 1;
+  dapThread = 1;
   c.el.result.textContent = '';
   c.el.dbgVars.innerHTML = '';
   dapClient.send('initialize', {});
   const launch = dapClient.send('launch', { programText: src, function: 0, args: [], engine: 'bytecode' });
   if (!launch.response.success) {
     endDebug(c, null);
-    setState(c, 'error', 'debug launch failed — does the program parse and run single-threaded?');
+    setState(c, 'error', 'debug launch failed — does the program parse and verify?');
     return;
   }
   dapSyncBreakpoints(c);
@@ -1797,11 +1868,14 @@ function buildCard(name, ex) {
   };
   runBtn.addEventListener('click', () => runDemo(c));
   if (debugBtn) debugBtn.addEventListener('click', () => startDebug(c));
-  // Clicking a variable's ● toggle arms/clears a data breakpoint on it (delegated: the Variables pane
-  // is re-rendered on every stop, so the listener lives on the stable container).
+  // Clicking a variable's ● toggle arms/clears a data breakpoint; clicking a thread button focuses that
+  // thread's stack (delegated: the Variables pane is re-rendered on every stop, so the listener lives
+  // on the stable container).
   if (dbgVars) dbgVars.addEventListener('click', (ev) => {
-    const b = ev.target.closest('button[data-watch]');
-    if (b && !b.disabled) dapToggleWatch(c, b.dataset.watch);
+    const w = ev.target.closest('button[data-watch]');
+    if (w && !w.disabled) { dapToggleWatch(c, w.dataset.watch); return; }
+    const t = ev.target.closest('button[data-thread]');
+    if (t) dapSelectThread(c, Number(t.dataset.thread));
   });
   stopBtn.addEventListener('click', () => stopDemo(c));
   if (proveBtn) proveBtn.addEventListener('click', () => (c.ex.kind === 'module' ? proveModuleParity : proveParity)(c));

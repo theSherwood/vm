@@ -309,6 +309,48 @@ try {
   ok(`watchpoint tripped — ${tripped.replace(/\s+/g, ' ').trim()}`);
   await page.click(`${wpCard} .dbg-controls button[data-cmd="stop"]`);
 
+  // The threads card: a thread.spawn guest on the multithreaded scheduled bytecode engine. Debug stops
+  // in a worker; the Variables pane grows a thread selector (one chip per live vCPU); selecting another
+  // thread focuses its stack without resuming; Continue catches the second worker; the guest finishes.
+  const thCard = card('Debugger (SVM — threads)');
+  await page.click(`${thCard} .debug`);
+  await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
+    thCard, { timeout: 20_000 });
+  const thPaused = await page.evaluate((sel) => {
+    const chips = [...document.querySelectorAll(`${sel} .dbg-threads .thr`)];
+    return {
+      count: chips.length,
+      selected: chips.filter((b) => b.classList.contains('sel')).map((b) => b.dataset.thread),
+      marked: chips.filter((b) => b.textContent.includes('●')).map((b) => b.dataset.thread),
+      vars: document.querySelector(`${sel} .dbg-vars`).textContent,
+    };
+  }, thCard);
+  thPaused.count >= 3 && thPaused.selected.length === 1 && thPaused.selected[0] === thPaused.marked[0]
+    ? ok(`threads card paused in a worker — ${thPaused.count} thread chips, stopped one selected + marked ●`)
+    : fail(`threads paused: ${JSON.stringify(thPaused)}`);
+
+  // Focus a *different* thread (not the stopped one) → its chip becomes selected, without resuming.
+  const otherThread = await page.evaluate((sel) => {
+    const chips = [...document.querySelectorAll(`${sel} .dbg-threads .thr`)];
+    const stopped = chips.find((b) => b.classList.contains('sel'))?.dataset.thread;
+    return chips.map((b) => b.dataset.thread).find((t) => t !== stopped);
+  }, thCard);
+  await page.click(`${thCard} .dbg-threads .thr[data-thread="${otherThread}"]`);
+  const switched = await page.evaluate((sel) =>
+    document.querySelector(`${sel} .dbg-threads .thr.sel`)?.dataset.thread, thCard);
+  switched === otherThread
+    ? ok(`selecting another thread (${otherThread}) focuses its stack without resuming`)
+    : fail(`thread switch: selected ${switched}, wanted ${otherThread}`);
+
+  // Continue → the guest runs the second worker's breakpoint then finishes.
+  await page.click(`${thCard} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => {
+    const st = document.querySelector(`${sel} .state`).textContent;
+    return /paused .*thread-/.test(st) || /finished/.test(st);
+  }, thCard, { timeout: 10_000 });
+  ok('threads card: Continue advanced past the first worker');
+  await page.click(`${thCard} .dbg-controls button[data-cmd="stop"]`);
+
   // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.
   await page.selectOption('#theme', 'dark');
   const themed = await page.evaluate(() => ({

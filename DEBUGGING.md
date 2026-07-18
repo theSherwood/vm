@@ -141,11 +141,14 @@ different things depending on which pair you compare:
   step-over (run a call to completion) and step-out (return from a frame) land at the same op and agree
   on the call result. So the bytecode engine now has the full **forward-debug** primitive surface —
   breakpoints, cross-frame inspection, backtrace, stepping — all parity-tested against the tree-walker.
-  *Remaining, and scope-bounded:* the `svm-dap` server calls 18 distinct `Inspector` methods;
-  `DebugRun` covers the forward-debug subset, but the rest — `seek`/`step_back` (reverse debugging),
-  `set_watchpoint` (data breakpoints), `select_task`/`threads`/`stopped_task` (multithreading) — are
-  **outside the bytecode engine's single-vCPU debug scope** (it delegates those to the tree-walker, per
-  G2). So a DAP-over-bytecode backend can only ever cover the *forward-debug subset*. The **engine-side
+  *Remaining, and scope-bounded (as of this passage — since superseded):* the `svm-dap` server calls 18
+  distinct `Inspector` methods; `DebugRun` covers the forward-debug subset, but the rest — `seek`/
+  `step_back` (reverse debugging), `set_watchpoint` (data breakpoints), `select_task`/`threads`/
+  `stopped_task` (multithreading) — were then outside the bytecode engine's single-vCPU debug scope.
+  **All three have since landed on the bytecode engine, not by tree-walker delegation:** reverse
+  debugging (slice 4) and watchpoints (slice 5) on the single-vCPU `DebugRun`, and multithreading on the
+  new `ScheduledDebugRun` (slice 7, below) — so the "can only ever cover the forward-debug subset" claim
+  no longer holds. The **engine-side
   API for that subset is now complete**: `DebugRun::read_var` resolves a source variable by name over
   the same `VarLoc`s as `Inspector::read_var` (SSA from the typed slot, window/fixed from window memory),
   with `read_var_by_name_parity` checking it matches op-for-op — so `DebugRun` now mirrors the Inspector's
@@ -199,11 +202,40 @@ different things depending on which pair you compare:
   matches_the_tree_walker` (the same demo program, armed *by name* through `dataBreakpointInfo`, on both
   engines) and the `browser-play-editor-test.mjs` panel check (arm ● → Continue → "data breakpoint").
 
-  **Direction — the one remaining gap is bytecode-engine work, never tree-walker delegation.** The
-  tree-walker is the differential oracle only (far too slow for any user-facing path):
-  - **Multithreading** (`threads`/`select_task`/`stopped_task`) — the largest: a deterministic
-    cooperative multi-vCPU **debug scheduler** for the bytecode VM (fibers, controlled interleaving),
-    distinct from the real-Web-Worker production mode. Wanted eventually; sequenced last.
+  **Multithreaded debugging landed on the bytecode engine (slice 7).** `bytecode::ScheduledDebugRun` is
+  a deterministic cooperative multi-vCPU **debug scheduler** over one shared `Mem` for a
+  `thread.spawn`/`join` guest — the bytecode counterpart of the tree-walker's `attach_scheduled`. A
+  run-shared breakpoint set fires in **whichever** vCPU reaches it (stopping *before* the op, one op per
+  turn, lowest-index-runnable pick so the interleaving is reproducible); `stopped_task` reports which
+  thread paused, and `select_task` focuses read-inspection (`backtrace`/`read_var`/`read_window`) on any
+  live thread while stopped in another. It does **not** delegate to the tree-walker (the oracle only);
+  the frame-reading core is the shared `FrameReader` view both engines use, so a selected thread reads
+  its own stack through the exact single-vCPU logic. `BytecodeBackend` routes a `thread.spawn` module
+  (`module_spawns_threads`) to this engine and exposes `threads`/`stopped_task`/`select_task`/`turn`, so
+  a full multithreaded DAP conversation — `threads`, per-thread `stackTrace`, breakpoints firing in
+  distinct workers — runs on the engine the playground ships. Scheduled reverse debugging and
+  cross-thread watchpoints stay single-vCPU-only for now (the backend reports `supports_reverse` /
+  `supports_watch` `false` in scheduled mode, so `stepBack`/`setDataBreakpoints` fail cleanly); `wait`/
+  `notify`/fibers/`instantiate`/coroutines surface as `SchedStop::Declined`. Parity-tested against the
+  tree-walker `attach_scheduled` oracle (`crates/svm/tests/bytecode_debug_threads.rs`: a worker
+  breakpoint fires once per spawned thread on distinct vCPUs, `select_task` inspects another thread
+  mid-stop, single-step advances the stopped thread, and the determinate result matches all three
+  engines) and at the DAP level (`dap_over_bytecode_multithreaded_*`).
+
+  **The playground panel consumes it (slice 7, browser half).** `browser/web/play.js`'s Variables pane
+  grows a **thread selector** — one chip per live vCPU from DAP `threads`, the stopped thread marked ●
+  and focused by default; clicking another chip issues a per-thread `stackTrace` (`select_task`) and
+  re-renders its stack **without resuming**, while Step/Continue still drive the stopped thread. A new
+  demo card ("Debugger (SVM — threads)") spawns two workers that atomically bump a shared counter with a
+  breakpoint pre-placed in the worker, so Debug stops in each worker in turn. `browser-play-editor-
+  test.mjs` drives it in real Chromium (three thread chips, the stopped one selected + marked, focusing
+  another thread mid-stop, Continue past the first worker). *Next:* scheduled reverse (re-execute to a
+  global `turn`) + cross-thread watchpoints under the scheduler, then depth-aware step-over/out.
+
+  **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
+  path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
+  Remaining bytecode-engine debug work: scheduled reverse debugging (re-execute to a global `turn`),
+  cross-thread watchpoints under the scheduler, and depth-aware stepping (step-over/out) across threads.
 
 ---
 

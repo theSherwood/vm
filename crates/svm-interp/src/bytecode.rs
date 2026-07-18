@@ -3283,7 +3283,149 @@ fn watch_hit_before(
     })
 }
 
+/// A read-only inspection view over **one vCPU's** reified state (`vm`) plus the module's §6 debug
+/// metadata. This is the shared frame-reading engine behind both the single-vCPU [`DebugRun`] and the
+/// multi-vCPU [`ScheduledDebugRun`]: given any task's `Vm`, it resolves backtrace frames, block-local
+/// SSA values, and named source variables identically — so a thread selected mid-stop (`select_task`)
+/// reads its own stack through the exact same code the single-vCPU path uses.
+struct FrameReader<'a> {
+    vm: &'a Vm,
+    source: &'a ModuleSource,
+    mem: &'a Option<Mem>,
+    debug: Option<&'a DebugInfo>,
+    fn_block_base: &'a [Vec<u32>],
+    fn_block_types: &'a [Vec<Vec<ValType>>],
+}
+
+impl FrameReader<'_> {
+    /// Call-stack depth (running activation + suspended callers).
+    fn depth(&self) -> usize {
+        self.vm.stack.len() + 1
+    }
+
+    /// The `(module, func, block, inst, window base)` of the frame `depth` levels from the top (0 =
+    /// running activation; each caller resolved at its call site, `resume_pc - 1`). `None` past the
+    /// stack or when the top is paused on a non-instruction.
+    fn frame_at(&self, depth: usize) -> Option<(usize, usize, usize, usize, usize)> {
+        if depth == 0 {
+            let pc = self.vm.cur_ir_pc(self.source)?;
+            return Some((self.vm.module, self.vm.cur, pc.block, pc.inst, self.vm.base));
+        }
+        let n = self.vm.stack.len();
+        let &(module, f, base, resume_pc, _) = self.vm.stack.get(n.checked_sub(depth)?)?;
+        let cm = self.source.get(module)?;
+        let (block, inst) = cm
+            .progs
+            .get(f)?
+            .src
+            .get(resume_pc.checked_sub(1)?)
+            .copied()
+            .flatten()?;
+        Some((module, f, block as usize, inst as usize, base))
+    }
+
+    /// The `IrPc` of the frame `depth` levels from the top.
+    fn frame_pc(&self, depth: usize) -> Option<super::IrPc> {
+        let (module, func, block, inst, _) = self.frame_at(depth)?;
+        Some(super::IrPc {
+            module: module as u32,
+            func: func as FuncIdx,
+            block,
+            inst,
+        })
+    }
+
+    /// Block-local SSA value `idx` in the frame `depth` levels from the top, typed.
+    fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
+        let (module, func, block, _inst, base) = self.frame_at(depth)?;
+        if module != 0 {
+            return None;
+        }
+        let off = *self.fn_block_base.get(func)?.get(block)? as usize;
+        let ty = *self.fn_block_types.get(func)?.get(block)?.get(idx)?;
+        Some(self.vm.regs[base + off + idx].to_value(ty))
+    }
+
+    /// Read a source variable by name in the frame `depth` levels from the top, resolving its `VarLoc`
+    /// over the §6 debug info (SSA slot / window / fixed). `None` if unresolvable here.
+    fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
+        let di = self.debug?;
+        let (module, func, block, inst, base) = self.frame_at(depth)?;
+        if module != 0 {
+            return None;
+        }
+        let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
+        let window_read = |addr: u64| -> Option<VarValue> {
+            Some(VarValue::Bytes(
+                self.mem.as_ref()?.read_window(addr, width).ok()?,
+            ))
+        };
+        match &var.loc {
+            VarLoc::Ssa { value } => self
+                .value_in_frame(depth, *value as usize)
+                .map(VarValue::Value),
+            VarLoc::SsaList(locs) => {
+                let v = super::loclist_value(locs, block, inst)?;
+                self.value_in_frame(depth, v as usize).map(VarValue::Value)
+            }
+            // Address = data-SP (the frame's first value, v0) + off.
+            VarLoc::Window { off } => {
+                window_read((self.vm.regs[base].i64() as u64).wrapping_add(*off as u64))
+            }
+            VarLoc::WindowVia { base: locs, off } => {
+                let v = super::loclist_value(locs, block, inst)?;
+                let addr = match self.value_in_frame(depth, v as usize)? {
+                    Value::I32(x) => x as i64 as u64,
+                    Value::I64(x) => x as u64,
+                    _ => return None,
+                };
+                window_read(addr.wrapping_add(*off as u64))
+            }
+            VarLoc::Fixed { addr } => window_read(*addr),
+        }
+    }
+
+    /// The window address of a memory-located source variable by name in the frame `depth` from the
+    /// top; `None` for a promoted SSA scalar (no address) or an unresolvable name.
+    fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
+        let di = self.debug?;
+        let (module, func, block, inst, base) = self.frame_at(depth)?;
+        if module != 0 {
+            return None;
+        }
+        let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
+        match &var.loc {
+            VarLoc::Ssa { .. } | VarLoc::SsaList(_) => None,
+            VarLoc::Window { off } => {
+                Some((self.vm.regs[base].i64() as u64).wrapping_add(*off as u64))
+            }
+            VarLoc::WindowVia { base: locs, off } => {
+                let v = super::loclist_value(locs, block, inst)?;
+                let addr = match self.value_in_frame(depth, v as usize)? {
+                    Value::I32(x) => x as i64 as u64,
+                    Value::I64(x) => x as u64,
+                    _ => return None,
+                };
+                Some(addr.wrapping_add(*off as u64))
+            }
+            VarLoc::Fixed { addr } => Some(*addr),
+        }
+    }
+}
+
 impl DebugRun {
+    /// A [`FrameReader`] over this single-vCPU session's `Vm` + debug metadata.
+    fn reader(&self) -> FrameReader<'_> {
+        FrameReader {
+            vm: &self.vm,
+            source: &self.source,
+            mem: &self.mem,
+            debug: self.debug.as_ref(),
+            fn_block_base: &self.fn_block_base,
+            fn_block_types: &self.fn_block_types,
+        }
+    }
+
     /// Open a debug session on `m`'s `func(args)`. `None` if the module is outside the engine's subset.
     pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<DebugRun> {
         m.funcs.get(func as usize)?;
@@ -3554,41 +3696,13 @@ impl DebugRun {
     /// Number of live call frames at the current stop (callers + the running activation) — the depth a
     /// DAP `stackTrace` would report.
     pub fn depth(&self) -> usize {
-        self.vm.stack.len() + 1
-    }
-
-    /// The `(module, func, block, inst, window base)` of the frame `depth` levels from the top (0 =
-    /// running activation; each caller is resolved at its call site, `resume_pc - 1`). `None` past the
-    /// stack or when the top is paused on a non-instruction.
-    fn frame_at(&self, depth: usize) -> Option<(usize, usize, usize, usize, usize)> {
-        if depth == 0 {
-            let pc = self.vm.cur_ir_pc(&self.source)?;
-            return Some((self.vm.module, self.vm.cur, pc.block, pc.inst, self.vm.base));
-        }
-        // depth 1 = innermost caller = last stack entry; depth n = outermost.
-        let n = self.vm.stack.len();
-        let &(module, f, base, resume_pc, _) = self.vm.stack.get(n.checked_sub(depth)?)?;
-        let cm = self.source.get(module)?;
-        let (block, inst) = cm
-            .progs
-            .get(f)?
-            .src
-            .get(resume_pc.checked_sub(1)?)
-            .copied()
-            .flatten()?;
-        Some((module, f, block as usize, inst as usize, base))
+        self.reader().depth()
     }
 
     /// The `IrPc` of the frame `depth` levels from the top — the bytecode counterpart of a
     /// `Inspector::backtrace` entry. `None` past the stack.
     pub fn frame_pc(&self, depth: usize) -> Option<super::IrPc> {
-        let (module, func, block, inst, _) = self.frame_at(depth)?;
-        Some(super::IrPc {
-            module: module as u32,
-            func: func as FuncIdx,
-            block,
-            inst,
-        })
+        self.reader().frame_pc(depth)
     }
 
     /// Block-local SSA value `idx` in the frame `depth` levels from the top, typed — the bytecode
@@ -3596,13 +3710,7 @@ impl DebugRun {
     /// the stack. A not-yet-computed slot reads as its default; the caller compares only the defined
     /// prefix (where `read_ir_value` returns `Some`).
     pub fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
-        let (module, func, block, _inst, base) = self.frame_at(depth)?;
-        if module != 0 {
-            return None; // metadata is for module-0 functions
-        }
-        let off = *self.fn_block_base.get(func)?.get(block)? as usize;
-        let ty = *self.fn_block_types.get(func)?.get(block)?.get(idx)?;
-        Some(self.vm.regs[base + off + idx].to_value(ty))
+        self.reader().value_in_frame(depth, idx)
     }
 
     /// Read a **source variable by name** in the frame `depth` levels from the top — the bytecode
@@ -3611,40 +3719,7 @@ impl DebugRun {
     /// from window memory. `None` if there is no debug info, the name isn't an in-scope var here, or
     /// the location can't be resolved. This is the name→value read a DAP `variables` backend needs.
     pub fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
-        let di = self.debug.as_ref()?;
-        let (module, func, block, inst, base) = self.frame_at(depth)?;
-        if module != 0 {
-            return None;
-        }
-        let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
-        let window_read = |addr: u64| -> Option<VarValue> {
-            Some(VarValue::Bytes(
-                self.mem.as_ref()?.read_window(addr, width).ok()?,
-            ))
-        };
-        match &var.loc {
-            VarLoc::Ssa { value } => self
-                .value_in_frame(depth, *value as usize)
-                .map(VarValue::Value),
-            VarLoc::SsaList(locs) => {
-                let v = super::loclist_value(locs, block, inst)?;
-                self.value_in_frame(depth, v as usize).map(VarValue::Value)
-            }
-            // Address = data-SP (the frame's first value, v0) + off.
-            VarLoc::Window { off } => {
-                window_read((self.vm.regs[base].i64() as u64).wrapping_add(*off as u64))
-            }
-            VarLoc::WindowVia { base: locs, off } => {
-                let v = super::loclist_value(locs, block, inst)?;
-                let addr = match self.value_in_frame(depth, v as usize)? {
-                    Value::I32(x) => x as i64 as u64,
-                    Value::I64(x) => x as u64,
-                    _ => return None,
-                };
-                window_read(addr.wrapping_add(*off as u64))
-            }
-            VarLoc::Fixed { addr } => window_read(*addr),
-        }
+        self.reader().read_var(depth, name, width)
     }
 
     /// The **window address** of a source variable by name in the frame `depth` from the top — the
@@ -3653,28 +3728,7 @@ impl DebugRun {
     /// isn't an in-scope var here, or no debug info. Feeds a DAP `variables` aggregate/array/pointer
     /// expansion (and, on the tree-walker, data breakpoints).
     pub fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
-        let di = self.debug.as_ref()?;
-        let (module, func, block, inst, base) = self.frame_at(depth)?;
-        if module != 0 {
-            return None;
-        }
-        let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
-        match &var.loc {
-            VarLoc::Ssa { .. } | VarLoc::SsaList(_) => None,
-            VarLoc::Window { off } => {
-                Some((self.vm.regs[base].i64() as u64).wrapping_add(*off as u64))
-            }
-            VarLoc::WindowVia { base: locs, off } => {
-                let v = super::loclist_value(locs, block, inst)?;
-                let addr = match self.value_in_frame(depth, v as usize)? {
-                    Value::I32(x) => x as i64 as u64,
-                    Value::I64(x) => x as u64,
-                    _ => return None,
-                };
-                Some(addr.wrapping_add(*off as u64))
-            }
-            VarLoc::Fixed { addr } => Some(*addr),
-        }
+        self.reader().var_addr(depth, name)
     }
 
     /// Read `len` bytes from the guest window at `addr` — the bytecode counterpart of
@@ -3695,6 +3749,436 @@ impl DebugRun {
     /// The run result once finished (`None` while still running).
     pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
         self.done.as_ref()
+    }
+}
+
+/// Whether `m` can spawn a second vCPU — it contains a `thread.spawn` op somewhere. The DAP backend
+/// routes such a module to the multithreaded [`ScheduledDebugRun`] instead of the single-vCPU
+/// [`DebugRun`]; a spawn-free module stays on the (reverse- and watch-capable) single-vCPU path.
+pub fn module_spawns_threads(m: &Module) -> bool {
+    m.funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .any(|i| matches!(i, Inst::ThreadSpawn { .. }))
+}
+
+/// The outcome of one [`ScheduledDebugRun`] pump — the multi-vCPU counterpart of a `DebugRun` stop.
+#[derive(Debug)]
+pub enum SchedStop {
+    /// A breakpoint fired in some thread; that thread is now the stopped + focused one
+    /// ([`stopped_task`](ScheduledDebugRun::stopped_task)).
+    Break(super::IrPc),
+    /// The root vCPU finished — the run's result (or trap).
+    Finished(Result<Vec<Value>, Trap>),
+    /// No thread is runnable and the root hasn't finished: a `memory.wait`/deadlock the debug
+    /// scheduler can't advance (it drives only `thread.spawn`/`join`).
+    Blocked,
+    /// A thread reached an op outside the debug scheduler's subset — `memory.wait`/`notify`, fibers,
+    /// `instantiate`, coroutines, tier-up. This program can't be debugged multithreaded here.
+    Declined,
+}
+
+/// One scheduled vCPU under the multi-vCPU debugger.
+enum DbgTaskState {
+    Runnable,
+    /// Parked on `thread.join` of task `child` (handle `slot`); its result lands at `dst` on wake.
+    BlockedJoin {
+        child: usize,
+        slot: usize,
+        dst: u32,
+    },
+    /// Finished — result (or trap) retained for a joiner.
+    Done(Result<Vec<Value>, Trap>),
+}
+
+struct DbgTask {
+    /// The reified continuation (register file + call stack + cursor) of this vCPU.
+    vm: Vm,
+    /// This vCPU's `thread.spawn` children (handle = index → global task index; `None` = joined).
+    threads: Vec<Option<usize>>,
+    state: DbgTaskState,
+    /// Paused on a just-reported breakpoint — step one op past it before the next scan makes progress
+    /// (the per-task analogue of [`DebugRun::at_bp`], so a loop-body breakpoint re-fires each iteration).
+    at_bp: bool,
+}
+
+/// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
+/// deterministic cooperative debug scheduler over one shared `Mem` for a `thread.spawn`/`join` guest.
+/// Mirrors the tree-walker's [`Inspector::attach_scheduled`](crate::Inspector) — a run-shared breakpoint
+/// set fires in **whichever** vCPU reaches it (stopping *before* the op), `stopped_task` reports which,
+/// and `select_task` focuses read-inspection (backtrace / `read_var` / `read_window`) on any live thread
+/// while stopped in another. The schedule is a reproducible lowest-index-runnable, one-op-per-turn pick
+/// (the debuggable analogue of the production `drive`), so the interleaving is deterministic. Reverse
+/// debugging and cross-thread watchpoints stay single-vCPU-only for now (a later slice) — the DAP
+/// backend gates them off in scheduled mode. Anything outside the `spawn`/`join` subset (`memory.wait`,
+/// fibers, `instantiate`, coroutines) surfaces as [`SchedStop::Declined`].
+pub struct ScheduledDebugRun {
+    source: std::sync::Arc<ModuleSource>,
+    table: SharedSlots,
+    mem: Option<Mem>,
+    host: Host,
+    tasks: Vec<DbgTask>,
+    fn_block_base: Vec<Vec<u32>>,
+    fn_block_types: Vec<Vec<Vec<ValType>>>,
+    debug: Option<DebugInfo>,
+    breakpoints: Vec<super::IrPc>,
+    /// The task index paused on a breakpoint (stepping drives it); `None` while running.
+    stopped: Option<usize>,
+    /// The task `select_task` focuses read-inspection on; reset to the stopped thread on each stop.
+    focus: usize,
+    /// Global count of visible ops executed across all vCPUs — the scheduled-mode logical clock.
+    turn: u64,
+}
+
+/// Mark task `ti` done and wake any joiner parked on it (delivering its result / propagating a trap) —
+/// the debug-scheduler counterpart of the production [`complete`].
+fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>) {
+    let mut work = vec![(ti, res)];
+    while let Some((done, res)) = work.pop() {
+        tasks[done].state = DbgTaskState::Done(res.clone());
+        for (j, t) in tasks.iter_mut().enumerate() {
+            let DbgTaskState::BlockedJoin { child, slot, dst } = t.state else {
+                continue;
+            };
+            if child != done {
+                continue;
+            }
+            t.threads[slot] = None;
+            match &res {
+                Ok(vals) => {
+                    let v = vals.first().copied().unwrap_or(Value::I64(0));
+                    t.vm.set(dst, Reg::from_value(v));
+                    t.state = DbgTaskState::Runnable;
+                }
+                Err(trap) => work.push((j, Err(trap.clone()))),
+            }
+        }
+    }
+}
+
+/// `thread.spawn`: add a child vCPU running `func(sp, arg)` (sharing the domain), write its handle to
+/// the spawner's `dst`. Mirrors the production `drive`'s `Spawn` arm for the debuggable subset.
+fn dbg_spawn(
+    tasks: &mut Vec<DbgTask>,
+    ti: usize,
+    func: u32,
+    sp: i64,
+    arg: i64,
+    dst: u32,
+    source: &ModuleSource,
+) -> Result<(), Trap> {
+    let primary = source.primary();
+    if func as usize >= primary.progs.len() {
+        return Err(Trap::Malformed);
+    }
+    let live = tasks
+        .iter()
+        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
+        .count();
+    if live >= super::MAX_VCPUS {
+        return Err(Trap::ThreadFault); // thread bomb
+    }
+    let vm = Vm::new(&primary, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+    let cidx = tasks.len();
+    tasks.push(DbgTask {
+        vm,
+        threads: Vec::new(),
+        state: DbgTaskState::Runnable,
+        at_bp: false,
+    });
+    let handle = tasks[ti].threads.len() as i32;
+    tasks[ti].threads.push(Some(cidx));
+    tasks[ti].vm.set(dst, Reg::from_i32(handle));
+    Ok(())
+}
+
+/// `thread.join`: deliver a finished child's result now, else park the joiner. Mirrors `drive`'s `Join`.
+fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32) {
+    let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
+        Ok(s) => s,
+        Err(t) => {
+            dbg_complete(tasks, ti, Err(t));
+            return;
+        }
+    };
+    let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+    match &tasks[child].state {
+        DbgTaskState::Done(res) => {
+            let res = res.clone();
+            tasks[ti].threads[slot] = None;
+            match res {
+                Ok(vals) => {
+                    let v = vals.first().copied().unwrap_or(Value::I64(0));
+                    tasks[ti].vm.set(dst, Reg::from_value(v));
+                }
+                Err(t) => dbg_complete(tasks, ti, Err(t)),
+            }
+        }
+        _ => tasks[ti].state = DbgTaskState::BlockedJoin { child, slot, dst },
+    }
+}
+
+impl ScheduledDebugRun {
+    /// Open a multithreaded debug session on `m`'s `func(args)`. `None` if the module is outside the
+    /// bytecode engine's subset (`compile_module` declines it).
+    pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<ScheduledDebugRun> {
+        m.funcs.get(func as usize)?;
+        let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
+        let mut fn_block_base = Vec::with_capacity(m.funcs.len());
+        let mut fn_block_types = Vec::with_capacity(m.funcs.len());
+        for g in &m.funcs {
+            let mut base = Vec::with_capacity(g.blocks.len());
+            let mut n = 0u32;
+            for b in &g.blocks {
+                base.push(n);
+                n += b.params.len() as u32;
+                for inst in &b.insts {
+                    n += inst.result_count(&arities) as u32;
+                }
+            }
+            fn_block_base.push(base);
+            fn_block_types.push(svm_verify::func_value_types(
+                g,
+                &m.funcs,
+                m.memory.is_some(),
+            ));
+        }
+        let c = compile_module(&m.funcs)?;
+        let dom = Domain::new(c, 0);
+        let mem = build_mem(m);
+        let host = Host::new();
+        let vm = Vm::new(&dom.source.primary(), func as usize, args).ok()?;
+        let Domain { source, table } = dom;
+        Some(ScheduledDebugRun {
+            source,
+            table,
+            mem,
+            host,
+            tasks: vec![DbgTask {
+                vm,
+                threads: Vec::new(),
+                state: DbgTaskState::Runnable,
+                at_bp: false,
+            }],
+            fn_block_base,
+            fn_block_types,
+            debug: m.debug_info.clone(),
+            breakpoints: Vec::new(),
+            stopped: None,
+            focus: 0,
+            turn: 0,
+        })
+    }
+
+    /// Replace the run-shared breakpoint set (fires in whichever thread reaches a pc in it).
+    pub fn set_breakpoints(&mut self, bps: Vec<super::IrPc>) {
+        self.breakpoints = bps;
+    }
+
+    /// Drive the cooperative schedule until a breakpoint fires (in some thread), the root finishes, no
+    /// thread is runnable (`Blocked`), or a thread hits an unsupported op (`Declined`). Resumable — the
+    /// previously stopped thread steps one op past its breakpoint before the scan resumes.
+    pub fn run_until_stop(&mut self, fuel: &mut u64) -> SchedStop {
+        let Self {
+            source,
+            table,
+            mem,
+            host,
+            tasks,
+            breakpoints,
+            stopped,
+            focus,
+            turn,
+            ..
+        } = self;
+        *stopped = None;
+        loop {
+            if let DbgTaskState::Done(res) = &tasks[0].state {
+                return SchedStop::Finished(res.clone());
+            }
+            let Some(ti) = tasks
+                .iter()
+                .position(|t| matches!(t.state, DbgTaskState::Runnable))
+            else {
+                return SchedStop::Blocked;
+            };
+            // Breakpoint check *before* the op — but not on the thread we just reported (it must make
+            // progress off its current op first, so a loop-body breakpoint re-fires each iteration).
+            if !tasks[ti].at_bp {
+                if let Some(pc) = tasks[ti].vm.cur_ir_pc(source) {
+                    if breakpoints.contains(&pc) {
+                        tasks[ti].at_bp = true;
+                        *stopped = Some(ti);
+                        *focus = ti;
+                        return SchedStop::Break(pc);
+                    }
+                }
+            }
+            let outcome =
+                tasks[ti]
+                    .vm
+                    .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1);
+            tasks[ti].at_bp = false;
+            match outcome {
+                Ok(Outcome::Suspended) => *turn += 1,
+                Ok(Outcome::Done(vals)) => {
+                    *turn += 1;
+                    dbg_complete(tasks, ti, Ok(vals));
+                }
+                Ok(Outcome::ThreadSpawn { func, sp, arg, dst }) => {
+                    *turn += 1;
+                    if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
+                        dbg_complete(tasks, ti, Err(t));
+                    }
+                }
+                Ok(Outcome::ThreadJoin { handle, dst }) => {
+                    *turn += 1;
+                    dbg_join(tasks, ti, handle, dst);
+                }
+                // Fibers / wait / notify / instantiate / coroutine / tier-up — outside this slice.
+                Ok(_) => return SchedStop::Declined,
+                Err(t) => {
+                    *turn += 1;
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+        }
+    }
+
+    /// Single-step the **stopped** thread to its next instruction location (skipping terminators),
+    /// keeping the schedule fixed — the multithreaded counterpart of `DebugRun::step`. If that thread
+    /// finishes or blocks mid-step, control returns to the scheduler.
+    pub fn step(&mut self, fuel: &mut u64) -> SchedStop {
+        let Some(ti) = self.stopped else {
+            return self.run_until_stop(fuel);
+        };
+        self.stopped = None;
+        self.tasks[ti].at_bp = false;
+        loop {
+            if !matches!(self.tasks[ti].state, DbgTaskState::Runnable) {
+                return self.finish_or_continue(fuel);
+            }
+            let outcome = {
+                let Self {
+                    source,
+                    table,
+                    mem,
+                    host,
+                    tasks,
+                    ..
+                } = self;
+                tasks[ti]
+                    .vm
+                    .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
+            };
+            self.turn += 1;
+            match outcome {
+                Ok(Outcome::Suspended) => {}
+                Ok(Outcome::ThreadJoin { handle, dst }) => {
+                    dbg_join(&mut self.tasks, ti, handle, dst)
+                }
+                Ok(Outcome::ThreadSpawn { func, sp, arg, dst }) => {
+                    if let Err(t) = dbg_spawn(&mut self.tasks, ti, func, sp, arg, dst, &self.source)
+                    {
+                        dbg_complete(&mut self.tasks, ti, Err(t));
+                    }
+                }
+                Ok(Outcome::Done(vals)) => {
+                    dbg_complete(&mut self.tasks, ti, Ok(vals));
+                    return self.finish_or_continue(fuel);
+                }
+                Ok(_) => return SchedStop::Declined,
+                Err(t) => {
+                    dbg_complete(&mut self.tasks, ti, Err(t));
+                    return self.finish_or_continue(fuel);
+                }
+            }
+            if let Some(pc) = self.tasks[ti].vm.cur_ir_pc(&self.source) {
+                self.stopped = Some(ti);
+                self.focus = ti;
+                return SchedStop::Break(pc);
+            }
+        }
+    }
+
+    /// The root's result if it has finished, else keep driving the schedule (used when the stepped
+    /// thread finished/blocked mid-step).
+    fn finish_or_continue(&mut self, fuel: &mut u64) -> SchedStop {
+        if let DbgTaskState::Done(res) = &self.tasks[0].state {
+            return SchedStop::Finished(res.clone());
+        }
+        self.run_until_stop(fuel)
+    }
+
+    /// Every live (not-yet-finished) vCPU — one DAP thread each. The stopped thread is among them.
+    pub fn threads(&self) -> Vec<u64> {
+        (0..self.tasks.len())
+            .filter(|&i| !matches!(self.tasks[i].state, DbgTaskState::Done(_)))
+            .map(|i| i as u64)
+            .collect()
+    }
+
+    /// The thread index currently paused on a breakpoint (drives stepping); `None` while running.
+    pub fn stopped_task(&self) -> Option<u64> {
+        self.stopped.map(|i| i as u64)
+    }
+
+    /// Focus read-inspection (`backtrace`/`read_var`/`read_window`) on a live thread; `false` if `id`
+    /// is not a live task. Resets to the stopped thread on the next `run_until_stop`.
+    pub fn select_task(&mut self, id: u64) -> bool {
+        let i = id as usize;
+        if i < self.tasks.len() && !matches!(self.tasks[i].state, DbgTaskState::Done(_)) {
+            self.focus = i;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The scheduled-mode logical clock (visible ops across all vCPUs).
+    pub fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// A [`FrameReader`] over the **focused** thread's `Vm` (what `select_task` chose).
+    fn reader(&self) -> FrameReader<'_> {
+        FrameReader {
+            vm: &self.tasks[self.focus].vm,
+            source: &self.source,
+            mem: &self.mem,
+            debug: self.debug.as_ref(),
+            fn_block_base: &self.fn_block_base,
+            fn_block_types: &self.fn_block_types,
+        }
+    }
+
+    /// Call-stack depth of the focused thread.
+    pub fn depth(&self) -> usize {
+        self.reader().depth()
+    }
+
+    /// The `IrPc` of the focused thread's frame `depth` levels from the top.
+    pub fn frame_pc(&self, depth: usize) -> Option<super::IrPc> {
+        self.reader().frame_pc(depth)
+    }
+
+    /// Read a source variable by name in the focused thread's frame `depth` levels from the top.
+    pub fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
+        self.reader().read_var(depth, name, width)
+    }
+
+    /// The window address of a memory-located source variable in the focused thread's frame `depth`.
+    pub fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
+        self.reader().var_addr(depth, name)
+    }
+
+    /// Read `len` bytes from the shared guest window at `addr`.
+    pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        match self.mem.as_ref() {
+            Some(m) => m.read_window(addr, len),
+            None => Err(Trap::Malformed),
+        }
     }
 }
 

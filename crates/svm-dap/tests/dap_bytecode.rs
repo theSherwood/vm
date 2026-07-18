@@ -798,3 +798,165 @@ fn dap_over_bytecode_step_back_rewinds_one_op() {
         .unwrap();
     assert!(!frames.is_empty(), "a live frame after stepBack");
 }
+
+// A `thread.spawn` guest (two workers each load/add/store mem[0]; root spawns + joins). Auto debug
+// info makes the worker's `vc = i64.load vaddr` breakpointable — it's on line 18 (leading newline is
+// line 1). Drives the multithreaded scheduled bytecode engine over DAP.
+const RACY_COUNTER: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vaddr = i64.const 0
+  vc = i64.load vaddr
+  vn = i64.add vc varg
+  i64.store vaddr vn
+  vz = i64.const 0
+  return vz
+}
+"#;
+
+#[test]
+fn dap_over_bytecode_multithreaded_breakpoint_per_thread() {
+    // A breakpoint on the worker's load (line 18) fires once per spawned thread on the multithreaded
+    // bytecode engine, reporting a *distinct* DAP thread each time, with every live vCPU listed and
+    // the stopped thread's own stack readable — then the guest terminates.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let launch = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(RACY_COUNTER)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&launch).get("success"),
+        Some(&Json::Bool(true)),
+        "multithreaded launch on the bytecode engine"
+    );
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(18))])]),
+            ),
+        ]),
+    ));
+
+    // Run to the first worker's breakpoint.
+    let cfg = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let stop1 = event(&cfg, "stopped").expect("stops at the worker breakpoint");
+    assert_eq!(
+        stop1.get("body").unwrap().get("reason").unwrap().as_str(),
+        Some("breakpoint")
+    );
+    let tid1 = stop1
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert!(tid1 >= 2, "a spawned worker (thread id ≥ 2), not the root");
+
+    // `threads` lists every live vCPU: the root (join-blocked) plus the two workers.
+    let th = s.handle(&req(5, "threads", Json::obj(vec![])));
+    let ids: Vec<i64> = response(&th)
+        .get("body")
+        .unwrap()
+        .get("threads")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.get("id").unwrap().as_i64().unwrap())
+        .collect();
+    assert!(ids.contains(&1), "root thread listed: {ids:?}");
+    assert!(ids.len() >= 3, "root + two workers live: {ids:?}");
+
+    // The stopped thread's own stack: its top frame is at the worker load line (18).
+    let st = s.handle(&req(
+        6,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid1))]),
+    ));
+    let line = response(&st)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("line")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_eq!(line, 18, "stopped at the worker's load line");
+
+    // Continue → the *other* worker hits the same breakpoint (a distinct DAP thread).
+    let cont = s.handle(&req(7, "continue", Json::obj(vec![])));
+    let stop2 = event(&cont, "stopped").expect("the second worker stops");
+    let tid2 = stop2
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_ne!(tid1, tid2, "the two workers are distinct DAP threads");
+
+    // Continue → the guest terminates (no more breakpoint hits).
+    let done = s.handle(&req(8, "continue", Json::obj(vec![])));
+    assert!(
+        event(&done, "terminated").is_some(),
+        "the multithreaded guest finished"
+    );
+}
+
+#[test]
+fn dap_over_bytecode_multithreaded_gates_reverse() {
+    // The scheduled bytecode engine is forward-only this slice, so `supports_reverse` is `false` and
+    // the server rejects `stepBack` cleanly (rather than time-travelling) — the same clean-fail path a
+    // forward-only backend already uses. (The single-vCPU bytecode engine keeps reverse; that's the
+    // `dap_over_bytecode_reverse_matches_the_tree_walker` case.)
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let launch = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(RACY_COUNTER)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&launch).get("success"),
+        Some(&Json::Bool(true)),
+        "multithreaded launch succeeds"
+    );
+    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    let back = s.handle(&req(4, "stepBack", Json::obj(vec![])));
+    assert_eq!(
+        response(&back).get("success"),
+        Some(&Json::Bool(false)),
+        "stepBack is rejected on the forward-only scheduled engine"
+    );
+}
