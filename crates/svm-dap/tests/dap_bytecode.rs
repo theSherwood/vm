@@ -1147,3 +1147,95 @@ fn dap_over_bytecode_multithreaded_wait_notify() {
         "the futex handoff finished"
     );
 }
+
+// A generator fiber: the root cont.new's + cont.resume's a fiber that suspends (11) then returns (25);
+// the root sums 11+25 = 36. The fiber's `v1 = i64.add varg v0` is line 17 (leading newline = line 1).
+// Drives §12 fiber debugging on the single-vCPU engine over DAP (a fiber-only program is spawn-free, so
+// it routes to the single-vCPU `DebugRun`).
+const SUSPEND_ROUNDTRIP: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 10
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 20
+  v7, v8 = cont.resume v2 v6
+  v9 = i64.add v5 v8
+  return v9
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = i64.const 1
+  v1 = i64.add varg v0
+  v2 = suspend v1
+  v3 = i64.const 5
+  v4 = i64.add v2 v3
+  return v4
+}
+"#;
+
+#[test]
+fn dap_over_bytecode_breakpoint_inside_a_fiber() {
+    // A breakpoint inside the fiber body (line 17) fires once `cont.resume` switches the debugged
+    // continuation into the fiber — proving fiber debugging reaches a DAP client — then the guest
+    // finishes with the summed value.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let launch = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(SUSPEND_ROUNDTRIP)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&launch).get("success"),
+        Some(&Json::Bool(true)),
+        "the fiber program launches on the bytecode engine"
+    );
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(17))])]),
+            ),
+        ]),
+    ));
+    let cfg = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let stop = event(&cfg, "stopped").expect("stops inside the fiber");
+    assert_eq!(
+        stop.get("body").unwrap().get("reason").unwrap().as_str(),
+        Some("breakpoint")
+    );
+    // The stopped frame is the fiber body (line 17).
+    let st = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let line = response(&st)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("line")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_eq!(line, 17, "stopped at the fiber's add");
+    // Continue → the fiber suspends, resumes, returns; the guest terminates.
+    let done = s.handle(&req(6, "continue", Json::obj(vec![])));
+    assert!(
+        event(&done, "terminated").is_some(),
+        "the fiber generator finished"
+    );
+}

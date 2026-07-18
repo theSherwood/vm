@@ -3222,7 +3222,13 @@ pub struct DebugRun {
     table: SharedSlots,
     mem: Option<Mem>,
     host: Host,
-    vm: Vm,
+    /// The reified continuation being debugged: the active `Vm` plus its §12 fiber resume `chain`. A
+    /// `cont.resume` switches `vt.active` into a fiber; `suspend` / a fiber return switches back. The
+    /// debugger inspects (backtrace / read_var) the **active** continuation.
+    vt: VTask,
+    /// The session's §12 fiber registry (handle = index). Populated by `cont.new`; rebuilt
+    /// deterministically on a reverse `seek` replay. Empty for a fiber-free program.
+    fibers: Vec<FiberState>,
     /// Per-**function**, per-block slot base (mirror of `compile_func`'s `base`) — for reading a value
     /// in any live call frame, not just the innermost.
     fn_block_base: Vec<Vec<u32>>,
@@ -3281,6 +3287,121 @@ fn watch_hit_before(
         let w_end = addr.saturating_add(*len);
         (base < w_end && *addr < end && kind.fires_on(write)).then_some((base, write))
     })
+}
+
+/// The outcome of advancing a debug session's active continuation by one op ([`debug_advance_fiber`]).
+enum FiberStep {
+    /// One op ran (a normal op, or a `cont.*` / fiber-return switch) — the clock ticks, keep going.
+    Stepped,
+    /// The **root** activation returned — the run's result.
+    Finished(Vec<Value>),
+    /// A trap (including a `FiberFault`).
+    Trapped(Trap),
+}
+
+/// Run **one op** of a single-vCPU debug session's active continuation (`vt.active`), applying any §12
+/// fiber switch (`cont.new` registers a fiber, `cont.resume` switches into one, `suspend` / a fiber's
+/// return switches back). The debug counterpart of [`step_vcpu`]'s fiber handling, minus threads and
+/// durability (debug runs are non-durable, so no `shadow_switch` / `fiber_sp`). The fiber registry
+/// `fibers` is owned by the session and rebuilt deterministically on a reverse `seek` replay.
+fn debug_advance_fiber(
+    vt: &mut VTask,
+    fibers: &mut Vec<FiberState>,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+) -> FiberStep {
+    match vt
+        .active
+        .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
+    {
+        Ok(Outcome::Suspended) => FiberStep::Stepped,
+        Ok(Outcome::Done(vals)) => match vt.chain.pop() {
+            // The root activation finished — the run's result.
+            None => FiberStep::Finished(vals),
+            // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer.
+            Some((rid, resumer, rdst)) => {
+                fibers[vt.active_id] = FiberState::Done;
+                let retval = vals.first().copied().unwrap_or(Value::I64(0));
+                vt.active = resumer;
+                vt.active_id = rid;
+                vt.active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
+                vt.active.set(rdst + 1, Reg::from_value(retval));
+                FiberStep::Stepped
+            }
+        },
+        Ok(Outcome::ContNew { funcref, sp, dst }) => {
+            if fibers.len() + 1 >= super::MAX_FIBERS {
+                return FiberStep::Trapped(Trap::FiberFault);
+            }
+            let h = fibers.len() as i32;
+            fibers.push(FiberState::Pending { funcref, sp });
+            vt.active.set(dst, Reg::from_i32(h));
+            FiberStep::Stepped
+        }
+        Ok(Outcome::ContResume { kh, arg, dst }) => {
+            let k = kh as usize;
+            let target = match fibers.get_mut(k) {
+                Some(slot @ FiberState::Pending { .. }) => {
+                    let (funcref, sp) = match std::mem::replace(slot, FiberState::Running) {
+                        FiberState::Pending { funcref, sp } => (funcref, sp),
+                        _ => unreachable!(),
+                    };
+                    let m0 = source.primary();
+                    let f = (funcref as u32 as usize) & m0.table_mask;
+                    let ok = m0
+                        .sigs
+                        .get(f)
+                        .is_some_and(|(p, r)| p[..] == FIBER_PARAMS && r[..] == FIBER_RESULTS);
+                    if !ok {
+                        return FiberStep::Trapped(Trap::FiberFault);
+                    }
+                    match Vm::new(&m0, f, &[Value::I64(sp), Value::I64(arg)]) {
+                        Ok(v) => v,
+                        Err(t) => return FiberStep::Trapped(t),
+                    }
+                }
+                Some(slot @ FiberState::Parked { .. }) => {
+                    match std::mem::replace(slot, FiberState::Running) {
+                        FiberState::Parked {
+                            mut vm,
+                            suspend_dst,
+                        } => {
+                            vm.set(suspend_dst, Reg::from_i64(arg));
+                            vm
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => return FiberStep::Trapped(Trap::FiberFault), // forged / Running / Done
+            };
+            let resumer = std::mem::replace(&mut vt.active, target);
+            vt.chain.push((vt.active_id, resumer, dst));
+            vt.active_id = k;
+            FiberStep::Stepped
+        }
+        Ok(Outcome::FiberSuspend { value, dst }) => {
+            // Pop the resumer to switch back to; an empty chain means the root tried to `suspend`.
+            let Some((rid, resumer, rdst)) = vt.chain.pop() else {
+                return FiberStep::Trapped(Trap::FiberFault);
+            };
+            let suspended = std::mem::replace(&mut vt.active, resumer);
+            fibers[vt.active_id] = FiberState::Parked {
+                vm: suspended,
+                suspend_dst: dst,
+            };
+            vt.active_id = rid;
+            vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
+            vt.active.set(rdst + 1, Reg::from_i64(value));
+            FiberStep::Stepped
+        }
+        // Threads / wait / notify / instantiate / coroutine / tier-up aren't in the single-vCPU fiber
+        // debug scope (a thread-spawner routes to `ScheduledDebugRun` instead).
+        Ok(_) => FiberStep::Trapped(Trap::Malformed),
+        Err(t) => FiberStep::Trapped(t),
+    }
 }
 
 /// A read-only inspection view over **one vCPU's** reified state (`vm`) plus the module's §6 debug
@@ -3417,7 +3538,7 @@ impl DebugRun {
     /// A [`FrameReader`] over this single-vCPU session's `Vm` + debug metadata.
     fn reader(&self) -> FrameReader<'_> {
         FrameReader {
-            vm: &self.vm,
+            vm: &self.vt.active,
             source: &self.source,
             mem: &self.mem,
             debug: self.debug.as_ref(),
@@ -3454,14 +3575,15 @@ impl DebugRun {
         let dom = Domain::new(c, 0);
         let mem = build_mem(m);
         let host = Host::new();
-        let vm = Vm::new(&dom.source.primary(), func as usize, args).ok()?;
+        let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
         let Domain { source, table } = dom;
         Some(DebugRun {
             source,
             table,
             mem,
             host,
-            vm,
+            vt,
+            fibers: Vec::new(),
             fn_block_base,
             fn_block_types,
             debug: m.debug_info.clone(),
@@ -3513,26 +3635,23 @@ impl DebugRun {
             table,
             mem,
             host,
-            vm,
+            vt,
+            fibers,
             done,
             op_clock,
             ..
         } = self;
-        match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
-            Ok(Outcome::Suspended) => {
+        match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
+            FiberStep::Stepped => {
                 *op_clock += 1;
                 true
             }
-            Ok(Outcome::Done(vals)) => {
+            FiberStep::Finished(vals) => {
                 *op_clock += 1;
                 *done = Some(Ok(vals));
                 false
             }
-            Ok(_) => {
-                *done = Some(Err(Trap::Malformed));
-                false
-            }
-            Err(t) => {
+            FiberStep::Trapped(t) => {
                 *done = Some(Err(t));
                 false
             }
@@ -3550,7 +3669,8 @@ impl DebugRun {
             table,
             mem,
             host,
-            vm,
+            vt,
+            fibers,
             at_bp,
             done,
             op_clock,
@@ -3563,25 +3683,21 @@ impl DebugRun {
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
-            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
-                Ok(Outcome::Suspended) => *op_clock += 1,
-                Ok(Outcome::Done(vals)) => {
+            match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
+                FiberStep::Stepped => *op_clock += 1,
+                FiberStep::Finished(vals) => {
                     *op_clock += 1;
                     *done = Some(Ok(vals));
                     return None;
                 }
-                Ok(_) => {
-                    *done = Some(Err(Trap::Malformed));
-                    return None;
-                }
-                Err(t) => {
+                FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
                     return None;
                 }
             }
         }
         loop {
-            if let Some(pc) = vm.cur_ir_pc(source) {
+            if let Some(pc) = vt.active.cur_ir_pc(source) {
                 if bps.contains(&pc) {
                     *at_bp = true;
                     return Some(pc);
@@ -3590,7 +3706,7 @@ impl DebugRun {
                 // hasn't applied — step once to observe the new bytes). Skipped when none are armed.
                 if !watchpoints.is_empty() && pc.module == 0 {
                     if let Some(hit) = watch_hit_before(
-                        vm,
+                        &vt.active,
                         &*mem,
                         funcs,
                         fn_block_base,
@@ -3605,21 +3721,17 @@ impl DebugRun {
                     }
                 }
             }
-            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
-                Ok(Outcome::Suspended) => {
+            match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
+                FiberStep::Stepped => {
                     *op_clock += 1;
                     continue;
                 }
-                Ok(Outcome::Done(vals)) => {
+                FiberStep::Finished(vals) => {
                     *op_clock += 1;
                     *done = Some(Ok(vals));
                     return None;
                 }
-                Ok(_) => {
-                    *done = Some(Err(Trap::Malformed));
-                    return None;
-                }
-                Err(t) => {
+                FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
                     return None;
                 }
@@ -3639,7 +3751,8 @@ impl DebugRun {
             table,
             mem,
             host,
-            vm,
+            vt,
+            fibers,
             at_bp,
             done,
             op_clock,
@@ -3647,25 +3760,21 @@ impl DebugRun {
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
-            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
-                Ok(Outcome::Suspended) => *op_clock += 1,
-                Ok(Outcome::Done(vals)) => {
+            match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
+                FiberStep::Stepped => *op_clock += 1,
+                FiberStep::Finished(vals) => {
                     *op_clock += 1;
                     *done = Some(Ok(vals));
                     return None;
                 }
-                Ok(_) => {
-                    *done = Some(Err(Trap::Malformed));
-                    return None;
-                }
-                Err(t) => {
+                FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
                     return None;
                 }
             }
-            let depth = vm.stack.len() + 1;
+            let depth = vt.active.stack.len() + 1;
             if max_depth.is_none_or(|m| depth <= m) {
-                if let Some(pc) = vm.cur_ir_pc(source) {
+                if let Some(pc) = vt.active.cur_ir_pc(source) {
                     return Some(pc);
                 }
             }

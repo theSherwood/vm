@@ -264,15 +264,31 @@ different things depending on which pair you compare:
   and the M:N executor, `bytecode_breakpoint_after_a_wait_fires_once_woken` proves the worker actually
   parked and was woken, and `dap_over_bytecode_multithreaded_wait_notify` drives it over DAP. A
   "Debugger (SVM — wait / notify)" playground demo (browser-verified: the worker stops after the wait,
-  woken by the root's notify, then finishes). Fibers/coroutines are the only remaining `Declined` ops.
+  woken by the root's notify, then finishes).
+
+  **§12 fibers on the single-vCPU engine (slice 12).** `DebugRun` now holds a `VTask` (an active `Vm`
+  plus a resume `chain`) + a per-session fiber registry instead of a bare `Vm`; a new
+  `debug_advance_fiber` runs one op of the active continuation and applies any switch — `cont.new`
+  registers a fiber, `cont.resume` switches `vt.active` into it (pushing the resumer onto the chain),
+  `suspend` / a fiber's return switches back — the debug counterpart of `step_vcpu`'s fiber handling,
+  minus threads/durability. So breakpoints fire **inside** a resumed fiber, `step` descends into it, the
+  backtrace/`read_var` inspect the active continuation, and reverse `seek` replays across the switches
+  (deterministic). The shared `FrameReader` is unchanged — it just reads `vt.active`. Covered by
+  `crates/svm/tests/bytecode_debug_fibers.rs` (breakpoint inside a fiber, step-into a resumed fiber,
+  oracle parity across the suspend/resume, deterministic tick-replay), `dap_over_bytecode_breakpoint_
+  inside_a_fiber` (over DAP), and a "Debugger (SVM — fibers / generators)" playground demo
+  (browser-verified: cont.resume steps into the fiber, the generator finishes → 36). A fiber-only guest
+  is spawn-free, so it routes to `DebugRun`; fibers *composed with threads* stay `Declined` on the
+  scheduled engine (a future slice — the fiber registry there is run-shared across vCPUs).
 
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
-  The bytecode debug engines (single-vCPU + scheduled) now cover the full `Inspector` forward/reverse/
-  watch surface plus `thread.spawn`/`join`/`wait`/`notify`. Remaining: **fibers/coroutines** under the
-  debug scheduler (they need the `VTask`/fiber-registry machinery neither bytecode debug path carries
-  yet — a larger slice; `SchedStop::Declined` today), and a checkpoint ladder to bound reverse-replay
-  cost (a perf optimization — today's small debugged programs replay from turn 0 cheaply).
+  The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
+  `thread.spawn`/`join`/`wait`/`notify` (scheduled) and **fibers** (single-vCPU). Remaining `Declined`
+  ops: fibers *composed with threads* on the scheduled engine, §14 **coroutines** (`Instantiator.spawn_
+  coroutine`/`resume`, which need the confined-child `Coro`/env machinery), and `instantiate` children —
+  each a further slice. Plus a checkpoint ladder to bound reverse-replay cost (a perf optimization —
+  today's small debugged programs replay from turn 0 cheaply).
 
 ---
 
