@@ -4,7 +4,7 @@
 //! step — parity-checked against the tree-walker `Inspector::attach_scheduled` oracle (the reference
 //! multithreaded debug engine). This is the bytecode counterpart of `debug_threads.rs`.
 
-use svm_interp::bytecode::{ScheduledDebugRun, SchedStop};
+use svm_interp::bytecode::{SchedStop, ScheduledDebugRun};
 use svm_interp::{bytecode, run, Inspector, IrPc, Stop, Trap, Value};
 use svm_text::parse_module;
 
@@ -145,7 +145,11 @@ fn bytecode_scheduled_run_matches_the_oracle() {
 
     // And the production M:N executor (real worker threads).
     let mut f = 50_000_000u64;
-    assert_eq!(bc, run(&m, 0, &[], &mut f), "bytecode scheduled ≡ the M:N executor");
+    assert_eq!(
+        bc,
+        run(&m, 0, &[], &mut f),
+        "bytecode scheduled ≡ the M:N executor"
+    );
 }
 
 /// While stopped at one worker's breakpoint, `select_task` focuses another live thread and reads *its*
@@ -202,7 +206,10 @@ fn bytecode_stepping_a_stopped_thread_advances_one_op() {
 
     match sd.step(&mut fuel) {
         SchedStop::Break(pc) => {
-            assert_eq!(pc.inst, 2, "stepped from the load (inst 1) to the add (inst 2)");
+            assert_eq!(
+                pc.inst, 2,
+                "stepped from the load (inst 1) to the add (inst 2)"
+            );
             assert_eq!(sd.stopped_task(), Some(who), "still the same thread");
             assert!(sd.turn() > t0, "the logical clock ticked");
         }
@@ -216,6 +223,7 @@ fn bytecode_stepping_a_stopped_thread_advances_one_op() {
 fn module_spawns_threads_detects_the_multithreaded_case() {
     let racy = parse_module(RACY_COUNTER).unwrap();
     assert!(bytecode::module_spawns_threads(&racy));
-    let seq = parse_module("func () -> (i64) {\nblock0():\n  a = i64.const 7\n  return a\n}").unwrap();
+    let seq =
+        parse_module("func () -> (i64) {\nblock0():\n  a = i64.const 7\n  return a\n}").unwrap();
     assert!(!bytecode::module_spawns_threads(&seq));
 }
