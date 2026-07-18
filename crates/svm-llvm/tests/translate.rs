@@ -5787,6 +5787,73 @@ fn vec2_minmax_per_lane() {
 }
 
 #[test]
+fn vec2_splat_constant() {
+    // LLVM 21's constant-splat shorthand `<2 x i32> splat (i32 K)` (≡ `<i32 K, i32 K>`). rustc's
+    // auto-vectorizer emits it pervasively (min/max clamps, elementwise ops); clang's textual output
+    // does not, so the on-ramp's `.ll` reader never saw it and fail-closed (`constant not yet
+    // supported: splat`) — blocking every auto-vectorized rustc module. Exercised through the 2-lane
+    // per-lane min/max path so the expanded lanes are actually observed:
+    //   smax(<-1, 3>, splat(2)) = <2, 3>  ⇒  s0*1000 + s1 = 2003.
+    let ll = "declare <2 x i32> @llvm.smax.v2i32(<2 x i32>, <2 x i32>)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %s = call <2 x i32> @llvm.smax.v2i32(<2 x i32> <i32 -1, i32 3>, <2 x i32> splat (i32 2))\n  \
+        %s0 = extractelement <2 x i32> %s, i32 0\n  \
+        %s1 = extractelement <2 x i32> %s, i32 1\n  \
+        %a = mul i32 %s0, 1000\n  \
+        %r = add i32 %a, %s1\n  \
+        ret i32 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate splat .ll");
+    svm_verify::verify_module(&t.module).expect("verify splat");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run splat");
+    assert_eq!(
+        r,
+        vec![Value::I32(2003)],
+        "splat(2) ⇒ smax(<-1,3>,<2,2>)=<2,3>"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 2003, "JIT splat = 2003"),
+        other => panic!("JIT splat: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn vec2_abs_per_lane() {
+    // A **2-lane 32-bit** `llvm.abs` (`<2 x i32>`, packed into an `i64` — §V) scalarizes **per lane**,
+    // like the min/max siblings: a packed-word fall-through would `abs` the whole `i64` and corrupt the
+    // lanes (`abs(<-7, 4>)` packs to a *positive* `i64`, so it would pass through unchanged, extracting
+    // lane 0 as -7). Per lane: `abs(<-7, 4>) = <7, 4>` ⇒ a0*1000 + a1 = 7004. Found via a rustc
+    // auto-vectorized `.iter().map(|d| d.abs())` reduction (ISSUES.md I23 follow-on probes).
+    let ll = "declare <2 x i32> @llvm.abs.v2i32(<2 x i32>, i1)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %a = call <2 x i32> @llvm.abs.v2i32(<2 x i32> <i32 -7, i32 4>, i1 false)\n  \
+        %a0 = extractelement <2 x i32> %a, i32 0\n  \
+        %a1 = extractelement <2 x i32> %a, i32 1\n  \
+        %m = mul i32 %a0, 1000\n  \
+        %r = add i32 %m, %a1\n  \
+        ret i32 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate vec2-abs .ll");
+    svm_verify::verify_module(&t.module).expect("verify vec2-abs");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec2-abs");
+    assert_eq!(
+        r,
+        vec![Value::I32(7004)],
+        "per-lane abs(<-7,4>)=<7,4> ⇒ 7*1000+4"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 7004, "JIT vec2-abs = 7004"),
+        other => panic!("JIT vec2-abs: unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn constexpr_gep_i8_element_stride() {
     // A **constexpr** `getelementptr (i8, ptr @g, i64 K)` strides by its **source element type** (`i8`
     // ⇒ K bytes), *not* by `@g`'s pointee type. With opaque pointers the two differ — `@g` here is a

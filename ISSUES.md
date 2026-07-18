@@ -66,7 +66,7 @@ suspects: `bf_set_si`/`bf_normalize` bit-length + shift, `bf_ftoa` base conversi
 from the JS layer. Then bisect the first miscompiling `bf_*` primitive. Not blocking the QuickJS
 playground demo (which doesn't use BigInt); a dedicated slice.
 
-### I23 — svm-jit miscompiles some rustc-emitted bitcode: an in-bounds heap `Vec` access faults / returns garbage (S2) — found by the `bench/rustbench` real-program harness (2026-07-14)
+### I23 — svm-jit miscompiles some rustc-emitted bitcode: an in-bounds heap `Vec` access faults / returns garbage (S2) — **RESOLVED** (2026-07-16; re-verified + extended 2026-07-18) — found by the `bench/rustbench` real-program harness (2026-07-14)
 
 **Where:** the LLVM on-ramp + `svm-jit` on **rustc**-produced bitcode (rustc 1.81, LLVM 18 — the
 version the on-ramp's `llvm-dis` reads). Not seen on any `clang`-produced module; the five other
@@ -118,6 +118,21 @@ opaque-pointer / auto-vectorizer patterns that clang happened not to emit but ru
 `vec2_minmax_per_lane` + `constexpr_gep_i8_element_stride` (hand-`.ll`, interp+JIT) added. The `bfs`
 workload now cross-checks byte-identical to native (`881260`) on all three backends and is **re-enabled**
 in the driver's `WORKLOADS`.
+
+**Re-verified + extended (2026-07-18).** Re-ran the full `rustbench` suite on the modern default
+toolchain (rustc 1.94 / LLVM 21): all six workloads (bfs included) cross-check byte-identical to native
+— the two original bugs stay fixed. To hunt for *sibling* rustc/auto-vectorizer patterns, added a fast
+correctness-only harness **`bench/src/bin/rustprobe.rs`** (rustc `--emit=llvm-ir` → `svm-llvm` →
+`svm-jit`, vs a native build, over a spread of `n`) with eight diverse stress workloads
+(`bench/rustbench/probes/`: reductions, checked/saturating arith, bit intrinsics, slice adapters,
+floats, structs+enums, wide auto-vectorized math, static tables). It surfaced **two new translate gaps**
+— both clean fail-closes (the on-ramp refused rather than miscompiling), now fixed in `crates/svm-llvm`:
+1. **LLVM 21's constant-splat shorthand `<N x T> splat (T v)`** (rustc emits it pervasively from
+   min/max clamps + elementwise ops; clang's textual output doesn't) — the `.ll` reader now parses it,
+   expanding to the explicit `<T v, …>` vector. Regression `vec2_splat_constant`.
+2. **2-lane `<2 x i32>` `llvm.abs`** wasn't scalarized (only the min/max siblings were, from the
+   original I23 fix) — now explode → per-lane `select(x<0,-x,x)` → repack. Regression `vec2_abs_per_lane`.
+All eight probes now cross-check byte-identical; **no new wrong-value/trap miscompile was found.**
 
 ### I24 — the LLVM on-ramp was effectively pinned to LLVM 18 — **RESOLVED** (2026-07-17): the textual reader is version-tolerant; consumers feed `.ll` text and skip `llvm-dis`
 

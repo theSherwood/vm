@@ -13383,12 +13383,40 @@ fn lower_int_intrinsic(
     // packed word `0x0000_0003_FFFF_FFFF` is positive. Explode to the two lanes, min/max each, repack.
     // Found via the auto-vectorized `if d > 0 { h += d }` clamp reduction (LLVM emits `smax(d, 0)`).
     if vec2_lane_ty(args[0].get_type(types).as_ref()) == Some(ValType::I32) {
+        // `llvm.abs` is **unary** (`args[1]` is the ignored is-int-min-poison `i1`): explode, take
+        // `select(lane < 0, 0 - lane, lane)` per lane, repack. Same class as the min/max scalarization
+        // below — a packed-word fall-through would `abs` the whole `i64` and corrupt both lanes.
+        if base == "llvm.abs" {
+            let a = vec_explode(ctx, args[0], types, true)?;
+            let mut lanes = Vec::with_capacity(a.len());
+            for &la in &a {
+                let zero = ctx.push(Inst::ConstI32(0));
+                let cond = ctx.push(Inst::IntCmp {
+                    ty: IntTy::I32,
+                    op: CmpOp::LtS,
+                    a: la,
+                    b: zero,
+                });
+                let neg = ctx.push(Inst::IntBin {
+                    ty: IntTy::I32,
+                    op: BinOp::Sub,
+                    a: zero,
+                    b: la,
+                });
+                lanes.push(ctx.push(Inst::Select {
+                    cond,
+                    a: neg,
+                    b: la,
+                }));
+            }
+            return Ok(Some(ctx.vec_pack(lanes[0], lanes[1], ValType::I32)));
+        }
         let (cmp, signed) = match base {
             "llvm.smax" => (CmpOp::GtS, true),
             "llvm.smin" => (CmpOp::LtS, true),
             "llvm.umax" => (CmpOp::GtU, false),
             "llvm.umin" => (CmpOp::LtU, false),
-            other => return unsup(format!("2-lane vector `{other}` (only min/max)")),
+            other => return unsup(format!("2-lane vector `{other}` (only min/max, abs)")),
         };
         let a = vec_explode(ctx, args[0], types, signed)?;
         let b = vec_explode(ctx, args[1], types, signed)?;

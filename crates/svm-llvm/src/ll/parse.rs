@@ -1683,6 +1683,23 @@ impl Parser {
                 self.expect(&Token::Gt)?;
                 Constant::Vector(elements)
             }
+            // `splat (<ty> <c>)` — LLVM 21's constant-splat shorthand for a vector whose every lane is
+            // `<c>` (e.g. `<2 x i32> splat (i32 -5)` ≡ `<i32 -5, i32 -5>`). rustc's auto-vectorizer emits
+            // it pervasively (min/max clamps, elementwise ops); clang's textual output does not. Expand
+            // to the explicit `Constant::Vector` of `num_elements` copies so every downstream lowering
+            // (per-lane scalarization, splat recognition) is identical to the long form.
+            Some(Token::Word(w)) if w == "splat" => {
+                self.pos += 1; // `splat`
+                self.expect(&Token::LParen)?;
+                let ety = self.type_()?;
+                let elem = self.constant(&ety)?;
+                self.expect(&Token::RParen)?;
+                let lanes = match ty.as_ref() {
+                    Type::VectorType { num_elements, .. } => *num_elements,
+                    _ => return self.err("splat constant with non-vector type"),
+                };
+                Constant::Vector(vec![elem; lanes])
+            }
             other => return self.err(format!("constant not yet supported: {other:?}")),
         };
         Ok(ConstantRef::new(c))
