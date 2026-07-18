@@ -495,6 +495,60 @@ block0(sp: i64, arg: i64):
 `,
   },
 
+  'Debugger (SVM — fibers + threads)': {
+    debug: true,
+    bp: 34, // a breakpoint pre-placed on line 35 (0-based 34), inside the fiber body
+    mode: 'plain',
+    desc: 'Fibers composed with threads on the scheduled bytecode engine. Two worker threads each run a ' +
+      '§12 generator fiber: the worker cont.new’s the fiber, cont.resume’s it twice (it suspends 11, then ' +
+      'returns 25), and atomically adds the 25 into mem[0] — two workers → 50. A breakpoint sits inside ' +
+      'the fiber body (line 35): press Debug and a *worker* vCPU (not the root) stops there, its own ' +
+      'fiber frame live. The thread selector switches between the workers; Continue lets the other ' +
+      'worker’s fiber hit it too, then the run finishes. ◀◀ Reverse replays the whole schedule — ' +
+      'fibers-on-threads included — deterministically. Fibers and threads, composed under one debugger.',
+    src: `; Two worker threads, each running a generator fiber. Each worker cont.new’s a
+; fiber, resumes it twice (it suspends 11, then returns 25), and atomically adds
+; the returned 25 into mem[0]. Two workers → 50. The breakpoint on line 35 fires
+; once a worker’s cont.resume enters the fiber — a *worker* vCPU, not the root.
+memory 16
+func () -> (i64) {
+block0():
+  sp = i64.const 0
+  a = i64.const 0
+  w0 = thread.spawn 1 sp a
+  w1 = thread.spawn 1 sp a
+  j0 = thread.join w0
+  j1 = thread.join w1
+  addr = i64.const 0
+  total = i64.atomic.load addr
+  return total
+}
+func (i64, i64) -> (i64) {
+block0(sp: i64, arg: i64):
+  mk = ref.func 2
+  z = i64.const 0
+  gen = cont.new mk z
+  a = i64.const 10
+  s0, v0 = cont.resume gen a
+  b = i64.const 20
+  s1, v1 = cont.resume gen b
+  addr = i64.const 0
+  rmw = i64.atomic.rmw.add addr v1
+  zero = i64.const 0
+  return zero
+}
+func (i64, i64) -> (i64) {
+block0(sp2: i64, arg2: i64):
+  one = i64.const 1
+  bumped = i64.add arg2 one
+  got = suspend bumped
+  five = i64.const 5
+  out = i64.add got five
+  return out
+}
+`,
+  },
+
   // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
   //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------

@@ -278,14 +278,27 @@ different things depending on which pair you compare:
   oracle parity across the suspend/resume, deterministic tick-replay), `dap_over_bytecode_breakpoint_
   inside_a_fiber` (over DAP), and a "Debugger (SVM — fibers / generators)" playground demo
   (browser-verified: cont.resume steps into the fiber, the generator finishes → 36). A fiber-only guest
-  is spawn-free, so it routes to `DebugRun`; fibers *composed with threads* stay `Declined` on the
-  scheduled engine (a future slice — the fiber registry there is run-shared across vCPUs).
+  is spawn-free, so it routes to `DebugRun`.
+
+  **§12 fibers composed with threads on the scheduled engine (slice 13).** `ScheduledDebugRun`'s per-vCPU
+  `DbgTask` now holds a `VTask` (active `Vm` + resume `chain`) instead of a bare `Vm`, plus one
+  run-shared fiber registry (a fiber can migrate between vCPUs — D57). Its `drive`/`tick` route each
+  runnable vCPU through the same `debug_advance_fiber` the single-vCPU engine uses: fiber switches
+  (`cont.new`/`resume`/`suspend`/return) apply per-task, and the non-fiber seam it hands back
+  (`FiberStep::Other`) dispatches the scheduler's own ops (`thread.spawn`/`join`, `memory.wait`/`notify`),
+  everything else → `SchedStop::Declined`. So a breakpoint fires **inside a fiber running on a spawned
+  worker vCPU**, `select_task`/backtrace inspect that worker's fiber frame, stepping descends into it, and
+  reverse `seek` replays the whole schedule (fibers-on-threads included) deterministically. Covered by
+  `bytecode_debug_threads.rs` (`bytecode_breakpoint_inside_a_fiber_on_a_spawned_thread`,
+  `bytecode_fiber_plus_thread_run_matches_the_oracle` — result 50 ≡ tree-walker + M:N executor,
+  `bytecode_fiber_plus_thread_tick_replays_deterministically`) and `dap_over_bytecode_fiber_on_a_spawned_
+  thread` (over DAP). `debug_advance_fiber` is now the single shared per-op driver for both engines.
 
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
-  `thread.spawn`/`join`/`wait`/`notify` (scheduled) and **fibers** (single-vCPU). Remaining `Declined`
-  ops: fibers *composed with threads* on the scheduled engine, §14 **coroutines** (`Instantiator.spawn_
+  `thread.spawn`/`join`/`wait`/`notify` and **fibers** — on the single-vCPU engine *and* composed with
+  threads on the scheduled engine. Remaining `Declined` ops: §14 **coroutines** (`Instantiator.spawn_
   coroutine`/`resume`, which need the confined-child `Coro`/env machinery), and `instantiate` children —
   each a further slice. Plus a checkpoint ladder to bound reverse-replay cost (a perf optimization —
   today's small debugged programs replay from turn 0 cheaply).

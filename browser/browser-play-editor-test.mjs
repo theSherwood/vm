@@ -399,6 +399,41 @@ try {
     fbCard, { timeout: 10_000 });
   ok('fibers card: the generator finished (36) after resuming');
 
+  // The fibers+threads card: two workers each run a generator fiber. A breakpoint inside the fiber body
+  // fires on a *worker* vCPU (a thread selector appears; the stopped chip is not the root), proving fibers
+  // compose with threads under the scheduled debugger. Continue catches the other worker; the run finishes.
+  const ftCard = card('Debugger (SVM — fibers + threads)');
+  await page.click(`${ftCard} .debug`);
+  await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
+    ftCard, { timeout: 20_000 });
+  const ftPaused = await page.evaluate((sel) => {
+    const chips = [...document.querySelectorAll(`${sel} .dbg-threads .thr`)];
+    const stopped = chips.find((b) => b.classList.contains('sel'))?.dataset.thread;
+    return {
+      count: chips.length,
+      stopped,
+      stopLine: !!document.querySelector(`${sel} .cm-stop-line`),
+      vars: document.querySelector(`${sel} .dbg-vars`).textContent,
+    };
+  }, ftCard);
+  // ≥3 live chips (root + two workers), the stop is inside the fiber (line 35), and the stopped vCPU is a
+  // worker (thread id ≠ 1, the root).
+  ftPaused.count >= 3 && ftPaused.stopLine && /line 35\b/.test(ftPaused.vars) && ftPaused.stopped !== '1'
+    ? ok(`fibers+threads card: a worker (thread ${ftPaused.stopped}) stopped inside its fiber (line 35)`)
+    : fail(`fibers+threads paused: ${JSON.stringify(ftPaused)}`);
+  await page.click(`${ftCard} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
+    ftCard, { timeout: 10_000 });
+  const ftSecond = await page.evaluate((sel) =>
+    document.querySelector(`${sel} .dbg-threads .thr.sel`)?.dataset.thread, ftCard);
+  ftSecond !== ftPaused.stopped
+    ? ok(`fibers+threads card: Continue caught the other worker's fiber (thread ${ftSecond})`)
+    : fail(`fibers+threads second stop: same thread ${ftSecond}`);
+  await page.click(`${ftCard} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => /finished/.test(document.querySelector(`${sel} .state`).textContent),
+    ftCard, { timeout: 10_000 });
+  ok('fibers+threads card: the run finished (50) after both workers');
+
   // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.
   await page.selectOption('#theme', 'dark');
   const themed = await page.evaluate(() => ({
