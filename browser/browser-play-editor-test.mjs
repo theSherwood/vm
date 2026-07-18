@@ -342,13 +342,24 @@ try {
     ? ok(`selecting another thread (${otherThread}) focuses its stack without resuming`)
     : fail(`thread switch: selected ${switched}, wanted ${otherThread}`);
 
-  // Continue → the guest runs the second worker's breakpoint then finishes.
+  // Continue → the second worker hits the same breakpoint (a distinct thread), still paused.
   await page.click(`${thCard} .dbg-controls button[data-cmd="continue"]`);
-  await page.waitForFunction((sel) => {
-    const st = document.querySelector(`${sel} .state`).textContent;
-    return /paused .*thread-/.test(st) || /finished/.test(st);
-  }, thCard, { timeout: 10_000 });
-  ok('threads card: Continue advanced past the first worker');
+  await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
+    thCard, { timeout: 10_000 });
+  const secondThread = await page.evaluate((sel) =>
+    document.querySelector(`${sel} .dbg-threads .thr.sel`)?.dataset.thread, thCard);
+  ok(`threads card: Continue caught the second worker (thread ${secondThread})`);
+
+  // ◀◀ Reverse → deterministic replay walks *backward* to the previous worker breakpoint (an earlier
+  // global turn) — the scheduled engine's reverse debugging, in the panel.
+  await page.click(`${thCard} .dbg-controls button[data-cmd="reverseContinue"]`);
+  await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
+    thCard, { timeout: 10_000 });
+  const reversedThread = await page.evaluate((sel) =>
+    document.querySelector(`${sel} .dbg-threads .thr.sel`)?.dataset.thread, thCard);
+  reversedThread && reversedThread !== secondThread
+    ? ok(`threads card: Reverse walked back to the earlier worker (thread ${reversedThread})`)
+    : fail(`threads reverse: landed on ${reversedThread}, expected the earlier worker (not ${secondThread})`);
   await page.click(`${thCard} .dbg-controls button[data-cmd="stop"]`);
 
   // Theme picker: selecting "dark" forces <html data-theme="dark"> and persists; a reload keeps it.

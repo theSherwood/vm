@@ -294,7 +294,12 @@ impl DapServer {
             .unwrap_or("treewalk");
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
             match BytecodeBackend::new(module, func, &call_args, fuel) {
-                Some(b) => (Box::new(b), false),
+                // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
+                // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
+                Some(b) => {
+                    let scheduled = b.is_threaded();
+                    (Box::new(b), scheduled)
+                }
                 None => return (false, Json::Null, vec![]), // outside the bytecode debug subset
             }
         } else {

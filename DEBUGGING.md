@@ -229,13 +229,37 @@ different things depending on which pair you compare:
   demo card ("Debugger (SVM — threads)") spawns two workers that atomically bump a shared counter with a
   breakpoint pre-placed in the worker, so Debug stops in each worker in turn. `browser-play-editor-
   test.mjs` drives it in real Chromium (three thread chips, the stopped one selected + marked, focusing
-  another thread mid-stop, Continue past the first worker). *Next:* scheduled reverse (re-execute to a
-  global `turn`) + cross-thread watchpoints under the scheduler, then depth-aware step-over/out.
+  another thread mid-stop, Continue past the first worker).
+
+  **The scheduled engine reached feature parity with the single-vCPU one (slices 8–10).** Three
+  follow-ups completed the multithreaded surface, all on the shared `drive` pump (`run_until_stop`,
+  `step`, and reverse `tick` are now one loop with a `step` mode):
+  - **Cross-thread watchpoints (slice 8).** `ScheduledDebugRun` gained a run-shared watchpoint set; the
+    per-op seam runs the interpreter's `access_of` for the op about to run and stops *before* any op —
+    in whichever thread — that touches a watched range, reporting the confined address + read/write via
+    `SchedBreak::Watchpoint`. `bytecode_cross_thread_write_watchpoint_fires_per_worker` proves a write
+    watch on `[0,8)` fires before each of two workers' stores (distinct threads); the DAP-level
+    `dap_over_bytecode_multithreaded_cross_thread_watchpoint` arms it over `setDataBreakpoints`.
+  - **Depth-aware step-over / step-out (slice 9).** `step`/`step_over`/`step_out` share a `step_to(max_
+    depth)` that drives the stepping thread (preferring it, falling back to the schedule only while it
+    is blocked, so a step *over* a `join` can't deadlock) until its call depth is `<= max`. Other
+    threads' breakpoints still interrupt a step. Covered by `bytecode_step_over_and_into_a_call_on_a_
+    worker` + `bytecode_step_out_of_a_callee_on_a_worker` (a worker calling a helper).
+  - **Reverse debugging (slice 10).** The debug schedule is deterministic (pure compute, one-op-per-turn,
+    lowest-index pick), so `seek(t)` = rebuild a fresh session and raw-`tick` `t` turns — the global
+    `turn` is the reverse coordinate. `BytecodeBackend::{seek,step_back}` dispatch to it, the DAP server
+    marks a threaded session `scheduled` (so `reverseContinue`/`stepBack` use `turn`, not the op
+    `clock`), and both engines now report `supports_reverse`/`supports_watch` = `true`.
+    `bytecode_scheduled_tick_replays_deterministically` pins the replay invariant; `dap_over_bytecode_
+    multithreaded_reverse_continue` walks backward to the earlier worker's breakpoint over DAP. The
+    playground panel's existing ◀◀ Reverse / data-breakpoint controls now light up for the threads demo
+    (browser-verified: Reverse walks back to the earlier worker).
 
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
-  Remaining bytecode-engine debug work: scheduled reverse debugging (re-execute to a global `turn`),
-  cross-thread watchpoints under the scheduler, and depth-aware stepping (step-over/out) across threads.
+  The bytecode debug engines (single-vCPU + scheduled) now cover the full `Inspector` forward/reverse/
+  watch surface. Remaining: `memory.wait`/`notify` + fibers/coroutines under the debug scheduler (they
+  surface as `SchedStop::Declined` today), and a checkpoint ladder to bound reverse-replay cost.
 
 ---
 

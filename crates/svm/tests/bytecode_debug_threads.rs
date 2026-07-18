@@ -4,8 +4,8 @@
 //! step — parity-checked against the tree-walker `Inspector::attach_scheduled` oracle (the reference
 //! multithreaded debug engine). This is the bytecode counterpart of `debug_threads.rs`.
 
-use svm_interp::bytecode::{SchedStop, ScheduledDebugRun};
-use svm_interp::{bytecode, run, Inspector, IrPc, Stop, Trap, Value};
+use svm_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
+use svm_interp::{bytecode, run, Inspector, IrPc, Stop, Trap, Value, WatchKind};
 use svm_text::parse_module;
 
 // Two threads each do a non-atomic load/add/store on mem[0]. func 0 is the root (spawns + joins);
@@ -77,7 +77,7 @@ fn drive_to_end(sd: &mut ScheduledDebugRun, fuel: &mut u64) -> Result<Vec<Value>
     loop {
         match sd.run_until_stop(fuel) {
             SchedStop::Finished(r) => return r,
-            SchedStop::Break(_) => continue,
+            SchedStop::Break { .. } => continue,
             other => panic!("unexpected stop: {other:?}"),
         }
     }
@@ -95,7 +95,7 @@ fn bytecode_breakpoint_fires_in_each_spawned_thread() {
 
     // The first worker thread reaches the load.
     match sd.run_until_stop(&mut fuel) {
-        SchedStop::Break(pc) => assert_eq!(pc, worker_load_bp()),
+        SchedStop::Break { pc, .. } => assert_eq!(pc, worker_load_bp()),
         other => panic!("expected Break, got {other:?}"),
     }
     let t1 = sd.stopped_task().expect("a thread is stopped");
@@ -107,7 +107,7 @@ fn bytecode_breakpoint_fires_in_each_spawned_thread() {
 
     // Continue → the *other* worker thread hits the same breakpoint (a different vCPU).
     match sd.run_until_stop(&mut fuel) {
-        SchedStop::Break(pc) => assert_eq!(pc, worker_load_bp()),
+        SchedStop::Break { pc, .. } => assert_eq!(pc, worker_load_bp()),
         other => panic!("expected Break, got {other:?}"),
     }
     let t2 = sd.stopped_task().expect("a thread is stopped");
@@ -161,7 +161,9 @@ fn bytecode_select_task_inspects_another_thread_while_stopped() {
     sd.set_breakpoints(vec![worker_load_bp()]);
     let mut fuel = 50_000_000u64;
 
-    assert!(matches!(sd.run_until_stop(&mut fuel), SchedStop::Break(pc) if pc == worker_load_bp()));
+    assert!(
+        matches!(sd.run_until_stop(&mut fuel), SchedStop::Break { pc, .. } if pc == worker_load_bp())
+    );
     let stopped = sd.stopped_task().unwrap();
 
     // Both workers plus the (join-blocked) root are live threads.
@@ -200,12 +202,14 @@ fn bytecode_stepping_a_stopped_thread_advances_one_op() {
     sd.set_breakpoints(vec![worker_load_bp()]);
     let mut fuel = 50_000_000u64;
 
-    assert!(matches!(sd.run_until_stop(&mut fuel), SchedStop::Break(pc) if pc == worker_load_bp()));
+    assert!(
+        matches!(sd.run_until_stop(&mut fuel), SchedStop::Break { pc, .. } if pc == worker_load_bp())
+    );
     let who = sd.stopped_task().unwrap();
     let t0 = sd.turn();
 
     match sd.step(&mut fuel) {
-        SchedStop::Break(pc) => {
+        SchedStop::Break { pc, .. } => {
             assert_eq!(
                 pc.inst, 2,
                 "stepped from the load (inst 1) to the add (inst 2)"
@@ -226,4 +230,210 @@ fn module_spawns_threads_detects_the_multithreaded_case() {
     let seq =
         parse_module("func () -> (i64) {\nblock0():\n  a = i64.const 7\n  return a\n}").unwrap();
     assert!(!bytecode::module_spawns_threads(&seq));
+}
+
+/// A **cross-thread write watchpoint** fires *before* each worker's store to the watched range, in
+/// whichever thread runs the store, reporting the confined address + write — the multithreaded
+/// counterpart of `cross_thread_watchpoints.rs`.
+#[test]
+fn bytecode_cross_thread_write_watchpoint_fires_per_worker() {
+    let m = parse_module(RACY_COUNTER).unwrap();
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    sd.set_watchpoints(vec![(0, 8, WatchKind::Write)]);
+    let mut fuel = 50_000_000u64;
+
+    // The worker's `i64.store vaddr vn` (func 1, block 0, inst 3) writes [0, 8).
+    let store = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 3,
+    };
+    let mut hitters = Vec::new();
+    for _ in 0..2 {
+        match sd.run_until_stop(&mut fuel) {
+            SchedStop::Break { pc, reason } => {
+                assert_eq!(pc, store, "stops before the store that writes the range");
+                assert_eq!(
+                    reason,
+                    SchedBreak::Watchpoint {
+                        addr: 0,
+                        write: true
+                    },
+                    "reports the confined address + write"
+                );
+                hitters.push(sd.stopped_task().unwrap());
+            }
+            other => panic!("expected a watchpoint stop, got {other:?}"),
+        }
+    }
+    assert_ne!(
+        hitters[0], hitters[1],
+        "each worker's store trips the watch — distinct threads"
+    );
+    // No further writes to the range; the guest finishes.
+    assert!(matches!(
+        sd.run_until_stop(&mut fuel),
+        SchedStop::Finished(_)
+    ));
+}
+
+// A worker that calls a helper — for exercising step-over / step-into / step-out across a call frame
+// on a spawned thread (while the root is blocked in `join`). func 1 worker: inst0 addr, inst1 load,
+// inst2 = `call 2` (the call), inst3 store, inst4 const. func 2 helper: inst0 add, then return.
+const WORKER_CALLS: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  sp = i64.const 0
+  one = i64.const 1
+  h0 = thread.spawn 1 sp one
+  j0 = thread.join h0
+  addr = i64.const 0
+  r = i64.load addr
+  return r
+}
+func (i64, i64) -> (i64) {
+block0(sp: i64, inc: i64):
+  addr = i64.const 0
+  cur = i64.load addr
+  nxt = call 2(cur, inc)
+  i64.store addr nxt
+  z = i64.const 0
+  return z
+}
+func (i64, i64) -> (i64) {
+block0(a: i64, b: i64):
+  s = i64.add a b
+  return s
+}
+"#;
+
+// The worker's `call 2` op (func 1, block 0, inst 2) — the step-over / step-into target.
+fn worker_call_bp() -> IrPc {
+    IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 2,
+    }
+}
+
+/// **Step-over** a call on a spawned thread runs the callee to completion and lands at the next op in
+/// the *same* frame; **step-into** descends into the callee. Both drive the stopped thread across a
+/// call while the root stays parked in `join`.
+#[test]
+fn bytecode_step_over_and_into_a_call_on_a_worker() {
+    let m = parse_module(WORKER_CALLS).unwrap();
+
+    // Step-over: from the call, land at the store (func 1, inst 3) — same thread, same depth.
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    sd.set_breakpoints(vec![worker_call_bp()]);
+    let mut fuel = 50_000_000u64;
+    assert!(
+        matches!(sd.run_until_stop(&mut fuel), SchedStop::Break { pc, .. } if pc == worker_call_bp())
+    );
+    let who = sd.stopped_task().unwrap();
+    match sd.step_over(&mut fuel) {
+        SchedStop::Break { pc, reason } => {
+            assert_eq!(
+                pc,
+                IrPc {
+                    module: 0,
+                    func: 1,
+                    block: 0,
+                    inst: 3
+                },
+                "step-over landed at the op after the call, same frame"
+            );
+            assert_eq!(reason, SchedBreak::Step);
+            assert_eq!(sd.stopped_task(), Some(who), "still the same worker");
+        }
+        other => panic!("expected a step stop, got {other:?}"),
+    }
+
+    // Step-into: from the call, descend into the helper (func 2, block 0, inst 0).
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    sd.set_breakpoints(vec![worker_call_bp()]);
+    let mut fuel = 50_000_000u64;
+    assert!(
+        matches!(sd.run_until_stop(&mut fuel), SchedStop::Break { pc, .. } if pc == worker_call_bp())
+    );
+    assert!(matches!(
+        sd.step(&mut fuel),
+        SchedStop::Break {
+            pc: IrPc {
+                func: 2,
+                block: 0,
+                inst: 0,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+/// **Step-out** from inside the callee returns to the caller's next op — one call depth shallower — on
+/// the spawned thread.
+#[test]
+fn bytecode_step_out_of_a_callee_on_a_worker() {
+    let m = parse_module(WORKER_CALLS).unwrap();
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    sd.set_breakpoints(vec![worker_call_bp()]);
+    let mut fuel = 50_000_000u64;
+    assert!(
+        matches!(sd.run_until_stop(&mut fuel), SchedStop::Break { pc, .. } if pc == worker_call_bp())
+    );
+
+    // Into the helper, then out — back to the store after the call (func 1, inst 3).
+    assert!(matches!(
+        sd.step(&mut fuel),
+        SchedStop::Break {
+            pc: IrPc { func: 2, .. },
+            ..
+        }
+    ));
+    match sd.step_out(&mut fuel) {
+        SchedStop::Break { pc, .. } => assert_eq!(
+            pc,
+            IrPc {
+                module: 0,
+                func: 1,
+                block: 0,
+                inst: 3
+            },
+            "step-out returned to the caller's next op"
+        ),
+        other => panic!("expected a step stop, got {other:?}"),
+    }
+}
+
+/// Reverse debugging rests on **deterministic replay**: a fresh session ticked to a global `turn`
+/// reproduces the exact scheduler position (same about-to-run thread, same pc) a forward run reached at
+/// that turn. This is what `BytecodeBackend::seek` relies on for `stepBack`/`reverseContinue`.
+#[test]
+fn bytecode_scheduled_tick_replays_deterministically() {
+    let m = parse_module(RACY_COUNTER).unwrap();
+
+    // Forward to the first worker breakpoint; record (turn, thread, pc).
+    let mut a = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    a.set_breakpoints(vec![worker_load_bp()]);
+    let mut fuel = 50_000_000u64;
+    assert!(matches!(
+        a.run_until_stop(&mut fuel),
+        SchedStop::Break { .. }
+    ));
+    let turn = a.op_turn();
+    let who = a.stopped_task();
+    let pc = a.frame_pc(0);
+    assert_eq!(pc, Some(worker_load_bp()));
+
+    // A fresh run raw-ticked to that same global turn lands at the identical position.
+    let mut b = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    let mut f2 = 50_000_000u64;
+    while b.op_turn() < turn && b.tick(&mut f2) {}
+    b.locate();
+    assert_eq!(b.op_turn(), turn, "replayed to the same global turn");
+    assert_eq!(b.stopped_task(), who, "same about-to-run thread");
+    assert_eq!(b.frame_pc(0), pc, "same pc");
 }

@@ -11,17 +11,19 @@
 //! *before* an op that touches one). For a spawn-free guest `supports_reverse`/`supports_watch` are
 //! both `true`.
 //!
-//! **Multithreading** now lands too, on its *own* engine — a `thread.spawn` guest launches the
+//! **Multithreading** lands on its *own* engine — a `thread.spawn` guest launches the
 //! `svm_interp::bytecode::ScheduledDebugRun`, a deterministic cooperative multi-vCPU **debug
 //! scheduler**: breakpoints fire in whichever thread reaches them, `threads`/`stopped_task`/
-//! `select_task` serve per-thread stacks, and stepping drives the stopped thread — *not* delegated to
-//! the tree-walker (the differential oracle only, far too slow for any user-facing path). The
-//! scheduled engine is forward-only for now (`supports_reverse`/`supports_watch` report `false` — a
-//! later slice adds scheduled reverse + cross-thread watchpoints). Correctness is guaranteed by
-//! `crates/svm/tests/debug_parity.rs` and `bytecode_debug_threads.rs` (engine level, vs the tree-walker
-//! oracle) and `dap_over_bytecode_*` (server level).
+//! `select_task` serve per-thread stacks, stepping (in/over/out) drives the stopped thread,
+//! **cross-thread watchpoints** fire in whichever thread touches the range, and **reverse debugging**
+//! works by deterministic replay to a global scheduler `turn` — *not* delegated to the tree-walker
+//! (the differential oracle only, far too slow for any user-facing path). Both engines report
+//! `supports_reverse`/`supports_watch` = `true`; the single-vCPU coordinate is the op `clock`, the
+//! multithreaded one the global `turn`. Correctness is guaranteed by `crates/svm/tests/debug_parity.rs`
+//! and `bytecode_debug_threads.rs` (engine level, vs the tree-walker oracle) and `dap_over_bytecode_*`
+//! (server level).
 
-use svm_interp::bytecode::{self, DebugRun, SchedStop, ScheduledDebugRun};
+use svm_interp::bytecode::{self, DebugRun, SchedBreak, SchedStop, ScheduledDebugRun};
 use svm_interp::{
     FrameInfo, Inspector, IrPc, SourceLoc, Stop, StopReason, Trap, Value, VarValue, WatchId,
     WatchKind,
@@ -143,10 +145,11 @@ impl Debuggee for Inspector {
     }
 }
 
-/// The bytecode engine behind a [`BytecodeBackend`]: the single-vCPU [`DebugRun`] (forward **and**
-/// reverse, watchpoints) for a spawn-free guest, or the multi-vCPU [`ScheduledDebugRun`] (a
-/// cooperative debug scheduler with per-thread breakpoints + `select_task`, forward-only) for a
-/// `thread.spawn` guest. Chosen at launch by [`bytecode::module_spawns_threads`].
+/// The bytecode engine behind a [`BytecodeBackend`]: the single-vCPU [`DebugRun`] for a spawn-free
+/// guest, or the multi-vCPU [`ScheduledDebugRun`] (a cooperative debug scheduler with per-thread
+/// breakpoints, `select_task`, in/over/out stepping, cross-thread watchpoints, and reverse debugging)
+/// for a `thread.spawn` guest. Chosen at launch by [`bytecode::module_spawns_threads`]; both are fully
+/// forward + reverse + watch capable.
 enum Engine {
     Single(DebugRun),
     Threaded(ScheduledDebugRun),
@@ -196,56 +199,69 @@ impl BytecodeBackend {
         })
     }
 
-    /// Whether this session runs on the multithreaded scheduled engine.
-    fn is_threaded(&self) -> bool {
+    /// Whether this session runs on the multithreaded scheduled engine (so the DAP server uses the
+    /// global `turn` as the reverse time coordinate, not the single-vCPU op `clock`).
+    pub fn is_threaded(&self) -> bool {
         matches!(self.engine, Engine::Threaded(_))
     }
 
-    /// Push the current watchpoint ranges into the live single-vCPU `DebugRun` (after arming/clearing
-    /// one, or re-arming a fresh run built by `seek`). No-op on the scheduled engine.
+    /// Push the current watchpoint ranges into the live engine (after arming/clearing one, or re-arming
+    /// a fresh single-vCPU run built by `seek`). Cross-thread on the scheduled engine.
     fn apply_watches(&mut self) {
-        if let Engine::Single(run) = &mut self.engine {
-            run.set_watchpoints(
-                self.watch_specs
-                    .iter()
-                    .map(|(_, a, l, k)| (*a, *l, *k))
-                    .collect(),
-            );
+        let ranges: Vec<_> = self
+            .watch_specs
+            .iter()
+            .map(|(_, a, l, k)| (*a, *l, *k))
+            .collect();
+        match &mut self.engine {
+            Engine::Single(run) => run.set_watchpoints(ranges),
+            Engine::Threaded(run) => run.set_watchpoints(ranges),
         }
     }
 
-    /// Map a single-vCPU `DebugRun` completion (`run_to`/`step` returned `None`) to a `Stop`: the
-    /// finished result (or trap) if done, else `Blocked` (a concurrency seam that engine can't follow).
+    /// Map an engine completion (a resume/step returned no pc) to a `Stop`: the finished result (or
+    /// trap) if the root is done, else `Blocked` (a concurrency seam that engine can't follow).
     fn finish_stop(&self) -> Stop {
-        match &self.engine {
-            Engine::Single(run) => match run.result() {
-                Some(r) => Stop::Finished(r.clone()),
-                None => Stop::Blocked,
-            },
-            Engine::Threaded(_) => Stop::Blocked,
+        let result = match &self.engine {
+            Engine::Single(run) => run.result().cloned(),
+            Engine::Threaded(run) => run.result().cloned(),
+        };
+        match result {
+            Some(r) => Stop::Finished(r),
+            None => Stop::Blocked,
         }
     }
 
-    /// A `Step` stop at the current pc (or the finished result), for a single-vCPU resume/seek that
+    /// A `Step` stop at the focused thread's current pc (or the finished result), for a resume/seek that
     /// didn't hit a breakpoint.
     fn step_stop(&self) -> Stop {
-        match &self.engine {
-            Engine::Single(run) => match run.frame_pc(0) {
-                Some(pc) => Stop::Break {
-                    reason: StopReason::Step,
-                    pc,
-                },
-                None => self.finish_stop(),
+        let pc = match &self.engine {
+            Engine::Single(run) => run.frame_pc(0),
+            Engine::Threaded(run) => run.frame_pc(0),
+        };
+        match pc {
+            Some(pc) => Stop::Break {
+                reason: StopReason::Step,
+                pc,
             },
-            Engine::Threaded(_) => Stop::Blocked,
+            None => self.finish_stop(),
         }
     }
 
-    /// Map a multithreaded [`SchedStop`] to the DAP [`Stop`], tagging a breakpoint stop with `reason`
-    /// (`Breakpoint` for a resume, `Step` for a single-step).
-    fn sched_stop(s: SchedStop, reason: StopReason) -> Stop {
+    /// Map a multithreaded [`SchedStop`] to the DAP [`Stop`] — the `SchedBreak` reason carries whether
+    /// it was a breakpoint, a data breakpoint (with the confined address + read/write), or a step.
+    fn sched_stop(s: SchedStop) -> Stop {
         match s {
-            SchedStop::Break(pc) => Stop::Break { reason, pc },
+            SchedStop::Break { pc, reason } => {
+                let reason = match reason {
+                    SchedBreak::Breakpoint => StopReason::Breakpoint,
+                    SchedBreak::Watchpoint { addr, write } => {
+                        StopReason::Watchpoint { addr, write }
+                    }
+                    SchedBreak::Step => StopReason::Step,
+                };
+                Stop::Break { reason, pc }
+            }
             SchedStop::Finished(r) => Stop::Finished(r),
             // No runnable thread (deadlock/`wait`), or an op outside the scheduler's subset.
             SchedStop::Blocked | SchedStop::Declined => Stop::Blocked,
@@ -272,7 +288,7 @@ impl Debuggee for BytecodeBackend {
             },
             Engine::Threaded(run) => {
                 run.set_breakpoints(self.breakpoints.clone());
-                Self::sched_stop(run.run_until_stop(&mut fuel), StopReason::Breakpoint)
+                Self::sched_stop(run.run_until_stop(&mut fuel))
             }
         }
     }
@@ -286,7 +302,7 @@ impl Debuggee for BytecodeBackend {
                 },
                 None => self.finish_stop(),
             },
-            Engine::Threaded(run) => Self::sched_stop(run.step(&mut fuel), StopReason::Step),
+            Engine::Threaded(run) => Self::sched_stop(run.step(&mut fuel)),
         }
     }
     fn step_over(&mut self) -> Stop {
@@ -299,8 +315,7 @@ impl Debuggee for BytecodeBackend {
                 },
                 None => self.finish_stop(),
             },
-            // Depth-aware stepping across the scheduler is a later slice — a plain single-step.
-            Engine::Threaded(run) => Self::sched_stop(run.step(&mut fuel), StopReason::Step),
+            Engine::Threaded(run) => Self::sched_stop(run.step_over(&mut fuel)),
         }
     }
     fn step_out(&mut self) -> Stop {
@@ -313,7 +328,7 @@ impl Debuggee for BytecodeBackend {
                 },
                 None => self.finish_stop(),
             },
-            Engine::Threaded(run) => Self::sched_stop(run.step(&mut fuel), StopReason::Step),
+            Engine::Threaded(run) => Self::sched_stop(run.step_out(&mut fuel)),
         }
     }
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
@@ -321,41 +336,86 @@ impl Debuggee for BytecodeBackend {
     // replay to that many ops. `step_back` = one op earlier. (A checkpoint ladder to bound the replay
     // cost is a future optimization; the debugged programs here are small.)
     fn step_back(&mut self) -> Stop {
-        // Reverse debugging is single-vCPU only this slice (the server gates it on `supports_reverse`).
-        let Engine::Single(run) = &self.engine else {
-            return Stop::Blocked;
-        };
         // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
-        // terminator slot, where there's nothing to inspect). One replay pass records the latest such
-        // op clock strictly before now; then seek there.
-        let now = run.op_clock();
-        let Some(mut probe) = DebugRun::new(&self.module, self.func, &self.args) else {
-            return Stop::Blocked;
+        // terminator slot, where there's nothing to inspect) strictly before now, then seek there. The
+        // single-vCPU coordinate is the op `clock`; the multithreaded one is the global scheduler `turn`.
+        let now = match &self.engine {
+            Engine::Single(run) => run.op_clock(),
+            Engine::Threaded(run) => run.op_turn(),
         };
         let mut fuel = self.fuel;
-        let mut target = 0;
-        loop {
-            let c = probe.op_clock();
-            if c >= now {
-                break;
+        let target = match &self.engine {
+            Engine::Single(_) => {
+                let Some(mut probe) = DebugRun::new(&self.module, self.func, &self.args) else {
+                    return Stop::Blocked;
+                };
+                let mut target = 0;
+                loop {
+                    let c = probe.op_clock();
+                    if c >= now {
+                        break;
+                    }
+                    if probe.frame_pc(0).is_some() {
+                        target = c;
+                    }
+                    if !probe.tick(&mut fuel) {
+                        break;
+                    }
+                }
+                target
             }
-            if probe.frame_pc(0).is_some() {
-                target = c;
+            Engine::Threaded(_) => {
+                let Some(mut probe) = ScheduledDebugRun::new(&self.module, self.func, &self.args)
+                else {
+                    return Stop::Blocked;
+                };
+                let mut target = 0;
+                loop {
+                    let c = probe.op_turn();
+                    if c >= now {
+                        break;
+                    }
+                    probe.locate();
+                    if probe.frame_pc(0).is_some() {
+                        target = c;
+                    }
+                    if !probe.tick(&mut fuel) {
+                        break;
+                    }
+                }
+                target
             }
-            if !probe.tick(&mut fuel) {
-                break;
-            }
-        }
+        };
         self.seek(target)
     }
     fn seek(&mut self, t: u64) -> Stop {
+        let mut fuel = self.fuel;
         if self.is_threaded() {
-            return Stop::Blocked;
+            // Rebuild a fresh scheduled run and replay `t` turns — the schedule is deterministic, so
+            // this reproduces the exact state at global turn `t` (DEBUGGING.md W1, multithreaded).
+            let Some(mut run) = ScheduledDebugRun::new(&self.module, self.func, &self.args) else {
+                return Stop::Blocked;
+            };
+            run.set_breakpoints(self.breakpoints.clone());
+            run.set_watchpoints(
+                self.watch_specs
+                    .iter()
+                    .map(|(_, a, l, k)| (*a, *l, *k))
+                    .collect(),
+            );
+            while run.op_turn() < t && run.tick(&mut fuel) {}
+            run.locate();
+            if let Some(pc) = run.frame_pc(0) {
+                if self.breakpoints.contains(&pc) {
+                    run.arm_breakpoint_skip();
+                }
+            }
+            self.engine = Engine::Threaded(run);
+            return self.step_stop();
         }
         let Some(mut run) = DebugRun::new(&self.module, self.func, &self.args) else {
             return Stop::Blocked;
         };
-        let mut fuel = self.fuel;
         while run.op_clock() < t && run.tick(&mut fuel) {}
         self.engine = Engine::Single(run);
         self.apply_watches(); // re-arm the watchpoints on the fresh (replayed) run
@@ -381,11 +441,8 @@ impl Debuggee for BytecodeBackend {
         self.breakpoints.len() != before
     }
     // Data breakpoints: arm a window watchpoint (a backend-owned stable id, so it survives a `seek`).
-    // Single-vCPU only this slice — the scheduled engine reports `supports_watch = false`.
+    // Cross-thread on the scheduled engine (fires in whichever thread touches the range).
     fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Option<WatchId> {
-        if self.is_threaded() {
-            return None;
-        }
         let id = WatchId::from_raw(self.next_watch);
         self.next_watch += 1;
         self.watch_specs.push((id, addr, len, kind));
@@ -480,12 +537,12 @@ impl Debuggee for BytecodeBackend {
             Engine::Threaded(run) => run.turn(),
         }
     }
-    // Reverse debugging + data breakpoints are single-vCPU only this slice; the scheduled engine gates
-    // `stepBack`/`reverseContinue`/`setDataBreakpoints` off so they fail cleanly instead of misbehaving.
+    // Both engines are fully reversible (deterministic replay) and watch-capable: the single-vCPU op
+    // `clock` and the multithreaded global `turn` are the two time coordinates.
     fn supports_reverse(&self) -> bool {
-        !self.is_threaded()
+        true
     }
     fn supports_watch(&self) -> bool {
-        !self.is_threaded()
+        true
     }
 }
