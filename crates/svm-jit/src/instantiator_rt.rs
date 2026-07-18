@@ -118,12 +118,13 @@ pub(crate) struct Nursery {
     /// [`ChildCodeKey`], each entry is a compiled [`crate::ChildCode`] reused across spawns — so a
     /// shell respawning the same applet (any offset, same size) recompiles nothing. Held behind the
     /// nursery, alive for the run; the durable / nesting child bypasses it (its baked per-child
-    /// nursery makes its code un-shareable). `Rc` so a lookup can drop the lock before the run:
-    /// today's children run **synchronously on the calling thread** (the same single-thread contract
-    /// the `unsafe impl Send`/`Sync` below documents), so `Rc` is correct and `ChildCode` need not be
-    /// `Send`/`Sync` yet. S1c (OS-thread children) is where cross-thread sharing — `Rc` → `Arc` plus
-    /// a proven `ChildCode: Send + Sync` — actually lands and gets tested.
-    child_code: Mutex<HashMap<ChildCodeKey, std::rc::Rc<crate::ChildCode>>>,
+    /// nursery makes its code un-shareable). **`Arc`** (S1c): a cached child can be handed to an
+    /// OS-thread child executor and run concurrently on several threads — sound because `ChildCode` is
+    /// `Send + Sync` (its code arena + `fn_table` are immutable read-execute memory after
+    /// `finalize_definitions`; the `unsafe impl` + compile-time assertion live in `lib.rs`). A lookup
+    /// still drops the lock before the run. (Children run synchronously on the calling thread **today**;
+    /// this makes the artifact ready for the async spawn slice that follows.)
+    child_code: Mutex<HashMap<ChildCodeKey, std::sync::Arc<crate::ChildCode>>>,
     /// PROCESS.md S2 (JIT parity): the host callbacks for `instantiate_granted` (op 8) — build a
     /// granted child's powerbox `Host` and free it after the run — stored as raw fn-pointer addresses
     /// (`0` ⇒ none, an inert `CapFault`, like a run that re-grants nothing). Set once at run entry via
@@ -578,7 +579,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         let code = {
             let mut cache = rt.child_code.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = cache.get(&key) {
-                std::rc::Rc::clone(c)
+                std::sync::Arc::clone(c)
             } else {
                 match crate::compile_nondurable_child(
                     child_funcs,
@@ -587,8 +588,8 @@ pub(crate) unsafe extern "C" fn instantiate(
                     rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
                 ) {
                     Ok(cc) => {
-                        let a = std::rc::Rc::new(cc);
-                        cache.insert(key, std::rc::Rc::clone(&a));
+                        let a = std::sync::Arc::new(cc);
+                        cache.insert(key, std::sync::Arc::clone(&a));
                         a
                     }
                     Err(_) => {
