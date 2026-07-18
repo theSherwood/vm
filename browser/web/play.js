@@ -539,10 +539,8 @@ SELECT n, a AS fib FROM fib;
   },
   'JavaScript (QuickJS — write & run JS)': {
     kind: 'module',
-    // Interp tier only: the wasm-JIT emitter can't yet emit QuickJS's `_start` (`status 2 = not
-    // emittable` — an op the emitter lacks, unlike Lua/SQLite which emit but wasmi-reject the giant
-    // function). Browser-verified on the interpreter tier (real Chromium/V8). Enabling the JIT tier is
-    // a follow-up on the `svm-wasmjit` emitter. See LLVM.md "Active target — QuickJS".
+    jit: true, // _start is wasm-JIT-emittable (atomics + cap.self.resolve outlining + pooled locals);
+    // ~6× over the interpreter, byte-identical (browser-jit-module-test). See LLVM.md "Active target — QuickJS".
     editable: true,
     lang: 'js',
     url: './assets/qjs_repl.svmb',
@@ -551,7 +549,8 @@ SELECT n, a AS fib FROM fib;
       'VM with computed-goto dispatch, BigInt, regex, Unicode) compiled through the LLVM on-ramp. Edit ' +
       'the JS on the left and click Run: it evaluates in a fresh runtime (each Run starts clean), and ' +
       'prints anything you print()/console.log() plus the value of the last expression. Real QuickJS, ' +
-      'running client-side in the sandbox — no ambient authority.',
+      'running client-side in the sandbox — no ambient authority. Toggle "wasm-JIT" to run the whole ' +
+      'engine on emitted wasm (~6× faster); "Prove interp ≡ JIT" checks the stdout is byte-identical on both tiers.',
     src: `// Write JavaScript here, then click Run. Each Run is a fresh QuickJS runtime.
 function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
 console.log("fib(0..10):", Array.from({length: 11}, (_, i) => fib(i)).join(" "));

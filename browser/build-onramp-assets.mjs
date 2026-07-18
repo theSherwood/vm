@@ -137,7 +137,9 @@ if (ensureAmalgamation()) {
 //     Multi-TU, mirroring the `demo_quickjs_eval_vs_native` test: the engine + a guest libm (openlibm,
 //     for the address-taken Math functions) + the reused printf/strtod/libc shims, `llvm-link`ed into
 //     one `.ll`, then translated. Fetched-and-cached (QuickJS from bellard.org, openlibm from GitHub);
-//     skipped offline.
+//     when the openlibm fetch is unavailable (the Pages pipeline can't reach GitHub) this rebuild is
+//     skipped and the **committed** `web/assets/qjs_repl.svmb` is left in place, so the JS playground
+//     works out of the box regardless (see `web/assets/.gitignore` whitelist).
 const QJS_VER = '2024-01-13';
 const QJS_CACHE = '/tmp/svm_quickjs_cache';
 const QJS_DIR = join(QJS_CACHE, `quickjs-${QJS_VER}`);
@@ -206,7 +208,7 @@ if (ensureQuickJS() && ensureOpenlibm()) {
     console.log(`  ✗ qjs_repl: ${e.message}`);
   }
 } else {
-  console.log('  – qjs_repl skipped (quickjs/openlibm fetch failed — offline?)');
+  console.log('  – qjs_repl rebuild skipped (quickjs/openlibm fetch failed) — using committed qjs_repl.svmb');
 }
 
 // 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math/coroutine/io/os libraries + a guest

@@ -23,3 +23,8 @@ patched*.wasm
 !/web/assets/bounce.svmb
 !/web/assets/life.svmb
 !/web/assets/mandelzoom.svmb
+# QuickJS is committed prebuilt: its build needs a guest libm (openlibm) fetched from GitHub, which
+# the Pages pipeline can't reach — so the translated `.svmb` ships in-tree (like `hello_c`) and the
+# playground's JS demo works out of the box. `build-onramp-assets.mjs` rebuilds it in place when the
+# sources *are* fetchable, and otherwise leaves this committed artifact untouched.
+!/web/assets/qjs_repl.svmb

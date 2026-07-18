@@ -269,9 +269,11 @@ fn transitive_pure_leaves_both_emitted() {
     diff_eligible(&m, &eligible, &wasm, SWEEP);
 }
 
-/// An in-subset function that calls a **non-leaf, non-subset** function (one using atomics) must be
-/// dropped — its emitted body would carry an unroutable `Call`. The fixpoint removes it; the deeper
-/// pure leaf still emits.
+/// An in-subset function that calls a **non-leaf, non-subset** function (one using a concurrency op —
+/// `memory.notify` — which forces the interpreter and is not a leaf) must be dropped: its emitted body
+/// would carry an unroutable `Call`. The fixpoint removes it; the deeper pure leaf still emits.
+/// (`memory.notify` — not an atomic — is the out-of-subset vehicle: atomics are now emitted in a
+/// concurrency-free module, so a concurrency op is what a non-subset non-leaf needs here.)
 const UNROUTABLE_CALLER: &str = r#"
 memory 16
 func (i64) -> (i64) {
@@ -282,9 +284,10 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64.const 0
-  v2 = i64.atomic.rmw.add v1 v0
-  v3 = call 2 (v2)
-  return v3
+  v2 = i32.const 1
+  v3 = atomic.notify v1 v2
+  v4 = call 2 (v0)
+  return v4
 }
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -298,9 +301,9 @@ block0(v0: i64):
 fn caller_of_nonleaf_is_dropped() {
     let m = build(UNROUTABLE_CALLER);
     let (wasm, eligible) = compile_module_tierup(&m, false).expect("tier-up emit");
-    // func 1 uses atomics (not in-subset, not a leaf — it has memory + a call). func 0 is in-subset
-    // but calls func 1 (non-emitted, non-leaf) → dropped by the fixpoint. func 2 is a pure leaf →
-    // emitted. Result: only func 2 eligible.
+    // func 1 uses `memory.notify` (concurrency → not in-subset; and not a leaf — it has memory + a
+    // call). func 0 is in-subset but calls func 1 (non-emitted, non-leaf) → dropped by the fixpoint.
+    // func 2 is a pure leaf → emitted. Result: only func 2 eligible.
     assert_eq!(eligible, vec![false, false, true], "eligibility bitmap");
     diff_eligible(&m, &eligible, &wasm, SWEEP);
 }

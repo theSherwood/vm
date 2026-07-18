@@ -1089,3 +1089,133 @@ fn fail_closed() {
         );
     }
 }
+
+// ---- §12 atomics (single-threaded lowering) -----------------------------------------------------
+// A concurrency-free guest runs single-threaded, so an atomic op is observably identical to its plain
+// load/(rmw)/store sequence — which is exactly what the emitter lowers it to (with the interpreter's
+// natural-align trap). These differentials pin that: value semantics (old returned, new written) for
+// load/store/rmw/cmpxchg, and the confinement + alignment trap boundary (the security hinge — atomics
+// additionally trap on a misaligned effective address, which plain loads/stores do not).
+
+/// Atomic address probe: aligned and **misaligned** offsets (for both the 4- and 8-byte widths),
+/// exactly at / straddling / past the 64 KiB window edge, plus negative wraps. Both engines must trap
+/// iff the effective address is out of `[0, mapped - width]` **or** not naturally aligned.
+const ATOMIC_ADDR_PROBE: &[i64] = &[
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    8,
+    12,
+    16,
+    100,
+    101,
+    65528,
+    65532,
+    65535,
+    65536,
+    65537,
+    65540,
+    1 << 20,
+    -1,
+    -4,
+    -8,
+    i64::MIN,
+];
+
+/// `*(i32*)addr` as an atomic load — width 4, so it faults on `addr % 4 != 0` or `addr + 4 > 65536`.
+const ATOMIC_LOAD32: &str = r#"
+memory 16
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.atomic.load v0
+  return v1
+}
+"#;
+
+/// `*(i64*)addr` as an atomic load — width 8, so it faults on `addr % 8 != 0` or `addr + 8 > 65536`.
+const ATOMIC_LOAD64: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.atomic.load v0
+  return v1
+}
+"#;
+
+/// A store then atomic load at the same swept address — confinement/alignment must match on the store
+/// too (both faults surface identically), and the round-tripped value proves the store landed.
+const ATOMIC_STORE_ROUNDTRIP: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 12345
+  i64.atomic.store v0 v1
+  v2 = i64.atomic.load v0
+  return v2
+}
+"#;
+
+#[test]
+fn atomic_confine_and_align() {
+    diff("atomic_load32", ATOMIC_LOAD32, ATOMIC_ADDR_PROBE, FUEL);
+    diff("atomic_load64", ATOMIC_LOAD64, ATOMIC_ADDR_PROBE, FUEL);
+    diff(
+        "atomic_store_roundtrip",
+        ATOMIC_STORE_ROUNDTRIP,
+        ATOMIC_ADDR_PROBE,
+        FUEL,
+    );
+}
+
+/// A sweep that includes the cmpxchg seed (100) so the compare-succeeds branch is exercised.
+const ATOMIC_VAL_SWEEP: &[i64] = &[0, 1, 100, -1, 7, 255, i64::MIN, i64::MAX];
+
+#[test]
+fn atomic_rmw_value_semantics() {
+    // For each RMW op: seed *8 = 100, rmw with the swept operand (returns the **old** value and writes
+    // op(old, operand)), then read back the **new** value; return old + new. The interpreter oracle and
+    // the emitted wasm must agree for every op and operand.
+    for op in ["add", "sub", "and", "or", "xor", "xchg"] {
+        let src = format!(
+            "memory 16\n\
+             func (i64) -> (i64) {{\n\
+             block0(v0: i64):\n\
+             \x20 v1 = i64.const 8\n\
+             \x20 v2 = i64.const 100\n\
+             \x20 i64.atomic.store v1 v2\n\
+             \x20 v3 = i64.atomic.rmw.{op} v1 v0\n\
+             \x20 v4 = i64.atomic.load v1\n\
+             \x20 v5 = i64.add v3 v4\n\
+             \x20 return v5\n\
+             }}\n"
+        );
+        diff(&format!("atomic_rmw_{op}"), &src, ATOMIC_VAL_SWEEP, FUEL);
+    }
+}
+
+/// cmpxchg: seed *8 = 100; compare-exchange against the swept `expected` with replacement 999; read
+/// back; return old + current. The compare-succeeds path (expected == 100) and the leave-unchanged
+/// path must both match the oracle.
+const ATOMIC_CMPXCHG: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 8
+  v2 = i64.const 100
+  i64.atomic.store v1 v2
+  v3 = i64.const 999
+  v4 = i64.atomic.cmpxchg v1 v0 v3
+  v5 = i64.atomic.load v1
+  v6 = i64.add v4 v5
+  return v6
+}
+"#;
+
+#[test]
+fn atomic_cmpxchg_value_semantics() {
+    diff("atomic_cmpxchg", ATOMIC_CMPXCHG, ATOMIC_VAL_SWEEP, FUEL);
+}
