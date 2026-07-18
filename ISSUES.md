@@ -40,7 +40,7 @@ linked fine on the same commit. Distinct from the macOS-launch SIGBUS entry belo
 recurs, reduce link-time memory: cap the linker's parallelism or split the heaviest test binaries. Log
 recurrences here to judge whether it needs a durable mitigation vs. staying a re-run-and-move-on flake.
 
-### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — found by the QuickJS breadth harness (2026-07-17)
+### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — **RESOLVED** (2026-07-18) — found by the QuickJS breadth harness (2026-07-17)
 
 **Where:** the LLVM on-ramp on Bellard's QuickJS 2024-01-13, the `libbf` bignum path (BigInt).
 `crates/svm-run/demos/quickjs/` — the engine otherwise runs a wide slice of JS byte-identical to
@@ -61,10 +61,27 @@ guest == native over a focused probe): `__builtin_clzll`/`ctzll`, 64-bit variabl
 suspects: `bf_set_si`/`bf_normalize` bit-length + shift, `bf_ftoa` base conversion, a struct-layout /
 `memcpy` of the `bf_t` limb array, or an `add/sub_overflow` carry idiom), not one of those ops.
 
-**Fix sketch.** Reproduce headlessly by linking `libbf.c` alone with a tiny driver that calls
-`bf_set_si` + `bf_ftoa` (base 10) and diffing guest vs native — that isolates set/normalize/format
-from the JS layer. Then bisect the first miscompiling `bf_*` primitive. Not blocking the QuickJS
-playground demo (which doesn't use BigInt); a dedicated slice.
+**Root cause — the translator dropped the high 64 bits of a large i128 constant.** Bisected exactly as
+the fix sketch below suggested (`bf_probe.c` linking `libbf.c` + `cutils.c`): `bf_set_si`/`bf_add`/
+`bf_mul`/`bf_ftoa` are all correct, but the BigInt *literal* path (`bf_atof`, string → bf_t) gave
+garbage — `(7n)` parsed to `128000000000000000008` with `expn=67`. Narrowed through `bf_atof` →
+`bf_mul_pow_radix` (the `T·radix^expn` finalizer, wrong only on the **negative** exponent / division
+branch) → `bf_div` → `mp_div1norm` → **`udiv1norm`** (the Granlund–Montgomery divide-by-invariant).
+Its `a = (a1<<64|a0) − q·d − d` folds `2^126` as an i128 constant subtrahend; `i128_parts` (and the
+i128-φ path) split an i128 constant into `(lo, hi)` with **`hi` hardcoded to `0`**, silently dropping
+every bit ≥ 2⁶⁴. So `2^126 − x` came out with a zero high limb → wrong quotient → wrong BigInt. (The
+stale comment claimed `llvm-ir` held the value in a `u64`; the textual `.ll` reader holds the full
+`u128`.) The 128-bit *multiply* was fine because it never took a large i128 **constant** operand.
+
+**Fix.** `i128_parts` and the aggregate-φ i128-constant case now split out **both** limbs
+(`lo = value as i64`, `hi = (value >> 64) as i64`). Regression `i128_large_constant_operand` (hand-C,
+interp+JIT: `2^126 − x` vs a `u128` oracle) fails on the old code, passes now; and
+`demo_quickjs_bigint_vs_native` (`#[ignore]`d, wall-clock) diffs the real `libbf` BigInt path
+(literal `toString`, `+`, `*`) byte-for-byte against native. BigInt is no longer a JS-surface gap.
+
+**Fix sketch (as pursued).** Reproduce headlessly by linking `libbf.c` alone with a tiny driver that
+calls `bf_set_si` + `bf_ftoa` (base 10) and diffing guest vs native — that isolates set/normalize/format
+from the JS layer. Then bisect the first miscompiling `bf_*` primitive.
 
 ### I23 — svm-jit miscompiles some rustc-emitted bitcode: an in-bounds heap `Vec` access faults / returns garbage (S2) — **RESOLVED** (2026-07-16; re-verified + extended 2026-07-18) — found by the `bench/rustbench` real-program harness (2026-07-14)
 
