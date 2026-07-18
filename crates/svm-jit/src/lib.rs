@@ -105,6 +105,11 @@ mod setjmp_rt;
 // loom-verified. Available where `svm_fiber::supported()` (x86-64 unix).
 #[cfg(fiber_rt)]
 mod os_thread_rt;
+// PROCESS.md S1b/S1c: the canonical-key futex region registry — `svm-run` records a §13 `map`'s pages
+// (so the JIT futex thunks canonicalize `Backed` addresses) and purges them at teardown. Real-runtime
+// only; the loom futex model has no regions (`futex_key_of` is `Anon`-only there).
+#[cfg(not(loom))]
+pub use os_thread_rt::{region_canon_forget_window, region_canon_record};
 
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
 // (substrate-independent), so a plain non-fiber root has a TLS word too.

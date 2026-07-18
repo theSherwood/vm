@@ -9843,6 +9843,14 @@ pub struct Host {
     /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries. Each is a
     /// shared host buffer; aliasing a region into several window offsets clones this `Rc`.
     regions: Vec<RegionBacking>,
+    /// PROCESS.md S1b/S1c — the **canonical-key futex** region hook. On a §13 `map`/`unmap` the JIT needs
+    /// to canonicalize a `Backed` address to `(backing, region offset)` for its futex, but its futex
+    /// thunk has no region map. `svm-run` installs a recorder here (over the JIT window's `mem_base`);
+    /// the dispatch calls it after each successful `map` (`Some(win_off, region_off, len, backing_fd)`)
+    /// and each `unmap` (`None`), so the JIT registry stays in step. `None` on the interpreter (whose own
+    /// `PageProt::Backed` already canonicalizes) and on any host with no recorder installed.
+    #[allow(clippy::type_complexity)]
+    region_hook: Option<Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>>,
     /// §15 / PROCESS.md §5 `Budget` states, indexed by the id a [`Binding::Budget`] carries. Each is a
     /// remaining resource-quota vector; `split` moves quota from a parent's entry into a fresh child
     /// entry (append-only, like `regions` — a split budget's index stays valid for the run).
@@ -10071,6 +10079,7 @@ impl Host {
             err_sink: None,
             clock_ns: 0,
             regions: Vec::new(),
+            region_hook: None,
             budgets: Vec::new(),
             pipes: Vec::new(),
             attestation: Attestation::default(),
@@ -10880,6 +10889,25 @@ impl Host {
         self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
     }
 
+    /// PROCESS.md S1b/S1c — install (or clear, with `None`) the **canonical-key futex** region hook.
+    /// `svm-run` installs it for a JIT run so a §13 `map` records the aliased pages into the JIT's futex
+    /// registry (and `unmap` forgets them); the interpreter needs none (its `PageProt::Backed` already
+    /// canonicalizes). Called with `(win_off, len, Some((region_off, backing)))` on `map`,
+    /// `(win_off, len, None)` on `unmap`.
+    #[allow(clippy::type_complexity)]
+    pub fn set_region_hook(
+        &mut self,
+        hook: Option<Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>>,
+    ) {
+        self.region_hook = hook;
+    }
+
+    /// Whether a canonical-key region hook is installed — so `svm-run`'s `cap.call` trampoline installs
+    /// it lazily (once, over the run's `mem_base`) only when absent.
+    pub fn has_region_hook(&self) -> bool {
+        self.region_hook.is_some()
+    }
+
     /// Grant a §15 / PROCESS.md §5 `Budget` — a splittable resource-quota vector `(fuel, mem, spawn)` —
     /// returning its handle. The embedder mints the **root** budget with the total resources it lends a
     /// domain; the guest `split`s sub-budgets out of it (attenuation) and `read`s remaining. A field of
@@ -11585,11 +11613,30 @@ impl Host {
                         let region_off = *args.get(1).unwrap_or(&0) as u64;
                         let len = *args.get(2).unwrap_or(&0) as u64;
                         let prot = *args.get(3).unwrap_or(&0) as i32;
-                        mem.map_region(win_off, region_off, len, prot, region, backing)
+                        // The backing's OS identity, stable across every alias of one region: the
+                        // memfd on unix, the section HANDLE on Windows (`MapViewOfFile3`). Either makes
+                        // two aliases key on the same `(backing, offset)` — a software-only region (no
+                        // OS handle) can't be canonicalized on the JIT, so it stays `Anon`.
+                        let backing_id = backing
+                            .os_fd()
+                            .map(|fd| fd as u64)
+                            .or_else(|| backing.os_section().map(|s| s as u64));
+                        let r = mem.map_region(win_off, region_off, len, prot, region, backing);
+                        // S1b/S1c: on a successful map of an OS-fd-backed region, tell the JIT futex
+                        // registry which pages now alias which region bytes (a no-op on the interp).
+                        if r >= 0 {
+                            if let (Some(hook), Some(id)) = (&self.region_hook, backing_id) {
+                                hook(win_off, len, Some((region_off, id)));
+                            }
+                        }
+                        r
                     }
                     1 => {
                         let win_off = *args.first().unwrap_or(&0) as u64;
                         let len = *args.get(1).unwrap_or(&0) as u64;
+                        if let Some(hook) = &self.region_hook {
+                            hook(win_off, len, None);
+                        }
                         mem.unmap(win_off, len)
                     }
                     2 => backing.size() as i64,

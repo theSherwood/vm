@@ -176,7 +176,7 @@ pub(crate) struct Domain {
     /// Monotonic task-id allocator for the durable single-worker path (root = `0`, first spawn = `1`),
     /// matching the interpreter's `next_task` so `FrozenVCpu.task` is byte-identical.
     next_task: Mutex<u64>,
-    futex: Mutex<HashMap<u64, FutexEntry>>,
+    futex: Mutex<HashMap<FutexKey, FutexEntry>>,
     futex_cv: Condvar,
     /// §15 spawn quota: max **concurrently-live** vCPUs (incl. the root) this domain may have, clamped
     /// to [`MAX_VCPUS`]. Exceeding it is a clean `ThreadFault`. Bounds `Threads::live` (concurrent),
@@ -240,6 +240,84 @@ struct FutexEntry {
     /// Bumped by `notify` so parked waiters re-check and observe a wake (vs a spurious one).
     generation: u64,
     waiters: u32,
+}
+
+/// PROCESS.md S1b/S1c — **canonical futex key**. A §13 `SharedRegion` mapped at several window offsets
+/// aliases the same bytes at *different* absolute addresses; the futex must key those on the region's
+/// canonical `(backing, region-offset)` identity so a `notify` through one alias wakes a waiter parked
+/// through another — the distinction Linux draws between a private (VA-keyed) and a shared (page-keyed)
+/// futex. **Not** a confinement structure: a wrong key misses a wakeup, it cannot escape (PROCESS.md §4
+/// S0 — the futex key is a rendezvous coordinate, not a bounds check).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum FutexKey {
+    /// A non-region page: keyed on the window-absolute address (the private-futex case, unchanged).
+    Anon(u64),
+    /// A `Backed` region byte: keyed on `(backing identity, canonical byte offset in the region)`.
+    Region(u64, u64),
+}
+
+/// Per-absolute-page `(backing identity, region byte offset of the page start)` recorded by every §13
+/// `map`, so the futex thunks can canonicalize an address (below). Process-global because the JIT futex
+/// itself is process-global (real OS threads); keyed **absolutely** so a thunk needs only `phys`, never
+/// the window base. Concurrent runs live at distinct window addresses (distinct pages); a sequential
+/// run reusing a virtual address is protected by the teardown/unmap purge ([`region_canon_forget_window`]).
+/// Real-runtime only — regions are not part of the loom futex model.
+#[cfg(not(loom))]
+static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, (u64, u64)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(not(loom))]
+fn region_map() -> &'static std::sync::Mutex<HashMap<u64, (u64, u64)>> {
+    REGION_MAP.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record that the absolute window range `[abs_base, abs_base + len)` aliases region-`backing` starting
+/// at byte `region_off` — called by the `Host` region recorder `svm-run` installs on a §13 `map`. Pages
+/// the range with **this** module's page size (so the recorder and the futex thunks never disagree on
+/// the granule); `abs_base`/`region_off` are page-aligned (`map` requires it), so page `i` of the span
+/// aliases region byte `region_off + i·page`.
+#[cfg(not(loom))]
+pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u64) {
+    if len == 0 {
+        return;
+    }
+    let page = mem::page_size() as u64;
+    let first = abs_base / page;
+    let last = (abs_base + len - 1) / page;
+    let mut g = region_map().lock().unwrap_or_else(|e| e.into_inner());
+    for p in first..=last {
+        g.insert(p, (backing, region_off + (p - first) * page));
+    }
+}
+
+/// Forget every canonical mapping in the absolute window `[base, base + size)` — called at `unmap` and
+/// at run teardown so a reused virtual address never inherits a stale region identity.
+#[cfg(not(loom))]
+pub fn region_canon_forget_window(base: u64, size: u64) {
+    let page = mem::page_size() as u64;
+    let lo = base / page;
+    let hi = base.saturating_add(size).div_ceil(page);
+    region_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|&p, _| p < lo || p >= hi);
+}
+
+/// The canonical futex key for absolute guest address `phys`: `Region(backing, off)` when its page was
+/// region-`map`ped, else `Anon(phys)`.
+fn futex_key_of(phys: u64) -> FutexKey {
+    #[cfg(not(loom))]
+    {
+        let page = mem::page_size() as u64;
+        if let Some(&(backing, region_off)) = region_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(phys / page))
+        {
+            return FutexKey::Region(backing, region_off + phys % page);
+        }
+    }
+    FutexKey::Anon(phys)
 }
 
 impl Domain {
@@ -1447,10 +1525,14 @@ pub(crate) unsafe extern "C" fn thread_wait(
     } else {
         0
     };
+    // Canonical key (S1b/S1c): a region-mapped page keys on `(backing, region offset)` so aliases at
+    // different window offsets rendezvous; a plain page keys on the absolute address as before. The
+    // value re-check below still reads the real `phys` — queue on the canonical key, compare on the
+    // address (mirrors the interpreter's split key/addr park).
     let status = futex_wait(
         &dom.futex,
         &dom.futex_cv,
-        phys,
+        futex_key_of(phys),
         || read_phys(phys, width) & mask == expected & mask,
         deadline,
         dom.env().epoch_addr,
@@ -1481,7 +1563,7 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
     let dom = &*sched;
     // The count is **unsigned** "wake up to N" (wasm's notify count is u32; `-1` = wake all);
     // `futex_notify` caps at the real waiter count, so reinterpret the i32 bits as u32.
-    futex_notify(&dom.futex, &dom.futex_cv, phys, count as u32) as i32
+    futex_notify(&dom.futex, &dom.futex_cv, futex_key_of(phys), count as u32) as i32
 }
 
 /// §12.8 concurrent-thaw stage 3: RAII counter for [`Domain::parked`]. Increments while a vCPU is blocked
@@ -1506,9 +1588,9 @@ impl Drop for ParkGuard<'_> {
 /// makes a real `notify` distinguishable so the returned status is accurate.
 #[allow(clippy::too_many_arguments)] // a futex park threads its full guest/kill/freeze/deadlock context
 fn futex_wait(
-    futex: &Mutex<HashMap<u64, FutexEntry>>,
+    futex: &Mutex<HashMap<FutexKey, FutexEntry>>,
     cv: &Condvar,
-    key: u64,
+    key: FutexKey,
     still_eq: impl Fn() -> bool,
     deadline: Option<Instant>,
     epoch_addr: usize,
@@ -1623,9 +1705,9 @@ fn futex_wait(
 /// Futex wake core: bump `key`'s generation (so up to `count` parked waiters observe a real wake) and
 /// `notify_all`; return how many waiters were parked (capped at `count`).
 fn futex_notify(
-    futex: &Mutex<HashMap<u64, FutexEntry>>,
+    futex: &Mutex<HashMap<FutexKey, FutexEntry>>,
     cv: &Condvar,
-    key: u64,
+    key: FutexKey,
     count: u32,
 ) -> u32 {
     let woken = {
@@ -1657,7 +1739,7 @@ mod loom_tests {
     #[test]
     fn loom_wait_notify_never_hangs() {
         loom::model(|| {
-            let futex = Arc::new(Mutex::new(HashMap::<u64, FutexEntry>::new()));
+            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
             let cv = Arc::new(Condvar::new());
             let word = Arc::new(AtomicU64::new(0)); // the guest futex word
             const KEY: u64 = 0x1000;
@@ -1666,7 +1748,7 @@ mod loom_tests {
             let producer = loom::thread::spawn(move || {
                 // store then notify (the release/wake pair)
                 w2.store(1, Ordering::SeqCst);
-                futex_notify(&f2, &cv2, KEY, 1);
+                futex_notify(&f2, &cv2, FutexKey::Anon(KEY), 1);
             });
 
             // consumer: wait while the word is still 0. Must not hang: either it sees 1 (NOT_EQUAL) or
@@ -1676,7 +1758,7 @@ mod loom_tests {
             let status = futex_wait(
                 &futex,
                 &cv,
-                KEY,
+                FutexKey::Anon(KEY),
                 || word.load(Ordering::SeqCst) == 0,
                 None,
                 0,
@@ -1699,7 +1781,7 @@ mod loom_tests {
     #[test]
     fn loom_deadlock_detection_resolves_when_last_peer_exits() {
         loom::model(|| {
-            let futex = Arc::new(Mutex::new(HashMap::<u64, FutexEntry>::new()));
+            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
             let cv = Arc::new(Condvar::new());
             // A loom atomic (explored by the model); `parked` below stays the std type `futex_wait` takes.
             let peer_live = Arc::new(loom::sync::atomic::AtomicUsize::new(1)); // 1 ⇒ a peer could notify
@@ -1718,7 +1800,7 @@ mod loom_tests {
             let status = futex_wait(
                 &futex,
                 &cv,
-                KEY,
+                FutexKey::Anon(KEY),
                 || true, // the guest word never changes (always still equals `expected`)
                 None,
                 0,

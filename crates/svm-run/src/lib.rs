@@ -134,6 +134,19 @@ pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Modul
 /// own via [`grant_jit`] + the compile `table_reserve_log2`.
 const CLI_JIT_TABLE_LOG2: u8 = 10;
 
+/// PROCESS.md S1b/S1c — a teardown guard for the canonical-key futex region registry: forgets every
+/// mapping in `[base, base+reserved)` when dropped (the recorder closure that owns it is held for the
+/// run and released at teardown), so a reused window virtual address never inherits a stale identity.
+struct WindowRegionPurge {
+    base: u64,
+    reserved: u64,
+}
+impl Drop for WindowRegionPurge {
+    fn drop(&mut self) {
+        svm_jit::region_canon_forget_window(self.base, self.reserved);
+    }
+}
+
 /// The host trampoline bridging the JIT's [`svm_jit::CapThunk`] ABI (§9) to the reference
 /// [`Host`]'s capability dispatch — the host code a real embedder supplies. One shared copy.
 ///
@@ -157,6 +170,33 @@ pub unsafe extern "C" fn cap_thunk(
     trap_out: *mut i64,
 ) {
     let host = &mut *(ctx as *mut Host);
+    // PROCESS.md S1b/S1c — the **canonical-key futex** region recorder. The JIT futex thunk has no
+    // region map, so a §13 `map` must record which absolute pages alias which region bytes into the JIT
+    // registry (`svm_jit::region_canon_record`) and `unmap` must forget them. The `Host` dispatch owns
+    // the backing (hence its `os_fd`), but only *this* trampoline knows the window's `mem_base`; install
+    // the recorder here, once, over this run's base (the interp needs none — it canonicalizes via its own
+    // `PageProt::Backed`). Idempotent + on the root thread's first `cap.call` (before any `map`/spawn),
+    // so no vCPU races the install. A no-op on non-JIT hosts that never `map` a region.
+    if !mem_base.is_null() && !host.has_region_hook() {
+        let base = mem_base as u64;
+        // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
+        // so a later run reusing the virtual address never inherits a stale region identity.
+        let purge = WindowRegionPurge {
+            base,
+            reserved: mem_reserved,
+        };
+        host.set_region_hook(Some(std::sync::Arc::new(
+            move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| {
+                let _keep = &purge; // the closure owns the teardown guard
+                match mapped {
+                    Some((region_off, backing)) => {
+                        svm_jit::region_canon_record(base + win_off, len, backing, region_off)
+                    }
+                    None => svm_jit::region_canon_forget_window(base + win_off, len),
+                }
+            },
+        )));
+    }
     // The JIT passes a null args/results pointer when the count is 0; `from_raw_parts` requires a
     // non-null (aligned) pointer even for an empty slice, so use `&[]` in that case (UB otherwise).
     let arg_slots = if n_args == 0 {
