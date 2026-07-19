@@ -12,9 +12,10 @@
 //! a spec row (see the tally in [`struct_rows`] and the `structural_row_tally` test),
 //! finishing the exhaustive walk `coverage()` began — adding an op now forces a row.
 //!
-//! `CallImport` is the one op with `verifies: false`: it is the *pre-resolution* import
-//! form (§7), which `resolve_imports` lowers to a `cap.call` before any backend or the
-//! verifier ever sees it, so no *valid* module contains one. Its row still round-trips
+//! `CallImport` is the one op with `verifies: false`: its row module carries no import
+//! **manifest**, and a `call.import` whose index names no declared import is fail-closed
+//! (IMPORTS.md phase 1 — with a matching manifest it *is* executable; the manifest-bearing
+//! accept/reject legs live in the `spec_verify` directed cases). Its row still round-trips
 //! and pins its byte; only the verifier-accept leg is skipped for it.
 
 use svm_ir::*;
@@ -25,7 +26,8 @@ use crate::Enc;
 pub struct StructRow {
     pub id: String,
     pub encoding: Enc,
-    /// Whether a *valid* module can contain the op (false only for `CallImport`).
+    /// Whether the op's **row module** verifies (false only for `CallImport`, whose row
+    /// carries no import manifest — a manifest-bearing `call.import` is valid, IMPORTS.md).
     pub verifies: bool,
     /// The op sits at `funcs[0].blocks[0].term` (true) or `.insts[0]` (false) — the
     /// encoding suite derives its opcode-pin baseline accordingly.

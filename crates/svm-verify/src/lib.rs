@@ -90,10 +90,19 @@ pub enum VerifyError {
     /// A lane-wise op was given a shape of the wrong category — an integer op on a float shape
     /// or a float op on an integer shape (§17).
     BadSimdShape { func: u32, block: u32 },
-    /// A [`Inst::CallImport`] reached the verifier (§7). Named imports must be lowered to
-    /// concrete `cap.call`s by `svm_ir::resolve_imports` at instantiation *before*
-    /// verification; an unresolved import in a module presented for execution is fail-closed.
+    /// A [`Inst::CallImport`] referenced an import index at or past the end of the module's
+    /// [`Module::imports`] manifest (§7 / IMPORTS.md phase 1). A `call.import` is executable when
+    /// its index names a declared import; one that names nothing is fail-closed. (This variant also
+    /// covers the pre-manifest legacy shape — a `CallImport` in a module with an empty import
+    /// section is by definition out of range.)
     UnresolvedImport { func: u32, block: u32, import: u32 },
+    /// A [`Inst::CallImport`]'s self-describing `sig` disagreed with the declared signature of the
+    /// import it references (IMPORTS.md phase 1). The manifest is the canonical interface; a call
+    /// site asserting a different one is fail-closed (the §7 structural signature check).
+    ImportSigMismatch { func: u32, block: u32, import: u32 },
+    /// Two [`Module::imports`] entries share a name — imports must be uniquely resolvable by the
+    /// host's instantiation policy (IMPORTS.md phase 1), mirroring [`VerifyError::DuplicateExport`].
+    DuplicateImport { import: u32 },
     /// A `gc.roots` carried a **constant** payload mask that clears more than the top byte (its
     /// low 56 bits are not all-ones). Such a mask could fold a canonical host pointer down into the
     /// guest window and leak host-address bits past the range filter (GC.md §3, §6). Only
@@ -137,9 +146,17 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
             return Err(VerifyError::DataOutOfWindow { seg });
         }
     }
+    // Import manifest (§7 / IMPORTS.md phase 1): names must be uniquely resolvable — the
+    // instantiation policy binds by name, so an ambiguous manifest is fail-closed here,
+    // mirroring the export-name check below.
+    for (ii, imp) in m.imports.iter().enumerate() {
+        if m.imports[..ii].iter().any(|o| o.name == imp.name) {
+            return Err(VerifyError::DuplicateImport { import: ii as u32 });
+        }
+    }
     let has_memory = m.memory.is_some();
     for (fi, f) in m.funcs.iter().enumerate() {
-        verify_func(fi as u32, f, &m.funcs, has_memory)?;
+        verify_func(fi as u32, f, &m.funcs, &m.imports, has_memory)?;
     }
     // Named exports must point at a real function and be uniquely addressable (backends ignore the
     // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
@@ -158,7 +175,13 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     Ok(())
 }
 
-fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<(), VerifyError> {
+fn verify_func(
+    fi: u32,
+    f: &Func,
+    funcs: &[Func],
+    imports: &[svm_ir::Import],
+    has_memory: bool,
+) -> Result<(), VerifyError> {
     // Per function: the entry block's parameters are the function's parameters.
     match f.blocks.first() {
         Some(entry) if entry.params == f.params => {}
@@ -270,14 +293,53 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.extend_from_slice(&sig.results);
                 continue;
             }
-            // §7 named imports must be resolved to `cap.call`s before verification — reject
-            // a stray `CallImport` fail-closed (it carries no `type_id`/`op` to check).
-            if let Inst::CallImport { import, .. } = inst {
-                return Err(VerifyError::UnresolvedImport {
-                    func: fi,
-                    block: bi,
-                    import: *import,
-                });
+            // §7 executable named import (IMPORTS.md phase 1): the index must name a declared
+            // import and the call's self-describing `sig` must equal the manifest's — the
+            // canonical-interface check `cap.call` cannot have (its sig is self-asserted). The
+            // handle operand is typed like `cap.call`'s (vestigial in static dispatch, but still
+            // a value reference that must be well-formed). Arg/result typing mirrors `cap.call`.
+            if let Inst::CallImport {
+                import,
+                sig,
+                handle,
+                args,
+            } = inst
+            {
+                let Some(decl) = imports.get(*import as usize) else {
+                    return Err(VerifyError::UnresolvedImport {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                };
+                if decl.sig != *sig {
+                    return Err(VerifyError::ImportSigMismatch {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                {
+                    let cx = Cx {
+                        fi,
+                        bi,
+                        types: &types,
+                    };
+                    cx.expect(*handle, ValType::I32)?;
+                    if args.len() != sig.params.len() {
+                        return Err(VerifyError::CallArgCountMismatch {
+                            func: fi,
+                            block: bi,
+                            expected: sig.params.len(),
+                            found: args.len(),
+                        });
+                    }
+                    for (a, want) in args.iter().zip(&sig.params) {
+                        cx.expect(*a, *want)?;
+                    }
+                }
+                types.extend_from_slice(&sig.results);
+                continue;
             }
             // §12 `cont.resume` appends two results `(status: i32, value: i64)`, so —
             // like `call` — it is checked here rather than in `check_inst`.
@@ -443,7 +505,9 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
             Inst::CapSelfLabel { .. } => types.push(ValType::I32),   // label length
             Inst::ThreadSpawn { .. } => types.push(ValType::I32),
             Inst::RefFunc { .. } => types.push(ValType::I32),
-            Inst::CallImport { .. } => {} // unreachable in a verified module
+            // Executable named import (IMPORTS.md phase 1): the verifier checked `sig` equals the
+            // manifest's declared signature, so the self-describing copy is authoritative here.
+            Inst::CallImport { sig, .. } => types.extend_from_slice(&sig.results),
             // Everything else (single result, or `Store`/no result) goes through the shared
             // `check_inst` rules — the single source of truth for those types.
             _ => {
@@ -594,7 +658,8 @@ fn check_inst(
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
-        // §7 named imports are rejected above (the multi-result/call section); unreachable here.
+        // §7 executable named imports append their results in the multi-result/call section of
+        // `verify_func` (manifest-checked there); unreachable here.
         Inst::CallImport { .. } => {
             unreachable!("CallImport handled before check_inst's value match")
         }

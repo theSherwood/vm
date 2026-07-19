@@ -291,7 +291,32 @@ pre-phase-1 audits have been **run** (findings in §7); the file-level items
 below incorporate them.
 
 **Phase 1 — executable `call.import` (static, one-op-per-import). Additive;
-every legacy path keeps working.**
+every legacy path keeps working.** *Status: **landed**. Implementation notes,
+recorded where they refined the plan:*
+
+- *Dispatch is the audit's option (a): a reserved `CAP_IMPORT_TYPE_ID`
+  pseudo-type_id (the `CAP_SELF_TYPE_ID` precedent) carrying the import index
+  as the op; `Host::cap_dispatch_slots` translates it through the
+  instantiation-time binding table (`Host::set_import_bindings`). One shared
+  implementation; all three backends (and the W1 record/replay tape, which
+  sees the translated call) stay in lockstep. The bytecode engine needed no
+  new op — `call.import` compiles to the existing generic `Op::CapCall` with
+  the sentinel.*
+- *Slot-bindable interfaces are allow-listed to the generic-dispatch set
+  (`Stream`/`Exit`/`Clock`/`Memory`/`HostFn`); an import naming an
+  executor-dispatch interface (`Instantiator`, guest-`Jit`, …) falls back to
+  the legacy rewrite (those interfaces are special-cased in each backend's
+  eval/compile loop — reaching them through the binding translation is
+  phase-2 work).*
+- *`instantiate_with_imports` (name↔handle 1:1 by construction) is the
+  converted no-rewrite path. `instantiate()` (the fixed §3e preset) stays on
+  the rewrite: its `Resolved::Cap` semantics let the call-site operand select
+  the endpoint (stdout vs stdin on one `Stream` interface), which
+  slot-binding deliberately does not model.*
+- *The `decode_verify` fuzz target covers the new surface with no changes:
+  the decoder already round-trips manifests, so fuzzer-built manifest
+  modules exercise the new verifier arms, and a verified `call.import`
+  reaching a bare host is a clean `CapFault` (fail-closed), never a panic.*
 
 - `svm-ir`: **no changes required.** `Inst::CallImport` already carries
   `import`/`sig`/`handle`/`args` (lib.rs:1723); `Effects` already classifies
