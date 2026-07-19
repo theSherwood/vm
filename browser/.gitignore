@@ -15,6 +15,7 @@ patched*.wasm
 # `hello_c.svmb` is committed so the playground has a working example out of the box; the big
 # guests (Lua/SQLite) are built on demand / by the Pages pipeline.
 /web/assets/*.bc
+/web/assets/*.ll
 /web/assets/*.svmb
 /web/assets/*.wad
 /web/assets/*.img
