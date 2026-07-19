@@ -1804,8 +1804,7 @@ fn fetch_quickjs() -> Option<PathBuf> {
 /// SVM float ops (slice L), but the `Math` function table takes their *address*, which needs a
 /// real guest definition for the funcref table.
 const QUICKJS_OPENLIBM_EXTRA: &[&str] = &[
-    "s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot", "s_floor", "s_ceil", "s_trunc",
-    "e_sqrt",
+    "s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot", "s_floor", "s_ceil", "s_trunc", "e_sqrt",
 ];
 
 /// **▶ QuickJS eval — the full-JS-engine breadth target. RUNS byte-identical to native.** Wires the
