@@ -4462,6 +4462,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::CallIndirect { .. }
                 | Inst::CapCall { .. }
                 | Inst::CallImport { .. }
+                | Inst::ImportAttach { .. }
                 | Inst::RefFunc { .. }
                 | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
@@ -5259,6 +5260,30 @@ fn lower_block(
                 sig,
                 h0,
                 args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // Phase-2 `import.attach` (IMPORTS.md): the attach sentinel with the handle value as the
+        // one `i32` argument; `i32` status result. Same shared host entry as the interpreter and
+        // the bytecode engine.
+        if let Inst::ImportAttach { import, handle } = inst {
+            let h0 = b.ins().iconst(I32, 0);
+            let sig = FuncType {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32],
+            };
+            let call_args = [*handle];
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_IMPORT_ATTACH_TYPE_ID,
+                *import,
+                &sig,
+                h0,
+                &call_args,
                 &mut vals,
             )?;
             ubs.resize(vals.len(), UB_TOP);

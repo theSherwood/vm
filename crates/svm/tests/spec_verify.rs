@@ -442,6 +442,7 @@ fn directed_rule_rejects() {
     m.imports = vec![svm_ir::Import {
         name: "ping".into(),
         sig: unit_sig.clone(),
+        mode: svm_ir::ImportMode::Required,
     }];
     accept(&m, "manifest-bearing call.import");
     // Same module, call-site sig disagrees with the manifest's declaration.
@@ -452,6 +453,7 @@ fn directed_rule_rejects() {
     m.imports = vec![svm_ir::Import {
         name: "ping".into(),
         sig: unit_sig.clone(),
+        mode: svm_ir::ImportMode::Required,
     }];
     reject(&m, "import sig mismatch", |e| {
         matches!(e, VerifyError::ImportSigMismatch { .. })
@@ -462,14 +464,55 @@ fn directed_rule_rejects() {
         svm_ir::Import {
             name: "ping".into(),
             sig: unit_sig.clone(),
+            mode: svm_ir::ImportMode::Required,
         },
         svm_ir::Import {
             name: "ping".into(),
             sig: unit_sig,
+            mode: svm_ir::ImportMode::Required,
         },
     ];
     reject(&m, "duplicate import name", |e| {
         matches!(e, VerifyError::DuplicateImport { .. })
+    });
+
+    // Phase-2 `import.attach` (IMPORTS.md): valid against a rebindable declaration; rejected
+    // against a required one and past the manifest — by both verifiers.
+    let attach_fn = func(
+        vec![],
+        vec![],
+        vec![
+            Inst::ConstI32(0),
+            Inst::ImportAttach {
+                import: 0,
+                handle: 0,
+            },
+        ],
+        T::Return(vec![]),
+    );
+    let stream_sig = FuncType {
+        params: vec![V::I64, V::I64],
+        results: vec![V::I64],
+    };
+    let mut m = module(vec![attach_fn.clone()]);
+    m.imports = vec![svm_ir::Import {
+        name: "out".into(),
+        sig: stream_sig.clone(),
+        mode: svm_ir::ImportMode::Rebindable,
+    }];
+    accept(&m, "attach to a rebindable import");
+    let mut m = module(vec![attach_fn.clone()]);
+    m.imports = vec![svm_ir::Import {
+        name: "out".into(),
+        sig: stream_sig,
+        mode: svm_ir::ImportMode::Required,
+    }];
+    reject(&m, "attach to a required import", |e| {
+        matches!(e, VerifyError::AttachNotRebindable { .. })
+    });
+    let m = module(vec![attach_fn]);
+    reject(&m, "attach past the manifest", |e| {
+        matches!(e, VerifyError::UnresolvedImport { .. })
     });
 
     // GC.md: a constant gc.roots mask may only clear the top byte.

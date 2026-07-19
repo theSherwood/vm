@@ -2385,6 +2385,9 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
                 *v = f(*v);
             }
         }
+        // Phase-2 attach (IMPORTS.md): the handle is its one value operand (`import` is an
+        // immediate index into the manifest, not a value).
+        Inst::ImportAttach { handle, .. } => *handle = f(*handle),
     }
 }
 

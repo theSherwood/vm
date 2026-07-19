@@ -6965,6 +6965,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
                 }
+                // Phase-2 `import.attach` (IMPORTS.md): rebind rebindable slot `import` to the
+                // handle value — routed through the shared attach dispatch entry, so all three
+                // backends agree over one implementation. Result is the `i32` status.
+                Inst::ImportAttach { import, handle } => {
+                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results = hg.cap_dispatch_slots(
+                        svm_ir::CAP_IMPORT_ATTACH_TYPE_ID,
+                        *import,
+                        0,
+                        &[h as i64],
+                        None,
+                    )?;
+                    let status = *results.first().ok_or(Trap::Malformed)?;
+                    frames[top].vals.push(Reg::from_i32(status as i32));
+                }
                 // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
                 // through `self_dispatch` (op 0) — the same path the JIT's thunk takes, so they agree.
                 Inst::CapSelfCount => {
@@ -7806,9 +7822,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         }
         Inst::ConstI32(c) => Reg::from_i32(*c),
         Inst::ConstI64(c) => Reg::from_i64(*c),
-        // §7 executable named imports need the host's import-binding table, so they're serviced
-        // in the eval loop (like `cap.call`), never in this pure-op helper.
-        Inst::CallImport { .. } => return Err(Trap::Malformed),
+        // §7 executable named imports (+ phase-2 attach) need the host's import-binding table,
+        // so they're serviced in the eval loop (like `cap.call`), never in this pure-op helper.
+        Inst::CallImport { .. } | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
         Inst::CapSelfCount
@@ -10004,6 +10020,40 @@ pub struct BoundImport {
     pub type_id: u32,
     pub op: u32,
     pub handle: i32,
+    /// Whether the slot currently holds a live binding (IMPORTS.md phase 2). A `required` import
+    /// is always bound; a `rebindable` one may start unbound (`call.import` then `CapFault`s,
+    /// fail-closed) until an `import.attach` fills it.
+    pub bound: bool,
+    /// Whether `import.attach` may retarget this slot (the manifest's `rebindable` mode). The
+    /// verifier enforces this statically for guest code; the host re-checks fail-closed (the
+    /// dispatch entry is also reachable by host-side callers).
+    pub rebindable: bool,
+}
+
+impl BoundImport {
+    /// A bound `required`-mode entry (the phase-1 shape): immutable for the instance's lifetime.
+    pub fn required(type_id: u32, op: u32, handle: i32) -> BoundImport {
+        BoundImport {
+            type_id,
+            op,
+            handle,
+            bound: true,
+            rebindable: false,
+        }
+    }
+
+    /// A `rebindable` entry: `handle` is the initial binding (`Some`) or the slot starts empty
+    /// (`None` — `call.import` traps until an `import.attach` fills it). The `(type_id, op)`
+    /// template is fixed either way: attach swaps *which object*, never *which interface*.
+    pub fn rebindable(type_id: u32, op: u32, handle: Option<i32>) -> BoundImport {
+        BoundImport {
+            type_id,
+            op,
+            handle: handle.unwrap_or(0),
+            bound: handle.is_some(),
+            rebindable: true,
+        }
+    }
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -11487,6 +11537,10 @@ impl Host {
                 .get(op as usize)
                 .copied()
                 .ok_or(Trap::CapFault)?;
+            // An unbound rebindable slot (declared, never attached — phase 2) is fail-closed.
+            if !b.bound {
+                return Err(Trap::CapFault);
+            }
             (b.type_id, b.op, b.handle)
         } else {
             (type_id, op, handle)
@@ -11569,6 +11623,30 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
+        // in `args[0]`. The new handle must resolve **live under the slot's declared interface
+        // type_id** (the §3c mask + type + generation check) — attach swaps which *object* the slot
+        // names, never which *interface*. Authority-neutral (aliases a held capability into a named
+        // slot). Structural misuse (unknown slot / non-rebindable) is a `CapFault` — the verifier
+        // rules that out for guest code, so reaching it means a hostile/buggy direct caller; a
+        // wrong-type or dead handle returns `-EINVAL` so a guest can probe a discovered handle and
+        // fall back. Serialized by the Host lock like every dispatch (the §12 ordering guarantee:
+        // concurrent `call.import`s on the slot see the old or the new binding atomically).
+        if type_id == svm_ir::CAP_IMPORT_ATTACH_TYPE_ID {
+            let slot = op as usize;
+            let b = self.import_bindings.get(slot).ok_or(Trap::CapFault)?;
+            if !b.rebindable {
+                return Err(Trap::CapFault);
+            }
+            let new_handle = *args.first().ok_or(Trap::Malformed)? as i32;
+            if self.resolve(new_handle, b.type_id).is_err() {
+                return Ok(vec![EINVAL]);
+            }
+            let b = &mut self.import_bindings[slot];
+            b.handle = new_handle;
+            b.bound = true;
+            return Ok(vec![0]);
+        }
         // §7 reflection: the reserved pseudo-`type_id` has no handle to resolve — service it directly
         // (read-only over this domain's own powerbox). This is the JIT's entry point for `cap.self.*`.
         if type_id == svm_ir::CAP_SELF_TYPE_ID {

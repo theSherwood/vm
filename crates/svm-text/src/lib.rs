@@ -67,9 +67,14 @@ pub fn print_module(m: &Module) -> String {
     // `call.import` references): `import <idx> "<name>" (params) -> (results)`.
     if !m.imports.is_empty() {
         for (i, imp) in m.imports.iter().enumerate() {
+            // A `rebindable` suffix marks the phase-2 mode; `required` (the default) is implicit.
+            let mode = match imp.mode {
+                svm_ir::ImportMode::Required => "",
+                svm_ir::ImportMode::Rebindable => " rebindable",
+            };
             let _ = writeln!(
                 s,
-                "import {i} \"{}\" ({}) -> ({})",
+                "import {i} \"{}\" ({}) -> ({}){mode}",
                 imp.name,
                 types(&imp.sig.params),
                 types(&imp.sig.results)
@@ -396,6 +401,8 @@ fn print_inst(inst: &Inst) -> String {
             args,
             ..
         } => format!("call.import {import} v{handle}{}", arglist(args)),
+        // Phase-2 `import.attach <idx> v<handle>`: rebind a rebindable slot to a held capability.
+        Inst::ImportAttach { import, handle } => format!("import.attach {import} v{handle}"),
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => "cap.self.count".to_string(),
         Inst::CapSelfAttest => "cap.self.attest".to_string(),
@@ -1149,9 +1156,17 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 let params = p.parse_type_list()?;
                 p.expect(&Tok::Arrow)?;
                 let results = p.parse_type_list()?;
+                // Optional phase-2 mode suffix; absent = `required` (the default).
+                let mode = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "rebindable") {
+                    p.next()?;
+                    svm_ir::ImportMode::Rebindable
+                } else {
+                    svm_ir::ImportMode::Required
+                };
                 p.imports.push(Import {
                     name,
                     sig: FuncType { params, results },
+                    mode,
                 });
             }
             // Module-level `data [ro] <offset> "<bytes>"` segment (§3a / D40).
@@ -1251,6 +1266,10 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_type_list()?;
                 p.expect(&Tok::Arrow)?;
                 p.parse_type_list()?;
+                // Optional phase-2 mode suffix.
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "rebindable") {
+                    p.next()?;
+                }
             }
             Some(Tok::Ident(s)) if s == "data" => {
                 // `data [ro] <offset> "<bytes>"` — skip past it in the header prescan.
@@ -1855,6 +1874,7 @@ impl<'a> Parser<'a> {
                         self.imports.push(Import {
                             name,
                             sig: sig.clone(),
+                            mode: svm_ir::ImportMode::Required, // name-inline interning is required-mode
                         });
                         self.imports.len() - 1
                     });
@@ -1886,6 +1906,14 @@ impl<'a> Parser<'a> {
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             return Ok(Inst::RefFunc { func });
+        }
+        // Phase-2 `import.attach <idx> v<handle>` (IMPORTS.md): rebind a rebindable import slot.
+        if op == "import.attach" {
+            let n = self.parse_int()?;
+            let import = u32::try_from(n)
+                .map_err(|_| ParseError(format!("import index out of range: {n}")))?;
+            let handle = self.value(names)?;
+            return Ok(Inst::ImportAttach { import, handle });
         }
         // §7 capability reflection intrinsics.
         if op == "cap.self.count" {

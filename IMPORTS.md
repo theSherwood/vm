@@ -373,13 +373,39 @@ recorded where they refined the plan:*
   packed handle value for a previously-attached-then-detached rebindable
   slot loses D37 protection across a freeze.
 
-**Phase 2 — dynamic mode + rebindable + completeness bit.** Recast `cap.call`
-as the dynamic addressing mode (wire mnemonic decision = open question 5);
-`rebindable` mode + `import.attach` (+ attach ordering under §12 threads,
-open question 4); the verifier's manifest-completeness bit; optionally
-interface-grouped imports (`op` immediate + interface declarations, open
-question 3) and the JIT instance-context threading for import-bearing cache
-sharing.
+**Phase 2 — dynamic mode + rebindable + completeness bit.** *Status:
+**landed** (except the two "optionally" items, which stay open). Implementation
+notes:*
+
+- *`rebindable` is a per-import mode (`ImportMode`, wire format **v4**: a mode
+  byte per import entry; text: a `rebindable` suffix). `required` stays the
+  default and is immutable-per-instance. A rebindable slot may start empty
+  (`HostCap::template(type_id, op)` — declared interface, no grant; calling
+  through it `CapFault`s) or start bound and be retargeted.*
+- *`import.attach <slot> v<handle>` (opcode 0x63) rebinds a rebindable slot to
+  a **held** capability. The new handle must resolve live under the slot's
+  declared interface `type_id` (the §3c check) — attach swaps which *object*,
+  never which *interface*. Wrong-type/dead handles return `-EINVAL`
+  (probeable); structural misuse (out-of-range, non-rebindable target) is
+  rejected **statically** by the verifier (`AttachNotRebindable`). Dispatched
+  through a second reserved pseudo-type_id (`CAP_IMPORT_ATTACH_TYPE_ID`), so
+  all three backends share one host implementation, like phase 1.*
+- *`svm_verify::manifest_complete(m)` is the completeness bit: no `cap.call`
+  anywhere ⇒ the manifest is the complete egress surface. Reflection does not
+  affect the bit (discovery confers nothing without a dispatch).*
+- ***OQ5 resolved:** `cap.call` keeps its mnemonic and wire form — it simply
+  *is* the dynamic addressing mode. No rename, no migration churn.*
+- ***OQ4 resolved:** attach is serialized by the Host lock like every
+  capability dispatch; a concurrent `call.import` on the same slot observes
+  the old or the new binding atomically (the binding is copied out under the
+  lock — no torn read).*
+- *Format v4 required updating the five guest-side C emitters in
+  `demos/jit/*` (version byte + mode byte per import entry) — the "verified
+  bytes are executed bytes" principle applies to guest-emitted blobs too.*
+
+Still open from the phase-2 list: interface-grouped imports (`op` immediate +
+interface declarations, open question 3) and the JIT instance-context
+threading for import-bearing cache sharing.
 
 **Phase 3 — frontends.** `svm-wasm` de-threading (~73 handle-threading
 sites — the largest single item); `svm-llvm`; chibicc; `svm-posix` off

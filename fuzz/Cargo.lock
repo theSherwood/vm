@@ -636,6 +636,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-fs"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+]
+
+[[package]]
 name = "svm-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -734,6 +741,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "svm-encode",
+ "svm-fs",
  "svm-interp",
  "svm-ir",
  "svm-jit",

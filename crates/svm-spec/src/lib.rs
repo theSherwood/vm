@@ -1729,6 +1729,7 @@ pub fn coverage(inst: &Inst) -> Class {
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } | Inst::DurableShadowBase => Class::Control,
         Inst::CapCall { .. }
         | Inst::CallImport { .. }
+        | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }

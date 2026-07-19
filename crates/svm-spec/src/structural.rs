@@ -105,10 +105,11 @@ fn inst_row(id: &str, enc: Enc, params: Vec<ValType>, op: Inst, needs_mem: bool)
 
 /// Every remaining op, as a structural row. The tally (asserted by
 /// `structural_row_tally`): 7 memory/atomic (4 atomics + fence + 2 `v128` mem); 3 calls
-/// (`call`, `call_indirect`, `ref.func`); 6 host (`cap.call`, 4 `cap.self.*`,
-/// `call_import`); 7 concurrency; 6 misc control (`setjmp`/`longjmp`/`gc.roots`/2
-/// tls/`durable_shadow_base`); 7 terminators = **36 rows**, which with the 80 scalar +
-/// 70 float + 26 memory + SIMD rows homes all 86 `Inst` variants and 7 `Terminator`s.
+/// (`call`, `call_indirect`, `ref.func`); 7 host (`cap.call`, 4 `cap.self.*`,
+/// `call_import`, `import_attach`); 7 concurrency; 6 misc control
+/// (`setjmp`/`longjmp`/`gc.roots`/2 tls/`durable_shadow_base`); 7 terminators =
+/// **37 rows**, which with the 80 scalar + 70 float + 26 memory + SIMD rows homes all
+/// 87 `Inst` variants and 7 `Terminator`s.
 // Sequential `push`es (not a `vec![]` literal) so the `call`/`thread.spawn` rows can
 // name their intermediate callee `Func`s between pushes.
 #[allow(clippy::vec_init_then_push)]
@@ -313,6 +314,25 @@ pub fn struct_rows() -> Vec<StructRow> {
                 sig: ft_void.clone(),
                 handle: 0,
                 args: vec![],
+            },
+            false,
+            vec![],
+        ),
+    });
+
+    // Phase-2 `import.attach` (IMPORTS.md): like `call_import`, the row module carries no
+    // manifest, so the op fails verification (out-of-range import) — round-trip + byte pin
+    // only; the manifest-bearing accept/reject legs are `spec_verify` directed cases.
+    rows.push(StructRow {
+        id: "import_attach".into(),
+        encoding: Enc::Byte(0x63),
+        verifies: false,
+        is_term: false,
+        module: inst_module(
+            vec![i32t],
+            Inst::ImportAttach {
+                import: 0,
+                handle: 0,
             },
             false,
             vec![],
@@ -659,6 +679,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::RefFunc { .. }
         | Inst::CapCall { .. }
         | Inst::CallImport { .. }
+        | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
@@ -687,13 +708,15 @@ mod tests {
     #[test]
     fn structural_row_tally() {
         let rows = struct_rows();
-        assert_eq!(rows.len(), 36, "structural row count (update on new ops)");
+        assert_eq!(rows.len(), 37, "structural row count (update on new ops)");
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), rows.len(), "duplicate structural row id");
-        // Exactly one op is the un-verifiable pre-resolution import form.
-        assert_eq!(rows.iter().filter(|r| !r.verifies).count(), 1);
+        // Exactly two ops have manifest-less row modules that fail verification
+        // (`call_import` + `import_attach` — both valid only against a declared manifest,
+        // IMPORTS.md; the manifest-bearing accept legs live in `spec_verify`).
+        assert_eq!(rows.iter().filter(|r| !r.verifies).count(), 2);
         assert_eq!(rows.iter().filter(|r| r.is_term).count(), 7, "terminators");
     }
 

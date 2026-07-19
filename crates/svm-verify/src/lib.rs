@@ -103,6 +103,11 @@ pub enum VerifyError {
     /// Two [`Module::imports`] entries share a name — imports must be uniquely resolvable by the
     /// host's instantiation policy (IMPORTS.md phase 1), mirroring [`VerifyError::DuplicateExport`].
     DuplicateImport { import: u32 },
+    /// An [`Inst::ImportAttach`] targeted an import that is not declared
+    /// [`svm_ir::ImportMode::Rebindable`] (IMPORTS.md phase 2). `required` bindings are
+    /// immutable-per-instance by construction — that immutability is what makes them always legal
+    /// to devirtualize — so attaching to one is fail-closed here, statically.
+    AttachNotRebindable { func: u32, block: u32, import: u32 },
     /// A `gc.roots` carried a **constant** payload mask that clears more than the top byte (its
     /// low 56 bits are not all-ones). Such a mask could fold a canonical host pointer down into the
     /// guest window and leak host-address bits past the range filter (GC.md §3, §6). Only
@@ -173,6 +178,22 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         }
     }
     Ok(())
+}
+
+/// Whether `m`'s capability egress is **manifest-complete** (IMPORTS.md §2.2): the module contains
+/// no dynamic-mode capability dispatch (`cap.call` — dispatch on a runtime handle value), so the
+/// import manifest is the *complete* list of interfaces the module can ever drive. A statically
+/// checkable per-module property — tooling can report it, and a host policy may require it for
+/// high-assurance slots. Reflection (`cap.self.*`) is authority-neutral and does not affect the
+/// bit: discovering a handle confers nothing without a `cap.call` to drive it, which the bit
+/// catches. Modules needing open-world discovery (shells, plugin hosts) legitimately report
+/// `false` — their egress is bounded by grants instead (the ocap bound).
+pub fn manifest_complete(m: &Module) -> bool {
+    m.funcs.iter().all(|f| {
+        f.blocks
+            .iter()
+            .all(|b| !b.insts.iter().any(|i| matches!(i, Inst::CapCall { .. })))
+    })
 }
 
 fn verify_func(
@@ -339,6 +360,34 @@ fn verify_func(
                     }
                 }
                 types.extend_from_slice(&sig.results);
+                continue;
+            }
+            // Phase-2 `import.attach` (IMPORTS.md): the index must name a declared **rebindable**
+            // import (attaching to a `required` slot would break its immutability-per-instance);
+            // the handle operand is an ordinary forgeable `i32` (validity is the runtime's §3c
+            // check at attach). Appends the `i32` status.
+            if let Inst::ImportAttach { import, handle } = inst {
+                if imports.get(*import as usize).is_none() {
+                    return Err(VerifyError::UnresolvedImport {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                if imports[*import as usize].mode != svm_ir::ImportMode::Rebindable {
+                    return Err(VerifyError::AttachNotRebindable {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*handle, ValType::I32)?;
+                types.push(ValType::I32);
                 continue;
             }
             // §12 `cont.resume` appends two results `(status: i32, value: i64)`, so —
@@ -508,6 +557,8 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
             // Executable named import (IMPORTS.md phase 1): the verifier checked `sig` equals the
             // manifest's declared signature, so the self-describing copy is authoritative here.
             Inst::CallImport { sig, .. } => types.extend_from_slice(&sig.results),
+            // Phase-2 attach: one `i32` status.
+            Inst::ImportAttach { .. } => types.push(ValType::I32),
             // Everything else (single result, or `Store`/no result) goes through the shared
             // `check_inst` rules — the single source of truth for those types.
             _ => {
@@ -658,10 +709,10 @@ fn check_inst(
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
-        // §7 executable named imports append their results in the multi-result/call section of
-        // `verify_func` (manifest-checked there); unreachable here.
-        Inst::CallImport { .. } => {
-            unreachable!("CallImport handled before check_inst's value match")
+        // §7 executable named imports + phase-2 attach append their results in the
+        // multi-result/call section of `verify_func` (manifest-checked there); unreachable here.
+        Inst::CallImport { .. } | Inst::ImportAttach { .. } => {
+            unreachable!("CallImport/ImportAttach handled before check_inst's value match")
         }
         // §7 reflection appends its results in the multi-result section above; unreachable here.
         Inst::CapSelfCount

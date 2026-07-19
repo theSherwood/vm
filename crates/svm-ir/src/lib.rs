@@ -45,6 +45,15 @@ pub const CAP_SELF_TYPE_ID: u32 = u32::MAX;
 /// no handle ever carries it, and a table entry can never bind to it.
 pub const CAP_IMPORT_TYPE_ID: u32 = u32::MAX - 2;
 
+/// Reserved pseudo-`type_id` for **`import.attach`** (IMPORTS.md phase 2): rebinding a
+/// [`ImportMode::Rebindable`] import slot to a capability the domain already holds. Dispatched like
+/// [`CAP_IMPORT_TYPE_ID`] — the `op` carries the import index, the single argument the handle value
+/// to attach — and serviced host-side against the instantiation-time binding table: the handle must
+/// resolve **live** under the slot's declared interface `type_id` (mask + type + generation, §3c),
+/// then the slot's bound handle is swapped. Authority-neutral: it aliases a held capability into a
+/// named slot (no new grant-graph edge, the D37 argument). Returns `0` ok / `-errno`.
+pub const CAP_IMPORT_ATTACH_TYPE_ID: u32 = u32::MAX - 3;
+
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
 /// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
 /// raw bytes whose lane interpretation is per-op, never per-value.
@@ -1736,6 +1745,19 @@ pub enum Inst {
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
+    /// `import.attach` (IMPORTS.md phase 2): (re)bind **rebindable** import slot `import` to the
+    /// capability behind `handle` — an `i32` handle value the domain already holds (typically
+    /// discovered via `cap.self.get`/`resolve`). The handle must resolve live under the slot's
+    /// declared interface `type_id` (the §3c mask + type + generation check); on success the slot's
+    /// binding swaps and subsequent `call.import <import>` dispatch through it. Authority-neutral
+    /// (aliases a held capability into a named slot — no new grant-graph edge). The verifier checks
+    /// `import` is in range and names a [`ImportMode::Rebindable`] declaration — attaching to a
+    /// `Required` slot is a verify error, keeping required bindings immutable-per-instance. Result
+    /// is `i32`: `0` ok, `-errno` (wrong-type / dead handle) — a guest may probe and fall back.
+    ImportAttach {
+        import: u32,
+        handle: ValIdx,
+    },
     /// §7 capability **reflection** (`cap.self.count`): the number of capabilities the calling
     /// **domain** currently holds — the count of live entries in its own handle table. An
     /// always-available, read-only intrinsic (not a handle-gated `cap.call`): reflecting your own
@@ -2350,6 +2372,9 @@ impl Inst {
             | Inst::CallIndirect { .. }
             | Inst::CallImport { .. }
             | Inst::CapCall { .. } => fx(true, true, true, true),
+            // `import.attach` mutates host binding state (no guest-memory access, but ordering
+            // against every `call.import` matters) — conservative full clobber, like the calls.
+            Inst::ImportAttach { .. } => fx(true, true, true, true),
 
             // ---- Fibers, threads, and non-local control transfer. ----
             Inst::ContNew { .. } => fx(false, false, false, true), // allocates a fiber; runs nothing yet
@@ -3181,6 +3206,22 @@ pub struct SsaLoc {
 pub struct Import {
     pub name: String,
     pub sig: FuncType,
+    /// How the slot binds (IMPORTS.md phase 2): [`ImportMode::Required`] is bound fail-closed at
+    /// instantiation and immutable for the instance's lifetime; [`ImportMode::Rebindable`] is
+    /// declared and typed but may start empty and be (re)bound at runtime via
+    /// [`Inst::ImportAttach`]. Calling through an empty slot traps (`CapFault`).
+    pub mode: ImportMode,
+}
+
+/// A declared import's binding mode (IMPORTS.md §2.1). `Required` is the wasm-like default: a
+/// missing binding refuses instantiation, and the binding is immutable-per-instance (always legal
+/// to devirtualize). `Rebindable` supports the reflect-then-attach discovery pattern: the slot is
+/// declared with its interface up front, filled or re-filled at runtime with a held capability.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ImportMode {
+    #[default]
+    Required,
+    Rebindable,
 }
 
 /// A named function **export**: a `name` the host (or a linker) addresses a function by, mapping to
@@ -3654,10 +3695,12 @@ mod import_tests {
                 Import {
                     name: "write".into(),
                     sig: sig_write,
+                    mode: ImportMode::Required,
                 },
                 Import {
                     name: "exit".into(),
                     sig: sig_exit,
+                    mode: ImportMode::Required,
                 },
             ],
             exports: vec![],
