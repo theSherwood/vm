@@ -3418,6 +3418,12 @@ impl CompiledModule {
         if let Some(p) = prev_rt {
             fiber_rt::set_current(p);
         }
+        // S1c: join every async §14 child OS thread before freeing the window — a child copies to/from
+        // the parent window, so none may outlive it (mirrors the vCPU `join_all` just below).
+        #[cfg(fiber_rt)]
+        if let Some(n) = &(*this)._nursery {
+            n.join_children();
+        }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]
         if let Some(d) = &(*this).domain {
@@ -4042,6 +4048,29 @@ impl Drop for ChildCode {
         let _ = &self.module;
     }
 }
+
+// PROCESS.md S1c — a compiled child is shareable across OS threads. `ChildCode` is `!Send`/`!Sync`
+// only because of the raw `code: *const u8`; it holds no interior mutability and, once
+// `finalize_definitions` has run (before it is ever stored), the code arena and `fn_table` are
+// **immutable, read-execute memory** — the entry trampoline reads them, never writes. So handing
+// `&ChildCode` (or an `Arc<ChildCode>`) to a spawned child thread and running the same code
+// concurrently on N threads is sound: every thread only reads the same finalized bytes and jumps into
+// them, and the single `OwnedJit` frees the arena once when the last `Arc` drops (after `join_all`, so
+// no thread still runs the code). This is the foundation the S1c OS-thread child executor stands on
+// (the per-carve cache below becomes `Arc`-backed to match).
+#[cfg(fiber_rt)]
+unsafe impl Send for ChildCode {}
+#[cfg(fiber_rt)]
+unsafe impl Sync for ChildCode {}
+
+// Compile-time proof that the child artifact stays thread-shareable — if a future field reintroduced a
+// `!Send`/`!Sync` type (e.g. an `Rc` or `Cell`) without a matching soundness review, this assertion
+// would fail to compile, catching the regression at the type level (the S1c executor relies on it).
+#[cfg(fiber_rt)]
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ChildCode>();
+};
 
 /// Compile a §14 child module: every function confined (top-level masking) to a fresh
 /// `2^child_size_log2`-byte window, `cap.call`s baked to `cap_thunk`/`cap_ctx`, and the entry
