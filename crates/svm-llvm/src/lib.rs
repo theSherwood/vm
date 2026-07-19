@@ -622,6 +622,7 @@ fn translate_impl(
             imports.push(svm_ir::Import {
                 name: "vm_map".to_string(),
                 sig: import_sig("vm_map"),
+                mode: svm_ir::ImportMode::Required,
             });
             i
         });
@@ -3190,6 +3191,7 @@ fn collect_cap_imports(
                         imports.push(svm_ir::Import {
                             name: import.to_string(),
                             sig: import_sig(import),
+                            mode: svm_ir::ImportMode::Required,
                         });
                         i
                     });
@@ -3243,6 +3245,7 @@ fn register_vm_memory_imports(
                         imports.push(svm_ir::Import {
                             name: import.to_string(),
                             sig: import_sig(import),
+                            mode: svm_ir::ImportMode::Required,
                         });
                         i
                     });
@@ -3290,6 +3293,7 @@ fn register_vm_io_imports(
                         imports.push(svm_ir::Import {
                             name: import.to_string(),
                             sig: import_sig(import),
+                            mode: svm_ir::ImportMode::Required,
                         });
                         i
                     });
@@ -3338,6 +3342,7 @@ fn register_vm_stream_imports(
                         imports.push(svm_ir::Import {
                             name: import.to_string(),
                             sig: import_sig(import),
+                            mode: svm_ir::ImportMode::Required,
                         });
                         i
                     });
@@ -3389,6 +3394,7 @@ fn register_vm_jit_imports(
                         imports.push(svm_ir::Import {
                             name: import.to_string(),
                             sig: import_sig(import),
+                            mode: svm_ir::ImportMode::Required,
                         });
                         i
                     });
@@ -3439,6 +3445,7 @@ fn register_vm_region_imports(
                         imports.push(svm_ir::Import {
                             name: import.to_string(),
                             sig: import_sig(import),
+                            mode: svm_ir::ImportMode::Required,
                         });
                         i
                     });
