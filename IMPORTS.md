@@ -210,6 +210,8 @@ exports) is §3.2.
 
 ### 2.5 What gets deleted (end state)
 
+The headline conventions:
+
 - The numeric `("42","7")` module/name convention in `svm-wasm`.
 - Handle threading as leading params of every transpiled function, the
   spawn-shim handle stash, and the powerbox window stash.
@@ -219,6 +221,50 @@ exports) is §3.2.
   which legitimately produces new module bytes (`link`, `compile_linked`).
   Instantiation never rewrites.
 - Re-verification at instantiation (verify once, at load/install).
+
+And the secondary machinery those conventions carried (the full obviation
+inventory — each entry exists only to work around the absence of
+slot-addressed imports):
+
+- **The synthesized bootstrap prologues**: the `synth_powerbox_start` /
+  `synth_powerbox_start_for_imports` / `synth_powerbox_start_with_names`
+  family (svm-ir lib.rs:2700-2741) — generated `_start` wrappers that stash
+  positional handles or `cap.self.resolve` names at startup. A manifest
+  module needs no synthesized prologue: its slots are bound before entry.
+- **`powerbox_resolver` and `svm-posix::resolve_bound`** — the
+  `CapBound`-producing resolver wrappers (the "general-form powerbox"
+  S15 path). Superseded by slot binding in `grant_caps`.
+- **The positional entry-args ABI** for capability delivery: the
+  `slots: Vec<Value>` leading-`i32`-handle-arguments convention
+  (`grant_powerbox_prefix` positional delivery, the fixed §3e 8-slot entry
+  contract). Entry functions go back to taking only their real parameters.
+  (The *child* positional-args ABI migrates to the reserved-prefix child
+  manifest, §2.1.)
+- **`Inst::CallImport`'s `handle` operand** becomes vestigial in static
+  mode (the slot is the dispatch; no handle value is threaded). Retire the
+  field at the next wire-format bump — until then frontends emit a dummy
+  and backends ignore it (encode keeps round-tripping).
+- **Test/doc surface asserting the old world**: the
+  `resolved.imports.is_empty()` / imports-cleared assertions across
+  `svm-posix`, `svm-run/tests`, `svm/tests/dynlink*`, `svm-text`'s
+  `resolves_to_capcalls_and_clears_imports`, and the c_frontend/c_posix/
+  c_shell/powerbox_* test families that pin the stash/positional/by-name
+  bootstraps — flipped or deleted with their phase-3 frontend migrations;
+  DESIGN.md §7/§3a text, POWERBOX.md F7/S15, FRONTEND.md entry-convention
+  claims updated in phase 4.
+
+Deliberately **kept** (not obviated): `cap.self.count/get/resolve` and
+`register_cap_name` (discovery tier 3 and the name directory — §3.4);
+`grant_host_fn`/`grant_host_fn_region` (host-side capability definition);
+the handle table and every §3c use-site check (the mechanism everything
+above now routes through).
+
+**Completion gate for phase 4** — grep-clean checks, so "done" is checkable
+rather than asserted: no non-linker caller of `resolve_imports*`; no
+occurrence of `CapBound`, `patch_placeholder`, `SlotHandleNotConst`,
+`synth_powerbox_start`, `powerbox_resolver`, `resolve_bound`,
+`NAMED_IMPORT`, `handle_modules`, or `stash_base` outside the linker and
+this document's history; `svm-wasm` emits no leading handle params.
 
 ### 2.6 Security argument
 
@@ -322,10 +368,14 @@ browser build inherits support).
 `svm-posix`/`svm-run` child spawns adopt the reserved-prefix child manifest
 rule (§2.1).
 
-**Phase 4 — deletions** (§2.5): numeric convention, threading, stash,
-`CapBound` + `patch_placeholder`, instantiation-time `resolve_imports`
-(retreats to the linker); docs (`DESIGN.md` §3a/§7 deltas, POWERBOX.md F7
-update). Net-negative LOC.
+**Phase 4 — deletions**: the **full §2.5 inventory** — the five headline
+conventions *and* the secondary machinery (the `synth_powerbox_start*`
+family, `powerbox_resolver`/`resolve_bound`, the positional entry-args ABI,
+the vestigial `CallImport` handle operand at the next format bump, the
+imports-cleared test/doc assertions) — plus docs (`DESIGN.md` §3a/§7
+deltas, POWERBOX.md F7/S15, FRONTEND.md entry conventions). Net-negative
+LOC. **Exit criterion: the §2.5 grep-clean completion gate passes** — done
+is checked, not asserted.
 
 **The deletion phase is tracked work, not eventual cleanup.** The failure
 mode of this migration is not a wrong design; it is stalling at phase 1 and
