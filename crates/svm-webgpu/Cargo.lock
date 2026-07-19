@@ -1254,6 +1254,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-fs"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+]
+
+[[package]]
 name = "svm-interp"
 version = "0.0.0"
 dependencies = [
@@ -1307,11 +1314,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "svm-peval"
+name = "svm-opt"
 version = "0.0.0"
 dependencies = [
  "libm",
  "svm-ir",
+ "svm-verify",
+]
+
+[[package]]
+name = "svm-peval"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+ "svm-opt",
  "svm-verify",
 ]
 
@@ -1321,9 +1337,11 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "svm-encode",
+ "svm-fs",
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-opt",
  "svm-peval",
  "svm-text",
  "svm-verify",
