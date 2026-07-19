@@ -105,6 +105,43 @@ Import modes:
 There is deliberately **no `deferred`/`import.bind`** mode (a mid-run
 guest→instantiator upcall channel); see §5.2.
 
+**Slot-layout rules** (audit-verified, §7):
+
+- **Root modules: `import i` = slot `i` is already the tree's behavior.** The
+  name-bound path documents and implements exactly this — `NamedBinding` is
+  "slot `i` of the powerbox stash ↔ import `i`" (svm-run lib.rs:3477-3483),
+  `grant_caps` grants in import order on a fresh `Host` whose allocator is
+  first-free-slot, so slots `0..N` are guaranteed. This design formalizes
+  existing behavior rather than introducing new mechanism.
+- **Child modules: a reserved prefix.** `spawn_granted_child` /
+  `spawn_named_child` auto-grant `Instantiator` into slot 0 and
+  `AddressSpace` into slot 1 before any named grants (svm-interp
+  lib.rs:11294-11300, 11356-11367) — the same order the child entry already
+  receives them as args. A child manifest therefore treats these as
+  **implicit leading imports**: its named imports start at slot 2. This is
+  documented ABI, checked at wiring; "import i = slot i" is never applied
+  naively to child modules.
+- **Mem-hooks instrumentation is exclusive with manifest binding.** The
+  opt-in `with_mem_hooks` diagnostics path deliberately takes slot 0
+  ("hooks first", svm-run lib.rs:3884-3886). Under a manifest it is refused
+  (simplest; it is a diagnostics-only mode) — offsetting the manifest by the
+  hook-grant count is the fallback if refusing proves too restrictive.
+
+**The op selector — phase-1 scope decision** (audit finding, §7): today's
+data model is **one operation per import entry** — `Import { name, sig }`
+carries a single signature, and `Inst::CallImport` carries no `op` immediate
+(svm-ir lib.rs:1723). Phase 1 keeps exactly that: an import names one
+operation (`"fs.read"`, `"fs.open"`, … — the existing `default_cap_resolver`
+name shape), `call.import i` invokes it, and instantiation records the
+resolved `(type_id, op)` per slot as **per-instance binding state** beside
+the handle entry (cold + per-instance — the §1 rule; the dispatch reads it
+host-side). Interface-*grouped* imports (`import 0 "fs" : Fs` declaring an
+op list, invoked as `call.import 0.read`) require an `op` immediate on the
+static form plus manifest interface declarations — that lands with phase 2
+alongside open question 3 (the interned interface section), not phase 1.
+Examples elsewhere in this document use the interface-grouped surface as the
+end state.
+
 ### 2.2 One call convention, two addressing modes
 
 `cap.call` disappears as a guest-facing concept. All capability invocation is
@@ -201,22 +238,96 @@ exports) is §3.2.
   exclusively by its parent from things the parent holds; everything
   terminates in root-host grants (D19 generalized).
 
-### 2.7 Migration plan
+### 2.7 Implementation plan
 
-Phased, each phase a PR ≤ 1000 LOC, differential tests as the net:
+Phased, each phase 1–2 PRs ≤ 1000 LOC, differential tests as the net. The
+pre-phase-1 audits have been **run** (findings in §7); the file-level items
+below incorporate them.
 
-| Phase | Content | Notes |
-|---|---|---|
-| 1 | Executable `call.import` (static mode) in verifier + tree-walker + bytecode + JIT; instantiation-time binding + sig validation; `import.handle`; spec vectors + fuzz | Additive; old paths keep working. `CallImport` already exists in IR/encode/text/verify (as fail-closed reject — flip the arm). Bytecode debug engines inherit via the shared per-op driver; add a `cap_stops` arm + one debug test. **Invariant: `jit_instantiate_cache`/`jit_lifecycle` cache-hit assertions keep passing.** |
-| 2 | Dynamic mode (recast `cap.call` as it); `rebindable` + `import.attach`; manifest-completeness bit | |
-| 3 | Migrate frontends: `svm-wasm` de-threading (the big one, ~73 sites), `svm-llvm`, chibicc, `svm-posix` off `CapBound` | Each independent |
-| 4 | Deletions (§2.5); shrink `resolve_imports` into the linker; docs (`DESIGN.md` §3a/§7 deltas) | Net-negative LOC |
+**Phase 1 — executable `call.import` (static, one-op-per-import). Additive;
+every legacy path keeps working.**
 
-Pre-phase-1 audits: (a) `svm-wasmjit`/browser and DURABILITY for baked-in
-"backends never see imports" assumptions; (b) powerbox-prefix slot ordering vs
-the snapshot format's `DurableHandle` classification (slot order becomes ABI).
+- `svm-ir`: **no changes required.** `Inst::CallImport` already carries
+  `import`/`sig`/`handle`/`args` (lib.rs:1723); `Effects` already classifies
+  it as a full clobber identical to `CapCall` (lib.rs:2339-2342).
+- `svm-encode` / `svm-text`: **no changes required.** Both already round-trip
+  `Module.imports` and `CallImport` with tests (encode lib.rs:322-331,
+  506-518, 1558-1566, 1888-1896; text lib.rs:66-73, 393-398, 1141-1153,
+  1841-1878, `imports_round_trip`).
+- `svm-verify`: thread `imports: &[Import]` into `verify_func` (one-argument
+  change mirroring the existing `&funcs` thread-through, lib.rs:142/161).
+  Flip the reject arm (lib.rs:275) to: `import < imports.len()`,
+  `sig == imports[import].sig`, then the arg-count/arg-type/result checks
+  copied from the `CapCall` arm (lib.rs:245-271). Flip the two
+  "unreachable" arms (lib.rs:446, 597). Add manifest validation to
+  `verify_module` (which today never inspects `m.imports` at all): unique
+  names, well-formed sigs.
+- `svm-interp` tree-walker: a `CallImport` arm beside the generic `CapCall`
+  arm (lib.rs:6914-6934) — resolve table slot `import` (a `resolve_slot`
+  sibling of `resolve`, lib.rs:11232) + the per-slot `(type_id, op)` binding
+  record, then the existing `cap_dispatch_slots` tail. Flip `eval_inst`'s
+  `Trap::Malformed` arm (lib.rs:7782). One-line `cap_stops` arm
+  (lib.rs:414-423) so the debugger stops on it like `CapCall`.
+- `svm-interp` bytecode: `Op::CallImport` variant (ops are a Rust enum,
+  bytecode.rs:66 — no opcode-space concern), a `compile_inst` arm mirroring
+  the generic `Op::CapCall` lowering (bytecode.rs:1217, replacing the
+  `return None` reject at :1321), one exec arm beside :7856. Debug engines
+  (`DebugRun`/`ScheduledDebugRun`/`debug_advance_fiber`) inherit it through
+  the shared `Vm` op driver — audited: they classify only scheduler-seam
+  outcomes, not inline ops. One debug test pinning that.
+- `svm-jit`: a lowering arm reusing `lower_cap_call`'s thunk call
+  (lib.rs:6945-6977) with `(type_id, op)` from the instantiation binding as
+  immediates and the handle resolved from slot `import`; remove `CallImport`
+  from the support-gate catch-all (lib.rs:4567). Baking `(type_id, op)` is
+  phase-1-correct: the child compile cache only caches **empty-powerbox**
+  children today (lib.rs:4252-4273), so import-bearing modules are not the
+  cached case and the `jit_instantiate_cache`/`jit_lifecycle` cache-hit
+  assertions keep passing (audited). Cache sharing *for import-bearing
+  modules* arrives when the binding table is threaded (phase 2+, the
+  instance-context consolidation of §1).
+- `svm-run`: bind in `Instance::grant_caps` (lib.rs:3884-3919) — it already
+  iterates imports in declared order on a fresh Host; redirect from
+  rewrite/positional-args to slot-filling + recording `(type_id, op)` per
+  slot. `resolve_capability_imports` stays as the legacy path (its
+  `imports.is_empty()` early-return already makes it a no-op for migrated
+  callers). Refuse `with_mem_hooks` + manifest (slot-layout rule, §2.1).
+- `svm-spec` + fuzz: vectors for the new verifier arms (valid/invalid import
+  idx, sig mismatch, manifest dup names); extend verifier fuzzing to
+  manifest-bearing modules.
+- `svm-snapshot`/`svm-durable`: **no changes required** (audited: restore
+  pins exact `(slot, generation)` via `grant_at`, DURABILITY.md §12.5
+  declares slot stability as an invariant). Document the one non-guarantee:
+  an empty `rebindable` slot's generation resets across restore (capture
+  skips empty slots, lib.rs:10479) — slot ABI unaffected, only a stale
+  packed handle value for a previously-attached-then-detached rebindable
+  slot loses D37 protection across a freeze.
 
-**The deletion phases are tracked work, not eventual cleanup.** The failure
+**Phase 2 — dynamic mode + rebindable + completeness bit.** Recast `cap.call`
+as the dynamic addressing mode (wire mnemonic decision = open question 5);
+`rebindable` mode + `import.attach` (+ attach ordering under §12 threads,
+open question 4); the verifier's manifest-completeness bit; optionally
+interface-grouped imports (`op` immediate + interface declarations, open
+question 3) and the JIT instance-context threading for import-bearing cache
+sharing.
+
+**Phase 3 — frontends.** `svm-wasm` de-threading (~73 handle-threading
+sites — the largest single item); `svm-llvm`; chibicc; `svm-posix` off
+`CapBound`. `svm-wasmjit`: extend `outline_cap_calls` (lib.rs:1138-1181) to
+also outline `CallImport` — its tierability classifier already lists it as a
+host-boundary op (lib.rs:947-949) — and relax the `emit_module` import-free
+assertion (lib.rs:1352-1353) to "no `CallImport` call-site survives in an
+*emitted* function" (permit the manifest; capability dispatch already
+bounces to the interpreter tier, which phase 1 made import-capable, so the
+browser build inherits support).
+`svm-posix`/`svm-run` child spawns adopt the reserved-prefix child manifest
+rule (§2.1).
+
+**Phase 4 — deletions** (§2.5): numeric convention, threading, stash,
+`CapBound` + `patch_placeholder`, instantiation-time `resolve_imports`
+(retreats to the linker); docs (`DESIGN.md` §3a/§7 deltas, POWERBOX.md F7
+update). Net-negative LOC.
+
+**The deletion phase is tracked work, not eventual cleanup.** The failure
 mode of this migration is not a wrong design; it is stalling at phase 1 and
 leaving the tree with five conventions instead of four.
 
@@ -399,14 +510,46 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
 
 ## 6. Open questions
 
-1. Powerbox-prefix slot ordering vs the durable-snapshot handle format —
-   confirm slot order can be ABI (pre-phase-1 audit).
-2. Does anything in `svm-wasmjit`/browser assume import-free modules
-   post-load? (pre-phase-1 audit)
+1. ~~Powerbox-prefix slot ordering vs the durable-snapshot handle format~~ —
+   **RESOLVED (audit, §7): slot order is already stable ABI.** Restore
+   re-grants via `grant_at(slot, generation, …)` into the exact captured
+   slot; DURABILITY.md §12.5 pins "reinstate the same `(slot, generation)`"
+   as a hard invariant; the snapshot roundtrip test proves guest-held packed
+   handle values survive restore.
+2. ~~Does anything in `svm-wasmjit`/browser assume import-free modules
+   post-load?~~ — **RESOLVED (audit, §7): yes, one site** — `emit_module`
+   hard-rejects non-empty imports (svm-wasmjit lib.rs:1352-1353). Fix scoped
+   in phase 3; the browser adds no independent assumption (its `env.*` wasm
+   imports are unrelated to SVM capability imports, and capability dispatch
+   bounces to the interpreter tier).
 3. Wire format for the manifest's interface declarations: reuse the inline
    `FuncType` list per import (status quo shape) vs an interned interface
-   section (§13's deferred idea — phase 2 may want it for op-schema checks).
-4. `import.attach` concurrency semantics under §12 threads (per-domain table
-   already atomic per D59; specify attach's ordering guarantee).
+   section (§13's deferred idea). Phase 2 wants this for interface-grouped
+   imports (the `op`-immediate form, §2.1) and op-schema checks.
+4. `import.attach` concurrency semantics under §12 threads (the table is
+   `Arc<Mutex<Host>>` shared across vCPUs — audited — so attach is
+   serialized; specify the ordering guarantee observed by concurrent
+   `call.import` on the same slot).
 5. Whether dynamic mode keeps the `cap.call` mnemonic on the wire for
    compatibility during migration, or renames at a format bump.
+6. Snapshot digest wiring once the rewrite is removed: freeze/restore must be
+   handed the same manifest-carrying module on both sides (the existing
+   digest gate enforces this; a doc/wiring note, not a codec change — the
+   digest becomes per-module instead of per-instantiation, a strict
+   improvement).
+
+---
+
+## 7. Tree-audit record (2026-07-19)
+
+Four parallel audits against the tree at `0c1a7c4` (post-#392/#398) verified
+the §2 design before the implementation plan above was finalized. Verdict:
+**no architectural obstacle; small, mechanical adaptations only.** Key
+findings, with the §2 deltas they forced:
+
+| Track | Verdict | Load-bearing findings |
+|---|---|---|
+| Verifier / encode / text / load pipeline | Works; small adaptations | `verify_func` lacks `imports` in scope — one-arg thread-through (mirrors `&funcs`). Encode + text already round-trip manifests and `call.import`, tested. `verify_module` never inspects `m.imports` today (manifest itself unchecked — phase 1 adds validation). `grant_caps` already grants in import order = the natural binding hook. |
+| Runtime dispatch (interp, bytecode, JIT, wasmjit, opt/peval) | Thin adapters everywhere | Effects model + svm-opt already treat `CallImport` identically to `CapCall`; svm-peval is effects-generic. Bytecode debug engines inherit new ops via the shared `Vm` driver. JIT: bake `(type_id,op)` phase-1 (cache unaffected — only empty-powerbox children are cached today); thread the binding for cache sharing later. **Design gap caught: `CallImport` has no `op` immediate → phase 1 is one-op-per-import (§2.1).** |
+| Handle table / prefix | Works; one real landmine, fixed in §2.1 | Root path already implements "import i = slot i" (`NamedBinding`). The DESIGN.md "first handle 0 vs 1" divergence is the *fiber* registry (separate table, already unified, D57) — false alarm for imports. **Real landmine: child auto-grants occupy slots 0/1 → reserved-prefix child manifest rule (§2.1).** `with_mem_hooks` steals slot 0 → exclusive with manifests (§2.1). Table is `Arc<Mutex<Host>>` across vCPUs — slot reads thread-safe. |
+| Durability / snapshots | Works as-is | Slot indices already stable ABI (`grant_at` pins `(slot, generation)`; DURABILITY.md §12.5 invariant; roundtrip test). Digest currently over post-rewrite bytes — removing the rewrite makes it per-module (improvement). Non-guarantee documented: empty `rebindable` slots reset generation across restore. |
