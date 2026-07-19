@@ -415,6 +415,63 @@ fn directed_rule_rejects() {
         matches!(e, VerifyError::UnresolvedImport { .. })
     });
 
+    // §7 / IMPORTS.md phase 1 — the manifest-bearing legs. A `call.import` whose index names a
+    // declared import with a matching sig is VALID (executable, no rewrite); a sig disagreement
+    // and a duplicate manifest name are each rejected, by both verifiers.
+    let import_call = |sig: FuncType| {
+        func(
+            vec![],
+            vec![],
+            vec![
+                Inst::ConstI32(0), // vestigial handle operand (IMPORTS.md §2.5)
+                Inst::CallImport {
+                    import: 0,
+                    sig,
+                    handle: 0,
+                    args: vec![],
+                },
+            ],
+            T::Return(vec![]),
+        )
+    };
+    let unit_sig = FuncType {
+        params: vec![],
+        results: vec![],
+    };
+    let mut m = module(vec![import_call(unit_sig.clone())]);
+    m.imports = vec![svm_ir::Import {
+        name: "ping".into(),
+        sig: unit_sig.clone(),
+    }];
+    accept(&m, "manifest-bearing call.import");
+    // Same module, call-site sig disagrees with the manifest's declaration.
+    let mut m = module(vec![import_call(FuncType {
+        params: vec![],
+        results: vec![V::I32],
+    })]);
+    m.imports = vec![svm_ir::Import {
+        name: "ping".into(),
+        sig: unit_sig.clone(),
+    }];
+    reject(&m, "import sig mismatch", |e| {
+        matches!(e, VerifyError::ImportSigMismatch { .. })
+    });
+    // Two manifest entries sharing a name.
+    let mut m = module(vec![import_call(unit_sig.clone())]);
+    m.imports = vec![
+        svm_ir::Import {
+            name: "ping".into(),
+            sig: unit_sig.clone(),
+        },
+        svm_ir::Import {
+            name: "ping".into(),
+            sig: unit_sig,
+        },
+    ];
+    reject(&m, "duplicate import name", |e| {
+        matches!(e, VerifyError::DuplicateImport { .. })
+    });
+
     // GC.md: a constant gc.roots mask may only clear the top byte.
     let mut m = module(vec![func(
         vec![V::I64],

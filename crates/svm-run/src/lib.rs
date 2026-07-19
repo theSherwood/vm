@@ -3606,21 +3606,42 @@ pub fn instantiate(module: Module) -> Result<Instance, String> {
 /// untouched by the prepend). Fails closed if an imported name has no binding in `imports`, or the
 /// resolved module fails verification.
 pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Instance, String> {
-    // Capture the import order *before* resolving (which clears the table). Slot i ↔ import i.
+    // Capture the import order. Slot i ↔ import i (the powerbox-prefix layout, IMPORTS.md §2.1).
     let order: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
-    // Resolve every name through the registry; an unbound name is fail-closed (no silent no-op).
+    // Every name must be bound in the registry — fail-closed before anything else (no silent no-op).
+    for name in &order {
+        if !imports.map.contains_key(name) {
+            return Err(format!(
+                "unbound capability import `{name}` (no binding in the host registry)"
+            ));
+        }
+    }
+    // IMPORTS.md phase 1 — the **no-rewrite** path: when every import binds to a
+    // generic-dispatch interface, keep the module's bytes exactly as verified (the manifest
+    // stays; `call.import` executes through the instantiation-time binding table each run
+    // installs). The module is content-addressable across instantiations — the §1 motivation.
+    if order
+        .iter()
+        .all(|n| generic_dispatch_iface(imports.map[n].type_id))
+    {
+        svm_verify::verify_module(&module)
+            .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
+        return Ok(Instance {
+            module,
+            binding: Some(NamedBinding { imports, order }),
+            hooks: None,
+        });
+    }
+    // Legacy rewrite fallback: an import bound to an executor-dispatch interface (Instantiator,
+    // JIT, …) still lowers to inline `cap.call`s, which the backends' specialized arms service.
+    // Slot-binding those interfaces is phase-2 work (IMPORTS.md §2.7).
     let resolved = svm_ir::resolve_imports(&module, |name| {
         imports.map.get(name).map(|c| svm_ir::ResolvedCap {
             type_id: c.type_id,
             op: c.op,
         })
     })
-    .map_err(|e| match e {
-        svm_ir::ImportError::Unresolved(n) => {
-            format!("unbound capability import `{n}` (no binding in the host registry)")
-        }
-        other => format!("resolve imports: {other:?}"),
-    })?;
+    .map_err(|e| format!("resolve imports: {e:?}"))?;
     svm_verify::verify_module(&resolved)
         .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
     Ok(Instance {
@@ -3628,6 +3649,18 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
         binding: Some(NamedBinding { imports, order }),
         hooks: None,
     })
+}
+
+/// Whether `type_id` is serviced entirely by the host's **generic** capability dispatch
+/// (`Host::cap_dispatch_slots`) — the IMPORTS.md phase-1 slot-binding precondition. The executor
+/// capability variants (`Instantiator`, `Yielder`, guest-`Jit` invoke/install, `SharedRegion`
+/// grant) are special-cased in each backend's eval/compile loop and cannot yet be reached through
+/// the import-binding translation; imports naming them fall back to the legacy rewrite.
+fn generic_dispatch_iface(type_id: u32) -> bool {
+    matches!(
+        type_id,
+        iface::STREAM | iface::EXIT | iface::CLOCK | iface::MEMORY | iface::HOST_FN
+    )
 }
 
 impl Instance {
@@ -3656,6 +3689,17 @@ impl Instance {
         self,
         make: impl Fn() -> MemHookFn + Send + Sync + 'static,
     ) -> Result<Instance, String> {
+        // IMPORTS.md §2.1 slot-layout rule: the hook capability deliberately takes slot 0 (the
+        // first grant), which a manifest-carrying (no-rewrite) instance reserves for import 0 —
+        // the two are exclusive. Refused fail-closed; hooks remain available on legacy resolved
+        // instances (whose manifest is empty).
+        if !self.module.imports.is_empty() {
+            return Err(
+                "mem hooks are exclusive with a manifest-carrying instance (the hook grant \
+                 would occupy import slot 0 — IMPORTS.md §2.1)"
+                    .into(),
+            );
+        }
         // Discover the handle the hook grant will mint: grants are deterministic and `grant_caps`
         // grants the hook first on each run's fresh Host, so a scratch first-grant yields exactly
         // the value the instrumented code must bake in as its `cap.call` handle constant.
@@ -3899,12 +3943,26 @@ impl Instance {
                     .first()
                     .is_some_and(|f| f.params.is_empty());
                 let mut args = Vec::new();
+                let mut bindings = Vec::with_capacity(b.order.len());
                 for name in &b.order {
-                    let handle = (b.imports.map[name].grant)(h, win);
+                    let cap = &b.imports.map[name];
+                    let handle = (cap.grant)(h, win);
                     h.register_cap_name(name, handle);
+                    bindings.push(svm_interp::BoundImport {
+                        type_id: cap.type_id,
+                        op: cap.op,
+                        handle,
+                    });
                     if !paramless {
                         args.push(Value::I32(handle));
                     }
+                }
+                // IMPORTS.md phase 1: a manifest-carrying (no-rewrite) instance executes its
+                // `call.import`s through this instantiation-time binding table — entry `i` is
+                // import `i`'s resolved `(type_id, op)` + granted handle. A legacy resolved
+                // instance has an empty manifest, making this a harmless no-op table.
+                if !self.module.imports.is_empty() {
+                    h.set_import_bindings(bindings);
                 }
                 args
             }

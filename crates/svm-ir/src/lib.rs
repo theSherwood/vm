@@ -35,6 +35,16 @@ pub type FuncIdx = u32;
 /// intrinsic, since reflection is ambient/authority-neutral; `u32::MAX` collides with no interface.)
 pub const CAP_SELF_TYPE_ID: u32 = u32::MAX;
 
+/// Reserved pseudo-`type_id` for **executable named imports** (IMPORTS.md phase 1). A verified
+/// [`Inst::CallImport`] dispatches as a host `cap.call` with this `type_id` and the **import index**
+/// as the `op`; the host translates it through the domain's instantiation-time import-binding table
+/// (import `i` → the bound `(type_id, op)` + granted handle — the powerbox-prefix slot) and
+/// re-dispatches. Like [`CAP_SELF_TYPE_ID`], sharing one host entry point keeps the interpreter,
+/// bytecode engine, and JIT in lockstep over one implementation, and the module bytes are **never
+/// rewritten** (the `resolve_imports` lowering becomes a linker-only concern). Not a real capability:
+/// no handle ever carries it, and a table entry can never bind to it.
+pub const CAP_IMPORT_TYPE_ID: u32 = u32::MAX - 2;
+
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
 /// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
 /// raw bytes whose lane interpretation is per-op, never per-value.

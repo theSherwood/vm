@@ -35,8 +35,16 @@ pub fn verify(m: &Module) -> R {
             _ => return Err(format!("data segment {i} outside the window")),
         }
     }
+    // §7 / IMPORTS.md phase 1: import names must be uniquely resolvable (the instantiation
+    // policy binds by name), mirroring the export-name rule below.
+    for (i, imp) in m.imports.iter().enumerate() {
+        if m.imports[..i].iter().any(|o| o.name == imp.name) {
+            return Err(format!("duplicate import name {:?}", imp.name));
+        }
+    }
     for (fi, f) in m.funcs.iter().enumerate() {
-        verify_func(f, &m.funcs, m.memory.is_some()).map_err(|e| format!("fn{fi}: {e}"))?;
+        verify_func(f, &m.funcs, &m.imports, m.memory.is_some())
+            .map_err(|e| format!("fn{fi}: {e}"))?;
     }
     // Exports name real functions, uniquely.
     for (i, e) in m.exports.iter().enumerate() {
@@ -50,7 +58,7 @@ pub fn verify(m: &Module) -> R {
     Ok(())
 }
 
-fn verify_func(f: &Func, funcs: &[Func], has_memory: bool) -> R {
+fn verify_func(f: &Func, funcs: &[Func], imports: &[Import], has_memory: bool) -> R {
     // §3b rule 2: the entry block's params equal the function signature's params.
     match f.blocks.first() {
         Some(entry) if entry.params == f.params => {}
@@ -60,7 +68,7 @@ fn verify_func(f: &Func, funcs: &[Func], has_memory: bool) -> R {
     for b in &f.blocks {
         let mut types: Vec<ValType> = b.params.clone();
         for inst in &b.insts {
-            check_inst(inst, &mut types, funcs, has_memory, b, &fn_results)?;
+            check_inst(inst, &mut types, funcs, imports, has_memory, b, &fn_results)?;
         }
         check_term(&b.term, &types, f, funcs)?;
     }
@@ -94,6 +102,7 @@ fn check_inst(
     inst: &Inst,
     types: &mut Vec<ValType>,
     funcs: &[Func],
+    imports: &[Import],
     has_memory: bool,
     block: &Block,
     fn_results: &[usize],
@@ -306,8 +315,28 @@ fn check_inst(
             check_args(types, args, &sig.params)?;
             sig.results.clone()
         }
-        // §7: named imports must be resolved away before verification — fail closed.
-        Inst::CallImport { .. } => return Err("unresolved import".into()),
+        // §7 / IMPORTS.md phase 1: a `call.import` is executable when its index names a declared
+        // import and its self-describing sig equals the manifest's (the canonical interface);
+        // out-of-range (including the empty-manifest legacy shape) or a sig disagreement is
+        // fail-closed. Operand typing mirrors `cap.call` (handle i32 + args per sig).
+        Inst::CallImport {
+            import,
+            sig,
+            handle,
+            args,
+        } => {
+            let Some(decl) = imports.get(*import as usize) else {
+                return Err(format!(
+                    "unresolved import {import} (out of manifest range)"
+                ));
+            };
+            if decl.sig != *sig {
+                return Err(format!("import {import} signature mismatch with manifest"));
+            }
+            w(*handle, V::I32)?;
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
+        }
         Inst::CapSelfCount => vec![V::I32],
         Inst::CapSelfAttest => vec![V::I32],
         Inst::CapSelfGet { idx } => {

@@ -418,6 +418,13 @@ impl DebugShared {
                 type_id: *type_id,
                 op: *op,
             }),
+            // An executable `call.import` (IMPORTS.md phase 1) is a capability boundary too;
+            // reported under the reserved import-dispatch type_id with the import index as the op
+            // (the concrete binding is instantiation state, not visible at this layer).
+            Inst::CallImport { import, .. } if self.cap_stops => Some(StopReason::CapCall {
+                type_id: svm_ir::CAP_IMPORT_TYPE_ID,
+                op: *import,
+            }),
             _ => None,
         }
     }
@@ -6936,6 +6943,28 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
                 }
+                // §7 executable named import (IMPORTS.md phase 1): dispatch through the reserved
+                // [`svm_ir::CAP_IMPORT_TYPE_ID`] with the import index as the op — the host
+                // translates it via the domain's instantiation-time binding table (import `i` →
+                // bound `(type_id, op)` + granted handle) and re-dispatches. The module is never
+                // rewritten; the handle operand is vestigial (the binding carries the handle), so
+                // it is not read. Same shared host entry as the JIT thunk and the bytecode engine,
+                // so all three backends agree over one implementation.
+                Inst::CallImport {
+                    import, sig, args, ..
+                } => {
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args {
+                        argv.push(get(&frames[top].vals, *a)?.i64());
+                    }
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results =
+                        hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                    for (s, ty) in results.iter().zip(&sig.results) {
+                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                    }
+                }
                 // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
                 // through `self_dispatch` (op 0) — the same path the JIT's thunk takes, so they agree.
                 Inst::CapSelfCount => {
@@ -7777,8 +7806,8 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         }
         Inst::ConstI32(c) => Reg::from_i32(*c),
         Inst::ConstI64(c) => Reg::from_i64(*c),
-        // §7 named imports must be lowered to `cap.call` by `resolve_imports` before
-        // execution; a stray `CallImport` is fail-closed (it carries no `type_id`/`op`).
+        // §7 executable named imports need the host's import-binding table, so they're serviced
+        // in the eval loop (like `cap.call`), never in this pure-op helper.
         Inst::CallImport { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
@@ -9958,6 +9987,23 @@ pub struct Host {
     /// (`svm_run`); empty for a bare `Host` (resolution then finds nothing — fail-closed). First match
     /// wins on a duplicate name. A side table only — it never affects handle values or grant order.
     cap_names: Vec<(String, i32)>,
+    /// §7 / IMPORTS.md phase 1: the **import-binding table** — entry `i` is the instantiation-time
+    /// resolution of the module's import `i` ([`Host::set_import_bindings`]). Read by the
+    /// [`svm_ir::CAP_IMPORT_TYPE_ID`] translation in [`Host::cap_dispatch_slots`], the one shared
+    /// entry all three backends dispatch executable `call.import`s through. Empty for a module with
+    /// no imports (or a legacy resolved one) — an executable `call.import` then `CapFault`s.
+    import_bindings: Vec<BoundImport>,
+}
+
+/// One instantiation-time import binding (§7 / IMPORTS.md phase 1): the `(type_id, op)` the host's
+/// policy resolved an import name to, plus the **granted handle** for its powerbox-prefix slot.
+/// Installed by [`Host::set_import_bindings`]; consumed by the [`svm_ir::CAP_IMPORT_TYPE_ID`]
+/// dispatch translation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BoundImport {
+    pub type_id: u32,
+    pub op: u32,
+    pub handle: i32,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -10104,7 +10150,23 @@ impl Host {
             frozen_nested: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
+            import_bindings: Vec::new(),
         }
+    }
+
+    /// Install this domain's **import-binding table** (§7 / IMPORTS.md phase 1): entry `i` is the
+    /// instantiation-time resolution of the module's import `i` — the bound `(type_id, op)` plus the
+    /// granted handle. An executable [`svm_ir::CAP_IMPORT_TYPE_ID`] dispatch translates through it,
+    /// so a `call.import` runs without the module ever being rewritten. Host-controlled only (the
+    /// guest cannot reach this); an unbound index is a `CapFault` at use, fail-closed.
+    pub fn set_import_bindings(&mut self, bindings: Vec<BoundImport>) {
+        debug_assert!(
+            bindings
+                .iter()
+                .all(|b| b.type_id != svm_ir::CAP_IMPORT_TYPE_ID),
+            "an import binding can never target the import-dispatch pseudo-type_id"
+        );
+        self.import_bindings = bindings;
     }
 
     /// Mark this domain **durable**: its module has been freeze/thaw-instrumented, so the runtime
@@ -11411,6 +11473,24 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        // §7 executable named import (IMPORTS.md phase 1): the reserved pseudo-`type_id` carries the
+        // **import index** in `op`; translate it through the instantiation-time binding table to the
+        // bound `(type_id, op, granted handle)` and fall through to the ordinary flow. Translating
+        // *before* the record/replay gate below means a taped `call.import` records exactly what the
+        // equivalent resolved `cap.call` would — replay parity across the two forms. An unbound
+        // index (no manifest binding installed) is a `CapFault`, fail-closed. The guest-supplied
+        // handle argument is ignored: the binding carries the granted handle (the operand is
+        // vestigial in static dispatch — IMPORTS.md §2.5).
+        let (type_id, op, handle) = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+            let b = self
+                .import_bindings
+                .get(op as usize)
+                .copied()
+                .ok_or(Trap::CapFault)?;
+            (b.type_id, b.op, b.handle)
+        } else {
+            (type_id, op, handle)
+        };
         // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
         // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
         if is_recorded_input(type_id, op) {

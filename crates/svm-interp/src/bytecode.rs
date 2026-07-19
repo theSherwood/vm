@@ -1318,7 +1318,25 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             cap: g(*cap),
             dst,
         },
-        Inst::CallImport { .. } => return None,
+        // §7 executable named import (IMPORTS.md phase 1): lower to the **generic** cap dispatch
+        // with the reserved [`svm_ir::CAP_IMPORT_TYPE_ID`] and the import index as the op — the
+        // host's dispatch translates it through the instantiation-time binding table, exactly as
+        // the tree-walker and the JIT thunk do (one shared implementation, three backends in
+        // lockstep). The handle operand is vestigial (the binding carries the granted handle) but
+        // still a live register; pass it like `cap.call`'s — the dispatch ignores it.
+        Inst::CallImport {
+            import,
+            sig,
+            handle,
+            args,
+        } => Op::CapCall {
+            type_id: svm_ir::CAP_IMPORT_TYPE_ID,
+            op: *import,
+            handle: g(*handle),
+            args: args.iter().map(|a| g(*a)).collect(),
+            dst,
+            results: sig.results.clone().into(),
+        },
         // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
         // context), so it gets a dedicated op rather than the `Eval` fallback.
         Inst::DurableShadowBase => Op::DurableShadowBase { dst },

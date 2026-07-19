@@ -4461,6 +4461,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Call { .. }
                 | Inst::CallIndirect { .. }
                 | Inst::CapCall { .. }
+                | Inst::CallImport { .. }
                 | Inst::RefFunc { .. }
                 | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
@@ -5235,6 +5236,32 @@ fn lower_block(
                 lower_cap_call(module, b, lower, *type_id, *op, sig, h, args, &mut vals)?;
             }
             ubs.resize(vals.len(), UB_TOP); // cap-call results are unknown
+            continue;
+        }
+        // §7 executable named import (IMPORTS.md phase 1): lower like the `cap.self.*` family — a
+        // `cap.call` thunk with the reserved `CAP_IMPORT_TYPE_ID` and the **import index** as the
+        // op. The host's dispatch translates it through the instantiation-time binding table
+        // (import `i` → bound `(type_id, op)` + granted handle) and re-dispatches — one shared
+        // implementation with the interpreter and the bytecode engine. The vestigial handle operand
+        // is not read (constant 0, like `cap.self.*`); the module bytes are never rewritten, so the
+        // compiled code is identical across instantiations (the binding is host-side state).
+        if let Inst::CallImport {
+            import, sig, args, ..
+        } = inst
+        {
+            let h0 = b.ins().iconst(I32, 0);
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_IMPORT_TYPE_ID,
+                *import,
+                sig,
+                h0,
+                args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §7/§6 capability reflection: lower to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`
