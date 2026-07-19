@@ -1799,8 +1799,14 @@ fn fetch_quickjs() -> Option<PathBuf> {
 }
 
 /// The openlibm sources QuickJS's `Math` object takes the address of beyond [`OPENLIBM_SRCS`]
-/// (the Postgres set) — inverse hyperbolics, `log1p`, `hypot`.
-const QUICKJS_OPENLIBM_EXTRA: &[&str] = &["s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot"];
+/// (the Postgres set) — inverse hyperbolics, `log1p`, `hypot`, and the rounding/sqrt set. The
+/// latter four only ever surface here: direct *calls* to `floor`/`ceil`/`trunc`/`sqrt` lower to
+/// SVM float ops (slice L), but the `Math` function table takes their *address*, which needs a
+/// real guest definition for the funcref table.
+const QUICKJS_OPENLIBM_EXTRA: &[&str] = &[
+    "s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot", "s_floor", "s_ceil", "s_trunc",
+    "e_sqrt",
+];
 
 /// **▶ QuickJS eval — the full-JS-engine breadth target. RUNS byte-identical to native.** Wires the
 /// whole differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the

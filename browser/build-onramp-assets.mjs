@@ -153,6 +153,7 @@ const OPENLIBM_SRCS = [
   'k_sin', 'k_cos', 'k_tan', 'e_rem_pio2', 'k_rem_pio2', 'e_asin', 'e_acos', 's_atan',
   'e_atan2', 'e_sinh', 'e_cosh', 's_tanh', 's_cbrt', 'e_fmod', 's_scalbn', 's_copysign',
   's_fabs', 'k_exp', 's_expm1', 's_asinh', 'e_acosh', 'e_atanh', 's_log1p', 'e_hypot',
+  's_floor', 's_ceil', 's_trunc', 'e_sqrt',
 ];
 function ensureQuickJS() {
   if (existsSync(join(QJS_DIR, 'quickjs.c'))) return true;
