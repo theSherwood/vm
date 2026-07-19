@@ -343,6 +343,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                             named_imports.push(svm_ir::Import {
                                 name,
                                 sig: sig.clone(),
+                                mode: svm_ir::ImportMode::Required,
                             });
                             imports.push((NAMED_IMPORT, idx, sig, slot));
                         }

@@ -78,7 +78,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 3); // format v3 (adds the export section after imports)
+  eb(buf, 4); // format v4 (v3 sections + the per-import binding-mode byte)
   eb(buf, 1);
   eb(buf, 16);
   eb(buf, 0);
@@ -121,11 +121,13 @@ static long emit_poly(char *buf) {
   eb(buf, 'u');
   eb(buf, 'l');
   emit_i64_pair_sig(buf);
+  eb(buf, 0); // mode: required (v4)
   eb(buf, 3); // "add"
   eb(buf, 'a');
   eb(buf, 'd');
   eb(buf, 'd');
   emit_i64_pair_sig(buf);
+  eb(buf, 0); // mode: required (v4)
   eb(buf, 0); // 0 exports (v3 export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);

@@ -93,6 +93,7 @@ mod op {
     pub const EXTEND_I32_S: u8 = 0x60;
     pub const EXTEND_I32_U: u8 = 0x61;
     pub const WRAP_I64: u8 = 0x62;
+    pub const IMPORT_ATTACH: u8 = 0x63; // v4: import idx, handle operand idx -> i32 status
 
     pub const SELECT: u8 = 0x70;
     pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
@@ -222,11 +223,14 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // runtime-`Module` analogue of a link unit's exports — so an embedder can `call("main")` by name.
 // The decoder accepts only the exact current `VERSION`, so the bump simply retires v2 readers; there
 // is no in-place v2 blob to stay compatible with.
+// v4 adds the per-import binding **mode** byte (`required`/`rebindable`, IMPORTS.md phase 2) and the
+// `import.attach` opcode — the reflect-then-attach discovery pattern over executable imports.
+// v3 adds the first-class **export section** (named function entry points: name + funcidx).
 // v2 adds the §7 import section (name + op signature per import) and the `call.import` opcode, so a
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -246,6 +250,8 @@ pub enum DecodeError {
     BadMemoryFlag(u8),
     /// A data segment's `readonly` flag byte was neither 0 nor 1.
     BadDataFlag(u8),
+    /// An import's binding-mode byte (v4) was neither 0 (required) nor 1 (rebindable).
+    BadImportMode(u8),
     /// An import name's length-prefixed bytes were not valid UTF-8.
     BadUtf8,
     /// Bytes remained after a complete module was decoded.
@@ -328,6 +334,11 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
         write_str(&mut out, &imp.name);
         write_types(&mut out, &imp.sig.params);
         write_types(&mut out, &imp.sig.results);
+        // v4: the binding mode (0 = required, 1 = rebindable — IMPORTS.md phase 2).
+        out.push(match imp.mode {
+            svm_ir::ImportMode::Required => 0,
+            svm_ir::ImportMode::Rebindable => 1,
+        });
     }
     // Export section (v3): count, then each export's `name` and target funcidx. Usually a handful
     // (the named entry points); empty for a bare kernel addressed only by index.
@@ -515,6 +526,13 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_types(out, &sig.results);
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
+        }
+        // `import.attach` (v4, IMPORTS.md phase 2): rebind a rebindable import slot to a held
+        // capability — import idx, then the handle value's operand index.
+        Inst::ImportAttach { import, handle } => {
+            out.push(op::IMPORT_ATTACH);
+            write_uleb(out, *import as u64);
+            write_uleb(out, *handle as u64);
         }
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
@@ -1563,7 +1581,13 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
             params: decode_types(&mut c)?,
             results: decode_types(&mut c)?,
         };
-        imports.push(Import { name, sig });
+        // v4: the binding mode byte (0 = required, 1 = rebindable); anything else fails closed.
+        let mode = match c.byte()? {
+            0 => svm_ir::ImportMode::Required,
+            1 => svm_ir::ImportMode::Rebindable,
+            b => return Err(DecodeError::BadImportMode(b)),
+        };
+        imports.push(Import { name, sig, mode });
     }
     // Export section (v3): mirrors the encoder. Grows on demand (the count is attacker-influenced).
     // Funcidx range + name uniqueness are the verifier's job, not the decoder's (it stays a pure,
@@ -1893,6 +1917,10 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             },
             handle: c.idx()?,
             args: decode_idxs(c)?,
+        },
+        op::IMPORT_ATTACH => Inst::ImportAttach {
+            import: c.idx()?,
+            handle: c.idx()?,
         },
         op::CAP_SELF_COUNT => Inst::CapSelfCount,
         op::CAP_SELF_ATTEST => Inst::CapSelfAttest,

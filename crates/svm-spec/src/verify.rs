@@ -337,6 +337,18 @@ fn check_inst(
             check_args(types, args, &sig.params)?;
             sig.results.clone()
         }
+        // Phase-2 `import.attach` (IMPORTS.md): the index must name a declared **rebindable**
+        // import; the handle operand is a forgeable i32 (validity is the runtime §3c check).
+        Inst::ImportAttach { import, handle } => {
+            let Some(decl) = imports.get(*import as usize) else {
+                return Err(format!("attach to unresolved import {import}"));
+            };
+            if decl.mode != ImportMode::Rebindable {
+                return Err(format!("attach to non-rebindable import {import}"));
+            }
+            w(*handle, V::I32)?;
+            vec![V::I32]
+        }
         Inst::CapSelfCount => vec![V::I32],
         Inst::CapSelfAttest => vec![V::I32],
         Inst::CapSelfGet { idx } => {

@@ -103,7 +103,7 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 'V');
   eb(&e, 'M');
   eb(&e, 0);
-  eb(&e, 3); // format v3 (adds the §7 import section + the export section below)
+  eb(&e, 4); // format v4 (v3 sections + the per-import binding-mode byte)
   // Memory descriptor: present, size_log2 16 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(&e, 1);

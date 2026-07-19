@@ -1337,6 +1337,16 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             dst,
             results: sig.results.clone().into(),
         },
+        // Phase-2 `import.attach` (IMPORTS.md): the attach sentinel with the handle value as the
+        // one argument — the same shared host entry as the tree-walker and the JIT.
+        Inst::ImportAttach { import, handle } => Op::CapCall {
+            type_id: svm_ir::CAP_IMPORT_ATTACH_TYPE_ID,
+            op: *import,
+            handle: g(*handle),
+            args: [g(*handle)].into(),
+            dst,
+            results: [ValType::I32].into(),
+        },
         // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
         // context), so it gets a dedicated op rather than the `Eval` fallback.
         Inst::DurableShadowBase => Op::DurableShadowBase { dst },

@@ -3342,6 +3342,10 @@ pub struct HostCap {
     type_id: u32,
     op: u32,
     grant: GrantFn,
+    /// Phase-2 (IMPORTS.md): a **template-only** capability for a `rebindable` import — declares
+    /// the slot's `(type_id, op)` interface but grants nothing at instantiation (the slot starts
+    /// empty; the guest fills it with `import.attach`). Built by [`HostCap::template`].
+    unbound: bool,
 }
 
 impl HostCap {
@@ -3351,6 +3355,7 @@ impl HostCap {
             type_id: iface::STREAM,
             op: 1,
             grant: Arc::new(|h, _| h.grant_stream(StreamRole::Out)),
+            unbound: false,
         }
     }
     /// A `Stream` read endpoint (stdin): `read(buf, len)` is op 0.
@@ -3359,6 +3364,7 @@ impl HostCap {
             type_id: iface::STREAM,
             op: 0,
             grant: Arc::new(|h, _| h.grant_stream(StreamRole::In)),
+            unbound: false,
         }
     }
     /// The `Exit` lifecycle capability: `exit(code)` (op 0, noreturn).
@@ -3367,6 +3373,7 @@ impl HostCap {
             type_id: iface::EXIT,
             op: 0,
             grant: Arc::new(|h, _| h.grant_exit()),
+            unbound: false,
         }
     }
     /// The `Clock` capability: `now(clock_id) -> i64` (op 0).
@@ -3375,6 +3382,7 @@ impl HostCap {
             type_id: iface::CLOCK,
             op: 0,
             grant: Arc::new(|h, _| h.grant_clock()),
+            unbound: false,
         }
     }
     /// A **host-defined** capability (iface [`iface::HOST_FN`]) — arbitrary semantics behind a named
@@ -3387,6 +3395,7 @@ impl HostCap {
             type_id: iface::HOST_FN,
             op,
             grant: Arc::new(move |h, _| h.grant_host_fn(make())),
+            unbound: false,
         }
     }
     /// An **mmap-capable** host-defined capability (§4b): like [`host_fn`](HostCap::host_fn) but the
@@ -3403,6 +3412,7 @@ impl HostCap {
             type_id: iface::HOST_FN,
             op,
             grant: Arc::new(move |h, _| h.grant_host_fn_region(make())),
+            unbound: false,
         }
     }
     /// A fully custom binding: an explicit `(type_id, op)` and a re-grantable grant action. The escape
@@ -3416,6 +3426,20 @@ impl HostCap {
             type_id,
             op,
             grant: Arc::new(grant),
+            unbound: false,
+        }
+    }
+
+    /// Phase-2 (IMPORTS.md): a **template-only** binding for a `rebindable` import — the slot's
+    /// declared interface `(type_id, op)` with **no** initial grant. The slot starts empty
+    /// (`call.import` traps until the guest `import.attach`es a held capability of `type_id`).
+    pub fn template(type_id: u32, op: u32) -> HostCap {
+        HostCap {
+            type_id,
+            op,
+            // Never called (grant_caps skips template caps); inert if a future path slips.
+            grant: Arc::new(|_, _| -1),
+            unbound: true,
         }
     }
 }
@@ -3459,6 +3483,7 @@ impl Imports {
                 HostCap {
                     type_id: cap.type_id,
                     op,
+                    unbound: false,
                     grant: Arc::new(move |h, win| match h.resolve_cap_name(&module_name) {
                         Some(handle) => handle,
                         None => {
@@ -3616,6 +3641,21 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
             ));
         }
     }
+    // Phase-2 mode checks (IMPORTS.md §2.1): a `required` import must have a real grant (a
+    // template-only cap can never satisfy fail-closed instantiation), and `rebindable` imports
+    // only exist on the no-rewrite path (the legacy rewrite has no binding table to attach into).
+    for (i, name) in order.iter().enumerate() {
+        if module.imports[i].mode == svm_ir::ImportMode::Required && imports.map[name].unbound {
+            return Err(format!(
+                "required import `{name}` bound to a template-only capability \
+                 (templates serve rebindable slots — IMPORTS.md phase 2)"
+            ));
+        }
+    }
+    let has_rebindable = module
+        .imports
+        .iter()
+        .any(|i| i.mode == svm_ir::ImportMode::Rebindable);
     // IMPORTS.md phase 1 — the **no-rewrite** path: when every import binds to a
     // generic-dispatch interface, keep the module's bytes exactly as verified (the manifest
     // stays; `call.import` executes through the instantiation-time binding table each run
@@ -3631,6 +3671,14 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
             binding: Some(NamedBinding { imports, order }),
             hooks: None,
         });
+    }
+    if has_rebindable {
+        return Err(
+            "rebindable imports require every import to bind a slot-dispatchable interface \
+             (Stream/Exit/Clock/Memory/HostFn) — the legacy rewrite path cannot serve them \
+             (IMPORTS.md phase 2)"
+                .into(),
+        );
     }
     // Legacy rewrite fallback: an import bound to an executor-dispatch interface (Instantiator,
     // JIT, …) still lowers to inline `cap.call`s, which the backends' specialized arms service.
@@ -3944,14 +3992,33 @@ impl Instance {
                     .is_some_and(|f| f.params.is_empty());
                 let mut args = Vec::new();
                 let mut bindings = Vec::with_capacity(b.order.len());
-                for name in &b.order {
+                for (i, name) in b.order.iter().enumerate() {
                     let cap = &b.imports.map[name];
+                    // The declared mode of import `i` (order was captured from `module.imports`,
+                    // same indices). A legacy resolved instance has an empty manifest — mode then
+                    // defaults to `required`, and the bindings vec is discarded below anyway.
+                    let rebindable = self
+                        .module
+                        .imports
+                        .get(i)
+                        .is_some_and(|im| im.mode == svm_ir::ImportMode::Rebindable);
+                    // Phase-2 template-only cap: declare the interface, grant nothing — the slot
+                    // starts empty and the guest fills it with `import.attach`. Contributes no
+                    // positional arg and no name registration (there is no handle yet).
+                    if cap.unbound {
+                        bindings.push(svm_interp::BoundImport::rebindable(
+                            cap.type_id,
+                            cap.op,
+                            None,
+                        ));
+                        continue;
+                    }
                     let handle = (cap.grant)(h, win);
                     h.register_cap_name(name, handle);
-                    bindings.push(svm_interp::BoundImport {
-                        type_id: cap.type_id,
-                        op: cap.op,
-                        handle,
+                    bindings.push(if rebindable {
+                        svm_interp::BoundImport::rebindable(cap.type_id, cap.op, Some(handle))
+                    } else {
+                        svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
                     });
                     if !paramless {
                         args.push(Value::I32(handle));

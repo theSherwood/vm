@@ -947,6 +947,7 @@ fn interp_leaf(f: &Func) -> bool {
                         // and host/capability ops (no powerbox in the cross-tier callback).
                         | Inst::CapCall { .. }
                         | Inst::CallImport { .. }
+                        | Inst::ImportAttach { .. }
             )
         })
     })
