@@ -2,7 +2,9 @@
 //! `ScheduledDebugRun` cooperative debug scheduler drives a `thread.spawn` guest with breakpoints that
 //! fire **per-thread**, `stopped_task`/`select_task`/`threads` for per-thread inspection, and single-
 //! step — parity-checked against the tree-walker `Inspector::attach_scheduled` oracle (the reference
-//! multithreaded debug engine). This is the bytecode counterpart of `debug_threads.rs`.
+//! multithreaded debug engine). This is the bytecode counterpart of `debug_threads.rs`. It also covers
+//! **fibers composed with threads** (slice 13): a breakpoint fires inside a §12 fiber running on a
+//! spawned worker vCPU, and such runs stay bit-identical to the oracle + M:N executor across the switches.
 
 use svm_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use svm_interp::{bytecode, run, Inspector, IrPc, Stop, Trap, Value, WatchKind};
@@ -525,4 +527,150 @@ fn bytecode_breakpoint_after_a_wait_fires_once_woken() {
         SchedStop::Finished(r) => assert_eq!(r, Ok(vec![Value::I64(987654)])),
         other => panic!("expected Finished, got {other:?}"),
     }
+}
+
+// **Fibers composed with threads** (DEBUGGING.md slice 13): each spawned worker runs a §12 fiber. func 0
+// is the root (spawns + joins two workers, reads mem[0]); func 1 is the worker: it `cont.new`s the fiber
+// (func 2), `cont.resume`s it twice (the fiber suspends with 11, then returns 25), and `atomic.rmw.add`s
+// the fiber's return value (25) into mem[0]. func 2 is the fiber (same body as SUSPEND_ROUNDTRIP's). Two
+// workers each add 25 atomically → mem[0] = 50 on every schedule (determinate: the store is atomic).
+const FIBER_WORKERS: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 0
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.atomic.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vf = ref.func 2
+  vz0 = i64.const 0
+  vk = cont.new vf vz0
+  vc1 = i64.const 10
+  vs1, vr1 = cont.resume vk vc1
+  vc2 = i64.const 20
+  vs2, vr2 = cont.resume vk vc2
+  vaddr = i64.const 0
+  vrmw = i64.atomic.rmw.add vaddr vr2
+  vz = i64.const 0
+  return vz
+}
+func (i64, i64) -> (i64) {
+block0(vsp2: i64, varg2: i64):
+  v0 = i64.const 1
+  v1 = i64.add varg2 v0
+  v2 = suspend v1
+  v3 = i64.const 5
+  v4 = i64.add v2 v3
+  return v4
+}
+"#;
+
+// The fiber body's `v1 = i64.add varg2 v0` (func 2, block 0, inst 1) — reached only once a worker's
+// `cont.resume` has switched that vCPU's active continuation into the fiber.
+fn fiber_body_bp() -> IrPc {
+    IrPc {
+        module: 0,
+        func: 2,
+        block: 0,
+        inst: 1,
+    }
+}
+
+/// A breakpoint **inside a fiber** fires on each spawned worker — proving `cont.resume` switched the
+/// stopped *worker* vCPU (not the root) into the fiber body, so fibers and threads compose under the
+/// scheduled debugger. The two hits are on distinct worker threads.
+#[test]
+fn bytecode_breakpoint_inside_a_fiber_on_a_spawned_thread() {
+    let m = parse_module(FIBER_WORKERS).expect("parse");
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).expect("bytecode fiber+thread debug session");
+    sd.set_breakpoints(vec![fiber_body_bp()]);
+    let mut fuel = 50_000_000u64;
+
+    // The first worker resumes its fiber; the debugger follows the switch into the fiber body.
+    match sd.run_until_stop(&mut fuel) {
+        SchedStop::Break { pc, .. } => assert_eq!(pc, fiber_body_bp(), "stopped inside the fiber"),
+        other => panic!("expected Break inside the fiber, got {other:?}"),
+    }
+    let t1 = sd.stopped_task().expect("a worker is stopped");
+    assert_ne!(t1, 0, "the stopped vCPU is a worker, not the root");
+    assert_eq!(
+        sd.frame_pc(0),
+        Some(fiber_body_bp()),
+        "the worker's active continuation is the fiber's frame"
+    );
+
+    // Continue → the *other* worker resumes its own fiber and hits the same op (a distinct vCPU).
+    match sd.run_until_stop(&mut fuel) {
+        SchedStop::Break { pc, .. } => assert_eq!(pc, fiber_body_bp()),
+        other => panic!("expected the second worker inside its fiber, got {other:?}"),
+    }
+    let t2 = sd.stopped_task().expect("a worker is stopped");
+    assert_ne!(t2, 0, "the second stopped vCPU is a worker");
+    assert_ne!(t1, t2, "each worker ran its own fiber on its own vCPU");
+
+    // No more hits (each worker's fiber runs its prefix once), and the run finishes.
+    match sd.run_until_stop(&mut fuel) {
+        SchedStop::Finished(r) => assert_eq!(r, Ok(vec![Value::I64(50)]), "25 + 25 = 50"),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}
+
+/// The full fiber-on-threads run through the scheduled debugger matches the tree-walker
+/// `attach_scheduled` oracle **and** the production M:N executor — the fiber switches on each worker
+/// don't perturb the determinate result (was `SchedStop::Declined` before this slice).
+#[test]
+fn bytecode_fiber_plus_thread_run_matches_the_oracle() {
+    let m = parse_module(FIBER_WORKERS).expect("parse");
+
+    let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    let mut fuel = 50_000_000u64;
+    let bc = drive_to_end(&mut sd, &mut fuel);
+    assert_eq!(bc, Ok(vec![Value::I64(50)]), "two fiber workers → 50");
+
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
+    let tw = loop {
+        match insp.run_until_stop() {
+            Stop::Finished(r) => break r,
+            Stop::Break { .. } => continue,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    };
+    assert_eq!(bc, tw, "scheduled ≡ tree-walker across fibers-on-threads");
+    let mut f = 50_000_000u64;
+    assert_eq!(bc, run(&m, 0, &[], &mut f), "scheduled ≡ the M:N executor");
+}
+
+/// Reverse debugging composes with fibers-on-threads: a fresh session ticked to a global turn reproduces
+/// the exact schedule point — including which worker is inside its fiber — that a forward run reached.
+#[test]
+fn bytecode_fiber_plus_thread_tick_replays_deterministically() {
+    let m = parse_module(FIBER_WORKERS).expect("parse");
+
+    // Forward to the first in-fiber breakpoint; record the global turn + which worker + its position.
+    let mut a = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    a.set_breakpoints(vec![fiber_body_bp()]);
+    let mut fuel = 50_000_000u64;
+    assert!(matches!(
+        a.run_until_stop(&mut fuel),
+        SchedStop::Break { pc, .. } if pc == fiber_body_bp()
+    ));
+    let turn = a.op_turn();
+    let worker = a.stopped_task().unwrap();
+
+    // A fresh session raw-ticked to that global turn lands at the identical (fiber-on-worker) position.
+    let mut b = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
+    let mut f2 = 50_000_000u64;
+    while b.op_turn() < turn && b.tick(&mut f2) {}
+    assert_eq!(b.op_turn(), turn, "replayed to the same global turn");
+    b.locate();
+    assert_eq!(b.stopped_task(), Some(worker), "same worker is up");
+    assert_eq!(b.frame_pc(0), Some(fiber_body_bp()), "same fiber position");
 }

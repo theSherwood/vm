@@ -3293,17 +3293,22 @@ fn watch_hit_before(
 enum FiberStep {
     /// One op ran (a normal op, or a `cont.*` / fiber-return switch) — the clock ticks, keep going.
     Stepped,
-    /// The **root** activation returned — the run's result.
+    /// The **root** activation of this continuation returned (`chain` empty) — its result.
     Finished(Vec<Value>),
     /// A trap (including a `FiberFault`).
     Trapped(Trap),
+    /// A non-fiber seam the caller must apply: `thread.spawn`/`join`, `memory.wait`/`notify`,
+    /// `instantiate`, coroutine, tier-up. The single-vCPU [`DebugRun`] treats these as `Malformed`; the
+    /// multi-vCPU [`ScheduledDebugRun`] dispatches the ones it schedules (spawn/join/wait/notify).
+    Other(Outcome),
 }
 
-/// Run **one op** of a single-vCPU debug session's active continuation (`vt.active`), applying any §12
-/// fiber switch (`cont.new` registers a fiber, `cont.resume` switches into one, `suspend` / a fiber's
-/// return switches back). The debug counterpart of [`step_vcpu`]'s fiber handling, minus threads and
-/// durability (debug runs are non-durable, so no `shadow_switch` / `fiber_sp`). The fiber registry
-/// `fibers` is owned by the session and rebuilt deterministically on a reverse `seek` replay.
+/// Run **one op** of a debug session's active continuation (`vt.active`), applying any §12 fiber switch
+/// (`cont.new` registers a fiber in the run-shared `fibers`, `cont.resume` switches into one, `suspend`
+/// / a fiber's return switches back). Non-fiber seams are handed back as [`FiberStep::Other`]. The debug
+/// counterpart of [`step_vcpu`]'s fiber handling, minus durability (debug runs are non-durable, so no
+/// `shadow_switch` / `fiber_sp`). `fibers` is run-shared (a fiber created on one vCPU can be resumed on
+/// another — D57 migration) and rebuilt deterministically on a reverse `seek` replay.
 fn debug_advance_fiber(
     vt: &mut VTask,
     fibers: &mut Vec<FiberState>,
@@ -3397,9 +3402,9 @@ fn debug_advance_fiber(
             vt.active.set(rdst + 1, Reg::from_i64(value));
             FiberStep::Stepped
         }
-        // Threads / wait / notify / instantiate / coroutine / tier-up aren't in the single-vCPU fiber
-        // debug scope (a thread-spawner routes to `ScheduledDebugRun` instead).
-        Ok(_) => FiberStep::Trapped(Trap::Malformed),
+        // Threads / wait / notify / instantiate / coroutine / tier-up — a scheduler seam the caller
+        // applies (single-vCPU `DebugRun` rejects them; the scheduled engine dispatches its subset).
+        Ok(other) => FiberStep::Other(other),
         Err(t) => FiberStep::Trapped(t),
     }
 }
@@ -3655,6 +3660,11 @@ impl DebugRun {
                 *done = Some(Err(t));
                 false
             }
+            // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
+            FiberStep::Other(_) => {
+                *done = Some(Err(Trap::Malformed));
+                false
+            }
         }
     }
 
@@ -3692,6 +3702,11 @@ impl DebugRun {
                 }
                 FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
+                    return None;
+                }
+                // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
+                FiberStep::Other(_) => {
+                    *done = Some(Err(Trap::Malformed));
                     return None;
                 }
             }
@@ -3735,6 +3750,11 @@ impl DebugRun {
                     *done = Some(Err(t));
                     return None;
                 }
+                // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
+                FiberStep::Other(_) => {
+                    *done = Some(Err(Trap::Malformed));
+                    return None;
+                }
             }
         }
     }
@@ -3769,6 +3789,11 @@ impl DebugRun {
                 }
                 FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
+                    return None;
+                }
+                // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
+                FiberStep::Other(_) => {
+                    *done = Some(Err(Trap::Malformed));
                     return None;
                 }
             }
@@ -3921,8 +3946,9 @@ enum DbgTaskState {
 }
 
 struct DbgTask {
-    /// The reified continuation (register file + call stack + cursor) of this vCPU.
-    vm: Vm,
+    /// The reified continuation of this vCPU: its active `Vm` plus its §12 fiber resume `chain` (a
+    /// `cont.resume` switches `vt.active` into a fiber; `suspend` / a fiber return switches back).
+    vt: VTask,
     /// This vCPU's `thread.spawn` children (handle = index → global task index; `None` = joined).
     threads: Vec<Option<usize>>,
     state: DbgTaskState,
@@ -3940,15 +3966,20 @@ struct DbgTask {
 /// (the debuggable analogue of the production `drive`), so the interleaving is deterministic — which is
 /// what makes **reverse debugging** (`tick`-replay to a global `turn`) and **cross-thread watchpoints**
 /// (the per-op seam checks the armed ranges in whichever thread) sound. Stepping is depth-aware
-/// (in/over/out), and **`memory.wait`/`notify`** park/wake threads (a stuck set advances a logical
-/// `clock` to the earliest wait deadline, exactly as the production `drive`). Anything still outside the
-/// subset (fibers, `instantiate`, coroutines) surfaces as [`SchedStop::Declined`].
+/// (in/over/out), **`memory.wait`/`notify`** park/wake threads (a stuck set advances a logical `clock`
+/// to the earliest wait deadline, exactly as the production `drive`), and **§12 fibers** switch each
+/// vCPU's active continuation (breakpoints fire inside a resumed fiber; the fiber registry is run-shared
+/// so a fiber migrates across vCPUs — D57). Anything still outside the subset (`instantiate`,
+/// coroutines) surfaces as [`SchedStop::Declined`].
 pub struct ScheduledDebugRun {
     source: std::sync::Arc<ModuleSource>,
     table: SharedSlots,
     mem: Option<Mem>,
     host: Host,
     tasks: Vec<DbgTask>,
+    /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs; a fiber created on
+    /// one can be resumed on another — D57). Rebuilt deterministically on a reverse `seek` replay.
+    fibers: Vec<FiberState>,
     fn_block_base: Vec<Vec<u32>>,
     fn_block_types: Vec<Vec<Vec<ValType>>>,
     debug: Option<DebugInfo>,
@@ -3991,7 +4022,7 @@ fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>)
             match &res {
                 Ok(vals) => {
                     let v = vals.first().copied().unwrap_or(Value::I64(0));
-                    t.vm.set(dst, Reg::from_value(v));
+                    t.vt.active.set(dst, Reg::from_value(v));
                     t.state = DbgTaskState::Runnable;
                 }
                 Err(trap) => work.push((j, Err(trap.clone()))),
@@ -4022,17 +4053,17 @@ fn dbg_spawn(
     if live >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // thread bomb
     }
-    let vm = Vm::new(&primary, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+    let vt = VTask::new(&primary, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
     let cidx = tasks.len();
     tasks.push(DbgTask {
-        vm,
+        vt,
         threads: Vec::new(),
         state: DbgTaskState::Runnable,
         at_bp: false,
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
-    tasks[ti].vm.set(dst, Reg::from_i32(handle));
+    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
     Ok(())
 }
 
@@ -4053,7 +4084,7 @@ fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32) {
             match res {
                 Ok(vals) => {
                     let v = vals.first().copied().unwrap_or(Value::I64(0));
-                    tasks[ti].vm.set(dst, Reg::from_value(v));
+                    tasks[ti].vt.active.set(dst, Reg::from_value(v));
                 }
                 Err(t) => dbg_complete(tasks, ti, Err(t)),
             }
@@ -4081,7 +4112,10 @@ fn dbg_wait(
         .map(|m| m.atomic_value(base, width))
         .unwrap_or(0);
     if cur != expected {
-        tasks[ti].vm.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+        tasks[ti]
+            .vt
+            .active
+            .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
     } else {
         tasks[ti].state = DbgTaskState::BlockedWait {
             key: base,
@@ -4102,13 +4136,13 @@ fn dbg_notify(tasks: &mut [DbgTask], ti: usize, base: u64, count: i32, dst: u32)
         }
         if let DbgTaskState::BlockedWait { key, dst: wdst, .. } = t.state {
             if key == base {
-                t.vm.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
+                t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
                 t.state = DbgTaskState::Runnable;
                 woken += 1;
             }
         }
     }
-    tasks[ti].vm.set(dst, Reg::from_i32(woken as i32));
+    tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
 }
 
 /// Pick the next thread to run: the lowest-index runnable one. If none is runnable, advance the futex
@@ -4133,7 +4167,7 @@ fn dbg_pick_runnable(tasks: &mut [DbgTask], clock: &mut u64) -> Option<usize> {
         for t in tasks.iter_mut() {
             if let DbgTaskState::BlockedWait { deadline, dst, .. } = t.state {
                 if deadline <= *clock {
-                    t.vm.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
+                    t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
                     t.state = DbgTaskState::Runnable;
                 }
             }
@@ -4170,7 +4204,7 @@ impl ScheduledDebugRun {
         let dom = Domain::new(c, 0);
         let mem = build_mem(m);
         let host = Host::new();
-        let vm = Vm::new(&dom.source.primary(), func as usize, args).ok()?;
+        let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
         let Domain { source, table } = dom;
         Some(ScheduledDebugRun {
             source,
@@ -4178,11 +4212,12 @@ impl ScheduledDebugRun {
             mem,
             host,
             tasks: vec![DbgTask {
-                vm,
+                vt,
                 threads: Vec::new(),
                 state: DbgTaskState::Runnable,
                 at_bp: false,
             }],
+            fibers: Vec::new(),
             fn_block_base,
             fn_block_types,
             debug: m.debug_info.clone(),
@@ -4236,6 +4271,7 @@ impl ScheduledDebugRun {
             mem,
             host,
             tasks,
+            fibers,
             funcs,
             breakpoints,
             watchpoints,
@@ -4265,7 +4301,7 @@ impl ScheduledDebugRun {
             // Pre-op stop checks (breakpoint / watchpoint), skipped for a thread that just reported (it
             // must make progress off its current op first, so a loop-body stop re-fires each iteration).
             if !tasks[ti].at_bp {
-                if let Some(pc) = tasks[ti].vm.cur_ir_pc(source) {
+                if let Some(pc) = tasks[ti].vt.active.cur_ir_pc(source) {
                     if breakpoints.contains(&pc) {
                         tasks[ti].at_bp = true;
                         *stopped = Some(ti);
@@ -4277,7 +4313,7 @@ impl ScheduledDebugRun {
                     }
                     if !watchpoints.is_empty() && pc.module == 0 {
                         if let Some((addr, write)) = watch_hit_before(
-                            &tasks[ti].vm,
+                            &tasks[ti].vt.active,
                             mem,
                             funcs,
                             fn_block_base,
@@ -4298,54 +4334,56 @@ impl ScheduledDebugRun {
                     }
                 }
             }
-            let outcome =
-                tasks[ti]
-                    .vm
-                    .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1);
+            let step_res =
+                debug_advance_fiber(&mut tasks[ti].vt, fibers, source, table, fuel, mem, host);
             tasks[ti].at_bp = false;
-            match outcome {
-                Ok(Outcome::Suspended) => *turn += 1,
-                Ok(Outcome::Done(vals)) => {
+            match step_res {
+                // A fiber switch (or a plain op) — the vCPU advanced one op, stays runnable.
+                FiberStep::Stepped => *turn += 1,
+                FiberStep::Finished(vals) => {
                     *turn += 1;
                     dbg_complete(tasks, ti, Ok(vals));
                 }
-                Ok(Outcome::ThreadSpawn { func, sp, arg, dst }) => {
-                    *turn += 1;
-                    if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
-                        dbg_complete(tasks, ti, Err(t));
-                    }
-                }
-                Ok(Outcome::ThreadJoin { handle, dst }) => {
-                    *turn += 1;
-                    dbg_join(tasks, ti, handle, dst);
-                }
-                Ok(Outcome::MemoryWait {
-                    base,
-                    expected,
-                    width,
-                    timeout,
-                    dst,
-                }) => {
-                    *turn += 1;
-                    dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst);
-                }
-                Ok(Outcome::MemoryNotify { base, count, dst }) => {
-                    *turn += 1;
-                    dbg_notify(tasks, ti, base, count, dst);
-                }
-                // Fibers / instantiate / coroutine / tier-up — outside this slice.
-                Ok(_) => return SchedStop::Declined,
-                Err(t) => {
+                FiberStep::Trapped(t) => {
                     *turn += 1;
                     dbg_complete(tasks, ti, Err(t));
                 }
+                // A scheduler seam: the ones this engine dispatches, else `Declined`.
+                FiberStep::Other(outcome) => match outcome {
+                    Outcome::ThreadSpawn { func, sp, arg, dst } => {
+                        *turn += 1;
+                        if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
+                            dbg_complete(tasks, ti, Err(t));
+                        }
+                    }
+                    Outcome::ThreadJoin { handle, dst } => {
+                        *turn += 1;
+                        dbg_join(tasks, ti, handle, dst);
+                    }
+                    Outcome::MemoryWait {
+                        base,
+                        expected,
+                        width,
+                        timeout,
+                        dst,
+                    } => {
+                        *turn += 1;
+                        dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst);
+                    }
+                    Outcome::MemoryNotify { base, count, dst } => {
+                        *turn += 1;
+                        dbg_notify(tasks, ti, base, count, dst);
+                    }
+                    // Instantiate / coroutine / tier-up — outside this slice.
+                    _ => return SchedStop::Declined,
+                },
             }
             // Post-op step target: the stepping thread reached a qualifying call depth at an instruction.
             if let Some((st, max_depth)) = step {
                 if ti == st && matches!(tasks[st].state, DbgTaskState::Runnable) {
-                    let depth = tasks[st].vm.stack.len() + 1;
+                    let depth = tasks[st].vt.active.stack.len() + 1;
                     if max_depth.is_none_or(|m| depth <= m) {
-                        if let Some(pc) = tasks[st].vm.cur_ir_pc(source) {
+                        if let Some(pc) = tasks[st].vt.active.cur_ir_pc(source) {
                             *stopped = Some(st);
                             *focus = st;
                             return SchedStop::Break {
@@ -4379,7 +4417,9 @@ impl ScheduledDebugRun {
     /// **Step over** the next source op: run any call it makes to completion (schedule advances only if
     /// the stepped thread blocks), landing at the next op at the same call depth.
     pub fn step_over(&mut self, fuel: &mut u64) -> SchedStop {
-        let max = self.stopped.map(|s| self.tasks[s].vm.stack.len() + 1);
+        let max = self
+            .stopped
+            .map(|s| self.tasks[s].vt.active.stack.len() + 1);
         self.step_to(max, fuel)
     }
 
@@ -4387,7 +4427,7 @@ impl ScheduledDebugRun {
     pub fn step_out(&mut self, fuel: &mut u64) -> SchedStop {
         let max = self
             .stopped
-            .map(|s| (self.tasks[s].vm.stack.len() + 1).saturating_sub(1));
+            .map(|s| (self.tasks[s].vt.active.stack.len() + 1).saturating_sub(1));
         self.step_to(max, fuel)
     }
 
@@ -4407,6 +4447,7 @@ impl ScheduledDebugRun {
             mem,
             host,
             tasks,
+            fibers,
             turn,
             clock,
             ..
@@ -4414,32 +4455,33 @@ impl ScheduledDebugRun {
         let Some(ti) = dbg_pick_runnable(tasks, clock) else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
-        let outcome = tasks[ti]
-            .vm
-            .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1);
+        let step_res =
+            debug_advance_fiber(&mut tasks[ti].vt, fibers, source, table, fuel, mem, host);
         tasks[ti].at_bp = false;
         *turn += 1;
-        match outcome {
-            Ok(Outcome::Suspended) => {}
-            Ok(Outcome::Done(vals)) => dbg_complete(tasks, ti, Ok(vals)),
-            Ok(Outcome::ThreadSpawn { func, sp, arg, dst }) => {
-                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
-                    dbg_complete(tasks, ti, Err(t));
+        match step_res {
+            FiberStep::Stepped => {}
+            FiberStep::Finished(vals) => dbg_complete(tasks, ti, Ok(vals)),
+            FiberStep::Trapped(t) => dbg_complete(tasks, ti, Err(t)),
+            FiberStep::Other(outcome) => match outcome {
+                Outcome::ThreadSpawn { func, sp, arg, dst } => {
+                    if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
+                        dbg_complete(tasks, ti, Err(t));
+                    }
                 }
-            }
-            Ok(Outcome::ThreadJoin { handle, dst }) => dbg_join(tasks, ti, handle, dst),
-            Ok(Outcome::MemoryWait {
-                base,
-                expected,
-                width,
-                timeout,
-                dst,
-            }) => dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst),
-            Ok(Outcome::MemoryNotify { base, count, dst }) => {
-                dbg_notify(tasks, ti, base, count, dst)
-            }
-            Ok(_) => return false, // an unsupported op — stop the replay here
-            Err(t) => dbg_complete(tasks, ti, Err(t)),
+                Outcome::ThreadJoin { handle, dst } => dbg_join(tasks, ti, handle, dst),
+                Outcome::MemoryWait {
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                } => dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst),
+                Outcome::MemoryNotify { base, count, dst } => {
+                    dbg_notify(tasks, ti, base, count, dst)
+                }
+                _ => return false, // an unsupported op — stop the replay here
+            },
         }
         !matches!(tasks[0].state, DbgTaskState::Done(_))
     }
@@ -4509,7 +4551,7 @@ impl ScheduledDebugRun {
     /// A [`FrameReader`] over the **focused** thread's `Vm` (what `select_task` chose).
     fn reader(&self) -> FrameReader<'_> {
         FrameReader {
-            vm: &self.tasks[self.focus].vm,
+            vm: &self.tasks[self.focus].vt.active,
             source: &self.source,
             mem: &self.mem,
             debug: self.debug.as_ref(),

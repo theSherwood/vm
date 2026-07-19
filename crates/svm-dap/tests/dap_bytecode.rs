@@ -1239,3 +1239,128 @@ fn dap_over_bytecode_breakpoint_inside_a_fiber() {
         "the fiber generator finished"
     );
 }
+
+// A fibers-on-threads guest: two spawned workers each run a §12 fiber (`cont.new`/`resume`×2), then
+// atomically add the fiber's return (25) into mem[0] → 50. The fiber body's add is on line 32; the
+// module spawns threads, so DAP routes it to the scheduled `ScheduledDebugRun`.
+const FIBER_WORKERS: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 0
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.atomic.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vf = ref.func 2
+  vz0 = i64.const 0
+  vk = cont.new vf vz0
+  vc1 = i64.const 10
+  vs1, vr1 = cont.resume vk vc1
+  vc2 = i64.const 20
+  vs2, vr2 = cont.resume vk vc2
+  vaddr = i64.const 0
+  vrmw = i64.atomic.rmw.add vaddr vr2
+  vz = i64.const 0
+  return vz
+}
+func (i64, i64) -> (i64) {
+block0(vsp2: i64, varg2: i64):
+  v0 = i64.const 1
+  v1 = i64.add varg2 v0
+  v2 = suspend v1
+  v3 = i64.const 5
+  v4 = i64.add v2 v3
+  return v4
+}
+"#;
+
+#[test]
+fn dap_over_bytecode_fiber_on_a_spawned_thread() {
+    // A breakpoint inside the fiber body (line 32) fires on a *spawned worker* thread — proving fibers
+    // compose with threads all the way to a DAP client — with the stopped worker's own stack showing the
+    // fiber frame, then the guest terminates with 25 + 25 = 50.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let launch = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(FIBER_WORKERS)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&launch).get("success"),
+        Some(&Json::Bool(true)),
+        "the fiber-on-threads program launches on the bytecode engine"
+    );
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(32))])]),
+            ),
+        ]),
+    ));
+    let cfg = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let stop = event(&cfg, "stopped").expect("stops inside the fiber on a worker");
+    assert_eq!(
+        stop.get("body").unwrap().get("reason").unwrap().as_str(),
+        Some("breakpoint")
+    );
+    // The stopped vCPU is a spawned worker (DAP thread id ≥ 2), not the root.
+    let tid = stop
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert!(tid >= 2, "a spawned worker (thread id ≥ 2), not the root");
+    // The stopped worker's top frame is the fiber body (line 32).
+    let st = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid))]),
+    ));
+    let line = response(&st)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("line")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_eq!(line, 32, "stopped at the fiber's add on the worker");
+    // Continue → the other worker's fiber hits it too, then the guest terminates.
+    let cont = s.handle(&req(6, "continue", Json::obj(vec![])));
+    let stop2 = event(&cont, "stopped").expect("the second worker stops inside its fiber");
+    let tid2 = stop2
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_ne!(tid, tid2, "each worker ran its own fiber on its own vCPU");
+    let done = s.handle(&req(7, "continue", Json::obj(vec![])));
+    assert!(
+        event(&done, "terminated").is_some(),
+        "the fiber-on-threads guest finished"
+    );
+}
