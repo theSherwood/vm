@@ -3317,6 +3317,12 @@ struct OfferBinding {
     funcs: Arc<[svm_ir::Func]>,
     ops: Arc<[u32]>,
     op: u32,
+    /// §3.2 v2: `Some` = an **instanced** offer ([`HostCap::impl_service`]) — the provider
+    /// module whose memory declaration + data segments seed a persistent provider domain,
+    /// wired per host with `Host::wire_impl_instance` (each run's fresh host gets a fresh
+    /// provider instance, so backends stay in differential lockstep). `None` = a v1 pure
+    /// offer ([`HostCap::impl_offer`]).
+    provider: Option<Arc<Module>>,
 }
 
 impl HostCap {
@@ -3434,6 +3440,33 @@ impl HostCap {
                 funcs: provider.funcs.clone().into(),
                 ops: e.ops.clone().into(),
                 op,
+                provider: None,
+            }),
+        })
+    }
+
+    /// §3.2 v2 (IMPORTS.md): like [`HostCap::impl_offer`], but **instanced** — the offer gets a
+    /// persistent provider domain (a window seeded from `provider`'s memory declaration + data
+    /// segments, plus its own powerbox), so ops keep exporter-domain state across calls within a
+    /// run. Each run's fresh host wires a fresh instance from the same initial image, so the
+    /// three backends stay in differential lockstep.
+    ///
+    /// `None` if `provider` has no offer named `offer` or `op` is outside its op list.
+    pub fn impl_service(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
+        let e = provider.resolve_impl_export(offer)?;
+        if op as usize >= e.ops.len() {
+            return None;
+        }
+        Some(HostCap {
+            type_id: 0, // unused: the real interface id is interned per-host at wiring
+            op,
+            grant: Arc::new(|_, _| -1), // never called for an offer binding
+            unbound: false,
+            offer: Some(OfferBinding {
+                funcs: provider.funcs.clone().into(),
+                ops: e.ops.clone().into(),
+                op,
+                provider: Some(Arc::new(provider.clone())),
             }),
         })
     }
@@ -4058,9 +4091,13 @@ impl Instance {
                     // already passed at `instantiate_with_imports` (structural, fail-closed), so
                     // failure here is unreachable for a validated instance.
                     if let Some(off) = &cap.offer {
-                        let handle = h
-                            .wire_impl(&off.funcs, &off.ops)
-                            .expect("offer validated at instantiation");
+                        let handle = match &off.provider {
+                            // §3.2 v2 instanced offer: a fresh provider instance from the
+                            // module's initial image, per host — backends stay in lockstep.
+                            Some(m) => h.wire_impl_instance(m, &off.ops),
+                            None => h.wire_impl(&off.funcs, &off.ops),
+                        }
+                        .expect("offer validated at instantiation");
                         h.register_cap_name(name, handle);
                         let declared = &self.module.imports[i].sig;
                         bindings.push(

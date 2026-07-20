@@ -587,11 +587,21 @@ parent's resources. Not a loophole; the point of the model.
    (implementing an interface requires zero authority; v1 implements one *with* zero
    authority). That covers adapters, validators, policy checks, and test fakes, and keeps the
    three tiers in differential lockstep with a single implementation.
-3. **Follow-up: exporter-domain state.** The stateful headline ("an `Fs` backed by the
-   parent's own window") needs the op to run over the *exporter's* window and powerbox —
-   cross-domain window views, host references, and lock ordering that v1 deliberately does
-   not touch. It builds on the same `GuestImplEntry`/binding shape (add the domain reference,
-   thread caller fuel) without changing the wire format or the wiring API.
+3. **Exporter-domain state: landed as *provider instances* (v2, 2026-07-20).** An offer may
+   be wired **instanced** (`Host::wire_impl_instance` / `svm_run::HostCap::impl_service`):
+   it gets a persistent *provider domain* — a window seeded once from the provider module's
+   memory declaration + data segments, plus its own initially-empty powerbox — and every op
+   dispatch runs over that state, so it survives across calls (the stateful headline: an
+   in-memory `Fs` backed by the provider's own window works). The wirer re-grants real
+   capabilities *into* the provider (`Host::grant_impl_cap`, same policy as §14 child
+   re-grants) — how a wrap holds the real cap it forwards. Re-granting an instanced offer to
+   a child aliases the **same** instance (like a pipe's shared backing), so parent and
+   children drive one service. Deadlock-freedom is by construction: a provider can never
+   hold an offer, so provider chains are acyclic and the lock order is always
+   domain-host → provider. The provider is a *passive service domain* animated only by
+   dispatch — there is deliberately no re-entry into live running domains. Remaining
+   limits, recorded: per-op fuel is still the fixed deterministic budget (caller-fuel
+   threading needs the dispatch-ABI fuel plumbing), and providers hold no offers.
 
 ### 3.3 Forwarding, wrapping, overriding — one act
 

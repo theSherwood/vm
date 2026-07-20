@@ -9963,6 +9963,25 @@ pub struct GuestImplEntry {
     /// honest bit `cap.self` reports (op 5), and it lives host-side, so a parent can interpose
     /// but cannot hide that it did.
     pub depth: u32,
+    /// §3.2 v2 **provider instance** — the exporter's domain. `None` = a v1 *pure* offer
+    /// (windowless, empty powerbox: arguments in, results out). `Some` = an **instanced** offer:
+    /// ops run over this persistent window + powerbox ([`Host::wire_impl_instance`]), so state
+    /// survives across calls — the stateful wrap ("an `Fs` backed by the provider's own
+    /// window"). Shared (`Arc`) across re-grants: a parent and its children handed the same
+    /// offer drive one service instance, like a pipe's shared backing. The blocking lock is
+    /// deadlock-free by construction: a provider can never hold an offer
+    /// ([`Host::grant_impl_cap`] refuses one), so provider chains are acyclic and the lock
+    /// order is always domain-host → provider, never the reverse.
+    pub state: Option<Arc<Mutex<ProviderState>>>,
+}
+
+/// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
+/// once from the provider module's memory declaration + data segments at wiring) and powerbox
+/// its ops execute over. The powerbox starts empty; the wirer may re-grant its own capabilities
+/// in ([`Host::grant_impl_cap`]) — how a wrap holds the real cap it forwards to.
+pub struct ProviderState {
+    mem: Option<Mem>,
+    host: Host,
 }
 
 /// The fixed, deterministic fuel budget for one wired-offer op dispatch (v1 pure dispatch —
@@ -11170,8 +11189,69 @@ impl Host {
             sigs,
             type_id,
             depth: 1,
+            state: None,
         });
         Some(self.grant(type_id, Binding::GuestImpl(idx)))
+    }
+
+    /// Wire an **instanced** offer (IMPORTS.md §3.2 v2 — exporter-domain state): like
+    /// [`Host::wire_impl`], but the offer gets a persistent **provider domain** — a window built
+    /// once from `m`'s memory declaration + data segments, and its own (initially empty)
+    /// powerbox — that every op dispatch runs over, so state survives across calls. The wirer
+    /// may re-grant capabilities into the provider with [`Host::grant_impl_cap`] (the
+    /// wrap-holding-its-real-cap story). Fail-closed like `wire_impl`; `m.funcs` must be
+    /// verifier-passing (the host is trusted to wire only verified modules, as with every grant).
+    pub fn wire_impl_instance(&mut self, m: &Module, ops: &[u32]) -> Option<i32> {
+        let funcs: Arc<[Func]> = m.funcs.clone().into();
+        if ops.is_empty() || ops.iter().any(|&f| f as usize >= funcs.len()) {
+            return None;
+        }
+        let sigs: Arc<[FuncType]> = ops
+            .iter()
+            .map(|&f| FuncType {
+                params: funcs[f as usize].params.clone(),
+                results: funcs[f as usize].results.clone(),
+            })
+            .collect();
+        // The provider's window, exactly as a run of `m` would build it (§3a data segments
+        // included) — the exporter's own memory, not the wirer's and not any caller's.
+        let mem = m.memory.map(|mc| {
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            mm.init_data(&m.data);
+            mm
+        });
+        let type_id = self.intern_interface(&sigs);
+        let idx = self.guest_impls.len() as u32;
+        self.guest_impls.push(GuestImplEntry {
+            funcs,
+            ops: ops.into(),
+            sigs,
+            type_id,
+            depth: 1,
+            state: Some(Arc::new(Mutex::new(ProviderState {
+                mem,
+                host: Host::new(),
+            }))),
+        });
+        Some(self.grant(type_id, Binding::GuestImpl(idx)))
+    }
+
+    /// Re-grant one of **this** domain's capabilities into the provider instance behind `offer`,
+    /// registered under `name` in the provider's §7 name directory (IMPORTS.md §3.2 v2): how a
+    /// wrap comes to hold the real capability it forwards to. Same re-grant policy as a §14
+    /// child (coordinate-free caps and pipe ends; stdio shares this domain's sinks) with one
+    /// deliberate exception: **never another offer** — providers stay offer-free so provider
+    /// chains are acyclic and the blocking provider lock can never deadlock. `None` (nothing
+    /// granted) for a non-instanced offer, a non-grantable cap, or an offer-shaped `cap`.
+    pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
+        let state = self.resolve_guest_impl(offer).ok()?.state.clone()?;
+        if self.resolve_guest_impl(cap).is_ok() {
+            return None; // offers never nest in providers (acyclicity = deadlock-freedom)
+        }
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        let h = self.regrant_into_child(cap, &mut st.host)?;
+        st.host.register_cap_name(name, h);
+        Some(h)
     }
 
     /// Adopt a wired offer re-granted from a parent domain (IMPORTS.md §3.3 — the wrap/override
@@ -12099,15 +12179,35 @@ impl Host {
                     .map(|(ty, &s)| slot_to_val(*ty, s))
                     .collect();
                 let mut impl_fuel = GUEST_IMPL_FUEL;
-                let mut impl_host = Host::new();
-                let (res, _, _) = drive_arc(
-                    entry.funcs,
-                    f,
-                    &vals,
-                    &mut impl_fuel,
-                    &mut None,
-                    &mut impl_host,
-                );
+                let (res, _, _) = match &entry.state {
+                    // §3.2 v2 **instanced** offer: run over the provider's persistent window +
+                    // powerbox (exporter-domain state). The blocking lock is deadlock-free by
+                    // construction — providers never hold offers (`grant_impl_cap` refuses
+                    // them), so provider chains are acyclic and the lock order is always
+                    // domain-host → provider; cross-domain contention on a shared provider
+                    // serializes here, bounded by the impl fuel budget.
+                    Some(state) => {
+                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        let st = &mut *st;
+                        drive_arc(
+                            entry.funcs,
+                            f,
+                            &vals,
+                            &mut impl_fuel,
+                            &mut st.mem,
+                            &mut st.host,
+                        )
+                    }
+                    // v1 **pure** offer: windowless, empty powerbox — arguments in, results out.
+                    None => drive_arc(
+                        entry.funcs,
+                        f,
+                        &vals,
+                        &mut impl_fuel,
+                        &mut None,
+                        &mut Host::new(),
+                    ),
+                };
                 // A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the caller's
                 // call traps, fail-closed, identically on every backend.
                 Ok(res?.iter().map(|v| val_to_slot(*v)).collect())
