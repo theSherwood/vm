@@ -30,7 +30,9 @@ block3(v17: i64):
 "#;
 
 fn main() {
-    let out = std::env::args().nth(1).unwrap_or_else(|| "alu.svmbc".into());
+    let out = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "alu.svmbc".into());
     let m = svm_text::parse_module(ALU).expect("parse ALU module");
     let bytes = svm_encode::encode_module(&m);
     let mut f = std::fs::File::create(&out).expect("create fixture file");
