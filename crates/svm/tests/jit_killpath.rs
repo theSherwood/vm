@@ -19,6 +19,17 @@ use svm_jit::{compile_and_run, compile_and_run_with_host_interruptible, JitOutco
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
+/// Serialize this binary's tests (the ISSUES.md I4 pattern, applied per I33): every test here
+/// races a wall-clock watchdog against deliberately-runaway guest code, and sibling tests
+/// competing for the process's cores distort exactly that timing — I33 recorded the runaway-child
+/// leg flaking under full-workspace parallel load (twice locally, once on macOS CI, all
+/// 2026-07-20) while passing consistently in isolation. A poisoned lock (an earlier test failed)
+/// is fine to reuse — take the inner guard.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A non-terminating **intra-function loop** (block1 branches to itself forever) — caught by the
 /// per-back-edge kill-path check.
 const INFINITE_LOOP: &str = "\
@@ -89,6 +100,7 @@ fn jit_with_watchdog(src: &str, delay: Duration) -> JitOutcome {
 
 #[test]
 fn jit_killpath_stops_infinite_loop() {
+    let _serial = serial();
     // Interp: a small fuel budget bounds the infinite loop → OutOfFuel.
     let m = parse_module(INFINITE_LOOP).expect("parse");
     verify_module(&m).expect("verify");
@@ -110,6 +122,7 @@ fn jit_killpath_stops_infinite_loop() {
 
 #[test]
 fn jit_killpath_stops_infinite_tail_recursion() {
+    let _serial = serial();
     // Interp: fuel bounds the unbounded tail recursion → OutOfFuel.
     let m = parse_module(INFINITE_TAIL_RECURSION).expect("parse");
     verify_module(&m).expect("verify");
@@ -132,6 +145,7 @@ fn jit_killpath_stops_infinite_tail_recursion() {
 
 #[test]
 fn jit_armed_finite_run_completes_normally() {
+    let _serial = serial();
     // Arm the kill-path on a *finite* program whose watchdog is set far enough out that it never
     // fires before the program finishes: the per-iteration poll sees the cell stay zero and never
     // false-trips, so the run returns its real result. (Also the interp/JIT agree on that result.)
@@ -161,6 +175,7 @@ fn jit_armed_finite_run_completes_normally() {
 
 #[test]
 fn jit_unarmed_path_is_unchanged() {
+    let _serial = serial();
     // Sanity: the ordinary (kill-path-not-armed) entry still runs the same finite program to
     // completion — arming is strictly opt-in, so existing call sites are unaffected.
     let m = parse_module(FINITE_COUNTDOWN).expect("parse");
@@ -198,6 +213,7 @@ block1(v1: i64):
 
 #[test]
 fn jit_killpath_stops_runaway_child() {
+    let _serial = serial();
     if !svm_jit::fiber_supported() {
         return; // no JIT nesting runtime here — an instantiate is an inert CapFault, not a child run
     }

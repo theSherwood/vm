@@ -33,9 +33,16 @@ time — re-run with the failure line preserved), and consider serializing the b
 (macos-latest)` job 88426158563), same test, this time with the panic captured: expected
 `Trapped(OutOfFuel)`, got `Returned([0])` — the runaway child *completed* before the watchdog's
 interrupt landed, i.e. the deadline raced the kill signal exactly as hypothesized. Unrelated diff
-(the failing head touches only svm-llvm test fixtures). Two sightings in one day across two
-platforms upgrade this from "seen once locally" to "needs the I4-style serialization or a wider
-deadline"; still not touched here to keep the IMPORTS PR clean.
+(the failing head touches only svm-llvm test fixtures).
+
+**Third sighting + mitigation landed, 2026-07-20 (PR #407):** recurred again in a local full
+`cargo test --workspace` (same test, passed 3/3 in isolation immediately after). Three sightings
+in one day across two platforms, all under parallel load, none in isolation → applied the
+prescribed I4-pattern mitigation: `jit_killpath.rs` now serializes its five tests behind a
+process-local mutex (every test there races a wall-clock watchdog against runaway guest code, so
+sibling-test CPU contention distorts exactly what it measures). Leave this issue **open** until
+the serialized binary holds green across several full-workspace/CI runs; if it flakes *while
+serialized*, the deadline itself is too tight — widen it next.
 
 
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
