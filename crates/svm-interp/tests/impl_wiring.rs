@@ -482,6 +482,37 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
 }
 
 #[test]
+fn provider_pays_from_a_drainable_reserve() {
+    // §5.3 (resolved): the provider funds its own dispatch compute. The wirer prices the
+    // service; a dry reserve makes further calls an inert CapFault the caller can probe,
+    // and the wirer reads the meter.
+    let provider = counter_provider();
+    let mut h = Host::new();
+    let offer = h.wire_impl_instance(&provider, &[0]).expect("offer");
+    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+
+    let full = h
+        .impl_fuel_remaining(offer)
+        .expect("instanced offers meter");
+    assert_eq!(h.cap_dispatch_slots(tid, 0, offer, &[], None), Ok(vec![1]));
+    let after = h.impl_fuel_remaining(offer).unwrap();
+    assert!(after < full, "the call drained what it used");
+
+    // Clamp the reserve below one call's cost: the next dispatch fails closed and drains
+    // the remainder; the one after that is refused outright on the empty reserve.
+    h.set_impl_fuel_reserve(offer, 3).expect("wirer prices it");
+    assert!(h.cap_dispatch_slots(tid, 0, offer, &[], None).is_err());
+    assert!(h.cap_dispatch_slots(tid, 0, offer, &[], None).is_err());
+    // Top-up restores service — and the counter state survived the dry spell.
+    h.set_impl_fuel_reserve(offer, 1 << 20).expect("top-up");
+    assert_eq!(h.cap_dispatch_slots(tid, 0, offer, &[], None), Ok(vec![2]));
+
+    // Pure offers have no reserve to meter.
+    let pure = h.wire_impl(&offer_funcs(), &[0]).expect("pure");
+    assert!(h.impl_fuel_remaining(pure).is_none());
+}
+
+#[test]
 fn grant_impl_cap_refuses_offers_and_pure_offers() {
     // Acyclicity: a provider can never hold an offer (the deadlock-freedom invariant), and a
     // v1 pure offer has no provider to grant into.

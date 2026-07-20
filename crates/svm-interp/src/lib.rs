@@ -9982,7 +9982,19 @@ pub struct GuestImplEntry {
 pub struct ProviderState {
     mem: Option<Mem>,
     host: Host,
+    /// §5.3 **provider-pays metering** (resolved 2026-07-20): the provider funds its own
+    /// dispatch compute out of this drainable reserve — its code, its choice to offer.
+    /// Each op call is capped by `min(GUEST_IMPL_FUEL, remaining)` and drains what it
+    /// used; a dry reserve makes further calls an inert `CapFault` (probeable by the
+    /// caller, visible to the wirer via [`Host::impl_fuel_remaining`] — the §15 "read the
+    /// meters on what you granted" story). A provider worried about a hammering child
+    /// rate-limits or kills the child itself; the platform just meters honestly.
+    fuel: u64,
 }
+
+/// The default provider fuel reserve (§5.3 provider-pays): generous — a service is expected
+/// to live for many calls — and wirer-adjustable via [`Host::set_impl_fuel_reserve`].
+const PROVIDER_FUEL_RESERVE: u64 = 1 << 32;
 
 /// The fixed, deterministic fuel budget for one wired-offer op dispatch (v1 pure dispatch —
 /// see [`Binding::GuestImpl`]). A looping impl hits `OutOfFuel` and the caller's call traps,
@@ -11231,6 +11243,7 @@ impl Host {
             state: Some(Arc::new(Mutex::new(ProviderState {
                 mem,
                 host: Host::new(),
+                fuel: PROVIDER_FUEL_RESERVE,
             }))),
         });
         Some(self.grant(type_id, Binding::GuestImpl(idx)))
@@ -11252,6 +11265,24 @@ impl Host {
         let h = self.regrant_into_child(cap, &mut st.host)?;
         st.host.register_cap_name(name, h);
         Some(h)
+    }
+
+    /// §5.3 provider-pays: the provider's remaining fuel reserve behind `offer` — the wirer's
+    /// meter ("read the meters on what you granted", §15). `None` for a forged handle or a
+    /// pure (non-instanced) offer.
+    pub fn impl_fuel_remaining(&self, offer: i32) -> Option<u64> {
+        let state = self.resolve_guest_impl(offer).ok()?.state.clone()?;
+        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+        Some(st.fuel)
+    }
+
+    /// §5.3 provider-pays: set the provider's fuel reserve behind `offer` (the wirer pricing
+    /// its own service — top-up or clamp). `None` (no change) for a forged handle or a pure
+    /// offer.
+    pub fn set_impl_fuel_reserve(&mut self, offer: i32, fuel: u64) -> Option<()> {
+        let state = self.resolve_guest_impl(offer).ok()?.state.clone()?;
+        state.lock().unwrap_or_else(|e| e.into_inner()).fuel = fuel;
+        Some(())
     }
 
     /// Adopt a wired offer re-granted from a parent domain (IMPORTS.md §3.3 — the wrap/override
@@ -12178,7 +12209,6 @@ impl Host {
                     .zip(args)
                     .map(|(ty, &s)| slot_to_val(*ty, s))
                     .collect();
-                let mut impl_fuel = GUEST_IMPL_FUEL;
                 let (res, _, _) = match &entry.state {
                     // §3.2 v2 **instanced** offer: run over the provider's persistent window +
                     // powerbox (exporter-domain state). The blocking lock is deadlock-free by
@@ -12186,27 +12216,46 @@ impl Host {
                     // them), so provider chains are acyclic and the lock order is always
                     // domain-host → provider; cross-domain contention on a shared provider
                     // serializes here, bounded by the impl fuel budget.
+                    //
+                    // §5.3 **provider pays**: each call is funded from the provider's drainable
+                    // reserve (capped per-call by GUEST_IMPL_FUEL); a dry reserve is an inert
+                    // CapFault the caller can probe and the wirer can meter
+                    // ([`Host::impl_fuel_remaining`]) — its code, its choice to offer, its
+                    // budget. A provider worried about a hammering caller rate-limits or kills
+                    // that caller itself.
                     Some(state) => {
                         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                         let st = &mut *st;
-                        drive_arc(
+                        if st.fuel == 0 {
+                            return Err(Trap::CapFault);
+                        }
+                        let budget = st.fuel.min(GUEST_IMPL_FUEL);
+                        let mut impl_fuel = budget;
+                        let out = drive_arc(
                             entry.funcs,
                             f,
                             &vals,
                             &mut impl_fuel,
                             &mut st.mem,
                             &mut st.host,
+                        );
+                        st.fuel -= budget - impl_fuel; // drain what the call actually used
+                        out
+                    }
+                    // v1 **pure** offer: windowless, empty powerbox — arguments in, results out,
+                    // capped at the flat per-call budget (there is no provider domain to drain;
+                    // the wirer accepted the bounded per-call price at wiring).
+                    None => {
+                        let mut impl_fuel = GUEST_IMPL_FUEL;
+                        drive_arc(
+                            entry.funcs,
+                            f,
+                            &vals,
+                            &mut impl_fuel,
+                            &mut None,
+                            &mut Host::new(),
                         )
                     }
-                    // v1 **pure** offer: windowless, empty powerbox — arguments in, results out.
-                    None => drive_arc(
-                        entry.funcs,
-                        f,
-                        &vals,
-                        &mut impl_fuel,
-                        &mut None,
-                        &mut Host::new(),
-                    ),
                 };
                 // A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the caller's
                 // call traps, fail-closed, identically on every backend.
