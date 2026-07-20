@@ -39,7 +39,10 @@ fn main() {
     } else {
         svm_run::resolve_capability_imports(module).expect("resolve capability imports")
     };
-    println!("  resolve caps     {:>8.1?}  (legacy modules only)", t.elapsed());
+    println!(
+        "  resolve caps     {:>8.1?}  (legacy modules only)",
+        t.elapsed()
+    );
 
     let t = Instant::now();
     svm_verify::verify_module(&module).expect("verify (fail-closed TCB)");
