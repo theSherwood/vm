@@ -2181,6 +2181,32 @@ fn pg_setup(
     host.register_cap_name("exit", exit);
     let memory = host.grant_memory();
     host.register_cap_name("memory", memory);
+    // IMPORTS.md phase 3: a manifest-carrying module executes its `call.import`s through
+    // instantiation-time slot bindings — map each import name via the on-ramp policy onto the four
+    // granted handles (`Stream` disambiguated by op). A name outside this headless powerbox (e.g.
+    // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch. A
+    // pre-phase-3 resolved artifact has an empty manifest, making this a no-op.
+    if !resolved.imports.is_empty() {
+        use svm_interp::iface;
+        let bindings = resolved
+            .imports
+            .iter()
+            .map(|im| {
+                let Some(cap) = onramp_cap_resolver(&im.name) else {
+                    return svm_interp::BoundImport::rebindable(0, 0, None);
+                };
+                let handle = match (cap.type_id, cap.op) {
+                    (iface::STREAM, 1) => out,
+                    (iface::STREAM, _) => inp,
+                    (iface::EXIT, _) => exit,
+                    (iface::MEMORY, _) => memory,
+                    _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+                };
+                svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            })
+            .collect();
+        host.set_import_bindings(bindings);
+    }
     // Positional prefix for a pre-S15c `_start` (`arity` of stdout/stdin/exit/memory); empty for the
     // current paramless entry, which resolves every cap by name.
     let slots: Vec<Value> = [
