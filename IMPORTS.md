@@ -419,6 +419,25 @@ browser build inherits support).
 `svm-posix`/`svm-run` child spawns adopt the reserved-prefix child manifest
 rule (§2.1).
 
+*Phase-3 status:*
+
+- *`svm-wasmjit` — **landed.** `outline_cap_calls` outlines `CallImport`
+  into the same cross-tier wrapper as `cap.call` (import index baked as an
+  immediate); `emit_module` permits the manifest and rejects only an import
+  op surviving in an emitted function (`tests/outline_callimport.rs`).*
+- *`svm-wasm` — **landed.** Every wasm function import (numeric convention
+  and §7 named alike) is one manifest entry `"<module>.<name>"`; a `call`
+  lowers to `call.import <slot>` with a dummy handle operand. Deleted: the
+  `NAMED_IMPORT` sentinel and the numeric-vs-named split, `handle_modules`,
+  the leading-handle-params prefix on every function/block (and the splices
+  at direct/indirect/tail call sites), the spawn-shim handle stash (`§12`
+  spawn now needs only the tid counter — bindings are host state shared
+  across vCPUs), and the start-wrapper handle threading. Embedders migrated
+  to `Host::set_import_bindings` (svm-wasm's own differential tests,
+  `svm-wasi` — its `bind` helper replaces `resolve_imports` + handle-arg —
+  and the bench thunk/fast-resolver, which now map the
+  `CAP_IMPORT_TYPE_ID` sentinel dispatch by arity).*
+
 **Phase 4 — deletions**: the **full §2.5 inventory** — the five headline
 conventions *and* the secondary machinery (the `synth_powerbox_start*`
 family, `powerbox_resolver`/`resolve_bound`, the positional entry-args ABI,
