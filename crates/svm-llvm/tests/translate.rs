@@ -1813,9 +1813,11 @@ const QUICKJS_OPENLIBM_EXTRA: &[&str] = &[
 /// into one textual module, then translate → verify → run vs a native `cc` oracle. The unmodified
 /// QuickJS 2024-01-13 engine (1175 funcs) translates, verifies, and executes the driver program
 /// (recursion + a `sort` closure + `JSON.stringify` + string methods + `toFixed`) with stdout
-/// byte-identical to native. **`#[ignore]`d only for wall-clock**: it fetches openlibm and runs a
-/// whole JS engine on the tree-walking interpreter (tens of seconds). Run by hand:
-/// `cargo test --test translate demo_quickjs_eval_vs_native -- --ignored --nocapture`.
+/// byte-identical to native. Costs real wall-clock (it fetches openlibm and runs a whole JS engine
+/// on the tree-walking interpreter, tens of seconds) but runs in CI anyway: these tests are the
+/// only guard on the QuickJS on-ramp recipe (the address-taken `Math` set drifted unseen while
+/// they were `#[ignore]`d). A failed fetch skips loudly rather than failing — grep CI logs for
+/// `skipping quickjs` before trusting a green run.
 ///
 /// Shared harness: build the linked QuickJS module for `driver_rel` (a `demos/quickjs/*.c` driver),
 /// run it under the powerbox with `stdin`, and assert stdout byte-matches the native `cc` oracle
@@ -1823,6 +1825,7 @@ const QUICKJS_OPENLIBM_EXTRA: &[&str] = &[
 /// stdin) tests. Skips cleanly when QuickJS/openlibm/clang are unavailable.
 fn quickjs_diff(driver_rel: &str, stdin: &[u8]) {
     let (Some(qjs), Some(ol)) = (fetch_quickjs(), fetch_openlibm()) else {
+        eprintln!("note: skipping quickjs (QuickJS/openlibm fetch failed — offline?)");
         return;
     };
     let pid = std::process::id();
@@ -1983,9 +1986,7 @@ fn quickjs_diff(driver_rel: &str, stdin: &[u8]) {
 
 /// **▶ QuickJS eval — the full JS engine RUNS byte-identical to native.** The `qjs_eval.c` driver's
 /// built-in program (recursion + a `sort` closure + `JSON.stringify` + string methods + `toFixed`).
-/// `#[ignore]`d only for wall-clock (a whole JS engine on the tree-walker + an openlibm fetch).
 #[test]
-#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
 fn demo_quickjs_eval_vs_native() {
     quickjs_diff("qjs_eval.c", b"");
 }
@@ -1995,7 +1996,6 @@ fn demo_quickjs_eval_vs_native() {
 /// output plus the completion value — byte-identical to native over a JS program exercising a closure
 /// sort, `JSON.stringify`, and shortest float formatting (`0.1+0.2` → `0.30000000000000004`).
 #[test]
-#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
 fn demo_quickjs_repl_stdin() {
     quickjs_diff(
         "qjs_repl.c",
@@ -2012,7 +2012,6 @@ fn demo_quickjs_repl_stdin() {
 /// (BigInt is deliberately omitted — miscompiled through `libbf`, the one known JS-surface gap; see
 /// ISSUES.md.)
 #[test]
-#[ignore = "runs green; slow — full JS engine on the interpreter + fetches openlibm"]
 fn demo_quickjs_breadth_vs_native() {
     quickjs_diff("qjs_breadth.c", b"");
 }
@@ -2022,12 +2021,13 @@ fn demo_quickjs_breadth_vs_native() {
 /// `bf_probe.c` driver + the reused libc/printf shims, and diffs the printed BigInt results (literal
 /// `toString`, `+`, `*`) against native `cc`. The uncalled libm decls `libbf` carries are trap-stubbed
 /// (`stub_unresolved_externs`), so no openlibm fetch is needed — the integer BigInt path never calls
-/// them. Was garbage/hung before the i128-large-constant fix (`i128_parts` dropped the high limb);
-/// `#[ignore]`d only for wall-clock (fetches QuickJS, runs the engine on the interpreter).
+/// them. Was garbage/hung before the i128-large-constant fix (`i128_parts` dropped the high limb).
 #[test]
-#[ignore = "runs green; slow — fetches QuickJS + compiles libbf on the interpreter"]
 fn demo_quickjs_bigint_vs_native() {
-    let Some(qjs) = fetch_quickjs() else { return };
+    let Some(qjs) = fetch_quickjs() else {
+        eprintln!("note: skipping quickjs bigint (QuickJS fetch failed — offline?)");
+        return;
+    };
     let pid = std::process::id();
     let demos = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos");
     let driver = demos.join("quickjs/bf_probe.c");
