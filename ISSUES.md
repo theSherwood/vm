@@ -13,6 +13,23 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I33 — `jit_killpath_stops_runaway_child` flaked once under full-workspace parallel load (S4) — local run, 2026-07-20
+
+**Where:** `crates/svm/tests/jit_killpath.rs::jit_killpath_stops_runaway_child`, during a full
+`cargo test --workspace` on a loaded machine (the phase-3 IMPORTS migration's local gate). 4/5 of
+the binary's tests passed; this one failed exactly once.
+
+**Not reproducible in isolation:** the single test passed 3/3 re-runs and the whole `jit_killpath`
+binary passed 5/5 consecutive runs immediately afterward on the same tree. The failing run's
+machine was near its disk quota and running many test binaries concurrently, so the likely
+mechanism is timing pressure on the kill path (a watchdog/deadline racing a deliberately-runaway
+child), the same runner-pressure family as I3/I4.
+
+**Action if it recurs:** capture the panic message (it scrolled out of the grep-filtered log this
+time — re-run with the failure line preserved), and consider serializing the binary's tests like
+`imports.rs` does (ISSUES.md I4 pattern) or widening the kill deadline under load.
+
+
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
 
 **Where:** the gating `build · test · fmt · clippy` job (ubuntu-latest), during `cargo test --workspace`'s
