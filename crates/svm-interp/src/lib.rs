@@ -1833,7 +1833,19 @@ fn drive(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> TracedRun {
-    let funcs: Arc<[Func]> = funcs.to_vec().into();
+    drive_arc(funcs.to_vec().into(), entry, args, fuel, mem, host)
+}
+
+/// [`drive`] over an already-shared function table — the §3.2 wired-offer dispatch reuses the
+/// offer's `Arc<[Func]>` verbatim instead of re-copying the table per call.
+fn drive_arc(
+    funcs: Arc<[Func]>,
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+) -> TracedRun {
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -9526,10 +9538,11 @@ enum Binding {
     HostFnRegion(u32),
     /// A **wired interface offer** (IMPORTS.md §3.2): a guest-implemented capability, carrying the
     /// index of its [`GuestImplEntry`] in [`Host::guest_impls`] (out-of-line so `Binding` stays
-    /// `Copy`, like [`Binding::HostFn`]). Op `i` dispatches to the offer's `ops[i]` function —
-    /// guest code, so the **eval loop** must service it (running it needs executor access, the
-    /// [`iface::JIT`]-invoke precedent); the generic dispatch treats it as an inert `CapFault`
-    /// until that routing lands (slice 3).
+    /// `Copy`, like [`Binding::HostFn`]). Op `i` dispatches to the offer's `ops[i]` function via
+    /// the **generic dispatch** (one implementation, all three backends): a v1 **pure dispatch** —
+    /// a fresh reference run over the offer's functions with no window and an empty powerbox, so
+    /// the impl computes over its arguments alone. Exporter-domain state is the designed
+    /// follow-up.
     GuestImpl(u32),
     /// A §15 / PROCESS.md §5 `Budget` handle, carrying the index of its [`BudgetState`] in
     /// [`Host::budgets`]. Authority over a passable, **splittable** resource-quota vector (fuel / mem /
@@ -9926,8 +9939,8 @@ pub type HostFnRegion = Box<
 /// list, the op signatures **derived** from those functions' declared types (never self-asserted),
 /// and the interned interface id ([`Host::intern_interface`]). Minted only by the wiring party
 /// ([`Host::wire_impl`]) — declaring an offer confers nothing; this entry existing in a domain's
-/// table is what moves authority. Op `i` runs `funcs[ops[i]]` **in the offering domain** — guest
-/// code, serviced by the eval loop (slice 3), never the generic dispatch.
+/// table is what moves authority. Op `i` runs `funcs[ops[i]]` as a **v1 pure dispatch** (see
+/// [`Binding::GuestImpl`]): windowless, empty powerbox, fixed fuel — arguments in, results out.
 #[derive(Clone)]
 pub struct GuestImplEntry {
     pub funcs: Arc<[Func]>,
@@ -9935,6 +9948,12 @@ pub struct GuestImplEntry {
     pub sigs: Arc<[FuncType]>,
     pub type_id: u32,
 }
+
+/// The fixed, deterministic fuel budget for one wired-offer op dispatch (v1 pure dispatch —
+/// see [`Binding::GuestImpl`]). A looping impl hits `OutOfFuel` and the caller's call traps,
+/// fail-closed and identically on every backend. Caller-fuel threading is the designed
+/// follow-up alongside exporter-domain state.
+const GUEST_IMPL_FUEL: u64 = 1 << 26;
 
 // The `Host` *is* the region minter — the narrow authority a `HostFnRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
@@ -11967,10 +11986,47 @@ impl Host {
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
             Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
-            // A wired interface offer (IMPORTS.md §3.2) dispatches to **guest code in the offering
-            // domain** — only the eval loop can service that (the executor-dispatch rule, like
-            // `Instantiator`/`Jit.invoke`). Reaching the generic dispatch instead is inert.
-            Binding::GuestImpl(_) => Err(Trap::CapFault),
+            // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
+            // dispatch**. The op executes as a fresh reference run over the offer's own function
+            // table with **no window and an empty powerbox**: it computes over its arguments alone,
+            // so it gains exactly nothing from the wiring context (authority-neutral by
+            // construction — "implementing an interface requires zero authority", and this v1
+            // implements one *with* zero authority). A load/store or capability call inside the
+            // impl faults/`CapFault`s fail-closed. Living in the generic dispatch keeps all three
+            // backends on one implementation. Exporter-domain state (the stateful "parent `Fs`
+            // backed by its own window") is the designed follow-up; fuel is a fixed deterministic
+            // budget until caller-fuel threading lands with it.
+            Binding::GuestImpl(idx) => {
+                let entry = self
+                    .guest_impls
+                    .get(idx as usize)
+                    .ok_or(Trap::CapFault)?
+                    .clone();
+                let f = *entry.ops.get(op as usize).ok_or(Trap::CapFault)?;
+                let sig = entry.sigs.get(op as usize).ok_or(Trap::CapFault)?;
+                if args.len() != sig.params.len() {
+                    return Err(Trap::CapFault);
+                }
+                let vals: Vec<Value> = sig
+                    .params
+                    .iter()
+                    .zip(args)
+                    .map(|(ty, &s)| slot_to_val(*ty, s))
+                    .collect();
+                let mut impl_fuel = GUEST_IMPL_FUEL;
+                let mut impl_host = Host::new();
+                let (res, _, _) = drive_arc(
+                    entry.funcs,
+                    f,
+                    &vals,
+                    &mut impl_fuel,
+                    &mut None,
+                    &mut impl_host,
+                );
+                // A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the caller's
+                // call traps, fail-closed, identically on every backend.
+                Ok(res?.iter().map(|v| val_to_slot(*v)).collect())
+            }
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
             // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
             // then restore it — a panic would only poison this one slot, never the host.

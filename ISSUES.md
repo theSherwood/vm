@@ -29,6 +29,14 @@ child), the same runner-pressure family as I3/I4.
 time — re-run with the failure line preserved), and consider serializing the binary's tests like
 `imports.rs` does (ISSUES.md I4 pattern) or widening the kill deadline under load.
 
+**Recurred in CI (macos-latest), 2026-07-20** — PR #407, head `de02a9d0` (`build · test
+(macos-latest)` job 88426158563), same test, this time with the panic captured: expected
+`Trapped(OutOfFuel)`, got `Returned([0])` — the runaway child *completed* before the watchdog's
+interrupt landed, i.e. the deadline raced the kill signal exactly as hypothesized. Unrelated diff
+(the failing head touches only svm-llvm test fixtures). Two sightings in one day across two
+platforms upgrade this from "seen once locally" to "needs the I4-style serialization or a wider
+deadline"; still not touched here to keep the IMPORTS PR clean.
+
 
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
 
