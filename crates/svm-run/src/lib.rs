@@ -3297,6 +3297,22 @@ pub struct HostCap {
     /// the slot's `(type_id, op)` interface but grants nothing at instantiation (the slot starts
     /// empty; the guest fills it with `import.attach`). Built by [`HostCap::template`].
     unbound: bool,
+    /// §3.2 (IMPORTS.md): a **wired interface offer** — the slot binds to op `op` of a guest
+    /// `impl` export instead of a host-native capability. When set, `type_id` is unused (the
+    /// interface id is interned per-host at wiring) and `grant` is never called. Built by
+    /// [`HostCap::impl_offer`]; signature-checked structurally, fail-closed, at
+    /// [`instantiate_with_imports`].
+    offer: Option<OfferBinding>,
+}
+
+/// The state a [`HostCap::impl_offer`] carries: the offering module's function table and the
+/// offer's per-op funcidx list (both shared, cheap to clone per host), plus which op this
+/// import name selects.
+#[derive(Clone)]
+struct OfferBinding {
+    funcs: Arc<[svm_ir::Func]>,
+    ops: Arc<[u32]>,
+    op: u32,
 }
 
 impl HostCap {
@@ -3307,6 +3323,7 @@ impl HostCap {
             op: 1,
             grant: Arc::new(|h, _| h.grant_stream(StreamRole::Out)),
             unbound: false,
+            offer: None,
         }
     }
     /// A `Stream` read endpoint (stdin): `read(buf, len)` is op 0.
@@ -3316,6 +3333,7 @@ impl HostCap {
             op: 0,
             grant: Arc::new(|h, _| h.grant_stream(StreamRole::In)),
             unbound: false,
+            offer: None,
         }
     }
     /// The `Exit` lifecycle capability: `exit(code)` (op 0, noreturn).
@@ -3325,6 +3343,7 @@ impl HostCap {
             op: 0,
             grant: Arc::new(|h, _| h.grant_exit()),
             unbound: false,
+            offer: None,
         }
     }
     /// The `Clock` capability: `now(clock_id) -> i64` (op 0).
@@ -3334,6 +3353,7 @@ impl HostCap {
             op: 0,
             grant: Arc::new(|h, _| h.grant_clock()),
             unbound: false,
+            offer: None,
         }
     }
     /// A **host-defined** capability (iface [`iface::HOST_FN`]) — arbitrary semantics behind a named
@@ -3347,6 +3367,7 @@ impl HostCap {
             op,
             grant: Arc::new(move |h, _| h.grant_host_fn(make())),
             unbound: false,
+            offer: None,
         }
     }
     /// An **mmap-capable** host-defined capability (§4b): like [`host_fn`](HostCap::host_fn) but the
@@ -3364,6 +3385,7 @@ impl HostCap {
             op,
             grant: Arc::new(move |h, _| h.grant_host_fn_region(make())),
             unbound: false,
+            offer: None,
         }
     }
     /// A fully custom binding: an explicit `(type_id, op)` and a re-grantable grant action. The escape
@@ -3378,7 +3400,38 @@ impl HostCap {
             op,
             grant: Arc::new(grant),
             unbound: false,
+            offer: None,
         }
+    }
+
+    /// §3.2 (IMPORTS.md): bind an import slot to **op `op` of a guest interface offer** — a
+    /// named `impl` export of `provider` (`export "<offer>" impl <funcidx>...`). The wiring is
+    /// the authority-moving act: at instantiation the offer is wired into the instance's table
+    /// (`Host::wire_impl` — the interface id is interned per-host from the ops' derived
+    /// signatures) and the slot binds to `(interned id, op, handle)` after a structural,
+    /// fail-closed signature check against the import's declaration
+    /// ([`instantiate_with_imports`] refuses a mismatch).
+    ///
+    /// v1 executes a wired op as a **pure dispatch** (see `svm_interp::Binding::GuestImpl`):
+    /// the impl computes over its arguments alone — no window, no capabilities.
+    ///
+    /// `None` if `provider` has no offer named `offer` or `op` is outside its op list.
+    pub fn impl_offer(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
+        let e = provider.resolve_impl_export(offer)?;
+        if op as usize >= e.ops.len() {
+            return None;
+        }
+        Some(HostCap {
+            type_id: 0, // unused: the real interface id is interned per-host at wiring
+            op,
+            grant: Arc::new(|_, _| -1), // never called for an offer binding
+            unbound: false,
+            offer: Some(OfferBinding {
+                funcs: provider.funcs.clone().into(),
+                ops: e.ops.clone().into(),
+                op,
+            }),
+        })
     }
 
     /// Phase-2 (IMPORTS.md): a **template-only** binding for a `rebindable` import — the slot's
@@ -3391,6 +3444,7 @@ impl HostCap {
             // Never called (grant_caps skips template caps); inert if a future path slips.
             grant: Arc::new(|_, _| -1),
             unbound: true,
+            offer: None,
         }
     }
 }
@@ -3435,6 +3489,7 @@ impl Imports {
                     type_id: cap.type_id,
                     op,
                     unbound: false,
+                    offer: None,
                     grant: Arc::new(move |h, win| match h.resolve_cap_name(&module_name) {
                         Some(handle) => handle,
                         None => {
@@ -3655,15 +3710,33 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
     // Phase 4 (IMPORTS.md §2.5): the module's bytes are never rewritten — every import must bind
     // to an interface the slot dispatch serves. An executor-dispatch interface (`Instantiator`,
     // `Yielder`, …) is a dynamic-mode capability: dispatch on the interface handle at the call
-    // site (§2.2/§2.3), not through a manifest slot.
-    if let Some(name) = order
-        .iter()
-        .find(|n| !generic_dispatch_iface(imports.map[n.as_str()].type_id))
-    {
+    // site (§2.2/§2.3), not through a manifest slot. A §3.2 offer binding is exempt: it is
+    // served by the generic dispatch under its per-host interned id.
+    if let Some(name) = order.iter().find(|n| {
+        let cap = &imports.map[n.as_str()];
+        cap.offer.is_none() && !generic_dispatch_iface(cap.type_id)
+    }) {
         return Err(format!(
             "capability import `{name}` names an interface the slot dispatch cannot serve — use \
              dynamic mode (`cap.call` on a live handle, IMPORTS.md §2.2)"
         ));
+    }
+    // §3.2 offer bindings: the wiring-time signature check, structural and fail-closed — the
+    // import's declared op signature must equal the offered function's declared type exactly.
+    // (Checked here, host-independently, so `grant_caps` wires under a validated invariant.)
+    for (i, name) in order.iter().enumerate() {
+        let Some(off) = &imports.map[name.as_str()].offer else {
+            continue;
+        };
+        let f = &off.funcs[off.ops[off.op as usize] as usize];
+        let declared = &module.imports[i].sig;
+        if declared.params != f.params || declared.results != f.results {
+            return Err(format!(
+                "import `{name}` declares {:?} -> {:?} but the wired offer's op {} implements \
+                 {:?} -> {:?} (IMPORTS.md §3.2: structural, fail-closed)",
+                declared.params, declared.results, off.op, f.params, f.results
+            ));
+        }
     }
     // The **no-rewrite** path: keep the module's bytes exactly as verified (the manifest stays;
     // `call.import` executes through the instantiation-time binding table each run installs). The
@@ -3974,6 +4047,22 @@ impl Instance {
                             cap.op,
                             None,
                         ));
+                        continue;
+                    }
+                    // §3.2 offer binding: wire the offer into this host's table (interning its
+                    // interface id) and bind the slot to the selected op. The signature check
+                    // already passed at `instantiate_with_imports` (structural, fail-closed), so
+                    // failure here is unreachable for a validated instance.
+                    if let Some(off) = &cap.offer {
+                        let handle = h
+                            .wire_impl(&off.funcs, &off.ops)
+                            .expect("offer validated at instantiation");
+                        h.register_cap_name(name, handle);
+                        let declared = &self.module.imports[i].sig;
+                        bindings.push(
+                            h.bound_import_for_impl(handle, off.op, declared, rebindable)
+                                .expect("offer signature validated at instantiation"),
+                        );
                         continue;
                     }
                     let handle = (cap.grant)(h, win);
