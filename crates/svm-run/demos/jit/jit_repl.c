@@ -94,7 +94,7 @@ static long emit_unit(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 4); // format v4 (v3 sections + the per-import binding-mode byte)
+  eb(buf, 5); // format v5 (v4 sections + the impl-export section)
   // Memory descriptor: present, size_log2 16 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(buf, 1);
@@ -102,6 +102,7 @@ static long emit_unit(char *buf) {
   eb(buf, 0); // no data segments
   eb(buf, 0); // no imports — self-contained unit (v2 import section)
   eb(buf, 0); // no exports — invoked by handle, not by name (v3 export section)
+  eb(buf, 0); // no impl exports (v5 impl-export section)
   eb(buf, 1); // one function
   // params (a, b) : i64, i64 ; results : i64 (type tag 1 = i64).
   eb(buf, 2);

@@ -78,7 +78,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 4); // format v4 (v3 sections + the per-import binding-mode byte)
+  eb(buf, 5); // format v5 (v4 sections + the impl-export section)
   eb(buf, 1);
   eb(buf, 16);
   eb(buf, 0);
@@ -96,6 +96,7 @@ static long emit_binop(char *buf, int opcode) {
   emit_header(buf);
   eb(buf, 0); // 0 imports
   eb(buf, 0); // 0 exports (v3 export section)
+  eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
@@ -129,6 +130,7 @@ static long emit_poly(char *buf) {
   emit_i64_pair_sig(buf);
   eb(buf, 0); // mode: required (v4)
   eb(buf, 0); // 0 exports (v3 export section)
+  eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
