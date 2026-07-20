@@ -98,12 +98,12 @@ fn bind_shim(m: &svm_ir::Module, host: &mut Host, handle: i32) {
     let bindings = m
         .imports
         .iter()
-        .map(|i| {
-            match i.name.strip_prefix("__px_").and_then(svm_posix::resolve) {
+        .map(
+            |i| match i.name.strip_prefix("__px_").and_then(svm_posix::resolve) {
                 Some(c) => svm_interp::BoundImport::required(c.type_id, c.op, handle),
                 None => svm_interp::BoundImport::rebindable(0, 0, None),
-            }
-        })
+            },
+        )
         .collect();
     host.set_import_bindings(bindings);
 }
