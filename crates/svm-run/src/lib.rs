@@ -1442,12 +1442,16 @@ pub unsafe extern "C" fn child_bind_imports(
     parent_ctx: *mut c_void,
     child_ctx: *mut c_void,
     module: i64,
-) {
+) -> i32 {
     let parent = &*(parent_ctx as *mut Host);
     let child = &mut *(child_ctx as *mut Host);
     if let Some(imports) = parent.module_imports(module as i32) {
-        child.bind_child_manifest(&imports);
+        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL).
+        if child.bind_child_manifest(&imports).is_err() {
+            return -22;
+        }
     }
+    0
 }
 
 /// PROCESS.md S2 (JIT parity) — the §14 **named-grant-list builder** for `instantiate_named` (op 11):

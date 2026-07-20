@@ -503,9 +503,15 @@ leaving the tree with five conventions instead of four.
 
 ---
 
-## 3. Designed now, build on demand  [PROPOSED, consumer-gated; §3.2 v1 landed]
+## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 v1 landed (exporter-domain state pending); §3.4 built]
 
 ### 3.1 Binding provenance in `cap.self.attest`
+
+*Status: **landed** (2026-07-20) as `cap.self.provenance(handle) -> i32` — self-namespace
+op 5, reached via dynamic dispatch on the reserved `cap.self` id (no new instruction, no
+wire change): `0` = platform-terminated, `d ≥ 1` = ancestor-terminated `d` domain
+boundaries up (1 where the offer was wired, +1 per §3.3 re-grant hop). A forged/closed
+handle is an inert `CapFault`. PROCESS.md §6's growth-criterion list updated to name it.*
 
 Extends `PROCESS.md` §6 (and shares its status and its sign-off requirements).
 The handle table is host-owned, so the TCB knows, per entry, whether its
@@ -588,6 +594,16 @@ parent's resources. Not a loophole; the point of the model.
    thread caller fuel) without changing the wire format or the wiring API.
 
 ### 3.3 Forwarding, wrapping, overriding — one act
+
+*Status: **landed** (2026-07-20). A wired offer is re-grantable into a §14 child
+(`regrant_into_child` adopts the entry under the child's interned id, one provenance hop
+deeper), and `bind_child_manifest` binds, per slot: a **named offer grant** first (its
+first signature-matching op — structural, fail-closed, a name match with no signature
+match never silently binds), then the reference policy, then **withhold** — a
+`rebindable` slot starts empty, a `required` slot fails the whole spawn closed
+(probeable `-EINVAL` before any child code runs), on both the interpreter's inline spawn
+and the JIT's child builders. Forwarding of platform caps is the existing re-grant
+(zero-marginal-cost aliasing); a forwarded offer keeps its entry and gains a depth hop.*
 
 A parent instantiating a child supplies `name → binding` for the child's
 manifest (the existing `spawn_named_child` flow, given a manifest to bind
