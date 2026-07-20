@@ -29,6 +29,7 @@ fn one_func_module(f: Func) -> Module {
         data: vec![],
         imports: vec![],
         exports: vec![],
+        impl_exports: vec![],
         debug_info: None,
     }
 }
@@ -177,6 +178,7 @@ fn multi_result_call_identity_and_defs() {
         data: vec![],
         imports: vec![],
         exports: vec![],
+        impl_exports: vec![],
         debug_info: None,
     };
     assert_roundtrip(&m);

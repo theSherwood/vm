@@ -1833,7 +1833,19 @@ fn drive(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> TracedRun {
-    let funcs: Arc<[Func]> = funcs.to_vec().into();
+    drive_arc(funcs.to_vec().into(), entry, args, fuel, mem, host)
+}
+
+/// [`drive`] over an already-shared function table — the §3.2 wired-offer dispatch reuses the
+/// offer's `Arc<[Func]>` verbatim instead of re-copying the table per call.
+fn drive_arc(
+    funcs: Arc<[Func]>,
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+) -> TracedRun {
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -9205,6 +9217,11 @@ pub mod iface {
     /// (the `create(module, window, budget)` accounting) is the follow-up; this is the passable object
     /// + attenuation the rest builds on.
     pub const BUDGET: u32 = 14;
+    /// Base of the **guest-interface id space** (IMPORTS.md §3.2): ids for wired interface offers
+    /// are interned per-`Host` from this base upward ([`super::Host::intern_interface`] — the id ≡
+    /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
+    /// the fixed built-ins and far below the reserved `u32::MAX`-family dispatch sentinels.
+    pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -9519,6 +9536,14 @@ enum Binding {
     /// An mmap-capable host-function capability (§4b): like [`Binding::HostFn`] but its handler in
     /// [`Host::host_fns_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
     HostFnRegion(u32),
+    /// A **wired interface offer** (IMPORTS.md §3.2): a guest-implemented capability, carrying the
+    /// index of its [`GuestImplEntry`] in [`Host::guest_impls`] (out-of-line so `Binding` stays
+    /// `Copy`, like [`Binding::HostFn`]). Op `i` dispatches to the offer's `ops[i]` function via
+    /// the **generic dispatch** (one implementation, all three backends): a v1 **pure dispatch** —
+    /// a fresh reference run over the offer's functions with no window and an empty powerbox, so
+    /// the impl computes over its arguments alone. Exporter-domain state is the designed
+    /// follow-up.
+    GuestImpl(u32),
     /// A §15 / PROCESS.md §5 `Budget` handle, carrying the index of its [`BudgetState`] in
     /// [`Host::budgets`]. Authority over a passable, **splittable** resource-quota vector (fuel / mem /
     /// spawn): `split` attenuates a sub-budget out of the remaining, `read` reports it. Out-of-line (an
@@ -9634,6 +9659,9 @@ pub enum NonDurableKind {
     HostFn,
     Budget,
     Pipe,
+    /// A wired interface offer (IMPORTS.md §3.2) — carries an out-of-line reference to the
+    /// offering domain's functions, so it must be re-wired after restore, not snapshotted.
+    GuestImpl,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -9906,6 +9934,27 @@ pub type HostFnRegion = Box<
         + Send,
 >;
 
+/// A **wired interface offer**'s host-side state (IMPORTS.md §3.2), indexed by the id a
+/// [`Binding::GuestImpl`] carries: the offering module's functions, the offer's per-op funcidx
+/// list, the op signatures **derived** from those functions' declared types (never self-asserted),
+/// and the interned interface id ([`Host::intern_interface`]). Minted only by the wiring party
+/// ([`Host::wire_impl`]) — declaring an offer confers nothing; this entry existing in a domain's
+/// table is what moves authority. Op `i` runs `funcs[ops[i]]` as a **v1 pure dispatch** (see
+/// [`Binding::GuestImpl`]): windowless, empty powerbox, fixed fuel — arguments in, results out.
+#[derive(Clone)]
+pub struct GuestImplEntry {
+    pub funcs: Arc<[Func]>,
+    pub ops: Arc<[u32]>,
+    pub sigs: Arc<[FuncType]>,
+    pub type_id: u32,
+}
+
+/// The fixed, deterministic fuel budget for one wired-offer op dispatch (v1 pure dispatch —
+/// see [`Binding::GuestImpl`]). A looping impl hits `OutOfFuel` and the caller's call traps,
+/// fail-closed and identically on every backend. Caller-fuel threading is the designed
+/// follow-up alongside exporter-domain state.
+const GUEST_IMPL_FUEL: u64 = 1 << 26;
+
 // The `Host` *is* the region minter — the narrow authority a `HostFnRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
@@ -9991,6 +10040,14 @@ pub struct Host {
     /// carries, [`Host::grant_host_fn_region`]) — a `HostFn` plus a [`RegionMinter`]. Same
     /// take-out/run/restore dispatch as `host_fns`.
     host_fns_region: Vec<HostFnRegion>,
+    /// Wired interface offers (IMPORTS.md §3.2), indexed by the id a [`Binding::GuestImpl`]
+    /// carries ([`Host::wire_impl`]).
+    guest_impls: Vec<GuestImplEntry>,
+    /// The per-`Host` **structural interface intern** (D59 applied to capability interfaces):
+    /// index `i` holds the op-signature list whose interface id is `GUEST_IMPL_BASE + i`, so
+    /// id-equality ≡ structural equality within this table. Flat and scanned linearly — offers
+    /// are few; boring beats a map.
+    iface_intern: Vec<Arc<[FuncType]>>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -10214,6 +10271,9 @@ fn module_digest(m: &Module) -> [u8; 32] {
         memory: m.memory,
         data: m.data.clone(),
         exports: m.exports.clone(),
+        // Interface offers are semantic (they are what wiring resolves against), so they ride
+        // the identity digest like function exports do.
+        impl_exports: m.impl_exports.clone(),
         imports: Vec::new(),
         debug_info: None,
     };
@@ -10249,6 +10309,8 @@ impl Host {
             blockings: Vec::new(),
             host_fns: Vec::new(),
             host_fns_region: Vec::new(),
+            guest_impls: Vec::new(),
+            iface_intern: Vec::new(),
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -10749,6 +10811,9 @@ impl Host {
                 Binding::HostFn(_) | Binding::HostFnRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::HostFn))
                 }
+                Binding::GuestImpl(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::GuestImpl))
+                }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
                 Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
             };
@@ -10802,6 +10867,7 @@ impl Host {
                 Binding::JitDomain(_) => NonDurableKind::JitDomain,
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
+                Binding::GuestImpl(_) => NonDurableKind::GuestImpl,
                 Binding::Budget(_) => NonDurableKind::Budget,
                 Binding::PipeEnd { .. } => NonDurableKind::Pipe,
             };
@@ -11002,6 +11068,90 @@ impl Host {
         let idx = self.host_fns_region.len() as u32;
         self.host_fns_region.push(f);
         self.grant(iface::HOST_FN, Binding::HostFnRegion(idx))
+    }
+
+    /// Intern an interface's op-signature list and return its id (IMPORTS.md §3.2): structurally
+    /// identical lists collide to the same id, so **id-equality ≡ structural equality** within
+    /// this `Host` (D59 applied to capability interfaces — a parent-implemented interface is
+    /// typewise indistinguishable from any other structurally-equal one; provenance, not typing,
+    /// is the honest bit, §3.1). Ids allocate from [`iface::GUEST_IMPL_BASE`] upward.
+    pub fn intern_interface(&mut self, sigs: &[FuncType]) -> u32 {
+        if let Some(i) = self.iface_intern.iter().position(|s| **s == *sigs) {
+            return iface::GUEST_IMPL_BASE + i as u32;
+        }
+        self.iface_intern.push(sigs.into());
+        iface::GUEST_IMPL_BASE + (self.iface_intern.len() - 1) as u32
+    }
+
+    /// **Wire an interface offer into this domain's table** (IMPORTS.md §3.2) and return the
+    /// handle — the authority-moving act. `funcs` is the offering module's function table and
+    /// `ops` its offer's per-op funcidx list ([`svm_ir::ImplExport::ops`], verifier-checked
+    /// in-range for a verified module; re-checked here fail-closed since the wirer is host-side
+    /// code). Op signatures are **derived** from the named functions' declared types and interned
+    /// ([`Host::intern_interface`]), so the entry's `type_id` is its structural identity. Only a
+    /// wiring party holding both ends calls this — declaring the offer conferred nothing.
+    ///
+    /// Returns `None` (nothing minted) for an empty op list or an out-of-range funcidx.
+    pub fn wire_impl(&mut self, funcs: &Arc<[Func]>, ops: &[u32]) -> Option<i32> {
+        if ops.is_empty() || ops.iter().any(|&f| f as usize >= funcs.len()) {
+            return None;
+        }
+        let sigs: Arc<[FuncType]> = ops
+            .iter()
+            .map(|&f| FuncType {
+                params: funcs[f as usize].params.clone(),
+                results: funcs[f as usize].results.clone(),
+            })
+            .collect();
+        let type_id = self.intern_interface(&sigs);
+        let idx = self.guest_impls.len() as u32;
+        self.guest_impls.push(GuestImplEntry {
+            funcs: Arc::clone(funcs),
+            ops: ops.into(),
+            sigs,
+            type_id,
+        });
+        Some(self.grant(type_id, Binding::GuestImpl(idx)))
+    }
+
+    /// Resolve `handle` to its wired-offer state (§3c: mask + generation, then the binding must
+    /// actually be a [`Binding::GuestImpl`]) — the eval loop's lookup when servicing a dispatch
+    /// (slice 3), and the wiring-time lookup for [`Host::bound_import_for_impl`]. A forged /
+    /// closed / non-offer handle is an inert `CapFault`.
+    pub fn resolve_guest_impl(&self, handle: i32) -> Result<&GuestImplEntry, Trap> {
+        // The slot's own type_id feeds the canonical resolve (§3c mask + generation + type run
+        // through the one hinge, never re-implemented); the binding-kind match below is the check
+        // that the id actually names a wired offer.
+        let expect = self.table[(handle as u32 as usize) & (CAP - 1)].type_id;
+        match self.resolve(handle, expect)? {
+            Binding::GuestImpl(idx) => self.guest_impls.get(idx as usize).ok_or(Trap::CapFault),
+            _ => Err(Trap::CapFault),
+        }
+    }
+
+    /// Build the [`BoundImport`] that binds an import slot to op `op` of the wired offer behind
+    /// `handle` — **the §3.2 wiring-time signature check**, structural and fail-closed: `None`
+    /// unless `handle` resolves to a wired offer, `op` is within its op list, and the slot's
+    /// `declared` signature equals the op's derived signature exactly. On success the slot binds
+    /// `(offer's type_id, op, handle)` like any other capability binding
+    /// ([`Host::set_import_bindings`]).
+    pub fn bound_import_for_impl(
+        &self,
+        handle: i32,
+        op: u32,
+        declared: &FuncType,
+        rebindable: bool,
+    ) -> Option<BoundImport> {
+        let entry = self.resolve_guest_impl(handle).ok()?;
+        let sig = entry.sigs.get(op as usize)?;
+        if sig != declared {
+            return None;
+        }
+        Some(if rebindable {
+            BoundImport::rebindable(entry.type_id, op, Some(handle))
+        } else {
+            BoundImport::required(entry.type_id, op, handle)
+        })
     }
 
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
@@ -11836,6 +11986,47 @@ impl Host {
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
             Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
+            // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
+            // dispatch**. The op executes as a fresh reference run over the offer's own function
+            // table with **no window and an empty powerbox**: it computes over its arguments alone,
+            // so it gains exactly nothing from the wiring context (authority-neutral by
+            // construction — "implementing an interface requires zero authority", and this v1
+            // implements one *with* zero authority). A load/store or capability call inside the
+            // impl faults/`CapFault`s fail-closed. Living in the generic dispatch keeps all three
+            // backends on one implementation. Exporter-domain state (the stateful "parent `Fs`
+            // backed by its own window") is the designed follow-up; fuel is a fixed deterministic
+            // budget until caller-fuel threading lands with it.
+            Binding::GuestImpl(idx) => {
+                let entry = self
+                    .guest_impls
+                    .get(idx as usize)
+                    .ok_or(Trap::CapFault)?
+                    .clone();
+                let f = *entry.ops.get(op as usize).ok_or(Trap::CapFault)?;
+                let sig = entry.sigs.get(op as usize).ok_or(Trap::CapFault)?;
+                if args.len() != sig.params.len() {
+                    return Err(Trap::CapFault);
+                }
+                let vals: Vec<Value> = sig
+                    .params
+                    .iter()
+                    .zip(args)
+                    .map(|(ty, &s)| slot_to_val(*ty, s))
+                    .collect();
+                let mut impl_fuel = GUEST_IMPL_FUEL;
+                let mut impl_host = Host::new();
+                let (res, _, _) = drive_arc(
+                    entry.funcs,
+                    f,
+                    &vals,
+                    &mut impl_fuel,
+                    &mut None,
+                    &mut impl_host,
+                );
+                // A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the caller's
+                // call traps, fail-closed, identically on every backend.
+                Ok(res?.iter().map(|v| val_to_slot(*v)).collect())
+            }
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
             // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
             // then restore it — a panic would only poison this one slot, never the host.

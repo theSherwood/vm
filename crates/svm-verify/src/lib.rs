@@ -118,6 +118,14 @@ pub enum VerifyError {
     ExportFuncOutOfRange { export: u32, func: u32 },
     /// Two [`Module::exports`] entries share a name — exports must be uniquely addressable.
     DuplicateExport { export: u32 },
+    /// An [`Module::impl_exports`] offer's op list names a funcidx past the end of `funcs`.
+    ImplExportFuncOutOfRange { export: u32, op: u32, func: u32 },
+    /// An [`Module::impl_exports`] offer with an empty op list — an interface with no operations
+    /// can never be wired; fail-closed at verify rather than at wiring.
+    ImplExportEmpty { export: u32 },
+    /// Two export entries share a name. Function exports and impl exports (interface offers,
+    /// IMPORTS.md §3.2) are one namespace: the host addresses both by name.
+    DuplicateImplExport { export: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -175,6 +183,29 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         }
         if m.exports[..ei].iter().any(|o| o.name == e.name) {
             return Err(VerifyError::DuplicateExport { export: ei as u32 });
+        }
+    }
+    // Interface offers (IMPORTS.md §3.2): every per-op funcidx must be a real function (op `i`'s
+    // signature IS that function's declared type, so a dangling index would leave the interface
+    // unspecifiable), the op list must be non-empty, and names must be unique across *both*
+    // export namespaces (the host wires offers by name).
+    for (ei, e) in m.impl_exports.iter().enumerate() {
+        if e.ops.is_empty() {
+            return Err(VerifyError::ImplExportEmpty { export: ei as u32 });
+        }
+        for (oi, &f) in e.ops.iter().enumerate() {
+            if f as usize >= m.funcs.len() {
+                return Err(VerifyError::ImplExportFuncOutOfRange {
+                    export: ei as u32,
+                    op: oi as u32,
+                    func: f,
+                });
+            }
+        }
+        if m.impl_exports[..ei].iter().any(|o| o.name == e.name)
+            || m.exports.iter().any(|o| o.name == e.name)
+        {
+            return Err(VerifyError::DuplicateImplExport { export: ei as u32 });
         }
     }
     Ok(())

@@ -503,7 +503,7 @@ leaving the tree with five conventions instead of four.
 
 ---
 
-## 3. Designed now, build on demand  [PROPOSED, consumer-gated]
+## 3. Designed now, build on demand  [PROPOSED, consumer-gated; §3.2 v1 landed]
 
 ### 3.1 Binding provenance in `cap.self.attest`
 
@@ -534,11 +534,14 @@ Trust model served (the asymmetry, stated once):
 
 ### 3.2 Provider-side exports (`impl` exports) and wiring
 
+*Status: **v1 landed** (2026-07-20), with two recorded amendments and a scoped follow-up —
+see the "as built" note at the end of this section.*
+
 The symmetric half of the manifest: a domain that *implements* an interface.
 
 ```
 export "main"   func 0                 ; entry point (unchanged)
-export "logger" impl Log = func 7      ; func 7: the dispatch (op, args…) -> results
+export "logger" impl 7 9               ; one funcidx PER OP (amendment: was one dispatch func)
 ```
 
 An `impl` export is an **offer** — declaring it confers nothing. Authority
@@ -555,6 +558,34 @@ Interfaces are signatures; **implementing one requires zero authority**. A
 parent can offer an `Fs` backed purely by its own window, regardless of
 whether it holds any platform fs — the child's "fs" then consumes only the
 parent's resources. Not a loophole; the point of the model.
+
+**As built (v1, 2026-07-20).** Two amendments to the sketch above, and one scoped follow-up:
+
+1. **One func per op, not one dispatch func.** Guest functions have fixed signatures, so a
+   single `(op, args…)` dispatch func cannot be typed for an interface with heterogeneous op
+   arities without a padded-i64 marshaling convention that would blind the verifier. An offer
+   instead lists one funcidx per op (`svm_ir::ImplExport { name, ops }`, text
+   `export "logger" impl 7 9`, wire v5) and **op `i`'s signature IS `funcs[ops[i]]`'s declared
+   type** — derived, never asserted, so the verifier and the wiring check are exact. There is
+   no nominal interface name (`Log` above was illustrative): interface identity is the
+   structural op-signature list, interned per-host to a `type_id`
+   (`Host::intern_interface`, id-equality ≡ structural equality — D59 applied to capability
+   interfaces; the OQ3 interned-section wire format remains open, this intern is host-side).
+2. **v1 executes a wired op as a *pure dispatch*, not in the exporter's domain.** Wiring
+   (`Host::wire_impl` + `bound_import_for_impl`, surfaced as
+   `svm_run::HostCap::impl_offer`) is exactly as designed: authority moves only at the wiring
+   act, signature-checked structurally, fail-closed, and the binding is non-durable. But
+   execution runs the op's function as a fresh reference run over the offer's function table —
+   **no window, an empty powerbox, a fixed deterministic fuel budget** — inside the one
+   generic dispatch all three backends share. The impl computes over its arguments alone
+   (implementing an interface requires zero authority; v1 implements one *with* zero
+   authority). That covers adapters, validators, policy checks, and test fakes, and keeps the
+   three tiers in differential lockstep with a single implementation.
+3. **Follow-up: exporter-domain state.** The stateful headline ("an `Fs` backed by the
+   parent's own window") needs the op to run over the *exporter's* window and powerbox —
+   cross-domain window views, host references, and lock ordering that v1 deliberately does
+   not touch. It builds on the same `GuestImplEntry`/binding shape (add the domain reference,
+   thread caller fuel) without changing the wire format or the wiring API.
 
 ### 3.3 Forwarding, wrapping, overriding — one act
 

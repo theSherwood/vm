@@ -343,7 +343,9 @@ pub fn specialize_with_config(
         imports: vec![],
         // The residual's functions are freshly built (specialized/renumbered), so the source
         // module's name→funcidx exports no longer apply; a residual is addressed by index.
+        // Interface offers are dropped for the same reason (their op funcidxs are stale).
         exports: vec![],
+        impl_exports: vec![],
         debug_info: None,
     })
 }
