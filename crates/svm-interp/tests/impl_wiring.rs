@@ -266,6 +266,115 @@ fn a_wired_import_slot_runs_on_both_engines() {
 }
 
 #[test]
+fn an_offer_regrants_into_a_child_one_hop_deeper() {
+    // §3.3 wrap/override: a parent hands a wired offer to a §14 child by name; the child's
+    // adopted entry re-interns the (unchanged) structural id and sits one provenance hop
+    // deeper. The offer stays executable from the child's own table.
+    let mut parent = Host::new();
+    let funcs = offer_funcs();
+    let handle = parent.wire_impl(&funcs, &[1]).expect("offer");
+    let (mut child, _cinst, _cas) = parent
+        .spawn_named_child(&[("adder".into(), handle)], 1 << 16)
+        .expect("offer handles are re-grantable");
+    let ch = child.resolve_cap_name("adder").expect("named in the child");
+    let entry = child.resolve_guest_impl(ch).expect("adopted entry");
+    assert_eq!(entry.depth, 2, "one re-grant hop past the wiring domain");
+    let tid = entry.type_id;
+    assert_eq!(
+        child.cap_dispatch_slots(tid, 0, ch, &[40, 2], None),
+        Ok(vec![42]),
+        "the adopted offer executes from the child's table"
+    );
+}
+
+#[test]
+fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
+    use svm_ir::{Import, ImportMode};
+    let mut parent = Host::new();
+    let funcs = offer_funcs();
+    let handle = parent.wire_impl(&funcs, &[1, 0]).expect("offer");
+    let spawn = |parent: &mut Host| {
+        parent
+            .spawn_named_child(&[("add".into(), handle)], 1 << 16)
+            .expect("spawn")
+            .0
+    };
+    let import = |name: &str, params: Vec<ValType>, mode: ImportMode| Import {
+        name: name.into(),
+        sig: sig(params, vec![ValType::I64]),
+        mode,
+    };
+
+    // A named offer binds the slot to its first signature-matching op (op 0 here: (i64,i64)).
+    let mut child = spawn(&mut parent);
+    child
+        .bind_child_manifest(&[import(
+            "add",
+            vec![ValType::I64, ValType::I64],
+            ImportMode::Required,
+        )])
+        .expect("named offer binds");
+    let b = child.import_binding(0).expect("slot bound");
+    assert_eq!(b.op, 0, "first sig-matching op");
+
+    // §3.3 withhold: a required import with nothing to bind fails the spawn closed...
+    let mut child = spawn(&mut parent);
+    assert_eq!(
+        child.bind_child_manifest(&[import("fs", vec![ValType::I64], ImportMode::Required)]),
+        Err(0),
+        "required + unmatched refuses the manifest"
+    );
+    // ...a name-matched offer with NO signature-matching op also refuses (never silently binds)...
+    let mut child = spawn(&mut parent);
+    assert_eq!(
+        child.bind_child_manifest(&[import(
+            "add",
+            vec![ValType::I32, ValType::I32],
+            ImportMode::Required,
+        )]),
+        Err(0),
+        "sig mismatch on a named offer refuses"
+    );
+    // ...while a rebindable slot just starts empty.
+    let mut child = spawn(&mut parent);
+    child
+        .bind_child_manifest(&[import("fs", vec![ValType::I64], ImportMode::Rebindable)])
+        .expect("rebindable withhold is an empty slot, not a refusal");
+    assert!(child.import_binding(0).is_none(), "slot starts empty");
+}
+
+#[test]
+fn provenance_reports_platform_vs_ancestor_terminated() {
+    // §3.1: `cap.self.provenance(handle)` (self-namespace op 5) — 0 for a platform-native
+    // binding, depth d for a wired guest impl, +1 per re-grant hop; forged handles are inert.
+    let mut parent = Host::new();
+    let clock = parent.grant_clock();
+    let funcs = offer_funcs();
+    let offer = parent.wire_impl(&funcs, &[1]).expect("offer");
+
+    let prov = |h: &mut Host, cap: i32| {
+        h.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 5, 0, &[cap as i64], None)
+    };
+    assert_eq!(prov(&mut parent, clock), Ok(vec![0]), "platform-terminated");
+    assert_eq!(
+        prov(&mut parent, offer),
+        Ok(vec![1]),
+        "ancestor-terminated at the wiring domain"
+    );
+
+    let (mut child, _, _) = parent
+        .spawn_named_child(&[("adder".into(), offer)], 1 << 16)
+        .expect("spawn");
+    let ch = child.resolve_cap_name("adder").expect("named");
+    assert_eq!(
+        prov(&mut child, ch),
+        Ok(vec![2]),
+        "one hop deeper in the child"
+    );
+    assert!(prov(&mut child, 0x7f).is_err(), "forged handle is inert");
+}
+
+#[test]
 fn a_wired_offer_is_non_durable_and_drains_cleanly() {
     let mut h = Host::new();
     let funcs = offer_funcs();

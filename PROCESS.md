@@ -480,7 +480,10 @@ cap.self.attest() -> { isolation_tier,                      (§2: 0 / 1 / 3)
   erodes the self-similarity the rest of the design exists to provide. The growth
   criterion, pinned now so future pressure has a rule to argue against: the namespace
   admits only **facts the platform mechanically enforces** — never services, never
-  channels. `attest` and the existing reflection are the whole list.
+  channels. `attest`, the existing reflection, and per-binding **provenance**
+  (`cap.self.provenance(handle)` — platform- vs ancestor-terminated + depth, IMPORTS.md
+  §3.1: the honest bit that makes interposition visible without making it
+  distinguishable in-type) are the whole list.
 
 ---
 

@@ -6566,118 +6566,128 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         named_child.push(cg);
                                     }
                                 }
-                                // IMPORTS.md phase 3 / S2.1: bind the child module's import
-                                // manifest against its granted powerbox (the shared reference
-                                // policy on Host — same one the JIT's child builders call).
-                                if let Some((_, _, _, _, _, cimports)) = &child_mod {
-                                    ch.bind_child_manifest(cimports);
-                                }
-                                let child_host = Arc::new(Mutex::new(ch));
-                                let mut child_args = vec![Value::I64(cinst as i64)];
-                                if want_as {
-                                    child_args.push(Value::I64(cas as i64));
-                                }
-                                if let Some(cg) = cgrant {
-                                    child_args.push(Value::I64(cg as i64));
-                                }
-                                // Quota: the child's fuel, sub-allocated from (and capped by) ours.
-                                let child_fuel = if quota <= 0 {
-                                    *fuel
-                                } else {
-                                    (quota as u64).min(*fuel)
-                                };
-                                let cfuncs = child_mod.as_ref().map_or_else(
-                                    || Arc::clone(&funcs),
-                                    |(f, _, _, _, _, _)| Arc::clone(f),
-                                );
-                                let csched = sched.clone();
-                                // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
-                                // residue must reach the **root** host, not the child's private
-                                // powerbox. Compute our *effective* sink — our inherited one, or our
-                                // own host if we are the root/a shared-host domain — and hand it down;
-                                // the child (and transitively any grandchild) pushes there, so a whole
-                                // nesting subtree's residue coalesces where a thaw reads it (mirrors how
-                                // `thread.spawn`'s shared host coalesces [`FrozenVCpu`]).
-                                let residue_sink =
-                                    freeze_sink.clone().unwrap_or_else(|| Arc::clone(host));
-                                // §4 subtree STW (DURABILITY.md): the child inherits our **current
-                                // durable phase** (its own carve's, which is `UNWINDING` when we are
-                                // instantiating it mid-freeze), exactly as `thread.spawn` seeds
-                                // `child.dstate = child_state`. Without this the child's first
-                                // dispatch would store its default `NORMAL` over the freeze driver's
-                                // `UNWINDING` broadcast into the carve — clobbering the STW — so a
-                                // grandchild-of-the-root would never be driven to self-unwind (and
-                                // its residue would be lost). With it, a child instantiated while its
-                                // parent is unwinding is born unwinding: it runs its own
-                                // `instantiate`/`join` under `UNWINDING`, recording *its* live
-                                // children before it drains — the recursion that makes depth-2+ work.
-                                let child_dstate = mem
-                                    .as_ref()
-                                    .map(|m| m.durable_state())
-                                    .unwrap_or(STATE_NORMAL);
-                                // S3 `kill`: a fresh flag for this child's subtree; the child (and its
-                                // inherited-flag `thread.spawn` descendants) polls it per op, the
-                                // parent sets it via `Instantiator.kill`.
-                                let kflag = Arc::new(AtomicBool::new(false));
-                                let kflag_child = Arc::clone(&kflag);
-                                let made = sched.spawn(move |id| {
-                                    // A nested child is its **own** domain (own host/window/program),
-                                    // so it gets its own dispatch table, not the parent's.
-                                    let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
-                                    let mut child = VCpu::new(
-                                        cfuncs,
-                                        entry as u32,
-                                        &child_args, // [Instantiator] or [Instantiator, AddressSpace]
-                                        child_mem,
-                                        child_host,
-                                        child_fuel,
-                                        depth + 1,
-                                        id,
-                                        csched,
-                                        spawn_quota, // a nested child inherits the domain's spawn quota
-                                        cdt,
-                                    );
-                                    child.memop = memop;
-                                    // §4: durability is a subtree property — a durable parent's
-                                    // instantiated child runs durable (freezable module enforced
-                                    // at the admission check above).
-                                    child.durable = durable;
-                                    // Its freeze-unwind is carve-self-describing: record no
-                                    // host-side extent (see `VCpu::nested_child`).
-                                    child.nested_child = true;
-                                    // §4 depth-2: the child pushes its own [`FrozenNested`] residue
-                                    // (for any grandchild) into the subtree's shared sink, so it
-                                    // coalesces in the root host rather than the child's private one.
-                                    child.freeze_sink = Some(residue_sink);
-                                    // §4 subtree STW: inherit the parent's freeze phase (see above),
-                                    // so a mid-freeze instantiate composes recursively.
-                                    child.dstate = child_dstate;
-                                    child.kill = Some(kflag_child); // S3: parent-settable kill flag
-                                    Box::new(child)
-                                });
-                                match made {
-                                    Some(child_id) => {
-                                        threads.push(Some(child_id));
-                                        child_kill.insert(threads.len() - 1, kflag); // S3 kill map
-                                                                                     // §14 children are tracked apart from `thread.spawn`
-                                                                                     // vCPUs, with their carve geometry: a durable freeze
-                                                                                     // broadcasts into a live child's carve and records it
-                                                                                     // as residue — or fails closed on the un-covered
-                                                                                     // shapes (see `VCpu::nested_children`).
-                                        nested_children.push(NestedChildInfo {
-                                            slot: threads.len() - 1,
-                                            carve_off: ibase + off,
-                                            size_log2: size_log2 as u8,
-                                            entry: entry as u32,
-                                            module_digest: child_mod
-                                                .as_ref()
-                                                .map(|(_, _, _, _, d, _)| *d),
-                                        });
-                                        frames[top]
-                                            .vals
-                                            .push(Reg::from_i32((threads.len() - 1) as i32));
+                                // IMPORTS.md phase 3 / S2.1 + §3.3: bind the child module's
+                                // import manifest against its granted powerbox (named offers
+                                // first, then the shared reference policy — same binder the
+                                // JIT's child builders call). §3.3 **withhold**: a `required`
+                                // slot with nothing to bind fails the spawn closed — probeable
+                                // `-EINVAL`, before any child code runs.
+                                let manifest_ok = match &child_mod {
+                                    Some((_, _, _, _, _, cimports)) => {
+                                        ch.bind_child_manifest(cimports).is_ok()
                                     }
-                                    None => return Err(Trap::ThreadFault),
+                                    None => true,
+                                };
+                                if !manifest_ok {
+                                    frames[top].vals.push(Reg::from_i32(EINVAL as i32));
+                                } else {
+                                    let child_host = Arc::new(Mutex::new(ch));
+                                    let mut child_args = vec![Value::I64(cinst as i64)];
+                                    if want_as {
+                                        child_args.push(Value::I64(cas as i64));
+                                    }
+                                    if let Some(cg) = cgrant {
+                                        child_args.push(Value::I64(cg as i64));
+                                    }
+                                    // Quota: the child's fuel, sub-allocated from (and capped by) ours.
+                                    let child_fuel = if quota <= 0 {
+                                        *fuel
+                                    } else {
+                                        (quota as u64).min(*fuel)
+                                    };
+                                    let cfuncs = child_mod.as_ref().map_or_else(
+                                        || Arc::clone(&funcs),
+                                        |(f, _, _, _, _, _)| Arc::clone(f),
+                                    );
+                                    let csched = sched.clone();
+                                    // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
+                                    // residue must reach the **root** host, not the child's private
+                                    // powerbox. Compute our *effective* sink — our inherited one, or our
+                                    // own host if we are the root/a shared-host domain — and hand it down;
+                                    // the child (and transitively any grandchild) pushes there, so a whole
+                                    // nesting subtree's residue coalesces where a thaw reads it (mirrors how
+                                    // `thread.spawn`'s shared host coalesces [`FrozenVCpu`]).
+                                    let residue_sink =
+                                        freeze_sink.clone().unwrap_or_else(|| Arc::clone(host));
+                                    // §4 subtree STW (DURABILITY.md): the child inherits our **current
+                                    // durable phase** (its own carve's, which is `UNWINDING` when we are
+                                    // instantiating it mid-freeze), exactly as `thread.spawn` seeds
+                                    // `child.dstate = child_state`. Without this the child's first
+                                    // dispatch would store its default `NORMAL` over the freeze driver's
+                                    // `UNWINDING` broadcast into the carve — clobbering the STW — so a
+                                    // grandchild-of-the-root would never be driven to self-unwind (and
+                                    // its residue would be lost). With it, a child instantiated while its
+                                    // parent is unwinding is born unwinding: it runs its own
+                                    // `instantiate`/`join` under `UNWINDING`, recording *its* live
+                                    // children before it drains — the recursion that makes depth-2+ work.
+                                    let child_dstate = mem
+                                        .as_ref()
+                                        .map(|m| m.durable_state())
+                                        .unwrap_or(STATE_NORMAL);
+                                    // S3 `kill`: a fresh flag for this child's subtree; the child (and its
+                                    // inherited-flag `thread.spawn` descendants) polls it per op, the
+                                    // parent sets it via `Instantiator.kill`.
+                                    let kflag = Arc::new(AtomicBool::new(false));
+                                    let kflag_child = Arc::clone(&kflag);
+                                    let made = sched.spawn(move |id| {
+                                        // A nested child is its **own** domain (own host/window/program),
+                                        // so it gets its own dispatch table, not the parent's.
+                                        let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                                        let mut child = VCpu::new(
+                                            cfuncs,
+                                            entry as u32,
+                                            &child_args, // [Instantiator] or [Instantiator, AddressSpace]
+                                            child_mem,
+                                            child_host,
+                                            child_fuel,
+                                            depth + 1,
+                                            id,
+                                            csched,
+                                            spawn_quota, // a nested child inherits the domain's spawn quota
+                                            cdt,
+                                        );
+                                        child.memop = memop;
+                                        // §4: durability is a subtree property — a durable parent's
+                                        // instantiated child runs durable (freezable module enforced
+                                        // at the admission check above).
+                                        child.durable = durable;
+                                        // Its freeze-unwind is carve-self-describing: record no
+                                        // host-side extent (see `VCpu::nested_child`).
+                                        child.nested_child = true;
+                                        // §4 depth-2: the child pushes its own [`FrozenNested`] residue
+                                        // (for any grandchild) into the subtree's shared sink, so it
+                                        // coalesces in the root host rather than the child's private one.
+                                        child.freeze_sink = Some(residue_sink);
+                                        // §4 subtree STW: inherit the parent's freeze phase (see above),
+                                        // so a mid-freeze instantiate composes recursively.
+                                        child.dstate = child_dstate;
+                                        child.kill = Some(kflag_child); // S3: parent-settable kill flag
+                                        Box::new(child)
+                                    });
+                                    match made {
+                                        Some(child_id) => {
+                                            threads.push(Some(child_id));
+                                            child_kill.insert(threads.len() - 1, kflag); // S3 kill map
+                                                                                         // §14 children are tracked apart from `thread.spawn`
+                                                                                         // vCPUs, with their carve geometry: a durable freeze
+                                                                                         // broadcasts into a live child's carve and records it
+                                                                                         // as residue — or fails closed on the un-covered
+                                                                                         // shapes (see `VCpu::nested_children`).
+                                            nested_children.push(NestedChildInfo {
+                                                slot: threads.len() - 1,
+                                                carve_off: ibase + off,
+                                                size_log2: size_log2 as u8,
+                                                entry: entry as u32,
+                                                module_digest: child_mod
+                                                    .as_ref()
+                                                    .map(|(_, _, _, _, d, _)| *d),
+                                            });
+                                            frames[top]
+                                                .vals
+                                                .push(Reg::from_i32((threads.len() - 1) as i32));
+                                        }
+                                        None => return Err(Trap::ThreadFault),
+                                    }
                                 }
                             }
                         }
@@ -9947,6 +9957,12 @@ pub struct GuestImplEntry {
     pub ops: Arc<[u32]>,
     pub sigs: Arc<[FuncType]>,
     pub type_id: u32,
+    /// §3.1 **provenance depth**: how many domain boundaries stand between the holder and the
+    /// implementation — `1` where the offer was wired, `+1` per re-grant into a child. Every
+    /// wired offer is **ancestor-terminated** (guest code, never the platform); this is the
+    /// honest bit `cap.self` reports (op 5), and it lives host-side, so a parent can interpose
+    /// but cannot hide that it did.
+    pub depth: u32,
 }
 
 /// The fixed, deterministic fuel budget for one wired-offer op dispatch (v1 pure dispatch —
@@ -10343,18 +10359,26 @@ impl Host {
         self.resolve_module(handle).ok().map(|g| g.imports.clone())
     }
 
-    /// S2.1 / IMPORTS.md phase 3: bind a **child** module's import manifest against this (child)
-    /// host's granted powerbox, so the child's `call.import`s dispatch through instance bindings —
-    /// no rewrite, no window stash. The reference child policy mirrors the fixed powerbox names
-    /// (`write`/`read`/`exit`); each resolved slot binds the first granted cap of the matching
-    /// interface, in grant order (the auto-granted Instantiator/AddressSpace occupy slots 0/1, so
-    /// an S2 grant or named grant is found first for Stream/Exit). A name outside the policy, or
-    /// an interface the child was not granted, leaves the slot unbound — fail-closed at dispatch.
+    /// S2.1 / IMPORTS.md phase 3 + §3.3: bind a **child** module's import manifest against this
+    /// (child) host's granted powerbox, so the child's `call.import`s dispatch through instance
+    /// bindings — no rewrite, no window stash. Binding, per slot, in order:
+    ///
+    /// 1. **A named grant that is a wired offer** (§3.3 wrap/override): a cap registered under
+    ///    exactly the import's name that resolves to a [`Binding::GuestImpl`] binds the slot to
+    ///    its first op whose derived signature equals the declaration (structural, fail-closed —
+    ///    a name match with no signature match never silently binds).
+    /// 2. **The reference policy** (`write`/`read`/`exit` → first granted cap of the matching
+    ///    interface, in grant order — the auto-granted Instantiator/AddressSpace occupy slots
+    ///    0/1, so an S2 grant or named grant is found first for Stream/Exit).
+    /// 3. **Withhold** (§3.3): nothing bindable — a `rebindable` slot starts empty (attachable
+    ///    later); a `required` slot **fails the whole spawn closed** (`Err` with the offending
+    ///    import index; callers surface `-EINVAL` before any child code runs).
+    ///
     /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
     /// lockstep).
-    pub fn bind_child_manifest(&mut self, imports: &[svm_ir::Import]) {
+    pub fn bind_child_manifest(&mut self, imports: &[svm_ir::Import]) -> Result<(), u32> {
         if imports.is_empty() {
-            return;
+            return Ok(());
         }
         let policy = |name: &str| match name {
             "write" => Some((iface::STREAM, 1u32)),
@@ -10369,19 +10393,37 @@ impl Host {
                     .then_some(((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32)
             })
         };
-        let bindings = imports
-            .iter()
-            .map(|im| {
-                let Some((tid, iop)) = policy(&im.name) else {
-                    return BoundImport::rebindable(0, 0, None);
-                };
-                match first_of(self, tid) {
-                    Some(c) => BoundImport::required(tid, iop, c),
-                    None => BoundImport::rebindable(0, 0, None),
+        let mut bindings = Vec::with_capacity(imports.len());
+        for (i, im) in imports.iter().enumerate() {
+            let rebindable = im.mode == svm_ir::ImportMode::Rebindable;
+            // §3.3: a named offer grant binds directly — the parent's wrap/override.
+            if let Some(h) = self.resolve_cap_name(&im.name) {
+                if let Ok(entry) = self.resolve_guest_impl(h) {
+                    let op = entry.sigs.iter().position(|s| *s == im.sig);
+                    match op.and_then(|op| {
+                        self.bound_import_for_impl(h, op as u32, &im.sig, rebindable)
+                    }) {
+                        Some(b) => {
+                            bindings.push(b);
+                            continue;
+                        }
+                        None if rebindable => {
+                            bindings.push(BoundImport::rebindable(0, 0, None));
+                            continue;
+                        }
+                        None => return Err(i as u32),
+                    }
                 }
-            })
-            .collect();
+            }
+            match policy(&im.name).and_then(|(tid, iop)| first_of(self, tid).map(|c| (tid, iop, c)))
+            {
+                Some((tid, iop, c)) => bindings.push(BoundImport::required(tid, iop, c)),
+                None if rebindable => bindings.push(BoundImport::rebindable(0, 0, None)),
+                None => return Err(i as u32),
+            }
+        }
         self.set_import_bindings(bindings);
+        Ok(())
     }
 
     /// The interface `type_id` behind a live handle, or `None` for a forged/closed one. Used by
@@ -10753,6 +10795,23 @@ impl Host {
             // §6 `cap.self.attest`: the domain's platform-vouched provenance, packed as
             // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
             4 => Ok(vec![self.attestation.packed() as i64]),
+            // §3.1 `cap.self.provenance(handle) -> i32` (IMPORTS.md): the binding's provenance
+            // class — `0` = **platform-terminated** (host-native vtable), `d ≥ 1` =
+            // **ancestor-terminated** (a wired guest impl terminating `d` domain boundaries up:
+            // 1 where it was wired, +1 per re-grant hop). Interface identity is structural (D59),
+            // so this is the one honest bit typing deliberately cannot answer; it lives in the
+            // non-interposable namespace — a parent can interpose every capability but cannot
+            // hide that it did. A forged/closed handle is an inert `CapFault` (§3c).
+            5 => {
+                let h = *args.first().ok_or(Trap::Malformed)? as i32;
+                if let Ok(e) = self.resolve_guest_impl(h) {
+                    return Ok(vec![e.depth as i64]);
+                }
+                // Not a wired offer: any live binding is platform-terminated (the vtable is
+                // host-native); dead/forged stays an inert CapFault via the canonical resolve.
+                let expect = self.table[(h as u32 as usize) & (CAP - 1)].type_id;
+                self.resolve(h, expect).map(|_| vec![0])
+            }
             _ => Err(Trap::Malformed),
         }
     }
@@ -11110,8 +11169,23 @@ impl Host {
             ops: ops.into(),
             sigs,
             type_id,
+            depth: 1,
         });
         Some(self.grant(type_id, Binding::GuestImpl(idx)))
+    }
+
+    /// Adopt a wired offer re-granted from a parent domain (IMPORTS.md §3.3 — the wrap/override
+    /// leg of [`Host::regrant_into_child`]): install the entry under **this** host's interned id
+    /// for its (unchanged) signature list, one provenance hop deeper, and grant the handle.
+    fn adopt_guest_impl(&mut self, entry: GuestImplEntry) -> i32 {
+        let type_id = self.intern_interface(&entry.sigs);
+        let idx = self.guest_impls.len() as u32;
+        self.guest_impls.push(GuestImplEntry {
+            type_id,
+            depth: entry.depth + 1,
+            ..entry
+        });
+        self.grant(type_id, Binding::GuestImpl(idx))
     }
 
     /// Resolve `handle` to its wired-offer state (§3c: mask + generation, then the binding must
@@ -11702,7 +11776,9 @@ impl Host {
     /// cap ([`Self::resolve_copyable`]) or a pipe end ([`Self::resolve_pipe_end`]). Used to fail a grant
     /// closed *before* any child state is built.
     fn can_regrant(&self, handle: i32) -> bool {
-        self.resolve_pipe_end(handle).is_some() || self.resolve_copyable(handle).is_ok()
+        self.resolve_pipe_end(handle).is_some()
+            || self.resolve_guest_impl(handle).is_ok()
+            || self.resolve_copyable(handle).is_ok()
     }
 
     /// Re-grant `handle` from this (parent) host into `child` — the §14 child-powerbox re-grant policy:
@@ -11714,6 +11790,15 @@ impl Host {
     fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
         if let Some((write, backing)) = self.resolve_pipe_end(handle) {
             return Some(child.install_pipe_end(write, backing));
+        }
+        // A **wired interface offer** (IMPORTS.md §3.2/§3.3): re-granting it is how a parent
+        // forwards, wraps, or overrides a capability for a child — the entry (shared function
+        // table + op list) is adopted into the child's own table under the child's interned id,
+        // one domain boundary deeper (§3.1 provenance: the impl terminates in an ancestor, and
+        // the depth records how far up).
+        if let Ok(entry) = self.resolve_guest_impl(handle) {
+            let entry = entry.clone();
+            return Some(child.adopt_guest_impl(entry));
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
         if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {

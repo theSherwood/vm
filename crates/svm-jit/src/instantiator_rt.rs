@@ -1115,7 +1115,13 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        bind(rt.cap_ctx, gc.ctx, module);
+        // §3.3 withhold: a `required` import with nothing to bind fails the spawn closed —
+        // probeable `-EINVAL`, before compiling or running any child code (the interpreter's
+        // inline spawn takes the same early exit).
+        if bind(rt.cap_ctx, gc.ctx, module) != 0 {
+            release(gc.ctx);
+            return EINVAL as i32;
+        }
     }
 
     // Compile the foreign module's entry confined to the carve, with the child powerbox ctx so its
