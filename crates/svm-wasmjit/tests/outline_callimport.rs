@@ -3,7 +3,7 @@
 //! a host-boundary op outside the emitter's compute subset, so an inline one keeps its whole
 //! function on the interpreter; outlining hoists it into an integer-signature wrapper (a cross-tier
 //! leaf) and the hot function emits. The import is dispatched on the interpreter tier through the
-//! module's [`svm_interp::BoundImport`] bindings — no `resolve_imports` rewrite anywhere, so the
+//! module's [`svm_interp::BoundImport`] bindings — no import-resolution rewrite anywhere, so the
 //! phase-1 "verified bytes are executed bytes" invariant holds on the wasm tier too.
 //!
 //! Mirrors `outline_capcalls.rs`: (1) outlining **flips emittability** for an import-bearing entry

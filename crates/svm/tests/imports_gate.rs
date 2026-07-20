@@ -106,6 +106,7 @@ fn resolve_imports_calls_are_linker_only() {
     let callers: &[&str] = &[
         "crates/svm-ir/src/lib.rs",    // the pass itself + its linker tests
         "crates/svm-run/src/lib.rs",   // the guest-JIT `compile_linked` symbol-table path
+        "browser/src/lib.rs",          // browser_jit_validator — the same `compile_linked` path
         "crates/svm-text/src/lib.rs",  // parse → link integration test
         "crates/svm/tests/dynlink.rs", // linker tests (Func/Slot)
         "crates/svm/tests/dynlink_runtime.rs",

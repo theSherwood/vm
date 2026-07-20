@@ -216,7 +216,7 @@ fn run(shell: &svm_ir::Module, cmd: &svm_ir::Module, argv: &[&str], jit: bool) -
     let echo_h = host.grant_module(cmd);
     let _exec_h = host.grant_host_fn(exec_host(out_h, echo_h));
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
-    let m = svm_ir::resolve_imports_with(shell, |n| link_shim(n)).expect("resolve");
+    let m = svm_ir::resolve_imports_with(shell, link_shim).expect("resolve");
     verify_module(&m).expect("verify shell");
     // Seed the shell's own args buffer at POWERBOX_ARGS_BASE.
     let mut init = vec![0u8; win];

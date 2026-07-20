@@ -1123,8 +1123,8 @@ fn translate_impl(
             funcs,
             memory,
             data,
-            // §7 named capability imports (`write`/`read`/`exit` …) the host resolves at load
-            // (`resolve_capability_imports`); empty for a pure-compute (kernel) module.
+            // §7 named capability imports (`write`/`read`/`exit` …) — manifest slots the runtime
+            // binds at instantiation; empty for a pure-compute (kernel) module.
             imports,
             // First-class function exports: each defined function's name → its final `module.funcs`
             // index, so a C-compiled module is name-addressable (`call("main")`) like the wasm path.
@@ -1172,9 +1172,9 @@ const DATA_BASE: u64 = 16;
 /// The **default** page granularity the data stack is aligned to above the globals (≥ the largest OS
 /// page so a stack write never lands in a read-only global's protected page, D40). For a powerbox
 /// program this is also the globals base, so `[0, stack_page)` is the reserved low scratch — the
-/// handle stash, allocator/format state, and the §3e args buffer all live there. The powerbox layout
-/// is a public ABI ([`svm_ir::POWERBOX_STACK_PAGE`]), shared with the frontend-independent
-/// [`svm_ir::synth_powerbox_start`] so the two `_start` synthesizers stay byte-identical.
+/// allocator/format state and the §3e args buffer live there (the handle stash is retired; imports
+/// are manifest slots the runtime binds). The powerbox layout is a public ABI
+/// ([`svm_ir::POWERBOX_STACK_PAGE`]).
 ///
 /// This is only the **default**: the actual granularity is a per-translation parameter (see
 /// [`translate_bc_path_with_page`]). The isolation must be `≥` the *host* page the artifact will run
@@ -2930,28 +2930,13 @@ fn callee_name(c: &crate::ll::ast::Call) -> Option<String> {
 //
 // A C program that does I/O calls libc (`write`/`read`/`exit`); clang leaves those as
 // declaration-only externals. The on-ramp binds each to a **host capability** (§7 named import): a
-// call lowers to an `Inst::CallImport "<name>"` the embedder resolves at load (`default_cap_resolver`
-// → `(type_id, op)`). The capability **handle** is not a C argument — it is granted to the powerbox
-// entry and threaded to every call site through the *handle stash*, the reserved handle region
-// (`[0, HANDLE_REGION_END)`): `_start` stores the granted handles there and each call site reloads the
-// one it needs (so a handle reaches arbitrary call depth without a viral extra parameter). This keeps
-// the translator pure mechanism — it never interprets host semantics, just defers the bind (§2a).
+// call lowers to an `Inst::CallImport "<name>"` whose manifest slot the runtime binds at
+// instantiation (`default_cap_resolver` → `(type_id, op)`). The capability **handle** is not a C
+// argument and is never stashed (the synth family and the handle stash are retired, IMPORTS.md
+// phase 4): the frontend emits a paramless `_start` + manifest imports, call sites carry a
+// vestigial dummy handle operand, and the slot binding is the dispatch. This keeps the translator
+// pure mechanism — it never interprets host semantics, just defers the bind (§2a).
 
-/// Window offsets of the **powerbox handle stash + allocator state** (the reserved low scratch on
-/// page 0, which is writable — for a powerbox program the globals start a page up). `_start` stores
-/// the granted handles here; each call site reloads what it needs. The heap allocator (slice S) keeps
-/// its bump pointer + committed boundary here too.
-///
-/// **Layout (locked to the full §3e powerbox).** The handle region is `[0, HANDLE_REGION_END)` =
-/// `[0, 32)` — eight `i32` slots, one per `VM_CAP_*` index (`<svm.h>`): stdout, stdin, exit, memory,
-/// addrspace, ioring, blocking, jit. `_start` stashes a *prefix* of these (today 3 or 4 — stdout,
-/// stdin, exit, `[memory]`); offsets `16/20/24/28` are **reserved** for the AddressSpace/IoRing/
-/// Blocking/Jit tail so granting it later (the P2 async-I/O work) needs **no stash relocation**. The
-/// allocator/scratch/format state lives strictly **above** the handle region, so it never collides
-/// with a newly-granted handle (the bug this layout forecloses).
-// The handle stash is the public powerbox layout ([`svm_ir::POWERBOX_STASH_BASE`] + `i*4`), shared
-// with the frontend-independent [`svm_ir::synth_powerbox_start`]; the per-`VM_CAP_*` slots derive
-// from it so this and the public synthesizer can never drift.
 /// The `HostFn` interface id (`svm_interp::iface::HOST_FN`) — the **embedder-registered** capability
 /// (§7 "host-defined capabilities"), reached from C via `__vm_host_call`. Pinned here numerically
 /// (svm-llvm produces `svm-ir` and does not depend on the interpreter crate); `svm-run`'s
@@ -2971,8 +2956,8 @@ const HANDLE_REGION_END: u64 = svm_ir::POWERBOX_HEAP_BRK;
 /// placed just above the 8-handle region ([`svm_ir::POWERBOX_HEAP_BRK`]/[`svm_ir::POWERBOX_HEAP_TOP`]).
 const HEAP_BRK: u64 = HANDLE_REGION_END; // 32
 const HEAP_TOP: u64 = HEAP_BRK + 8; // 40
-                                    // Pin the C `_start` layout to the public powerbox ABI so this and `svm_ir::synth_powerbox_start`
-                                    // can never silently diverge (the dedup hinge: one source of truth in `svm-ir`).
+                                    // Pin the C `_start` layout to the public powerbox ABI
+                                    // (`svm_ir::POWERBOX_HEAP_TOP`) so the two can never silently diverge.
 const _: () = assert!(HEAP_TOP == svm_ir::POWERBOX_HEAP_TOP);
 /// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
 /// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit

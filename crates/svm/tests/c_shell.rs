@@ -902,7 +902,7 @@ fn run_shell_ex(
         "identical grant order → identical handles"
     );
 
-    let m = svm_ir::resolve_imports_with(&raw, |n| link_shim(n))
+    let m = svm_ir::resolve_imports_with(&raw, link_shim)
         .unwrap_or_else(|e| panic!("resolve imports: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     let init = vec![0u8; win];

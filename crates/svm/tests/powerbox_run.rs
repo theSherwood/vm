@@ -8,27 +8,26 @@
 
 use svm_run::{instantiate, Backend, Instance, Limits, Outcome, RunConfig, Value};
 
-/// A minimal fixed-powerbox program: loads the stashed stdout handle (slot 0) and writes a RO string.
+/// A minimal fixed-powerbox program: a paramless exported `_start` whose `write` manifest import
+/// binds to the stdout slot at instantiation (the handle operand is a vestigial dummy).
 const HELLO: &str = "\
 memory 15
 data ro 16384 \"hello, powerbox\\n\"
-export \"entry\" 0
-func (i64) -> (i32) {
-block0(v0: i64):
-  v1 = i64.const 0
-  v2 = i32.load v1
-  v3 = i64.const 16384
-  v4 = i64.const 16
-  v5 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v4)
-  v6 = i32.const 0
-  return v6
+export \"_start\" 0
+func () -> (i32) {
+block0():
+  v0 = i32.const 0
+  v1 = i64.const 16384
+  v2 = i64.const 16
+  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = i32.const 0
+  return v4
 }
 ";
 
 fn hello_instance() -> Instance {
     let module = svm_text::parse_module(HELLO).expect("parse");
-    let with_start = svm_ir::synth_powerbox_start(module, 0, 3, false).expect("synth");
-    instantiate(with_start).expect("instantiate")
+    instantiate(module).expect("instantiate")
 }
 
 /// All three backends run the same program through one `RunConfig` and produce identical output.
@@ -90,7 +89,7 @@ fn fuel_bounds_interpreters_not_the_jit() {
 #[test]
 fn memory_window_override_applies_to_every_backend() {
     let cfg = RunConfig {
-        memory_size_log2: Some(22), // 4 MiB — larger than the synthesized default
+        memory_size_log2: Some(22), // 4 MiB — larger than the module's declared window
         ..RunConfig::default()
     };
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {

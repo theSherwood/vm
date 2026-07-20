@@ -205,7 +205,7 @@ fn run(shell: &svm_ir::Module, cmd: &svm_ir::Module, argv: &[&str], jit: bool) -
     posix.register_command("echo", echo_h);
     posix.set_args(argv);
 
-    let m = svm_ir::resolve_imports_with(shell, |n| link_shim(n)).expect("resolve");
+    let m = svm_ir::resolve_imports_with(shell, link_shim).expect("resolve");
     verify_module(&m).expect("verify shell");
     let init = vec![0u8; win];
 

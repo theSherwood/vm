@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use svm_ir::Module;
 use svm_run::{
-    is_powerbox_entry, run_kernel, run_powerbox, run_powerbox_with_deadline,
+    is_named_powerbox_entry, run_kernel, run_powerbox, run_powerbox_with_deadline,
     run_powerbox_with_deadline_and_quota, Outcome, Quota, Value,
 };
 use svm_text::parse_module;
@@ -49,21 +49,23 @@ fn entry_points_reject_unverified_modules_fail_closed() {
 
 #[test]
 fn writes_to_stdout_and_returns() {
-    // A powerbox program: write "hi\n" to stdout (Stream cap, type 0 op 1) on the granted
-    // stdout handle (v0), then return 7.
+    // A powerbox program (phase-4 shape): a paramless exported `_start` whose `write` manifest
+    // import binds to the stdout slot at instantiation; the handle operand is a vestigial dummy.
     let m = load(
         "memory 16\n\
          data 16 \"hi\\n\"\n\
-         func (i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32):\n\
-         \x20 v3 = i64.const 16\n\
-         \x20 v4 = i64.const 3\n\
-         \x20 v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)\n\
-         \x20 v6 = i32.const 7\n\
-         \x20 return v6\n\
+         export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 v1 = i64.const 16\n\
+         \x20 v2 = i64.const 3\n\
+         \x20 v3 = call.import \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v4 = i32.const 7\n\
+         \x20 return v4\n\
          }\n",
     );
-    assert!(is_powerbox_entry(&m));
+    assert!(is_named_powerbox_entry(&m));
     let run = run_powerbox(&m, b"").expect("run");
     assert_eq!(run.stdout, b"hi\n");
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(7)]));
@@ -72,12 +74,14 @@ fn writes_to_stdout_and_returns() {
 
 #[test]
 fn exit_capability_sets_code() {
-    // The guest invokes Exit(5) (type 1 op 0) on the granted exit handle (v2) — terminal.
+    // The guest invokes Exit(5) through its `exit` manifest import — terminal.
     let m = load(
-        "func (i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32):\n\
-         \x20 v3 = i32.const 5\n\
-         \x20 cap.call 1 0 (i32) -> () v2(v3)\n\
+        "export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 v1 = i32.const 5\n\
+         \x20 call.import \"exit\" (i32) -> () v0(v1)\n\
          \x20 unreachable\n\
          }\n",
     );
@@ -87,17 +91,21 @@ fn exit_capability_sets_code() {
 
 #[test]
 fn echoes_stdin_to_stdout() {
-    // read(stdin) into the window, then write that many bytes back out — a stdin round-trip.
+    // read(stdin) into the window, then write that many bytes back out — a stdin round-trip
+    // through the `read` / `write` manifest slots (both `Stream`; the bound handle picks the
+    // endpoint: read→stdin, write→stdout).
     let m = load(
         "memory 16\n\
-         func (i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32):\n\
-         \x20 v3 = i64.const 0\n\
-         \x20 v4 = i64.const 64\n\
-         \x20 v5 = cap.call 0 0 (i64, i64) -> (i64) v1(v3, v4)\n\
-         \x20 v6 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v5)\n\
-         \x20 v7 = i32.const 0\n\
-         \x20 return v7\n\
+         export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 v1 = i64.const 0\n\
+         \x20 v2 = i64.const 64\n\
+         \x20 v3 = call.import \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v4 = call.import \"write\" (i64, i64) -> (i64) v0(v1, v3)\n\
+         \x20 v5 = i32.const 0\n\
+         \x20 return v5\n\
          }\n",
     );
     let run = run_powerbox(&m, b"ping").expect("run");
@@ -115,7 +123,7 @@ fn bare_kernel_returns_value() {
          \x20 return v2\n\
          }\n",
     );
-    assert!(!is_powerbox_entry(&m));
+    assert!(!is_named_powerbox_entry(&m));
     let out = run_kernel(&m, &[41]).expect("run kernel");
     assert_eq!(out, vec![Value::I64(42)]);
 }
@@ -435,14 +443,15 @@ fn cli_compiles_and_runs_c() {
 #[test]
 fn deadline_kills_runaway_powerbox_guest() {
     let m = load(
-        "func (i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32):\n\
-         \x20 v3 = i32.const 0\n\
+        "export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 br block1(v0)\n\
+         block1(v1: i32):\n\
+         \x20 v2 = i32.const 1\n\
+         \x20 v3 = i32.add v1 v2\n\
          \x20 br block1(v3)\n\
-         block1(v4: i32):\n\
-         \x20 v5 = i32.const 1\n\
-         \x20 v6 = i32.add v4 v5\n\
-         \x20 br block1(v6)\n\
          }\n",
     );
     let err = run_powerbox_with_deadline(&m, b"", Some(Duration::from_millis(100)))
@@ -461,15 +470,17 @@ fn deadline_kills_runaway_powerbox_guest() {
 #[test]
 fn trap_kill_message_carries_a_source_backtrace() {
     let m = load(
-        "func (i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32):\n\
-         \x20 v3 = i32.const 0\n\
-         \x20 v4 = i32.div_s v0 v3\n\
-         \x20 return v4\n\
+        "export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i32.const 1\n\
+         \x20 v1 = i32.const 0\n\
+         \x20 v2 = i32.div_s v0 v1\n\
+         \x20 return v2\n\
          }\n\
          debug.file 0 \"guest.c\"\n\
          debug.fname 0 \"divide\"\n\
-         debug.loc 0 0 1 0 7 5\n",
+         debug.loc 0 0 2 0 7 5\n",
     );
     let err = run_powerbox_with_deadline(&m, b"", None).expect_err("div-by-zero must be killed");
     assert!(err.contains("DivByZero"), "names the trap kind: {err}");
@@ -488,13 +499,14 @@ fn trap_kill_message_carries_a_source_backtrace() {
 fn memfault_kill_message_carries_a_source_backtrace() {
     let m = load(
         "memory 16\n\
-         func (i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32):\n\
-         \x20 v3 = i64.const 65532\n\
-         \x20 v4 = i64.const 0\n\
-         \x20 i64.store v3 v4\n\
-         \x20 v5 = i32.const 0\n\
-         \x20 return v5\n\
+         export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i64.const 65532\n\
+         \x20 v1 = i64.const 0\n\
+         \x20 i64.store v0 v1\n\
+         \x20 v2 = i32.const 0\n\
+         \x20 return v2\n\
          }\n\
          debug.file 0 \"mem.c\"\n\
          debug.fname 0 \"store_oob\"\n\
@@ -517,13 +529,15 @@ fn deadline_does_not_delay_fast_guest() {
     let m = load(
         "memory 16\n\
          data 16 \"hi\\n\"\n\
-         func (i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32):\n\
-         \x20 v3 = i64.const 16\n\
-         \x20 v4 = i64.const 3\n\
-         \x20 v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)\n\
-         \x20 v6 = i32.const 7\n\
-         \x20 return v6\n\
+         export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 v1 = i64.const 16\n\
+         \x20 v2 = i64.const 3\n\
+         \x20 v3 = call.import \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v4 = i32.const 7\n\
+         \x20 return v4\n\
          }\n",
     );
     let t0 = Instant::now();
@@ -539,33 +553,35 @@ fn deadline_does_not_delay_fast_guest() {
 
 // ── §13/§14 region minting through the powerbox (the 5-handle grant + region factory) ──────────
 
-/// A powerbox guest that takes the **5th** handle (an `AddressSpace`, §14) mints a `SharedRegion`,
-/// maps it at two window offsets, and aliases through it — pinning that `run_powerbox` grants the
-/// AddressSpace *and* installs the OS-shared-memory factory so a stock embedded guest can build the
-/// zero-copy data plane (the same capability `<svm.h>` exposes to C). Host-granularity-agnostic: it
+/// A powerbox guest mints a `SharedRegion` through its `vm_region_create` manifest import (the
+/// `AddressSpace` slot, §14), maps it at two window offsets, and aliases through it — pinning that
+/// `run_powerbox` binds the AddressSpace *and* installs the OS-shared-memory factory so a stock
+/// embedded guest can build the zero-copy data plane (the same capability `<svm.h>` exposes to C).
+/// The region handle `create` returns is a **real** runtime-minted handle the `cap.call`s use
+/// (§2.3: SharedRegion is dynamic-mode, never a manifest slot). Host-granularity-agnostic: it
 /// queries `region_page_size` (op 3) and works in whole granules.
 #[test]
 fn powerbox_region_minting_round_trips() {
     let m = load(
         "memory 17\n\
-         func (i32, i32, i32, i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):\n\
-         \x20 v5 = i64.const 65536\n\
-         \x20 v6 = cap.call 5 5 (i64) -> (i64) v4(v5)\n\
-         \x20 v7 = i32.wrap_i64 v6\n\
-         \x20 v8 = cap.call 4 3 () -> (i64) v7()\n\
-         \x20 v9 = i64.const 0\n\
-         \x20 v10 = i32.const 3\n\
-         \x20 v11 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v7(v9, v9, v8, v10)\n\
-         \x20 v12 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v7(v8, v9, v8, v10)\n\
-         \x20 v13 = i32.const 123\n\
-         \x20 i32.store8 v9 v13\n\
-         \x20 v14 = i32.load8_u v8\n\
-         \x20 return v14\n\
+         export \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block0():\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 v1 = i64.const 65536\n\
+         \x20 v2 = call.import \"vm_region_create\" (i64) -> (i64) v0(v1)\n\
+         \x20 v3 = i32.wrap_i64 v2\n\
+         \x20 v4 = cap.call 4 3 () -> (i64) v3()\n\
+         \x20 v5 = i64.const 0\n\
+         \x20 v6 = i32.const 3\n\
+         \x20 v7 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v3(v5, v5, v4, v6)\n\
+         \x20 v8 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v3(v4, v5, v4, v6)\n\
+         \x20 v9 = i32.const 123\n\
+         \x20 i32.store8 v5 v9\n\
+         \x20 v10 = i32.load8_u v4\n\
+         \x20 return v10\n\
          }\n",
     );
-    // The 5-param entry is still a recognized powerbox shape.
-    assert!(is_powerbox_entry(&m));
     let run = run_powerbox(&m, b"").expect("run");
     assert_eq!(
         run.outcome,
@@ -722,10 +738,11 @@ fn demo_jit_threads_runs() {
 ))]
 #[test]
 fn quota_contains_a_powerbox_thread_bomb() {
-    // A 3-handle powerbox entry (stdout, stdin, exit) that just spawns a vCPU and returns.
+    // A powerbox entry (paramless exported `_start`) that just spawns a vCPU and returns.
     let src = "memory 16\n\
-        func (i32, i32, i32) -> () {\n\
-        block0(vout: i32, vin: i32, vexit: i32):\n\
+        export \"_start\" 0\n\
+        func () -> () {\n\
+        block0():\n\
         \x20 v0 = i64.const 5\n\
         \x20 v1 = thread.spawn 1 v0 v0\n\
         \x20 v2 = thread.join v1\n\
@@ -736,7 +753,6 @@ fn quota_contains_a_powerbox_thread_bomb() {
         \x20 return varg\n\
         }\n";
     let m = load(src);
-    assert!(is_powerbox_entry(&m));
 
     // max_vcpus = 1 ⇒ the root alone fills the quota; the spawn detect-and-kills (Err).
     let tight = Quota {
@@ -758,58 +774,101 @@ fn quota_contains_a_powerbox_thread_bomb() {
 }
 
 // ----------------------------------------------------------------------------
-// §7 named capability imports (late binding): a frontend declares `extern`-style
-// capability imports by name; the host resolves each to a concrete `cap.call` at load.
+// §7 named capability imports (manifest binding, IMPORTS.md phase 4): a frontend
+// declares `extern`-style capability imports by name in the module manifest; the
+// runtime binds each import to a capability slot at instantiation (no rewrite).
 // ----------------------------------------------------------------------------
 
 #[test]
-fn named_imports_resolve_and_run_like_inline_capcalls() {
-    // The same program as `writes_to_stdout_and_returns`/`exit_capability_sets_code`, but the
-    // capabilities are reached by NAME (`write`, `exit`) instead of inline `cap.call 0 1`/`1 0`.
-    // The handle is still supplied by the call site (v0 = stdout, v2 = exit); the host policy
-    // binds only the (type_id, op). resolve_capability_imports lowers them to the same cap.calls.
-    let src = "memory 16\n\
+fn manifest_imports_run_like_inline_capcalls() {
+    // The same effects as an inline-`cap.call` program, but the capabilities are reached by NAME
+    // (`write`, `exit`) through the manifest: a paramless `_start` (func 0, exported — the phase-4
+    // powerbox-entry marker) whose `call.import`s dispatch through slots bound at instantiation
+    // under the reference policy (`default_cap_resolver`). The handle operands are vestigial
+    // dummies (`i32.const 0`).
+    let named = "memory 16\n\
         import 0 \"write\" (i64, i64) -> (i64)\n\
         import 1 \"exit\" (i32) -> ()\n\
         data 16 \"hi\\n\"\n\
-        func (i32, i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32, v2: i32):\n\
-        \x20 v3 = i64.const 16\n\
-        \x20 v4 = i64.const 3\n\
-        \x20 v5 = call.import 0 v0 (v3, v4)\n\
-        \x20 v6 = i32.const 0\n\
-        \x20 call.import 1 v2 (v6)\n\
+        export \"_start\" 0\n\
+        func () -> (i32) {\n\
+        block0():\n\
+        \x20 v0 = i32.const 0\n\
+        \x20 v1 = i64.const 16\n\
+        \x20 v2 = i64.const 3\n\
+        \x20 v3 = call.import 0 v0 (v1, v2)\n\
+        \x20 v4 = i32.const 0\n\
+        \x20 call.import 1 v0 (v4)\n\
         \x20 unreachable\n\
         }\n";
-    let m = parse_module(src).expect("parse text IR with imports");
+    let m = load(named);
     assert_eq!(m.imports.len(), 2, "two named imports declared");
-    // Resolve under the reference host policy, then verify + run.
-    let resolved = svm_run::resolve_capability_imports(m).expect("resolve imports");
-    assert!(resolved.imports.is_empty(), "imports must be lowered away");
-    verify_module(&resolved).expect("verify resolved module");
-    assert!(is_powerbox_entry(&resolved));
-    let run = run_powerbox(&resolved, b"").expect("run");
-    assert_eq!(run.stdout, b"hi\n", "write import produced stdout");
-    assert_eq!(run.outcome, Outcome::Exited(0), "exit import set the code");
+    assert!(
+        is_named_powerbox_entry(&m),
+        "paramless exported `_start` is the powerbox-entry shape"
+    );
+
+    // Its inline-`cap.call` twin: the same paramless `_start`, reaching stdout/exit through
+    // handles resolved from the fixed powerbox's canonical name directory (`cap.self.resolve`)
+    // and invoked with inline `cap.call 0 1` / `1 0` instead of manifest slots.
+    let inline = load(
+        "memory 16\n\
+        data 16 \"hi\\n\"\n\
+        data 32 \"stdout\"\n\
+        data 40 \"exit\"\n\
+        export \"_start\" 0\n\
+        func () -> (i32) {\n\
+        block0():\n\
+        \x20 v0 = i64.const 32\n\
+        \x20 v1 = i64.const 6\n\
+        \x20 v2 = cap.self.resolve v0 v1\n\
+        \x20 v3 = i64.const 16\n\
+        \x20 v4 = i64.const 3\n\
+        \x20 v5 = cap.call 0 1 (i64, i64) -> (i64) v2(v3, v4)\n\
+        \x20 v6 = i64.const 40\n\
+        \x20 v7 = i64.const 4\n\
+        \x20 v8 = cap.self.resolve v6 v7\n\
+        \x20 v9 = i32.const 0\n\
+        \x20 cap.call 1 0 (i32) -> () v8(v9)\n\
+        \x20 unreachable\n\
+        }\n",
+    );
+
+    // Both run through `run_powerbox` and agree exactly — the manifest slot binding IS the same
+    // dispatch the inline cap.calls perform.
+    let named_run = run_powerbox(&m, b"").expect("run manifest module");
+    let inline_run = run_powerbox(&inline, b"").expect("run inline twin");
+    assert_eq!(named_run.stdout, b"hi\n", "write import produced stdout");
+    assert_eq!(
+        named_run.outcome,
+        Outcome::Exited(0),
+        "exit import set the code"
+    );
+    assert_eq!(named_run.stdout, inline_run.stdout, "identical stdout");
+    assert_eq!(named_run.outcome, inline_run.outcome, "identical outcome");
 }
 
 #[test]
 fn unknown_named_import_fails_closed() {
-    // A capability name the host policy doesn't know is a clean load error — never a silent
-    // no-op or a wrong call.
-    let src = "func (i32, i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32, v2: i32):\n\
-        \x20 v3 = i64.const 0\n\
-        \x20 v4 = call.import 0 v0 (v3)\n\
-        \x20 v5 = i32.const 0\n\
-        \x20 return v5\n\
+    // A capability name the host policy doesn't know is a clean instantiation error
+    // (`validate_powerbox_manifest`) — never a silent no-op or a wrong call.
+    let src = "import 0 \"frobnicate\" (i64) -> (i64)\n\
+        export \"_start\" 0\n\
+        func () -> (i32) {\n\
+        block0():\n\
+        \x20 v0 = i32.const 0\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2 = call.import 0 v0 (v1)\n\
+        \x20 v3 = i32.const 0\n\
+        \x20 return v3\n\
         }\n";
-    // Declare the unknown import at the top.
-    let src = format!("import 0 \"frobnicate\" (i64) -> (i64)\n{src}");
-    let m = parse_module(&src).expect("parse");
-    let err = svm_run::resolve_capability_imports(m).expect_err("unknown import must fail closed");
+    let m = parse_module(src).expect("parse");
+    let err = match svm_run::instantiate(m) {
+        Ok(_) => panic!("unknown import must fail closed at instantiate"),
+        Err(e) => e,
+    };
     assert!(
-        err.contains("frobnicate"),
+        err.contains("unresolved capability import") && err.contains("frobnicate"),
         "error names the bad import: {err}"
     );
 }

@@ -1125,20 +1125,21 @@ pub fn compile_module_mixed_entry(
 /// call sites, the function table, and debug locs (all keyed by the original indices) stay valid. The
 /// rewrite is **1:1** at each call site: a `Call` to a wrapper appends exactly the wrapper's results,
 /// which equal the `cap.call`'s `sig.results`, so block-local value numbering is preserved (no
-/// renumbering — the same property [`svm_ir::resolve_imports`] relies on lowering `CallImport`).
+/// renumbering — the same property the linker-only [`svm_ir::resolve_imports_with`] relies on).
 ///
-/// Runs **after** [`svm_ir::resolve_imports`] (it rewrites concrete `cap.call`s, not named imports),
-/// and the transformed module must be the one **both** tiers use: the emitter reads it, and the host's
-/// `call_interp` runs the wrapper on the interpreter — the wrapper only exists in the outlined module.
+/// Named manifest imports are **not** rewritten here (or anywhere — the runtime binds each import
+/// to a slot at instantiation; see `CallImport` below). The transformed module must be the one
+/// **both** tiers use: the emitter reads it, and the host's `call_interp` runs the wrapper on the
+/// interpreter — the wrapper only exists in the outlined module.
 ///
 /// It outlines three host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
 /// executable manifest import, IMPORTS.md phase 3 — the wrapper carries the `call.import` to the
 /// import-capable interpreter tier, so an import-bearing guest emits without resolution or rewrite),
-/// and [`Inst::CapSelfResolve`] (the
-/// §7 by-name capability lookup the powerbox `_start` synth uses at startup — `cap.self.resolve`). The
-/// latter matters for the on-ramp entry: `_start` is otherwise pure compute + stores, so hoisting its
-/// handful of `cap.self.resolve`s into cross-tier wrappers makes func 0 itself emittable — the last
-/// thing keeping a QuickJS-scale guest (whose hot interpreter loop is all in-subset) off the wasm tier.
+/// and [`Inst::CapSelfResolve`] (the §7 runtime by-name capability lookup — `cap.self.resolve`). The
+/// latter matters for a `_start` that resolves names at startup: it is otherwise pure compute +
+/// stores, so hoisting its handful of `cap.self.resolve`s into cross-tier wrappers makes func 0
+/// itself emittable — the last thing keeping a QuickJS-scale guest (whose hot interpreter loop is
+/// all in-subset) off the wasm tier.
 pub fn outline_cap_calls(m: &mut Module) {
     let base = m.funcs.len() as u32;
     let mut wrappers: Vec<Func> = Vec::new();

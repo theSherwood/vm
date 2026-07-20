@@ -11,13 +11,14 @@
 //! via `DOOM_SVMB` / `DOOM_WAD` / `DOOM_NATIVE_FRAMES`; the defaults match the demo scripts' cache.
 //! Run:  `cargo test -p svm-run --test doom_diff -- --ignored --nocapture`
 
-use svm_interp::{bytecode, iface, Host, StreamRole, Value};
+use svm_interp::{bytecode, iface, Host, StreamRole};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// Lower the on-ramp's §7 libc→capability imports (`write`/`read`/`exit`/`vm_*`) to concrete caps.
+/// The on-ramp's §7 libc→capability import names (`write`/`read`/`exit`/`vm_*`) and the
+/// `(type_id, op)` each manifest slot binds to at instantiation.
 fn onramp_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     let (type_id, op) = match name {
         "write" => (iface::STREAM, 1),
@@ -49,30 +50,48 @@ fn doom_frame_hashes_match_native() {
     .expect("native frame list — run demos/doom/diff.sh first");
     assert!(&wad[..4] == b"IWAD", "shareware IWAD");
 
-    let m = svm_ir::resolve_imports(&svm_encode::decode_module(&svmb).unwrap(), onramp_resolver)
-        .expect("resolve imports");
-    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    // The fixture is a manifest module (IMPORTS.md phase 3+): a paramless `_start` (func 0) whose
+    // named imports bind to capability slots at instantiation — no rewrite, no positional handles.
+    let m = svm_encode::decode_module(&svmb).unwrap();
+    assert!(
+        m.funcs.first().is_some_and(|f| f.params.is_empty()),
+        "the committed fixture must carry the paramless manifest `_start` (rebuild via \
+         demos/doom/diff.sh if this is a stale positional-entry blob)"
+    );
 
-    // Powerbox prefix (stdout/stdin/exit/memory) by the entry's arity.
+    // Grant the powerbox prefix (stdout/stdin/exit/memory) and bind each manifest import's slot to
+    // its `(type_id, op)` + granted handle — the same binding `svm_run::instantiate` performs.
     let mut host = Host::new();
-    let mut slots = Vec::new();
-    if arity >= 1 {
-        slots.push(Value::I32(host.grant_stream(StreamRole::Out)));
+    let stdout = host.grant_stream(StreamRole::Out);
+    let stdin = host.grant_stream(StreamRole::In);
+    let exit = host.grant_exit();
+    let memory = host.grant_memory();
+    for (name, h) in [
+        ("stdout", stdout),
+        ("stdin", stdin),
+        ("exit", exit),
+        ("memory", memory),
+    ] {
+        host.register_cap_name(name, h);
     }
-    if arity >= 2 {
-        slots.push(Value::I32(host.grant_stream(StreamRole::In)));
-    }
-    if arity >= 3 {
-        slots.push(Value::I32(host.grant_exit()));
-    }
-    if arity >= 4 {
-        slots.push(Value::I32(host.grant_memory()));
-    }
-    for (name, s) in ["stdout", "stdin", "exit", "memory"].iter().zip(&slots) {
-        if let Value::I32(h) = s {
-            host.register_cap_name(name, *h);
-        }
-    }
+    let bindings = m
+        .imports
+        .iter()
+        .map(|im| match onramp_resolver(&im.name) {
+            Some(cap) => {
+                let handle = match (cap.type_id, cap.op) {
+                    (iface::STREAM, 1) => stdout,
+                    (iface::STREAM, _) => stdin,
+                    (iface::EXIT, _) => exit,
+                    _ => memory,
+                };
+                svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            }
+            // Unknown name: declared but unbound — a dispatch through it is a fail-closed CapFault.
+            None => svm_interp::BoundImport::rebindable(0, 0, None),
+        })
+        .collect();
+    host.set_import_bindings(bindings);
 
     // A read-only in-memory WAD over the `fs` capability (op protocol per lua_files_stdio.c):
     // 0 open(name,len,flags)->fd; 1 read(fd,buf,len)->n; 3 seek(fd,whence,off)->pos; 4 close.
@@ -117,7 +136,7 @@ fn doom_frame_hashes_match_native() {
 
     // func 0 = _start → main → doomgeneric_Create + the N-frame loop, printing a hash per frame.
     let mut fuel = u64::MAX;
-    bytecode::compile_and_run_with_host(&m, 0, &slots, &mut fuel, &mut host)
+    bytecode::compile_and_run_with_host(&m, 0, &[], &mut fuel, &mut host)
         .expect("engine supports the module")
         .expect("guest runs without trapping");
 
