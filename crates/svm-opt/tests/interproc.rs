@@ -83,6 +83,44 @@ fn entry_calling(callee: u32) -> Func {
 }
 
 #[test]
+fn impl_export_ops_are_dfe_roots() {
+    // An interface offer's op functions (IMPORTS.md §3.2) are entered from another domain via
+    // wiring — invisible to intra-module reachability, so DFE must treat them as roots and remap
+    // their funcidxs with the survivors.
+    let m = Module {
+        funcs: vec![
+            entry_calling(2), // 0: entry
+            add_const(999),   // 1: DEAD — uncalled, unoffered
+            add_const(1),     // 2: live helper
+            add_const(7),     // 3: only referenced by the offer's op list
+        ],
+        impl_exports: vec![svm_ir::ImplExport {
+            name: "adder".into(),
+            ops: vec![3],
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    let opt = dead_func_elim(&m);
+    verify_module(&opt).expect("DFE output re-verifies");
+    assert_eq!(opt.funcs.len(), 3, "only the unrooted function drops");
+    let offer = opt.resolve_impl_export("adder").expect("offer survives");
+    assert_eq!(
+        offer.ops,
+        vec![2],
+        "op funcidx renumbered with the survivors"
+    );
+    for a in [-5i32, 0, 7] {
+        assert_eq!(
+            run(&opt, offer.ops[0], &[Value::I32(a)]),
+            Ok(vec![Value::I32(a + 7)]),
+            "offered op behavior preserved at a={a}"
+        );
+    }
+}
+
+#[test]
 fn drops_uncalled_function_and_renumbers() {
     // func 0: entry, returns helper(a) = call func 2.
     // func 1: DEAD — nobody calls it, not exported.

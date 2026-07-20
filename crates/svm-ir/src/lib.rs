@@ -2722,6 +2722,12 @@ pub struct Module {
     /// verifier checks each `func` is in range and names are unique; both backends ignore the table
     /// (they execute a funcidx). Empty for a module with no named entry points.
     pub exports: Vec<Export>,
+    /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
+    /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
+    /// offer into an importer's slot, checking signatures structurally, fail-closed. Names share
+    /// a namespace with [`Module::exports`]; backends ignore the table. Empty for the common
+    /// consumer-only module.
+    pub impl_exports: Vec<ImplExport>,
     /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
     /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
     /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
@@ -2737,6 +2743,12 @@ impl Module {
     /// only match.
     pub fn resolve_export(&self, name: &str) -> Option<FuncIdx> {
         self.exports.iter().find(|e| e.name == name).map(|e| e.func)
+    }
+
+    /// Resolve a named [impl export](Module::impl_exports) (an interface offer, IMPORTS.md §3.2),
+    /// or `None` if no offer carries `name`. Verifier-unique, so the first match is the only match.
+    pub fn resolve_impl_export(&self, name: &str) -> Option<&ImplExport> {
+        self.impl_exports.iter().find(|e| e.name == name)
     }
 }
 
@@ -2974,6 +2986,27 @@ pub enum ImportMode {
 pub struct Export {
     pub name: String,
     pub func: FuncIdx,
+}
+
+/// A provider-side interface **offer** (IMPORTS.md §3.2): this module declares it *implements* an
+/// interface, one function per operation — `ops[i]` is the funcidx implementing op `i`, and op
+/// `i`'s signature **is** that function's declared type (derived, never duplicated; a structural
+/// interface per D59, so there is no nominal interface name beyond the export's `name`).
+///
+/// Declaring an offer confers nothing: authority moves only when a wiring party (the host, or a
+/// parent holding both ends) connects the offer to an importer's slot, minting a table entry that
+/// trampolines into these functions in *this* module's domain — the signature check at wiring is
+/// structural and fail-closed. The verifier checks each funcidx is in range, `ops` is non-empty,
+/// and the name is unique across both export namespaces; backends ignore the table (dispatch goes
+/// through the host-owned handle table, never through the offer).
+///
+/// (Amendment to the §3.2 sketch, which drew a single `(op, args…)` dispatch func: guest functions
+/// have fixed signatures, so one-func-per-op is what keeps the check exact — no padded marshaling
+/// convention, and the trampoline invokes the op's function directly with the call's arguments.)
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ImplExport {
+    pub name: String,
+    pub ops: Vec<FuncIdx>,
 }
 
 /// A capability binding resolved from an import name at link time (§7 / DESIGN.md §22): the
@@ -3286,6 +3319,9 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         data,
         imports: Vec::new(),
         exports,
+        // Merging per-unit impl exports (offers, §3.2) into a linked module is a follow-up; a
+        // link unit has no `impl` surface yet.
+        impl_exports: Vec::new(),
         // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
         debug_info: None,
     })
@@ -3404,6 +3440,7 @@ mod import_tests {
                 },
             ],
             exports: vec![],
+            impl_exports: vec![],
             debug_info: None,
         }
     }

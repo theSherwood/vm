@@ -17,6 +17,7 @@ fn module(f: Func) -> Module {
         data: vec![],
         imports: vec![],
         exports: vec![],
+        impl_exports: vec![],
         debug_info: None,
     }
 }

@@ -558,6 +558,56 @@ fn directed_rule_rejects() {
         matches!(e, VerifyError::DuplicateExport { .. })
     });
 
+    // Interface offers (IMPORTS.md §3.2): real op targets, non-empty op lists, one name
+    // namespace across function exports and offers. An in-range offer is VALID.
+    let offer_module = || module(vec![func(vec![], vec![], vec![], T::Return(vec![]))]);
+    let mut m = offer_module();
+    m.impl_exports.push(svm_ir::ImplExport {
+        name: "logger".into(),
+        ops: vec![0],
+    });
+    accept(&m, "well-formed impl export");
+    let mut m = offer_module();
+    m.impl_exports.push(svm_ir::ImplExport {
+        name: "logger".into(),
+        ops: vec![0, 5],
+    });
+    reject(&m, "impl export op out of range", |e| {
+        matches!(e, VerifyError::ImplExportFuncOutOfRange { op: 1, .. })
+    });
+    let mut m = offer_module();
+    m.impl_exports.push(svm_ir::ImplExport {
+        name: "logger".into(),
+        ops: vec![],
+    });
+    reject(&m, "impl export with no ops", |e| {
+        matches!(e, VerifyError::ImplExportEmpty { .. })
+    });
+    let mut m = offer_module();
+    for _ in 0..2 {
+        m.impl_exports.push(svm_ir::ImplExport {
+            name: "logger".into(),
+            ops: vec![0],
+        });
+    }
+    reject(&m, "duplicate impl export", |e| {
+        matches!(e, VerifyError::DuplicateImplExport { .. })
+    });
+    let mut m = offer_module();
+    m.exports.push(Export {
+        name: "logger".into(),
+        func: 0,
+    });
+    m.impl_exports.push(svm_ir::ImplExport {
+        name: "logger".into(),
+        ops: vec![0],
+    });
+    reject(
+        &m,
+        "impl export name collides with a function export",
+        |e| matches!(e, VerifyError::DuplicateImplExport { .. }),
+    );
+
     // Select is polymorphic but exact: `b` must match `a`'s type.
     let f = func(
         vec![V::I32, V::I32, V::I64],

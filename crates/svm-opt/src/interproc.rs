@@ -119,6 +119,13 @@ pub fn dead_func_elim(m: &Module) -> Module {
     for e in &m.exports {
         mark(e.func as usize, &mut reachable, &mut stack);
     }
+    // Interface offers (IMPORTS.md §3.2) are roots too: their op functions are entered from
+    // another domain via wiring, invisible to intra-module reachability.
+    for e in &m.impl_exports {
+        for &f in &e.ops {
+            mark(f as usize, &mut reachable, &mut stack);
+        }
+    }
     while let Some(fi) = stack.pop() {
         referenced_funcs(&m.funcs[fi], |g| {
             let g = g as usize;
@@ -160,6 +167,14 @@ pub fn dead_func_elim(m: &Module) -> Module {
             func: map[e.func as usize],
         })
         .collect();
+    let impl_exports: Vec<svm_ir::ImplExport> = m
+        .impl_exports
+        .iter()
+        .map(|e| svm_ir::ImplExport {
+            name: e.name.clone(),
+            ops: e.ops.iter().map(|&f| map[f as usize]).collect(),
+        })
+        .collect();
 
     Module {
         funcs,
@@ -167,6 +182,7 @@ pub fn dead_func_elim(m: &Module) -> Module {
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports,
+        impl_exports,
         debug_info: None, // positions go stale once functions are renumbered
     }
 }
@@ -600,6 +616,7 @@ pub fn inline_calls(m: &Module) -> Module {
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports: m.exports.clone(),
+        impl_exports: m.impl_exports.clone(),
         debug_info: None, // instruction positions shift once bodies are spliced
     }
 }
@@ -893,6 +910,7 @@ pub fn const_prop(m: &Module) -> Module {
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports: m.exports.clone(),
+        impl_exports: m.impl_exports.clone(),
         debug_info: None, // instruction positions shift in a specialized entry block
     }
 }
@@ -994,6 +1012,7 @@ pub fn devirtualize(m: &Module) -> Module {
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports: m.exports.clone(),
+        impl_exports: m.impl_exports.clone(),
         debug_info: None, // an instruction/terminator changed
     }
 }

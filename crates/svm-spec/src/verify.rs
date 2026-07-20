@@ -55,6 +55,25 @@ pub fn verify(m: &Module) -> R {
             return Err(format!("duplicate export name {:?}", e.name));
         }
     }
+    // Interface offers (IMPORTS.md §3.2): non-empty op lists, every op names a real function,
+    // and one name namespace across function exports and offers.
+    for (i, e) in m.impl_exports.iter().enumerate() {
+        if e.ops.is_empty() {
+            return Err(format!("impl export {i} has no ops"));
+        }
+        for (oi, &f) in e.ops.iter().enumerate() {
+            if f as usize >= m.funcs.len() {
+                return Err(format!(
+                    "impl export {i} op {oi} names function {f} out of range"
+                ));
+            }
+        }
+        if m.impl_exports[..i].iter().any(|o| o.name == e.name)
+            || m.exports.iter().any(|o| o.name == e.name)
+        {
+            return Err(format!("duplicate export name {:?}", e.name));
+        }
+    }
     Ok(())
 }
 

@@ -727,6 +727,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     func: *func,
                 })
                 .collect(),
+            // wasm has no provider-side interface offers (IMPORTS.md §3.2) — nothing to transpile.
+            impl_exports: vec![],
             // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7) and
             // carry every `.debug_*` section through as a rich blob.
             debug_info: build_debug_info(debug_line.as_deref(), op_locs, local_locs, debug_blobs),

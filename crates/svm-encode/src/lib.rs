@@ -223,6 +223,9 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // runtime-`Module` analogue of a link unit's exports — so an embedder can `call("main")` by name.
 // The decoder accepts only the exact current `VERSION`, so the bump simply retires v2 readers; there
 // is no in-place v2 blob to stay compatible with.
+// v5 adds the **impl-export section** (provider-side interface offers, IMPORTS.md §3.2): name +
+// one funcidx per op — op signatures derive from the named functions' declared types, so the wire
+// carries indices only, never duplicated signatures.
 // v4 adds the per-import binding **mode** byte (`required`/`rebindable`, IMPORTS.md phase 2) and the
 // `import.attach` opcode — the reflect-then-attach discovery pattern over executable imports.
 // v3 adds the first-class **export section** (named function entry points: name + funcidx).
@@ -230,7 +233,7 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -346,6 +349,16 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     for e in &m.exports {
         write_str(&mut out, &e.name);
         write_uleb(&mut out, e.func as u64);
+    }
+    // Impl-export section (v5): count, then each offer's `name` and its per-op funcidx list —
+    // op `i`'s signature is `funcs[ops[i]]`'s declared type, so no signatures are written here.
+    write_uleb(&mut out, m.impl_exports.len() as u64);
+    for e in &m.impl_exports {
+        write_str(&mut out, &e.name);
+        write_uleb(&mut out, e.ops.len() as u64);
+        for &f in &e.ops {
+            write_uleb(&mut out, f as u64);
+        }
     }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
@@ -1599,6 +1612,19 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         let func = c.uleb()? as FuncIdx;
         exports.push(Export { name, func });
     }
+    // Impl-export section (v5): mirrors the encoder. Funcidx range, non-empty ops, and name
+    // uniqueness are the verifier's job, not the decoder's.
+    let nimpl = c.count()?;
+    let mut impl_exports = Vec::new();
+    for _ in 0..nimpl {
+        let name = c.str()?;
+        let nops = c.count()?;
+        let mut ops = Vec::new();
+        for _ in 0..nops {
+            ops.push(c.uleb()? as FuncIdx);
+        }
+        impl_exports.push(svm_ir::ImplExport { name, ops });
+    }
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
     for _ in 0..nfuncs {
@@ -1620,6 +1646,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         data,
         imports,
         exports,
+        impl_exports,
         debug_info,
     })
 }
@@ -2516,6 +2543,7 @@ mod debug_tests {
             data: vec![],
             imports: vec![],
             exports: vec![],
+            impl_exports: vec![],
             debug_info,
         }
     }
@@ -2570,6 +2598,40 @@ mod debug_tests {
         ];
         let decoded = decode_module(&encode_module(&m)).expect("decode");
         assert_eq!(decoded.exports, m.exports, "export section round-trips");
+        assert_eq!(decoded, m);
+    }
+
+    #[test]
+    fn impl_exports_round_trip_through_binary() {
+        // Interface offers (IMPORTS.md §3.2, v5): name + per-op funcidx list — the op signatures
+        // are the named functions' declared types, so only indices ride the wire.
+        let mut m = module(None);
+        for _ in 0..3 {
+            m.funcs.push(Func {
+                params: vec![],
+                results: vec![],
+                blocks: vec![Block {
+                    params: vec![],
+                    insts: vec![],
+                    term: Terminator::Return(vec![]),
+                }],
+            });
+        }
+        m.impl_exports = vec![
+            svm_ir::ImplExport {
+                name: "logger".to_string(),
+                ops: vec![1, 2],
+            },
+            svm_ir::ImplExport {
+                name: "sink".to_string(),
+                ops: vec![0],
+            },
+        ];
+        let decoded = decode_module(&encode_module(&m)).expect("decode");
+        assert_eq!(
+            decoded.impl_exports, m.impl_exports,
+            "impl-export section round-trips"
+        );
         assert_eq!(decoded, m);
     }
 
