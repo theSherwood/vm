@@ -284,10 +284,9 @@ impl Posix {
     }
 }
 
-/// The §7 import-name resolver for the POSIX subset: binds libc symbol names to the
-/// [`iface::HOST_FN`] capability + op. Pass it to [`svm_ir::resolve_imports`] (via
-/// `svm_run::resolve_capability_imports`); compose with your own policy for other imports. Unknown
-/// names return `None`, so `resolve_imports` fails closed. Both bare (`"write"`) and `"posix."`-
+/// The §7 import-name policy for the POSIX subset: maps libc symbol names to the
+/// [`iface::HOST_FN`] capability + op — the name vocabulary [`bind`] installs as slot bindings.
+/// Unknown names return `None`, so binding fails closed. Both bare (`"write"`) and `"posix."`-
 /// prefixed names resolve, so it works whether the frontend emits raw libc symbols or namespaced ones.
 pub fn resolve(name: &str) -> Option<ResolvedCap> {
     let bare = name.strip_prefix("posix.").unwrap_or(name);
@@ -325,29 +324,13 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
     })
 }
 
-/// The §7 **general-form** resolver (DESIGN.md §7 late binding: a name resolves to "a registered
-/// implementation **+ handle**"): like [`resolve`], but also binds the granted personality `handle`,
-/// so a module's libc imports carry **no handle argument** — each `call.import`'s handle operand is a
-/// `ConstI32` placeholder patched at resolve ([`svm_ir::Resolved::CapBound`]). Pass the closure to
-/// [`svm_ir::resolve_imports_with`] **after** [`grant`] (resolution needs the granted handle — the §7
-/// "binding happens once, at instantiation" ordering). The guest declares plain libc signatures and
-/// never reads a powerbox slot; the import section is its capability manifest.
-pub fn resolve_bound(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
-    move |name| {
-        resolve(name).map(|c| svm_ir::Resolved::CapBound {
-            type_id: c.type_id,
-            op: c.op,
-            handle,
-        })
-    }
-}
-
-/// IMPORTS.md phase 3 — the no-rewrite successor of [`resolve_bound`]: bind a manifest module's
-/// import slots to this personality. Each import name maps through [`resolve`] to its `(HOST_FN,
-/// op)` on the granted personality `handle`, installed as instance bindings
-/// ([`Host::set_import_bindings`]) — the module bytes are never modified and its `call.import`s
-/// dispatch through the slots. Returns `false` (nothing installed, fail-closed) on a non-POSIX
-/// import name. Call **after** [`grant`], like `resolve_bound`.
+/// Bind a manifest module's import slots to this personality (IMPORTS.md): each import name maps
+/// through [`resolve`] to its `(HOST_FN, op)` on the granted personality `handle`, installed as
+/// instance bindings ([`Host::set_import_bindings`]) — the module bytes are never modified and its
+/// `call.import`s dispatch through the slots. The guest declares plain libc signatures and never
+/// threads a handle argument; the import section is its capability manifest. Returns `false`
+/// (nothing installed, fail-closed) on a non-POSIX import name. Call **after** [`grant`]
+/// (binding needs the granted handle — the §7 "binding happens once, at instantiation" ordering).
 pub fn bind(m: &svm_ir::Module, host: &mut Host, handle: i32) -> bool {
     let Some(caps) = m
         .imports
@@ -1534,36 +1517,12 @@ block0(vph: i32):\n\
         );
     }
 
-    /// The **real linking path**: a module that *imports* the libc names `malloc`/`write` (never
-    /// hand-writes a `cap.call`), exactly what a chibicc/`svm-llvm` frontend emits for unresolved libc
-    /// symbols. `svm_ir::resolve_imports` binds each name through [`resolve`] and lowers every
-    /// `call.import` to a `cap.call` on the personality's handle — the same program, now import-free,
-    /// runs identically on both backends. Semantically identical to `MALLOC_WRITE` (→ `2_004096`, `"hi"`),
-    /// so it proves the *binding*, not new behavior.
-    const IMPORT_MALLOC_WRITE: &str = "memory 17\n\
-func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
-  vsz = i64.const 2\n\
-  vptr = call.import \"malloc\" (i64) -> (i64) vph (vsz)\n\
-  vh = i32.const 104\n\
-  i32.store8 vptr vh\n\
-  vone = i64.const 1\n\
-  vp1 = i64.add vptr vone\n\
-  vi = i32.const 105\n\
-  i32.store8 vp1 vi\n\
-  vfd = i64.const 1\n\
-  vn = call.import \"write\" (i64, i64, i64) -> (i64) vph (vfd, vptr, vsz)\n\
-  vk = i64.const 1000000\n\
-  vt = i64.mul vn vk\n\
-  vr = i64.add vt vptr\n\
-  return vr\n\
-}\n";
-
-    /// The §7 **general form**: the module's imports carry a `ConstI32` **placeholder** handle
-    /// (`vph = i32.const 0`) and the entry takes **no capability parameters at all** — the granted
-    /// handle arrives by [`resolve_bound`] patching the placeholder at resolve (`Resolved::CapBound`),
-    /// never through an entry argument or a powerbox slot. Same program as `IMPORT_MALLOC_WRITE`
-    /// (→ `2_004096`, `"hi"`), differing only in how the authority binds.
+    /// The manifest form a chibicc/`svm-llvm` frontend emits for unresolved libc symbols: the
+    /// module *imports* the libc names `malloc`/`write` (never hand-writes a `cap.call`), each
+    /// call site carries a dummy `i32.const 0` handle operand (vestigial in static dispatch —
+    /// IMPORTS.md §2.5), and the entry takes **no capability parameters at all** — the granted
+    /// handle arrives through the slot binding ([`bind`]), never through an entry argument
+    /// (→ `2_004096`, `"hi"`).
     const IMPORT_BOUND_MALLOC_WRITE: &str = "memory 17\n\
 func () -> (i64) {\n\
 block0():\n\
@@ -1588,6 +1547,14 @@ block0():\n\
     #[test]
     fn bound_imports_supply_the_handle_at_resolve() {
         let m = parse_module(IMPORT_BOUND_MALLOC_WRITE).expect("parse");
+        assert_eq!(
+            m.imports
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            ["malloc", "write"],
+            "the module declares the libc names it imports"
+        );
 
         // Grant FIRST (resolution needs the handle), on two identical hosts; deterministic grant
         // order gives both backends the same handle value, so one resolved module serves both.
@@ -1632,71 +1599,6 @@ block0():\n\
         assert!(
             matches!(jo, JitOutcome::Returned(ref s) if s == &[2_004_096]),
             "jit: must match interp, got {jo:?}"
-        );
-        assert_eq!(jposix.stdout(), b"hi", "jit: stdout must match interp");
-    }
-
-    #[test]
-    fn named_imports_bind_through_resolve_and_run() {
-        let m = parse_module(IMPORT_MALLOC_WRITE).expect("parse");
-        assert_eq!(
-            m.imports
-                .iter()
-                .map(|i| i.name.as_str())
-                .collect::<Vec<_>>(),
-            ["malloc", "write"],
-            "the module declares the libc names it imports"
-        );
-        // §7 late binding: bind each import name through the personality's resolver, lowering
-        // `call.import` → `cap.call` on the handle operand. Fails closed on an unknown name.
-        let resolved = svm_ir::resolve_imports(&m, resolve).expect("all libc imports resolve");
-        assert!(
-            resolved.imports.is_empty(),
-            "resolution drops the import section — the result is import-free"
-        );
-        verify_module(&resolved).expect("verify the resolved module");
-
-        // Run the resolved (import-free) module on both backends with the personality granted.
-        let mut ih = Host::new();
-        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, Vec::new());
-        let mut fuel = 5_000_000u64;
-        let ir = run_capture_reserved_with_host(
-            &resolved,
-            0,
-            &[Value::I32(h)],
-            &mut fuel,
-            &[0u8; WIN],
-            0,
-            &mut ih,
-        )
-        .0;
-        let mut jh = Host::new();
-        let (jh_handle, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
-        let jo = compile_and_run_capture_reserved_with_host(
-            &resolved,
-            0,
-            &[jh_handle as i64],
-            &[0u8; WIN],
-            0,
-            svm_run::cap_thunk,
-            &mut jh as *mut Host as *mut core::ffi::c_void,
-        )
-        .expect("jit")
-        .0;
-
-        assert_eq!(
-            ir,
-            Ok(vec![Value::I64(2_004_096)]),
-            "interp: malloc+write through bound imports"
-        );
-        assert_eq!(
-            iposix.stdout(),
-            b"hi",
-            "interp: personality captured the write"
-        );
-        assert!(
-            matches!(jo, JitOutcome::Returned(ref s) if s == &[2_004_096]),
-            "jit: bound-import run must match interp, got {jo:?}"
         );
         assert_eq!(jposix.stdout(), b"hi", "jit: stdout must match interp");
     }

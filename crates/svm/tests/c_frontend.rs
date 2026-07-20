@@ -96,11 +96,11 @@ fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 8
         h.grant_blocking(block_for, None),
         h.grant_jit(mem_log2),
     ];
-    // S15 (c2): the frontend `_start` now resolves each cap **by name** (`cap.self.resolve`), so
-    // register the fixed powerbox under its canonical names (the order matches
-    // `svm_run::POWERBOX_CAP_NAMES` / the `VM_CAP_*` order). The entry takes no positional handle
-    // arguments — callers run function 0 with `&[]` — but the returned handles are still handy for
-    // tests that name a specific one (e.g. an explicit `__vm_cap`-style call).
+    // Register the fixed powerbox under its canonical names (the order matches svm-run's
+    // `POWERBOX_CAP_NAMES` / the `VM_CAP_*` order) so a guest can `cap.self.resolve` them at
+    // runtime. The frontend `_start` is paramless — its manifest imports bind to capability slots
+    // at instantiation (IMPORTS.md phase 4), and callers run function 0 with `&[]` — but the
+    // returned handles are still handy for tests that name a specific one.
     const NAMES: [&str; 8] = [
         "stdout",
         "stdin",

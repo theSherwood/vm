@@ -25,8 +25,8 @@ use std::{env, fs, process};
 
 use svm_ir::Module;
 use svm_run::{
-    is_named_powerbox_entry, is_powerbox_entry, run_kernel, run_powerbox_with_args_and_limits,
-    specialize_module, Outcome, Quota, SpecArg, SpecializeOpts, Value,
+    is_named_powerbox_entry, run_kernel, run_powerbox_with_args_and_limits, specialize_module,
+    Outcome, Quota, SpecArg, SpecializeOpts, Value,
 };
 use svm_verify::verify_module;
 
@@ -111,15 +111,16 @@ fn try_main() -> Result<(), String> {
     };
 
     let module = load_module(Path::new(&file))?;
-    // IMPORTS.md phase 3: a named powerbox entry keeps its manifest — `run_powerbox` binds each
-    // slot at instantiation and `call.import` dispatches through the bindings (no rewrite). A
-    // legacy module (positional entry / hand-written IR with imports) still takes the
-    // `resolve_capability_imports` rewrite until phase 4 retires it.
-    let module = if svm_run::is_named_powerbox_entry(&module) {
-        module
-    } else {
-        svm_run::resolve_capability_imports(module)?
-    };
+    // IMPORTS.md phase 4: the runtime never rewrites. A powerbox entry keeps its manifest —
+    // `run_powerbox` binds each slot at instantiation and `call.import` dispatches through the
+    // bindings. A module that declares imports without the powerbox entry shape cannot run.
+    if !module.imports.is_empty() && !svm_run::is_named_powerbox_entry(&module) {
+        return Err(
+            "module declares imports but has no powerbox entry (paramless exported `_start`) — \
+             the runtime binds manifest slots, it does not rewrite (IMPORTS.md phase 4)"
+                .into(),
+        );
+    }
     verify_module(&module).map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
 
     if specialize {
@@ -139,7 +140,7 @@ fn try_main() -> Result<(), String> {
         );
     }
 
-    if is_powerbox_entry(&module) || is_named_powerbox_entry(&module) {
+    if is_named_powerbox_entry(&module) {
         // §5 kill-path: `SVM_DEADLINE_MS` (CLI policy) bounds a possibly-runaway guest so it is
         // detect-and-killed after the deadline instead of hanging the process; unset ⇒ unbounded.
         let deadline = std::env::var("SVM_DEADLINE_MS")

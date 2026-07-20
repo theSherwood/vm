@@ -9,21 +9,22 @@
 
 use svm_run::{instantiate, Backend, RunConfig, Value};
 
-/// A reactor program with no capabilities: `init` (run once by `_start`) zeroes an accumulator in a
-/// BSS window slot (offset 1024, page 0, no data segment → persisted, not reset by `init_data`);
-/// `add(sp, x)` adds `x` to it and returns the running total. Exports are `(i64 sp, …)` per the
-/// reactor calling convention.
+/// A reactor program with no capabilities: the paramless `_start` (func 0, run once by
+/// [`Instance::start`]) zeroes an accumulator in a BSS window slot (offset 1024, page 0, no data
+/// segment → persisted, not reset by `init_data`); `add(sp, x)` adds `x` to it and returns the
+/// running total. Non-`_start` exports keep the `(i64 sp, …)` reactor calling convention
+/// (`call_export` supplies `sp`); only func 0 / `_start` is paramless (IMPORTS.md phase 4).
 const COUNTER: &str = "\
 memory 15
-export \"init\" 0
+export \"_start\" 0
 export \"add\" 1
-func (i64) -> (i32) {
-block0(v0: i64):
-  v1 = i64.const 1024
-  v2 = i64.const 0
-  i64.store v1 v2
-  v3 = i32.const 0
-  return v3
+func () -> (i32) {
+block0():
+  v0 = i64.const 1024
+  v1 = i64.const 0
+  i64.store v0 v1
+  v2 = i32.const 0
+  return v2
 }
 func (i64, i64) -> (i64) {
 block0(v0: i64, v1: i64):
@@ -36,9 +37,7 @@ block0(v0: i64, v1: i64):
 ";
 
 fn counter_module() -> svm_ir::Module {
-    let m = svm_text::parse_module(COUNTER).expect("parse");
-    // entry = func 0 (`init`), no granted handles, no heap.
-    svm_ir::synth_powerbox_start(m, 0, 0, false).expect("synth")
+    svm_text::parse_module(COUNTER).expect("parse")
 }
 
 /// On a single backend, state persists across `call_export` — the accumulator grows.

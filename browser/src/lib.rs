@@ -1822,16 +1822,22 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     Some(svm_ir::ResolvedCap { type_id, op })
 }
 
-/// Prepare an on-ramp module for execution (IMPORTS.md phase 3): a **paramless** (by-name) entry
-/// runs its manifest as-is — `call.import` dispatches through the instance bindings
-/// [`grant_onramp_caps`] installs, no rewrite. A legacy **positional** entry (pre-manifest blobs)
-/// still takes the `resolve_imports` rewrite until phase 4 retires it.
-fn onramp_prepare(m: &svm_ir::Module) -> Result<svm_ir::Module, ()> {
-    let paramless = m.funcs.first().is_some_and(|f| f.params.is_empty());
-    if paramless {
-        return Ok(m.clone());
+/// Gate an on-ramp module (IMPORTS.md phase 4): the runtime never rewrites. A module that declares
+/// imports must carry the **powerbox entry shape** — a paramless func 0 exported as `_start`
+/// (`svm-run`'s `is_named_powerbox_entry`) — so its manifest slots can bind at instantiation
+/// ([`grant_onramp_caps`] installs the bindings; `call.import` dispatches through them). An
+/// import-bearing module without that shape **fails closed** (the pre-manifest `resolve_imports`
+/// rewrite died with phase 4). An import-free module passes as-is: its entry runs with no args
+/// (missing params zero-seed, the `Session` convention) and reaches capabilities only by name via
+/// `cap.self.resolve`.
+fn onramp_check(m: &svm_ir::Module) -> Result<(), ()> {
+    let named_entry = m.funcs.first().is_some_and(|f| f.params.is_empty())
+        && m.exports.iter().any(|e| e.name == "_start" && e.func == 0);
+    if m.imports.is_empty() || named_entry {
+        Ok(())
+    } else {
+        Err(())
     }
-    svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| ())
 }
 
 /// A shared **keyboard event queue** (the `keyboard` capability's backing): the host pushes packed
@@ -1847,64 +1853,36 @@ type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>
 /// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
 /// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
 ///
-/// The on-ramp emits `_start` in one of two forms (mirroring `svm-run`'s `grant_caps`):
-/// a **paramless** by-name entry (the S15 synth) that resolves each capability by name from the stash
-/// via `cap.self.resolve`, or a **legacy positional** entry that takes its handles as arguments in slot
-/// order. Either way we grant the prefix and register every name; a positional entry additionally gets
-/// its first `arity` handles as `slots` (the by-name entry runs with none). A guest resolves only the
-/// names it uses, so registering the whole prefix is a harmless superset; one that resolves neither
-/// graphical cap is unaffected (the queue stays empty, the frame cell `None`). Shared by [`onramp_exec`]
-/// and the per-frame [`OnrampReactor`], so both grant the identical powerbox.
+/// The on-ramp entry is the phase-4 powerbox shape (mirroring `svm-run`'s `grant_caps`): a
+/// **paramless** `_start` whose manifest imports bind to slot bindings at instantiation, and which
+/// resolves any further capability by name via `cap.self.resolve`. The whole prefix is granted and
+/// registered under its canonical names; a guest resolves only the names it uses, so registering
+/// the full prefix is a harmless superset — one that resolves neither graphical cap is unaffected
+/// (the queue stays empty, the frame cell `None`). The entry receives **no** handle arguments (the
+/// positional slot-order delivery died in phase 4). Shared by [`onramp_exec`] and the per-frame
+/// [`OnrampReactor`], so both grant the identical powerbox.
 fn grant_onramp_caps(
     host: &mut Host,
     m: &svm_ir::Module,
     fs: Option<(String, Vec<u8>)>,
-) -> (
-    Vec<Value>,
-    std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-    KeyQueue,
-) {
+) -> (std::sync::Arc<std::sync::Mutex<Option<Frame>>>, KeyQueue) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let arity = m.funcs.first().map_or(0, |f| f.params.len());
-    // A paramless (by-name) entry resolves the whole prefix by name, so grant+register all of it; a
-    // positional entry gets exactly its `arity` handles as args (the old, slot-order grant).
-    let n = if arity == 0 {
-        ONRAMP_CAP_NAMES.len()
-    } else {
-        arity
-    };
-    let mut handles: Vec<i32> = Vec::new();
-    if n >= 1 {
-        handles.push(host.grant_stream(StreamRole::Out));
-    }
-    if n >= 2 {
-        handles.push(host.grant_stream(StreamRole::In));
-    }
-    if n >= 3 {
-        handles.push(host.grant_exit());
-    }
-    if n >= 4 {
-        handles.push(host.grant_memory());
-    }
-    if n >= 5 {
-        handles.push(host.grant_address_space(0, win));
-    }
+    let handles: [i32; 5] = [
+        host.grant_stream(StreamRole::Out),
+        host.grant_stream(StreamRole::In),
+        host.grant_exit(),
+        host.grant_memory(),
+        host.grant_address_space(0, win),
+    ];
     for (name, handle) in ONRAMP_CAP_NAMES.iter().zip(&handles) {
         host.register_cap_name(name, *handle);
     }
-    // Positional args for a legacy entry; empty for a by-name (paramless) entry.
-    let slots: Vec<Value> = if arity == 0 {
-        Vec::new()
-    } else {
-        handles.iter().map(|h| Value::I32(*h)).collect()
-    };
-    // IMPORTS.md phase 3: a manifest-carrying (paramless) module executes its `call.import`s
-    // through instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
+    // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
+    // instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
     // dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
-    if arity == 0 && !m.imports.is_empty() {
+    if !m.imports.is_empty() {
         use svm_interp::iface;
-        let hv = |i: usize| handles.get(i).copied().unwrap_or(0);
         let bindings = m
             .imports
             .iter()
@@ -1913,11 +1891,11 @@ fn grant_onramp_caps(
                     return svm_interp::BoundImport::rebindable(0, 0, None);
                 };
                 let handle = match (cap.type_id, cap.op) {
-                    (iface::STREAM, 1) => hv(0),
-                    (iface::STREAM, _) => hv(1),
-                    (iface::EXIT, _) => hv(2),
-                    (iface::MEMORY, _) => hv(3),
-                    (iface::ADDRESS_SPACE, _) => hv(4),
+                    (iface::STREAM, 1) => handles[0],
+                    (iface::STREAM, _) => handles[1],
+                    (iface::EXIT, _) => handles[2],
+                    (iface::MEMORY, _) => handles[3],
+                    (iface::ADDRESS_SPACE, _) => handles[4],
                     _ => return svm_interp::BoundImport::rebindable(0, 0, None),
                 };
                 svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
@@ -2061,7 +2039,7 @@ fn grant_onramp_caps(
         }));
         host.register_cap_name("fs", handle);
     }
-    (slots, frame, keys)
+    (frame, keys)
 }
 
 /// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `svm-llvm`'s synthesized `_start`
@@ -2071,11 +2049,10 @@ fn grant_onramp_caps(
 /// addrspace` (mirroring `svm-run`'s `grant_powerbox_prefix`) and registers each under its name, and
 /// the by-name `_start` resolves what it needs via `cap.self.resolve`.
 ///
-/// [`grant_onramp_caps`] handles both on-ramp entry forms — the paramless by-name `_start` (S15) and a
-/// legacy positional one. Prefix slots 6–8 (`ioring`/`blocking`/`jit`) need region/JIT wiring the
-/// browser powerbox doesn't carry yet, so a **positional** entry with arity > 5 is **fail-closed**
-/// (`STATUS_UNSUPPORTED`) rather than mis-granted; a paramless entry resolves by name and is unbounded
-/// by arity (an unregistered name simply fails to resolve). The `fs` capability (SQLite Phase B, Lua
+/// The entry is the phase-4 powerbox shape ([`onramp_check`]): a paramless `_start` whose manifest
+/// imports bind at instantiation, taking **no** handle arguments — the positional (slot-order
+/// handle-args) entry form died in phase 4 and an import-bearing module without the manifest entry
+/// shape is fail-closed (`STATUS_UNSUPPORTED`). The `fs` capability (SQLite Phase B, Lua
 /// `files.lua`) is a `host_fn` resolved by name — a Stage-1 follow-on, not part of this prefix.
 pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
@@ -2086,13 +2063,7 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         stderr: Vec::new(),
         framebuffer: None,
     };
-    let resolved = match onramp_prepare(m) {
-        Ok(r) => r,
-        Err(()) => return unsupported(),
-    };
-    let m = &resolved;
-    // A positional entry beyond the granted prefix (arity > 5) would be mis-granted; fail closed.
-    if m.funcs.first().map_or(0, |f| f.params.len()) > 5 {
+    if onramp_check(m).is_err() {
         return unsupported();
     }
     let mut host = Host::new();
@@ -2100,10 +2071,10 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
-    let (slots, frame, _keys) = grant_onramp_caps(&mut host, m, None);
+    let (frame, _keys) = grant_onramp_caps(&mut host, m, None);
     let mut fuel = u64::MAX;
     let (status, value, exit_code) =
-        match bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host) {
+        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
             None => (STATUS_UNSUPPORTED, 0, 0),
             Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
             Some(Err(_)) => (STATUS_TRAP, 0, 0),
@@ -2139,39 +2110,20 @@ fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Shared Postgres powerbox setup (used by the one-shot [`pg_exec`] and the persistent [`PgSession`]):
-/// resolve the module, grant `stdout/stdin/exit/memory` (registered by name — the paramless `_start`
-/// resolves them) + the in-memory `fs` cap over the data `image`, and build the `--single` argv image.
-/// Returns `(resolved module, host, positional slots, init_mem)` or a `STATUS_*` on failure. `host`'s
-/// stdin is left empty and non-blocking; the caller sets those per run mode.
-fn pg_setup(
-    m: &svm_ir::Module,
-    image: &[u8],
-) -> Result<
-    (
-        svm_ir::Module,
-        Host,
-        Vec<Value>,
-        Vec<u8>,
-        svm_fs::MemFsHandle,
-    ),
-    i32,
-> {
-    // Idempotent on the already-resolved `.svmb` (imports = 0); resolves a raw on-ramp module too.
-    let resolved = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
-    // Postgres' `_start` arity depends on the on-ramp entry convention: the current `synth_start_argv`
-    // (slice S15c) emits a **paramless** `_start` that resolves its caps **by name**, while an older
-    // pre-S15c artifact takes the 4-cap prefix (`stdout, stdin, exit, memory`) **positionally**. Accept
-    // both — anything past the 4-cap prefix is not a shape Postgres' entry uses.
-    let arity = resolved.funcs.first().map_or(0, |f| f.params.len());
-    if arity > 4 {
-        return Err(STATUS_UNSUPPORTED);
-    }
+/// gate the module shape, grant `stdout/stdin/exit/memory` (registered by name and bound to the
+/// manifest slots — the paramless `_start` takes no handle args) + the in-memory `fs` cap over the
+/// data `image`, and build the `--single` argv image. Returns `(host, init_mem, fs handle)` or a
+/// `STATUS_*` on failure. `host`'s stdin is left empty and non-blocking; the caller sets those per
+/// run mode.
+fn pg_setup(m: &svm_ir::Module, image: &[u8]) -> Result<(Host, Vec<u8>, svm_fs::MemFsHandle), i32> {
+    // IMPORTS.md phase 4: an import-bearing module must be a manifest module (paramless exported
+    // `_start`) — the runtime binds slots, it never rewrites. Fail closed otherwise.
+    onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
     let mut host = Host::new();
     // Grant the on-ramp powerbox prefix — stdout, stdin, exit, memory (the heap-growth cap `malloc`
-    // uses) — and register each **by name** (`cap.self.resolve`), which the paramless `_start` needs;
-    // a positional `_start` additionally receives the first `arity` of them as its params. Granted
-    // directly — not via `grant_onramp_caps`, whose graphical `display`/`keyboard`/`webgpu` caps would
-    // add a host import a headless Postgres neither needs nor can satisfy.
+    // uses) — and register each **by name** (`cap.self.resolve`). Granted directly — not via
+    // `grant_onramp_caps`, whose graphical `display`/`keyboard`/`webgpu` caps would add a host
+    // import a headless Postgres neither needs nor can satisfy.
     let out = host.grant_stream(StreamRole::Out);
     host.register_cap_name("stdout", out);
     let inp = host.grant_stream(StreamRole::In);
@@ -2180,14 +2132,13 @@ fn pg_setup(
     host.register_cap_name("exit", exit);
     let memory = host.grant_memory();
     host.register_cap_name("memory", memory);
-    // IMPORTS.md phase 3: a manifest-carrying module executes its `call.import`s through
+    // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
     // instantiation-time slot bindings — map each import name via the on-ramp policy onto the four
     // granted handles (`Stream` disambiguated by op). A name outside this headless powerbox (e.g.
-    // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch. A
-    // pre-phase-3 resolved artifact has an empty manifest, making this a no-op.
-    if !resolved.imports.is_empty() {
+    // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
+    if !m.imports.is_empty() {
         use svm_interp::iface;
-        let bindings = resolved
+        let bindings = m
             .imports
             .iter()
             .map(|im| {
@@ -2206,15 +2157,6 @@ fn pg_setup(
             .collect();
         host.set_import_bindings(bindings);
     }
-    // Positional prefix for a pre-S15c `_start` (`arity` of stdout/stdin/exit/memory); empty for the
-    // current paramless entry, which resolves every cap by name.
-    let slots: Vec<Value> = [
-        Value::I32(out),
-        Value::I32(inp),
-        Value::I32(exit),
-        Value::I32(memory),
-    ][..arity]
-        .to_vec();
     // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed). The **shared**
     // mount hands back a `MemFsHandle`, so a persistent session can snapshot the live data dir back out
     // later ([`svm_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
@@ -2228,7 +2170,7 @@ fn pg_setup(
     let base = svm_ir::POWERBOX_ARGS_BASE as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
-    Ok((resolved, host, slots, init_mem, fs_handle))
+    Ok((host, init_mem, fs_handle))
 }
 
 /// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
@@ -2237,8 +2179,8 @@ fn pg_setup(
 /// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
 /// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
 /// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). The `stdout, stdin,
-/// exit, memory, fs` caps are all resolved by name (the current paramless `_start`); a pre-S15c
-/// artifact whose `_start` takes the 4-cap prefix positionally is also accepted.
+/// exit, memory, fs` caps are reached by name (`cap.self.resolve`) or through the module's manifest
+/// slot bindings — the paramless `_start` takes no handle args (IMPORTS.md phase 4).
 pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         status,
@@ -2248,17 +2190,16 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
         stderr: Vec::new(),
         framebuffer: None,
     };
-    let (m, mut host, slots, init_mem, _fs) = match pg_setup(m, image) {
+    let (mut host, init_mem, _fs) = match pg_setup(m, image) {
         Ok(setup) => setup,
         Err(status) => return unsupported(status),
     };
-    let m = &m;
     host.stdin = stdin.to_vec();
     let mut fuel = u64::MAX;
     let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
         m,
         0,
-        &slots,
+        &[],
         &mut fuel,
         &init_mem,
         svm_ir::DEFAULT_RESERVED_LOG2,
@@ -2430,7 +2371,7 @@ pub extern "C" fn svm_pg_open(
         set(STATUS_VERIFY_ERR);
         return -STATUS_VERIFY_ERR;
     }
-    let (m, mut host, slots, init_mem, fs_snap) = match pg_setup(&m, image) {
+    let (mut host, init_mem, fs_snap) = match pg_setup(&m, image) {
         Ok(setup) => setup,
         Err(status) => {
             set(status);
@@ -2450,7 +2391,7 @@ pub extern "C" fn svm_pg_open(
     let vcpu = match bytecode::Vcpu::new_root_reserved_with_powerbox(
         unsafe { &*prog },
         0,
-        &slots,
+        &[],
         &init_mem,
         host,
         svm_ir::DEFAULT_RESERVED_LOG2,
@@ -2576,11 +2517,11 @@ pub struct OnrampReactor {
 }
 
 impl OnrampReactor {
-    /// Open a reactor over `m`: lower its §7 imports, grant the powerbox (prefix + `display`/
-    /// `keyboard`), and run `_start` once (stash handles + init) over a **live** window kept for the
-    /// per-frame `tick` calls. `Err(status)` if imports don't resolve, the entry arity is out of
-    /// range, there is no exported `tick`, the module is outside the engine's subset, or `_start`
-    /// traps.
+    /// Open a reactor over `m`: grant the powerbox (prefix + `display`/`keyboard`), bind its
+    /// manifest import slots, and run the entry once (init) over a **live** window kept for the
+    /// per-frame `tick` calls. `Err(status)` if an import-bearing module lacks the manifest entry
+    /// shape (fail-closed, IMPORTS.md phase 4), there is no exported `tick`, the module is outside
+    /// the engine's subset, or the entry traps.
     pub fn open(m: &svm_ir::Module) -> Result<OnrampReactor, i32> {
         Self::open_inner(m, None)
     }
@@ -2599,21 +2540,18 @@ impl OnrampReactor {
     }
 
     fn open_inner(m: &svm_ir::Module, fs: Option<(String, Vec<u8>)>) -> Result<OnrampReactor, i32> {
-        let module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let arity = module.funcs.first().map_or(0, |f| f.params.len());
-        if arity > 5 {
-            return Err(STATUS_UNSUPPORTED);
-        }
+        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         // The per-frame entry: the guest's exported `tick` (reactor convention `(sp) -> …`).
-        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+        let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = svm_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module, fs);
-        let mut inst = bytecode::Reactor::open(&module).ok_or(STATUS_UNSUPPORTED)?;
-        // Run `_start` (func 0) once on the live window: stash the granted handles + run the C
-        // initializer. The window (globals/BSS/heap) then persists for every `tick`.
+        let (frame, keys) = grant_onramp_caps(&mut host, m, fs);
+        let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
+        // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
+        // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
+        // then persists for every `tick`.
         let mut fuel = u64::MAX;
-        match inst.call(0, &slots, &mut fuel, &mut host) {
+        match inst.call(0, &[], &mut fuel, &mut host) {
             Ok(_) => {}
             Err(_) => return Err(STATUS_TRAP),
         }
@@ -2756,21 +2694,18 @@ impl SharedOnrampReactor {
         backing: Option<Box<[u8]>>,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<SharedOnrampReactor, i32> {
-        let module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let arity = module.funcs.first().map_or(0, |f| f.params.len());
-        if arity > 5 {
-            return Err(STATUS_UNSUPPORTED);
-        }
-        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = svm_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module, fs);
-        // Run `_start` (func 0) once over the shared window: stash the granted handles + run the C
-        // initializer, seeding + data-initialising the window (the once). The window then persists in
-        // the shared backing for every `tick`.
+        let (frame, keys) = grant_onramp_caps(&mut host, m, fs);
+        // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
+        // slot bindings deliver the capabilities) to run the C initializer, seeding +
+        // data-initialising the window (the once). The window then persists in the shared backing
+        // for every `tick`.
         let host = std::sync::Mutex::new(host);
-        let reactor = bytecode::VcpuReactor::open(&module, back.clone(), &host, &slots)
-            .map_err(|_| STATUS_TRAP)?;
+        let reactor =
+            bytecode::VcpuReactor::open(m, back.clone(), &host, &[]).map_err(|_| STATUS_TRAP)?;
         Ok(SharedOnrampReactor {
             reactor,
             host,
@@ -2929,7 +2864,8 @@ impl JitOnrampReactor {
         shared_memory: bool,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<JitOnrampReactor, i32> {
-        let mut module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let mut module = m.clone();
         // Hoist inline `cap.call`s into cross-tier wrapper functions so a hot `tick` that interleaves
         // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
         // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
@@ -2941,20 +2877,17 @@ impl JitOnrampReactor {
                 mc.size_log2 = win_log2;
             }
         }
-        let arity = module.funcs.first().map_or(0, |f| f.params.len());
-        if arity > 5 {
-            return Err(STATUS_UNSUPPORTED);
-        }
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = svm_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module, fs);
-        // Compile the module **once** — reused for `_start` and every per-frame cross-tier bounce.
+        let (frame, keys) = grant_onramp_caps(&mut host, &module, fs);
+        // Compile the module **once** — reused for the entry and every per-frame cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
-        // Run `_start` once over the shared window (seed data + init), servicing `cap.call`s (Doom's
-        // WAD read) inline against the powerbox. The window then persists in `back` for every frame.
+        // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
+        // slot bindings deliver the capabilities), servicing `cap.call`s (Doom's WAD read) inline
+        // against the powerbox. The window then persists in `back` for every frame.
         let mut fuel = u64::MAX;
-        match program.run_over(0, &slots, &mut fuel, back.clone(), &mut host, true) {
+        match program.run_over(0, &[], &mut fuel, back.clone(), &mut host, true) {
             Ok(_) => {}
             Err(_) => return Err(STATUS_TRAP),
         }
@@ -3058,12 +2991,13 @@ impl JitOnrampReactor {
 
 /// A **single-shot** wasm-JIT run of an on-ramp module — the run-to-completion twin of
 /// [`JitOnrampReactor`] (which drives an exported `tick` per frame). Here the whole program *is* func 0
-/// (`_start`), so we emit **that** and run it once: `_start` takes the granted capability handles as
-/// params (`slots`), stashes them, seeds the heap, and calls `main(sp)` — all on emitted wasm, with the
-/// 47/103 cross-tier helpers (Lua/SQLite) bouncing to the interpreter through `env.call_interp` over the
-/// same window (so `write`/`read`/`exit` resolve against the powerbox). Unlike the reactor, `_start` is
-/// **not** pre-run on the interpreter; instead the `.data`/`.rodata` segments are materialized into the
-/// window up front (the emitted `_start` seeds only the heap), then `f0(win, env, ...slots)` runs the
+/// (`_start`), so we emit **that** and run it once: the paramless `_start` reads its capabilities
+/// through the manifest slot bindings / `cap.self.resolve` (phase 4 — no handle params), seeds the
+/// heap, and calls `main(sp)` — all on emitted wasm, with the 47/103 cross-tier helpers (Lua/SQLite)
+/// bouncing to the interpreter through `env.call_interp` over the same window (so
+/// `write`/`read`/`exit` resolve against the powerbox). Unlike the reactor, `_start` is **not**
+/// pre-run on the interpreter; instead the `.data`/`.rodata` segments are materialized into the
+/// window up front (the emitted `_start` seeds only the heap), then `f0(win, env)` runs the
 /// program. `stdout`/`stderr`/`exit_code` are read back from the host afterward, exactly as
 /// [`onramp_exec`] captures them — so the two tiers are a stdout/exit differential.
 pub struct JitOnrampRun {
@@ -3073,8 +3007,6 @@ pub struct JitOnrampRun {
     _backing: Option<Box<[u8]>>,
     back: std::sync::Arc<svm_interp::Region>,
     win_base: usize,
-    /// The capability handles `_start` (func 0) takes as params — the emitted `f0`'s `...slots` args.
-    slots: Vec<Value>,
     emitted_wasm: Vec<u8>,
     emitted: Vec<bool>,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
@@ -3159,7 +3091,8 @@ impl JitOnrampRun {
         shared_memory: bool,
         stdin: Vec<u8>,
     ) -> Result<JitOnrampRun, i32> {
-        let mut module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let mut module = m.clone();
         svm_wasmjit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
         if let Some(mc) = module.memory.as_mut() {
@@ -3167,15 +3100,12 @@ impl JitOnrampRun {
                 mc.size_log2 = win_log2;
             }
         }
-        let arity = module.funcs.first().map_or(0, |f| f.params.len());
-        if arity > 5 {
-            return Err(STATUS_UNSUPPORTED);
-        }
         let mut host = Host::new();
         host.stdin = stdin;
-        // The powerbox prefix (stdout/stdin/exit/…) `_start` takes as params; `display` too (unused by a
-        // pure compute guest, present for parity with `onramp_exec`). No `fs` (input comes from stdin).
-        let (slots, frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+        // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered by
+        // name; `display` too (unused by a pure compute guest, present for parity with
+        // `onramp_exec`). No `fs` (input comes from stdin).
+        let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
         // Compile once — reused for every cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Materialize `.data`/`.rodata` into the window before the emitted `_start` runs (the interpreter
@@ -3203,7 +3133,6 @@ impl JitOnrampRun {
             _backing: backing,
             back,
             win_base,
-            slots,
             emitted_wasm,
             emitted,
             frame,
@@ -3221,9 +3150,11 @@ impl JitOnrampRun {
     pub fn win_base(&self) -> usize {
         self.win_base
     }
-    /// The capability-handle values `_start` takes as params — the emitted `f0`'s trailing `...slots`.
+    /// The emitted `f0`'s trailing `...slots` args — always empty since IMPORTS.md phase 4 (the
+    /// paramless `_start` takes no handle params; capabilities arrive via the manifest slot
+    /// bindings). Kept so the JS driver's `f0(win, env, ...slots)` call shape needs no change.
     pub fn slots(&self) -> &[Value] {
-        &self.slots
+        &[]
     }
     /// The per-function emitted bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the rest are cross-tier).
     pub fn emitted(&self) -> &[bool] {

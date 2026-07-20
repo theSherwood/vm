@@ -1,8 +1,8 @@
 //! **`svm-capi` — the C ABI over the `svm-run` embedding surface** (POWERBOX.md Phase 5).
 //!
-//! A C program can: parse a module (text or binary IR), prepend the powerbox `_start`
-//! ([`svm_ir::synth_powerbox_start`]), bind host capabilities **by name** (built-ins, or its own C
-//! function pointers — the wasm-style import registry of Phase 2), instantiate, and run on any backend
+//! A C program can: parse a module (text or binary IR) whose paramless exported `_start` declares
+//! its capability imports (the IMPORTS.md manifest), bind host capabilities **by name** (built-ins,
+//! or its own C function pointers — the wasm-style import registry of Phase 2), instantiate, and run on any backend
 //! under a uniform config (Phase 3) — then read back the outcome and captured stdout/stderr. It is the
 //! same pipeline as the Rust `Instance` API, exposed through `extern "C"`.
 //!
@@ -174,55 +174,6 @@ pub unsafe extern "C" fn svm_module_decode(bytes: *const u8, len: usize) -> *mut
         };
         let m = svm_encode::decode_module(slice).map_err(|e| format!("decode: {e:?}"))?;
         Ok(Box::into_raw(Box::new(SvmModule(m))))
-    })
-}
-
-/// Prepend the powerbox `_start` (the bootstrap) to `m` in place, for `n_handles` granted capability
-/// handles (stash slot `i` ↔ import `i`), seeding a guest heap if `seed_heap`. `entry` is the funcidx
-/// of the program's entry (a `(i64 sp) -> ()`/`(T)` function) *before* the prepend.
-///
-/// # Safety
-/// `m` must be a live module handle from this library.
-#[no_mangle]
-pub unsafe extern "C" fn svm_module_synth_powerbox_start(
-    m: *mut SvmModule,
-    entry: u32,
-    n_handles: usize,
-    seed_heap: bool,
-) -> i32 {
-    guard_status(|| {
-        let m = m
-            .as_mut()
-            .ok_or("svm_module_synth_powerbox_start: null module")?;
-        let module = std::mem::take(&mut m.0);
-        let synthd = svm_ir::synth_powerbox_start(module, entry, n_handles, seed_heap)?;
-        m.0 = synthd;
-        Ok(())
-    })
-}
-
-/// Prepend the powerbox `_start` for a **wasm-style arbitrary-imports** entry: the paramless `_start`
-/// resolves the module's own import names (in declaration order) by name into the stash, so slot `i`
-/// holds the `i`-th import's granted handle (the entry loads it there). Use this instead of
-/// [`svm_module_synth_powerbox_start`] when binding by name via `svm_instantiate_with_imports`; the
-/// fixed §3e powerbox (canonical cap names) uses that one. `entry` is the funcidx *before* the prepend.
-///
-/// # Safety
-/// `m` must be a live module handle from this library.
-#[no_mangle]
-pub unsafe extern "C" fn svm_module_synth_powerbox_start_for_imports(
-    m: *mut SvmModule,
-    entry: u32,
-    seed_heap: bool,
-) -> i32 {
-    guard_status(|| {
-        let m = m
-            .as_mut()
-            .ok_or("svm_module_synth_powerbox_start_for_imports: null module")?;
-        let module = std::mem::take(&mut m.0);
-        let synthd = svm_ir::synth_powerbox_start_for_imports(module, entry, seed_heap)?;
-        m.0 = synthd;
-        Ok(())
     })
 }
 

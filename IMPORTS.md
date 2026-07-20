@@ -471,7 +471,31 @@ the vestigial `CallImport` handle operand at the next format bump, the
 imports-cleared test/doc assertions) — plus docs (`DESIGN.md` §3a/§7
 deltas, POWERBOX.md F7/S15, FRONTEND.md entry conventions). Net-negative
 LOC. **Exit criterion: the §2.5 grep-clean completion gate passes** — done
-is checked, not asserted.
+is checked, not asserted. *Status: **landed**, notes:*
+
+- *The gate is a **test**, not a grep run by hand:
+  `crates/svm/tests/imports_gate.rs` scans the tree's `.rs`/`.c`/`.h`
+  sources and fails on any reappearance of the deleted symbols, and pins
+  `resolve_imports_with` call sites to the linker allowlist.
+  `patch_placeholder`/`SlotHandleNotConst` survive only as the
+  `Resolved::Slot` rewrite's internals — the gate's "outside the linker"
+  qualifier realized.*
+- *`resolve_imports` (the Cap-only wrapper) went with `CapBound`; the
+  linker pass is `resolve_imports_with` (`Cap`/`Func`/`Slot`). The
+  `compile_linked` guest symbol table still delivers `Cap` — link-time by
+  definition.*
+- *`instantiate` / the CLI / `run_powerbox` / the browser on-ramp fail
+  closed on an import-bearing module without the powerbox entry shape
+  (paramless exported `_start`): instantiation never rewrites, there is no
+  legacy fallback left. `instantiate_with_imports` rejects an import naming
+  a non-slot-dispatchable interface with a pointer at dynamic mode (§2.2).*
+- *The c_shell/c_shell_exec/stage1_posix_spawn suites link their compiled-C
+  shims with `Resolved::Cap` (handle-free, link-time symbol resolution) and
+  the guests discover their own handles via `cap.self` reflection — §2.3's
+  dynamic mode for the `Instantiator` ops, exercised end to end.*
+- *The vestigial `CallImport` handle operand is **kept** until the next
+  wire-format bump, exactly as §2.5 schedules it (frontends emit a dummy,
+  backends ignore it).*
 
 **The deletion phase is tracked work, not eventual cleanup.** The failure
 mode of this migration is not a wrong design; it is stalling at phase 1 and

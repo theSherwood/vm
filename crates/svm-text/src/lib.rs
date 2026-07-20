@@ -2804,12 +2804,14 @@ block2(vr: i64):
         assert_eq!(var("vsum").scope.unwrap().0, 8);
     }
 
+    // The linker's Cap lowering (IMPORTS.md §2.5: `resolve_imports_with` survives in the linker
+    // only) over parsed text IR — the parse → link integration, not an instantiation path.
     #[test]
-    fn resolves_to_capcalls_and_clears_imports() {
+    fn linker_lowers_parsed_imports_to_capcalls() {
         let m = parse_module(SRC).expect("parse");
-        let r = svm_ir::resolve_imports(&m, |n| match n {
-            "write" => Some(ResolvedCap { type_id: 0, op: 1 }),
-            "exit" => Some(ResolvedCap { type_id: 1, op: 0 }),
+        let r = svm_ir::resolve_imports_with(&m, |n| match n {
+            "write" => Some(svm_ir::Resolved::Cap(ResolvedCap { type_id: 0, op: 1 })),
+            "exit" => Some(svm_ir::Resolved::Cap(ResolvedCap { type_id: 1, op: 0 })),
             _ => None,
         })
         .expect("resolve");
