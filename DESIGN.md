@@ -918,17 +918,19 @@ kernel demand paging, so `map`/`unmap` are real (the shipped `<stdlib.h>` `mallo
 guest heap through them) and `protect` backs the RO-data setup.
 
 ### Powerbox (instantiation grant)
-`entry(h0…h5, args_buffer)`, imports declared in this order (§3b):
-```
-h0: Stream  (stdin,  readable)   h3: Exit
-h1: Stream  (stdout, writable)   h4: Clock
-h2: Stream  (stderr, writable)   h5: Memory (the window heap region)
-args_buffer: borrowed buffer at a known window offset
-```
-**`args_buffer` layout (pure bytes, §7):** `{ argc: u32, envc: u32 }` then
-`argc + envc` NUL-terminated UTF-8 strings packed in order. The C entry wrapper
-scans it to build `argv[]`/`envp[]` on the data stack, calls `main(argc, argv)`,
-then `cap.call h3 exit(ret)` (§3d).
+The entry is a **paramless `_start`** (function 0, `export "_start" 0`) over the
+module's **import manifest** (IMPORTS.md): each named import (`write`, `read`,
+`exit`, `vm_map`, …) is a slot the host binds to a granted capability at
+instantiation, and `call.import <slot>` dispatches through the binding — no
+handle is ever a positional entry argument. (The original `entry(h0…h5, args)`
+positional grant, and the later handle-stash bootstrap, were retired in
+IMPORTS.md phases 3–4.)
+
+**`args_buffer` layout (pure bytes, §7):** at a known window offset
+(`POWERBOX_ARGS_BASE`), `{ argc: u32, envc: u32 }` then `argc + envc`
+NUL-terminated UTF-8 strings packed in order. The C entry wrapper scans it to
+build `argv[]`/`envp[]` on the data stack, calls `main(argc, argv)`, then exits
+through its `exit` import (§3d).
 
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete

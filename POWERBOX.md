@@ -255,10 +255,11 @@ validated frontend output.
 locked. `Instance::call("<non-_start>", args)` resolves the name to its (possibly non-zero) funcidx and
 runs it as a **bare kernel** — args in, results out, interp == jit — with **no** powerbox caps
 (`powerbox_instantiate.rs::non_start_export_runs_as_bare_kernel`, `square` at funcidx 1). The decision:
-a non-`_start` export gets no caps run-once, because without `_start` the handle stash (window offset 0)
-is empty, so a granted handle would be unreachable anyway; a **cap-using export is reached through a
-reactor `Session`** (`Instance::start` runs `_start` once to stash handles, then `Session::call_export`
-calls exports against the live window). Rule: *pure function → `Instance::call`; cap-using export →
+a non-`_start` export gets no caps run-once, because without `_start` the module's initializer has not
+run and a one-shot kernel call installs no import bindings; a **cap-using export is reached through a
+reactor `Session`** (`Instance::start` runs `_start` once, then `Session::call_export` calls exports
+against the live window). *(Originally phrased in terms of the handle stash; the stash is deleted —
+IMPORTS.md phase 4 — but the rule and its rationale stand.)* Rule: *pure function → `Instance::call`; cap-using export →
 `Session::call_export`*. (Name-addressable **nested** exports are F2, above.)
 
 ---
@@ -267,8 +268,9 @@ calls exports against the live window). Rule: *pure function → `Instance::call
 
 **Landed (slice 1).** `svm_run::Session` (a live, stateful instance) + `Instance::start(backend,
 config) -> Session` and `Session::call_export(name, args) -> results`: instantiate once, run `_start`
-once, then call exports repeatedly with the guest window (globals, the handle stash, BSS) **persisting**
-between calls. Persistence is by **round-tripping the low `SNAP_CAP` (256 KiB) window snapshot** each
+once, then call exports repeatedly with the guest window (globals, BSS) **persisting** between calls.
+*(The "handle stash" this slice originally persisted is deleted — IMPORTS.md phase 4; capability
+delivery is the host-side import-binding table, which persists on the session's `Host`.)* Persistence is by **round-tripping the low `SNAP_CAP` (256 KiB) window snapshot** each
 call — the span all three backends already snapshot — so no TCB-internal changes were needed; the
 capability handles persist because the stash lives in that window. Exports use `(i64 sp, args…)`:
 `call_export` synthesizes the `sp` ([`svm_ir::powerbox_entry_sp`], now public) and appends the args.
@@ -442,6 +444,13 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   runner binding name → implementation **+ handle** (`Resolved::CapBound`, `svm_run::powerbox_resolver`,
   `powerbox_named.rs`). The positional handle-parameter `_start` is retired at every frontend; the
   runner keeps positional entry only as a low-level primitive for hand-written IR kernels.
+  *Update (IMPORTS.md phase 4):* the resolve-and-stash bootstrap itself is now retired too — a
+  powerbox module's **import manifest** binds each named slot at instantiation
+  (`Host::set_import_bindings`) and `call.import` dispatches through the binding, so the
+  synthesized `_start` prologue, the stash, `Resolved::CapBound`, `powerbox_resolver`, the
+  `synth_powerbox_start*` family, and the runner's positional-entry powerbox path are all
+  **deleted** (the §2.5 grep-clean gate, `crates/svm/tests/imports_gate.rs`, checks they stay
+  gone). `cap.self.resolve`/`count`/`get` remain as the guest-side discovery tier.
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic capability labels.** *Landed.* The reverse of F7: a human-readable **label** for a

@@ -1,8 +1,8 @@
 /*
  * svm.h — C bindings for the SVM embedding runtime (POWERBOX.md Phase 5).
  *
- * Pipeline: parse a module (text or binary IR) -> svm_module_synth_powerbox_start ->
- * bind host capabilities by name (built-ins or your own C callbacks) -> svm_instantiate* ->
+ * Pipeline: parse a module (text or binary IR; a paramless exported _start over an import
+ * manifest) -> bind host capabilities by name (built-ins or your own C callbacks) -> svm_instantiate* ->
  * svm_instance_run / svm_instance_run_diff -> read the outcome and captured stdout/stderr.
  *
  * Conventions:
@@ -52,9 +52,6 @@ const char *svm_last_error(void);
 /* ---- Module ---- */
 SvmModule *svm_module_parse_text(const char *ir);
 SvmModule *svm_module_decode(const uint8_t *bytes, size_t len);
-/* Prepend the powerbox _start for n_handles granted handles (slot i <-> import i); 0 = SVM_OK. */
-int32_t svm_module_synth_powerbox_start(SvmModule *m, uint32_t entry, size_t n_handles,
-                                        bool seed_heap);
 void svm_module_free(SvmModule *m);
 
 /* ---- Imports registry (wasm-style name -> capability) ---- */

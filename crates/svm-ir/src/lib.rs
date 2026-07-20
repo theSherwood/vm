@@ -15,8 +15,7 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 
@@ -1731,14 +1730,14 @@ pub enum Inst {
         args: Vec<ValIdx>,
     },
     /// Call a host capability by **name** — the §7 late-binding import. `import` indexes
-    /// [`Module::imports`] (which supplies the name); `handle` is the `i32` capability
-    /// handle (frontend-supplied, e.g. loaded from the powerbox stash, exactly like
-    /// `cap.call`); `args` are the op arguments; `sig` is a self-describing copy of the
-    /// import's op signature (mirroring `cap.call`/`call_indirect`, so result counting needs
-    /// no module context). It deliberately carries **no** `type_id`/`op`: those are bound at
-    /// instantiation by [`resolve_imports`], the host's `name → (type_id, op)` policy, which
-    /// rewrites every `CallImport` into a concrete [`Inst::CapCall`]. A `CallImport` that
-    /// reaches the verifier or a backend is a fail-closed error (resolution is mandatory).
+    /// [`Module::imports`] (which supplies the name); `handle` is vestigial in static mode
+    /// (the slot binding carries the granted handle — frontends emit a dummy const and
+    /// backends ignore it; retired at the next wire-format bump, IMPORTS.md §2.5); `args`
+    /// are the op arguments; `sig` is a self-describing copy of the import's op signature
+    /// (mirroring `cap.call`/`call_indirect`, so result counting needs no module context).
+    /// It deliberately carries **no** `type_id`/`op`: those are bound at instantiation
+    /// through the domain's import-binding table ([`CAP_IMPORT_TYPE_ID`]), installed by the
+    /// host when it grants the manifest's slots — the module bytes are never rewritten.
     CallImport {
         import: u32,
         sig: FuncType,
@@ -2585,17 +2584,10 @@ pub const POWERBOX_ARGS_BASE: u64 = 128;
 /// `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)` so it never collides with a data segment.
 pub const POWERBOX_ARGS_END: u64 = 16384;
 
-/// The §3e powerbox **handle-stash** base: the synthesized `_start` stashes each granted capability
-/// handle as an `i32` slot at window offset `STASH_BASE + i*4` (handle `i` at `i*4`), for the
-/// contiguous prefix of the eight fixed `VM_CAP_*` capabilities the program was granted. This is the
-/// *public* contract the C on-ramp (`svm-llvm`) bakes into its private `synth_start`;
-/// [`synth_powerbox_start`] reproduces it byte-for-byte so a frontend that emits SVM-IR directly
-/// gets the identical bootstrap without reaching into the on-ramp.
-pub const POWERBOX_STASH_BASE: u64 = 0;
 /// The canonical **names** of the fixed §3e powerbox capabilities, in `VM_CAP_*` / grant order (the
-/// same order/names `svm_run` grants + registers). A paramless `_start` resolves each by name
-/// (`cap.self.resolve`) into its stash slot ([`synth_powerbox_start`]); `[..n]` is the prefix a
-/// program granted `n` handles uses.
+/// same order/names `svm_run` grants + registers). A powerbox guest's manifest imports resolve
+/// against this vocabulary (and `cap.self.resolve` re-finds them by name); `[..n]` is the prefix a
+/// program granted `n` capabilities uses.
 pub const POWERBOX_CAP_NAMES: [&str; 8] = [
     "stdout",
     "stdin",
@@ -2606,8 +2598,8 @@ pub const POWERBOX_CAP_NAMES: [&str; 8] = [
     "blocking",
     "jit",
 ];
-/// The guest heap's bump-pointer word (`i64`), just above the 8-handle stash region (`[0, 32)`).
-/// Seeded by `_start` (to the window's mapped boundary) when the program allocates (`seed_heap`).
+/// The guest heap's bump-pointer word (`i64`) at window offset 32 (page 0 is reserved scratch).
+/// Seeded by a frontend's `_start` (to the window's mapped boundary) when the program allocates.
 pub const POWERBOX_HEAP_BRK: u64 = 32;
 /// The guest heap's committed-boundary word (`i64`), just above [`POWERBOX_HEAP_BRK`]. The allocator
 /// `Memory.map`-commits upward from here into the reserved tail (§1a sparse address space).
@@ -2628,13 +2620,9 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// `stack_page`, 64 KiB for wasm builds) already does this; this keeps the reactor's per-frame `tick`
 /// `sp` consistent with it. Over-alignment is free (a few KiB of window) and only ever adds clearance.
 pub const POWERBOX_STACK_ALIGN: u64 = 65536;
-/// The data-stack reserve [`synth_powerbox_start`] leaves above the globals when sizing the window
-/// (matches `svm-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
+/// The data-stack reserve a frontend's `_start` layout leaves above the globals when sizing the
+/// window (`svm-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
 pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
-/// The number of fixed powerbox capabilities (`VM_CAP_*`, `<svm.h>`): stdout, stdin, exit, memory,
-/// addrspace, ioring, blocking, jit — always granted as a contiguous prefix of this set.
-pub const POWERBOX_MAX_HANDLES: usize = 8;
-
 /// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
 /// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
 /// [`Quota`] can only *tighten* below this, never raise it. `1 << 24` (~16.7M) — the ceiling equals the
@@ -2689,10 +2677,9 @@ impl Quota {
 }
 
 /// The powerbox data-stack base for `module`: the page-aligned offset just above its globals/data
-/// segments (and never below [`POWERBOX_STACK_PAGE`]) — the `sp` the synthesized `_start` passes to
+/// segments (and never below [`POWERBOX_STACK_PAGE`]) — the `sp` a frontend's `_start` passes to
 /// the entry. Exposed so an embedder driving exports directly (the reactor / `Session` model) can
-/// synthesize the same `sp` per call that `_start` would. Stable across [`synth_powerbox_start`]
-/// (which adds no data segments), so it returns the same value before and after the prepend.
+/// synthesize the same `sp` per call that `_start` would.
 pub fn powerbox_entry_sp(module: &Module) -> u64 {
     let data_end = module
         .data
@@ -2710,251 +2697,6 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
         * POWERBOX_STACK_ALIGN
 }
 
-/// Prepend the powerbox bootstrap `_start` (the new function 0) to an already-linked, possibly
-/// import-bearing `module`, reproducing the exact layout the C on-ramp (`svm-llvm`) bakes into its
-/// own `synth_start` — so a frontend that emits SVM-IR directly (and links it itself, e.g. via
-/// [`link`]) gets the same "just works" powerbox bootstrap the C path enjoys, with no access to the
-/// on-ramp internals.
-///
-/// The synthesized `_start` takes `n_handles` `i32` capability handles (a contiguous prefix of the
-/// eight fixed [`POWERBOX_MAX_HANDLES`] `VM_CAP_*` slots — stdout, stdin, exit, memory, addrspace,
-/// ioring, blocking, jit), **stashes** each at window offset `i*4` (the public
-/// [`POWERBOX_STASH_BASE`] layout), optionally **seeds** the guest heap (`seed_heap`, when the
-/// program allocates — the bump pointer/boundary at [`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`]),
-/// then calls `entry(sp)` with the page-aligned data-stack base and returns the entry's result.
-///
-/// `entry` is the funcidx (in `module`, **before** the prepend) of the program's entry — a
-/// `(i64 sp) -> ()` or `(i64 sp) -> (T)` function (the C `main(void)` shape: it takes the threaded
-/// data-stack pointer). Prepending `_start` shifts every existing funcidx up by one; this is handled
-/// here (including the call to `entry`), so the returned module is internally consistent.
-///
-/// The window is grown (never shrunk) to cover the stash, the module's globals/data segments, and a
-/// [`POWERBOX_STACK_RESERVE`] data-stack reserve; a frontend's globals must already live at/above
-/// [`POWERBOX_STACK_PAGE`] (page 0 is the writable scratch). Returns an error if `n_handles` is
-/// outside `[3, 8]`, `entry` is out of range, or the entry signature isn't `(i64) -> ()`/`(i64) -> (T)`.
-pub fn synth_powerbox_start(
-    module: Module,
-    entry: FuncIdx,
-    n_handles: usize,
-    seed_heap: bool,
-) -> Result<Module, String> {
-    // The fixed §3e powerbox: `_start` resolves the first `n_handles` canonical cap names
-    // ([`POWERBOX_CAP_NAMES`]) by name into the stash. A wasm-style arbitrary-imports entry uses
-    // [`synth_powerbox_start_with_names`] with its own import names instead.
-    if n_handles > POWERBOX_CAP_NAMES.len() {
-        return Err(format!(
-            "fixed powerbox has {} named caps, got n_handles={n_handles} (use \
-             synth_powerbox_start_with_names for a larger/custom name set)",
-            POWERBOX_CAP_NAMES.len()
-        ));
-    }
-    synth_powerbox_start_with_names(module, entry, &POWERBOX_CAP_NAMES[..n_handles], seed_heap)
-}
-
-/// [`synth_powerbox_start_with_names`] using the module's **own import names** in declaration order
-/// — the wasm-style arbitrary-imports powerbox, where slot `i` holds the `i`-th import's granted
-/// handle (the entry loads it there, and the host registers each under that import name when it binds
-/// it, so the paramless `_start` re-finds it by `cap.self.resolve`). Sugar for the `instantiate_with_
-/// imports` path; the fixed §3e powerbox uses [`synth_powerbox_start`] instead.
-pub fn synth_powerbox_start_for_imports(
-    module: Module,
-    entry: FuncIdx,
-    seed_heap: bool,
-) -> Result<Module, String> {
-    let names: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    synth_powerbox_start_with_names(module, entry, &refs, seed_heap)
-}
-
-/// The **general form** of [`synth_powerbox_start`] (PROCESS.md S15 (c)): prepend a paramless
-/// `_start` that resolves **each name in `names`** by name (`cap.self.resolve`) into stash slot
-/// `i*4`, in order. For the fixed §3e powerbox pass [`POWERBOX_CAP_NAMES`]`[..n]`; for a wasm-style
-/// entry whose slots hold arbitrary host capabilities, pass the module's **own import names** in
-/// declaration order (the entry loads slot `i` for its `i`-th import — the names the host registers
-/// when it binds them), or use [`synth_powerbox_start_for_imports`]. `names.len()` handles are
-/// stashed at `[0, names.len()*4)`.
-pub fn synth_powerbox_start_with_names(
-    mut module: Module,
-    entry: FuncIdx,
-    names: &[&str],
-    seed_heap: bool,
-) -> Result<Module, String> {
-    let n_handles = names.len();
-    // The handle stash occupies `[0, n_handles*4)`. It must not run into the reserved low state that
-    // sits above it: the heap bump/boundary words at [`POWERBOX_HEAP_BRK`] (when the program seeds a
-    // heap), else the format scratch / §3e args buffer at [`POWERBOX_ARGS_BASE`]. So a *fixed*
-    // powerbox is the 8-handle case (`32 == POWERBOX_HEAP_BRK`), and a name-bound frontend may stash
-    // more (up to 32 handles) as long as it doesn't seed a heap. This is the only cap — there is no
-    // lower bound (a capability-free program stashes nothing).
-    let stash_end = n_handles as u64 * 4;
-    let ceiling = if seed_heap {
-        POWERBOX_HEAP_BRK
-    } else {
-        POWERBOX_ARGS_BASE
-    };
-    if stash_end > ceiling {
-        return Err(format!(
-            "powerbox stash for {n_handles} handles ([0, {stash_end})) overflows the reserved low \
-             region (must end by offset {ceiling}{})",
-            if seed_heap {
-                " — with seed_heap the heap state lives just above the 8-handle region"
-            } else {
-                ""
-            }
-        ));
-    }
-    let ef = module.funcs.get(entry as usize).ok_or_else(|| {
-        format!(
-            "entry funcidx {entry} out of range ({} funcs)",
-            module.funcs.len()
-        )
-    })?;
-    if ef.params.as_slice() != [ValType::I64] {
-        return Err(format!(
-            "powerbox entry must take a single i64 (the data-stack pointer), got params {:?}",
-            ef.params
-        ));
-    }
-    if ef.results.len() > 1 {
-        return Err(format!(
-            "powerbox entry must return 0 or 1 value, got {:?}",
-            ef.results
-        ));
-    }
-    let results = ef.results.clone();
-
-    // Globals/data segments live at/above STACK_PAGE; the data stack starts page-aligned above the
-    // highest data segment (and never below STACK_PAGE), so a read-only global never shares a page
-    // with the writable stash, and a stack write never lands on a read-only global's page (D40).
-    let entry_sp = powerbox_entry_sp(&module);
-
-    // The window must cover the stash + globals + a data-stack reserve. Grow the declared memory to
-    // fit (never shrink); beyond the mapped window is the faulting guard region (§5).
-    let top = entry_sp + POWERBOX_STACK_RESERVE;
-    let need_log2 = (64 - (top - 1).leading_zeros()) as u8;
-    let size_log2 = module
-        .memory
-        .map_or(need_log2, |m| m.size_log2.max(need_log2));
-    module.memory = Some(Memory { size_log2 });
-
-    // The guest heap (when the program allocates) begins at the window's mapped boundary and grows up
-    // into the reserved tail via `Memory.map`.
-    let heap_base = seed_heap.then(|| 1u64 << size_log2);
-
-    // Every existing funcidx (in code *and* in the export table) shifts up by one — the prepended
-    // `_start` becomes function 0.
-    offset_func_indices(&mut module, 1);
-    let start = build_powerbox_start(entry + 1, &results, entry_sp, names, heap_base);
-    module.funcs.insert(0, start);
-    // Expose the bootstrap as a named export so an embedder reaches it by name (`call("_start")`),
-    // not by a magic funcidx. A frontend's own entry export (e.g. "main") survives, shifted above.
-    module.exports.push(Export {
-        name: "_start".to_string(),
-        func: 0,
-    });
-    Ok(module)
-}
-
-/// Build the powerbox bootstrap `_start` body (the language-neutral core of `svm-llvm`'s
-/// `synth_start`, minus the C-specific argv/ctor paths): stash the granted handles, optionally seed
-/// the heap, then `call entry(sp)` and return its result. See [`synth_powerbox_start`].
-fn build_powerbox_start(
-    entry_idx: FuncIdx,
-    entry_results: &[ValType],
-    entry_sp: u64,
-    names: &[&str],
-    heap_base: Option<u64>,
-) -> Func {
-    // A **paramless** `_start` (PROCESS.md S15 (c)): instead of receiving the granted handles as
-    // positional arguments, its prologue obtains each **by name** (`cap.self.resolve`) from the §7
-    // name directory the host populates at grant, and stashes it at byte offset `i*4` (the public
-    // STASH layout) — so the entry (which loads the stash) is unchanged, and there is no positional
-    // guest/host agreement. `names[i]` is the name for slot `i`: the fixed-powerbox cap names for the
-    // §3e set, or the module's own import names for a wasm-style arbitrary-imports entry.
-    let params: Vec<ValType> = Vec::new();
-    let mut insts: Vec<Inst> = Vec::new();
-    let mut next: ValIdx = 0;
-    // Each name's bytes are written to a scratch cell at the data-stack base (`entry_sp`), reused per
-    // name — transient, since the entry (called below with the data-SP = `entry_sp`) overwrites it.
-    for (i, name) in names.iter().enumerate() {
-        for (k, &b) in name.as_bytes().iter().enumerate() {
-            insts.push(Inst::ConstI64(entry_sp as i64 + k as i64));
-            let addr = next;
-            next += 1;
-            insts.push(Inst::ConstI32(b as i32));
-            let val = next;
-            next += 1;
-            insts.push(Inst::Store {
-                op: StoreOp::I32_8,
-                addr,
-                value: val,
-                offset: 0,
-                align: 0,
-            });
-        }
-        insts.push(Inst::ConstI64(entry_sp as i64));
-        let name_ptr = next;
-        next += 1;
-        insts.push(Inst::ConstI64(name.len() as i64));
-        let name_len = next;
-        next += 1;
-        insts.push(Inst::CapSelfResolve { name_ptr, name_len });
-        let handle = next;
-        next += 1;
-        insts.push(Inst::ConstI64(POWERBOX_STASH_BASE as i64 + (i as i64) * 4));
-        let addr = next;
-        next += 1;
-        insts.push(Inst::Store {
-            op: StoreOp::I32,
-            addr,
-            value: handle,
-            offset: 0,
-            align: 0,
-        });
-    }
-    // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base`
-    // (the window's mapped boundary); the allocator `vm_map`-commits upward from there.
-    if let Some(hb) = heap_base {
-        for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
-            insts.push(Inst::ConstI64(off as i64));
-            let addr = next;
-            next += 1;
-            insts.push(Inst::ConstI64(hb as i64));
-            let val = next;
-            next += 1;
-            insts.push(Inst::Store {
-                op: StoreOp::I64,
-                addr,
-                value: val,
-                offset: 0,
-                align: 0,
-            });
-        }
-    }
-    // sp = entry_sp (constant); the data-SP the entry carries as param 0.
-    insts.push(Inst::ConstI64(entry_sp as i64));
-    let sp = next;
-    next += 1;
-    insts.push(Inst::Call {
-        func: entry_idx,
-        args: vec![sp],
-    });
-    let term = if entry_results.is_empty() {
-        Terminator::Return(vec![])
-    } else {
-        Terminator::Return(vec![next]) // the entry's single result, appended by the call
-    };
-    Func {
-        results: entry_results.to_vec(),
-        blocks: vec![Block {
-            params: params.clone(),
-            insts,
-            term,
-        }],
-        params,
-    }
-}
-
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
@@ -2965,14 +2707,13 @@ pub struct Module {
     /// to it faults, §4/§5). Like an ELF loader laying out `.data`/`.rodata`; replaces the
     /// frontend's per-byte `_start` init stores.
     pub data: Vec<Data>,
-    /// Named capability imports (§7 "Host-defined capabilities & discoverability"): the
-    /// interfaces this module expects the host to bind. Each is a `name` + op `sig`; a
-    /// [`Inst::CallImport`] references one by index. The host's instantiation policy resolves
-    /// each name to a concrete `(type_id, op)` via [`resolve_imports`], which lowers every
-    /// `CallImport` to a [`Inst::CapCall`] and clears this list — so the verifier and both
-    /// backends only ever see import-free modules. An import-bearing module that reaches a
-    /// backend is a fail-closed error (resolution is mandatory first). Empty for modules that
-    /// inline their capability calls (the legacy `cap.call`-only form).
+    /// The import **manifest** (§7 "Host-defined capabilities & discoverability" / IMPORTS.md):
+    /// the named capability slots this module expects the host to bind. Each is a `name` + op
+    /// `sig` + [`ImportMode`]; a [`Inst::CallImport`] references one by index and dispatches
+    /// through the domain's instantiation-time binding table ([`CAP_IMPORT_TYPE_ID`]) — the
+    /// module bytes are never rewritten. The linker ([`resolve_imports_with`]) is the one pass
+    /// that lowers `CallImport`s away, resolving names as link-time symbols. Empty for modules
+    /// that inline their capability calls (`cap.call` on a live handle — dynamic mode).
     pub imports: Vec<Import>,
     /// Named function **exports** (name → funcidx): the host-addressable entry points, the
     /// runtime-`Module` analogue of [`LinkUnit::exports`]. Populated by [`link`] from each unit's
@@ -3235,19 +2976,22 @@ pub struct Export {
     pub func: FuncIdx,
 }
 
-/// A capability binding resolved from an import name at instantiation (§7): the concrete
-/// interface `type_id` and operation `op` the host bound the name to. Returned by the
-/// resolver passed to [`resolve_imports`].
+/// A capability binding resolved from an import name at link time (§7 / DESIGN.md §22): the
+/// concrete interface `type_id` and operation `op` a name bound to. Returned by the resolver
+/// passed to [`resolve_imports_with`] (as [`Resolved::Cap`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ResolvedCap {
     pub type_id: u32,
     pub op: u32,
 }
 
-/// What an import **name** binds to when [`resolve_imports_with`] lowers it. The §7 capability
-/// case (`Cap`) is the host-ABI binding; `Func` is the **compile-time (static) linking** case — the
-/// name resolved to a concrete function index, so the call lowers to a direct [`Inst::Call`]. (A
-/// data-symbol binding — lowering to a constant window offset — is a natural follow-up.)
+/// What an import **name** binds to when [`resolve_imports_with`] lowers it — **link-time symbol
+/// resolution** (IMPORTS.md §2.5: the linker legitimately produces new module bytes; the runtime
+/// never rewrites — a manifest module's imports bind to slots at instantiation instead). The §7
+/// capability case (`Cap`) is the host-ABI binding a guest loader's symbol table can deliver;
+/// `Func` is the **compile-time (static) linking** case — the name resolved to a concrete
+/// function index, so the call lowers to a direct [`Inst::Call`]. (A data-symbol binding —
+/// lowering to a constant window offset — is a natural follow-up.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resolved {
     /// A host capability: lower to a `cap.call` on the import's handle operand (§7).
@@ -3261,17 +3005,6 @@ pub enum Resolved {
     /// The import's handle operand must be a `ConstI32` placeholder — it is patched to `slot` and
     /// reused as the `call_indirect` index (a 1:1 rewrite, no value renumbering).
     Slot(u32),
-    /// A host capability with a **resolver-supplied handle** — the §7 "general form of the powerbox"
-    /// (DESIGN.md §7 late binding: a name resolves to "a registered implementation **+ handle**").
-    /// Like [`Resolved::Cap`], but the import's handle operand must be a `ConstI32` **placeholder**
-    /// (as for [`Resolved::Slot`]), patched to `handle` — the granted handle the host's instantiation
-    /// policy chose for this name. The guest declares the operation by name with its real signature
-    /// and never threads a handle argument or reads a powerbox slot; the authority binds at resolve.
-    /// The natural binding for a per-domain **singleton** (a POSIX personality's shared `HostFn`);
-    /// a capability with many live objects (streams, regions) keeps the handle a call-site operand
-    /// ([`Resolved::Cap`]). Resolution must therefore run **after** grant — per-instantiation, which
-    /// is already the §7 flow ("binding happens once, at instantiation").
-    CapBound { type_id: u32, op: u32, handle: i32 },
 }
 
 impl From<ResolvedCap> for Resolved {
@@ -3280,46 +3013,29 @@ impl From<ResolvedCap> for Resolved {
     }
 }
 
-/// Why [`resolve_imports`] failed (fail-closed: a missing/garbled import never silently
+/// Why [`resolve_imports_with`] failed (fail-closed: a missing/garbled import never silently
 /// becomes a no-op or a wrong call).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ImportError {
-    /// The host policy returned no binding for this import name.
+    /// The resolver returned no binding for this import name.
     Unresolved(String),
     /// A `CallImport` referenced an import index past the module's [`Module::imports`].
     BadImportIndex(u32),
-    /// A placeholder-patched binding ([`Resolved::Slot`] / [`Resolved::CapBound`]) had a handle
-    /// operand that is **not** a `ConstI32` placeholder (the frontend must emit one for these
-    /// imports, since resolution patches it — to the `call_indirect` slot index, or to the granted
-    /// handle).
+    /// A [`Resolved::Slot`] binding had a handle operand that is **not** a `ConstI32` placeholder
+    /// (the frontend must emit one for these imports, since resolution patches it to the
+    /// `call_indirect` slot index).
     SlotHandleNotConst,
 }
 
-/// Lower every [`Inst::CallImport`] to a concrete [`Inst::CapCall`] using `resolve` (the
-/// host's `name → (type_id, op)` instantiation policy, §7), then drop the import section.
-/// This is the §7 **late binding at instantiation**: the module names the capabilities it
-/// wants, the host decides what each name binds to, and the result is an import-free module
-/// the verifier and both backends accept unchanged (so the §3c handle table + use-site
-/// checks carry safety — resolution moves only the `(type_id, op)` immediates, never a
-/// handle). Fails closed if any declared import name is unresolved, so a missing required
-/// capability surfaces at load, never as a silent miscompile.
-pub fn resolve_imports(
-    module: &Module,
-    mut resolve: impl FnMut(&str) -> Option<ResolvedCap>,
-) -> Result<Module, ImportError> {
-    resolve_imports_with(module, |name| resolve(name).map(Resolved::Cap))
-}
-
-/// The general §7 import-lowering pass: like [`resolve_imports`], but a name may bind to a host
-/// capability ([`Resolved::Cap`] → `cap.call`), a capability **with its handle**
-/// ([`Resolved::CapBound`] → `cap.call` on a patched placeholder — the §7 "implementation + handle"
-/// general form), another function in the linked module ([`Resolved::Func`] → a direct `call`), or a
-/// `call_indirect` table slot ([`Resolved::Slot`]). `Func` is the compile-time (static) linking step
-/// the in-window loader builds on. Each `CallImport` rewrites **1:1** (no value renumbering) — a
-/// `Func` binding drops the unused handle operand. Fails closed on an unresolved name. The result is
-/// import-free (verifier/both backends accept it). Note `CapBound` is the one binding that moves a
-/// *handle*, not just `(type_id, op)` immediates — deliberate: it is the host's instantiation policy
-/// granting by name, so resolution must run after grant (and the resolved module is re-verified).
+/// The **link-time** §7 import-lowering pass (IMPORTS.md §2.5: this survives in the linker only —
+/// [`link`], `compile_linked` — which legitimately produces new module bytes; instantiation never
+/// rewrites). A name may bind to a host capability ([`Resolved::Cap`] → `cap.call` on the import's
+/// handle operand), another function in the linked module ([`Resolved::Func`] → a direct `call`),
+/// or a `call_indirect` table slot ([`Resolved::Slot`]). `Func` is the compile-time (static)
+/// linking step the in-window loader builds on. Each `CallImport` rewrites **1:1** (no value
+/// renumbering) — a `Func` binding drops the unused handle operand. Fails closed on an unresolved
+/// name, so a missing symbol surfaces at link, never as a silent miscompile. The result is
+/// import-free (verifier/both backends accept it; the linked module is re-verified).
 pub fn resolve_imports_with(
     module: &Module,
     mut resolve: impl FnMut(&str) -> Option<Resolved>,
@@ -3379,22 +3095,6 @@ pub fn resolve_imports_with(
                             args,
                         }
                     }
-                    // A capability bound *with* its handle (§7 general form): patch the placeholder
-                    // to the granted handle and lower to an ordinary `cap.call` on it.
-                    Resolved::CapBound {
-                        type_id,
-                        op,
-                        handle: granted,
-                    } => {
-                        patch_placeholder(&mut b.insts, &def_of, handle, granted)?;
-                        Inst::CapCall {
-                            type_id,
-                            op,
-                            sig,
-                            handle,
-                            args,
-                        }
-                    }
                 };
             }
         }
@@ -3403,9 +3103,9 @@ pub fn resolve_imports_with(
     Ok(out)
 }
 
-/// Patch the `ConstI32` placeholder defining value `handle` to `value` — the shared rewrite for the
-/// placeholder-patched bindings ([`Resolved::Slot`] / [`Resolved::CapBound`]). Fails closed if the
-/// operand's defining instruction is not a `ConstI32` in the same block (a block param, or hoisted).
+/// Patch the `ConstI32` placeholder defining value `handle` to `value` — the [`Resolved::Slot`]
+/// rewrite. Fails closed if the operand's defining instruction is not a `ConstI32` in the same
+/// block (a block param, or hoisted).
 fn patch_placeholder(
     insts: &mut [Inst],
     def_of: &[Option<usize>],
@@ -3720,7 +3420,7 @@ mod import_tests {
     #[test]
     fn resolves_callimports_to_capcalls() {
         let m = module_with_imports();
-        let r = resolve_imports(&m, policy).expect("resolve");
+        let r = resolve_imports_with(&m, |n| policy(n).map(Resolved::Cap)).expect("resolve");
         // Import section is gone; the module is now backend-ready.
         assert!(r.imports.is_empty());
         let insts = &r.funcs[0].blocks[0].insts;
@@ -3760,8 +3460,8 @@ mod import_tests {
     fn unresolved_import_fails_closed() {
         let m = module_with_imports();
         // A policy that knows "write" but not "exit" must error, not silently drop it.
-        let err = resolve_imports(&m, |n| {
-            (n == "write").then_some(ResolvedCap { type_id: 0, op: 1 })
+        let err = resolve_imports_with(&m, |n| {
+            (n == "write").then_some(Resolved::Cap(ResolvedCap { type_id: 0, op: 1 }))
         })
         .expect_err("must fail closed");
         assert_eq!(err, ImportError::Unresolved("exit".into()));
@@ -3774,199 +3474,8 @@ mod import_tests {
         m.imports.clear();
         m.funcs[0].blocks[0].insts.clear();
         m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
-        let r = resolve_imports(&m, policy).expect("resolve");
+        let r = resolve_imports_with(&m, |n| policy(n).map(Resolved::Cap)).expect("resolve");
         assert_eq!(r, m, "a no-import module round-trips identically");
-    }
-}
-
-#[cfg(test)]
-mod powerbox_start_tests {
-    use super::*;
-
-    /// An entry that takes the threaded data-stack pointer and (statically) calls a sibling — so
-    /// we can pin that prepending `_start` shifts both the entry funcidx and its internal `Call`.
-    fn entry_module() -> Module {
-        // func 0: helper `(i64) -> (i64)` returns its arg.
-        let helper = Func {
-            params: vec![ValType::I64],
-            results: vec![ValType::I64],
-            blocks: vec![Block {
-                params: vec![ValType::I64],
-                insts: vec![],
-                term: Terminator::Return(vec![0]),
-            }],
-        };
-        // func 1: entry `(i64 sp) -> (i32)` calls helper(sp), discards it, returns 0.
-        let entry = Func {
-            params: vec![ValType::I64],
-            results: vec![ValType::I32],
-            blocks: vec![Block {
-                params: vec![ValType::I64],
-                insts: vec![
-                    Inst::Call {
-                        func: 0,
-                        args: vec![0],
-                    }, // v1 = helper(sp)
-                    Inst::ConstI32(0), // v2
-                ],
-                term: Terminator::Return(vec![2]),
-            }],
-        };
-        Module {
-            funcs: vec![helper, entry],
-            memory: Some(Memory { size_log2: 10 }),
-            data: vec![],
-            imports: vec![],
-            exports: vec![],
-            debug_info: None,
-        }
-    }
-
-    #[test]
-    fn prepends_start_and_reindexes() {
-        let m = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
-        // `_start` is the new function 0, **paramless** — it resolves its handles by name.
-        assert_eq!(m.funcs.len(), 3);
-        assert!(m.funcs[0].params.is_empty(), "paramless _start (S15 c)");
-        assert_eq!(m.funcs[0].results, vec![ValType::I32]); // mirrors the entry's result
-                                                            // It resolves each cap by name, stashes it at offset i*4, and ends by calling the (shifted) entry.
-        let blk = &m.funcs[0].blocks[0];
-        assert_eq!(
-            blk.insts
-                .iter()
-                .filter(|i| matches!(i, Inst::CapSelfResolve { .. }))
-                .count(),
-            3,
-            "three caps resolved by name (stdout/stdin/exit)"
-        );
-        assert!(matches!(
-            blk.term,
-            Terminator::Return(ref v) if v.len() == 1
-        ));
-        assert!(
-            blk.insts
-                .iter()
-                .any(|i| matches!(i, Inst::Call { func: 2, .. })),
-            "_start must call the entry at its shifted index (2)"
-        );
-        let stores: Vec<_> = blk
-            .insts
-            .iter()
-            .filter(|i| {
-                matches!(
-                    i,
-                    Inst::Store {
-                        op: StoreOp::I32,
-                        ..
-                    }
-                )
-            })
-            .collect();
-        assert_eq!(stores.len(), 3, "three handle stashes");
-        // The entry's internal `Call func: 0` (to the helper) shifted to `func: 1`.
-        assert!(
-            m.funcs[2].blocks[0]
-                .insts
-                .iter()
-                .any(|i| matches!(i, Inst::Call { func: 1, .. })),
-            "the entry's static call to the helper must be reindexed +1"
-        );
-    }
-
-    #[test]
-    fn registers_start_export_and_shifts_existing_ones() {
-        let mut m = entry_module();
-        // A frontend exports its entry by name; after the prepend it must shift +1 and `_start`
-        // must be registered at funcidx 0.
-        m.exports = vec![Export {
-            name: "main".to_string(),
-            func: 1,
-        }];
-        let m = synth_powerbox_start(m, 1, 3, false).expect("synth");
-        assert_eq!(
-            m.resolve_export("_start"),
-            Some(0),
-            "_start registered at 0"
-        );
-        assert_eq!(
-            m.resolve_export("main"),
-            Some(2),
-            "the entry export shifted +1"
-        );
-        assert_eq!(m.resolve_export("absent"), None);
-    }
-
-    #[test]
-    fn seeds_heap_when_requested() {
-        let m = synth_powerbox_start(entry_module(), 1, 4, true).expect("synth");
-        let blk = &m.funcs[0].blocks[0];
-        // Two i64 stores seed HEAP_BRK / HEAP_TOP (plus heap_base = 1 << size_log2 consts).
-        let i64_stores = blk
-            .insts
-            .iter()
-            .filter(|i| {
-                matches!(
-                    i,
-                    Inst::Store {
-                        op: StoreOp::I64,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(
-            i64_stores, 2,
-            "heap bump pointer + committed boundary seeded"
-        );
-    }
-
-    #[test]
-    fn grows_window_but_never_shrinks() {
-        // A tiny declared window is grown to cover the stash + stack reserve.
-        let grown = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
-        let g = grown.memory.unwrap().size_log2;
-        assert!(
-            (1u64 << g) >= POWERBOX_STACK_PAGE + POWERBOX_STACK_RESERVE,
-            "window must cover globals + the data-stack reserve"
-        );
-        // A generously-declared window is left as-is (never shrunk).
-        let mut big = entry_module();
-        big.memory = Some(Memory { size_log2: 40 });
-        let kept = synth_powerbox_start(big, 1, 3, false).expect("synth");
-        assert_eq!(kept.memory.unwrap().size_log2, 40);
-    }
-
-    #[test]
-    fn handle_count_is_bounded_only_by_the_stash_region() {
-        // The fixed powerbox is capped at the 8 canonical cap names; more needs the named form.
-        assert!(synth_powerbox_start(entry_module(), 1, 2, false).is_ok());
-        assert!(synth_powerbox_start(entry_module(), 1, 8, false).is_ok());
-        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_err()); // > 8 named caps
-        assert!(synth_powerbox_start(entry_module(), 1, 8, true).is_ok()); // the fixed 8-handle heap case
-
-        // The **named** form takes arbitrary names; no lower bound, and >8 is allowed without a heap
-        // (the stash may run up to `POWERBOX_ARGS_BASE`) — bounded only by the reserved stash region.
-        let names = |n: usize| -> Vec<&'static str> {
-            const POOL: [&str; 33] = ["c"; 33];
-            POOL[..n].to_vec()
-        };
-        let synth_n = |n: usize, heap: bool| {
-            synth_powerbox_start_with_names(entry_module(), 1, &names(n), heap)
-        };
-        assert!(synth_n(9, false).is_ok());
-        assert!(synth_n(32, false).is_ok()); // 32*4 == 128 == ARGS_BASE
-        assert!(synth_n(33, false).is_err()); // 33*4 > 128
-        assert!(synth_n(9, true).is_err()); // 9*4 > HEAP_BRK(32)
-        assert!(synth_n(8, true).is_ok()); // the fixed 8-handle heap case
-    }
-
-    #[test]
-    fn rejects_bad_entry() {
-        assert!(synth_powerbox_start(entry_module(), 99, 3, false).is_err()); // entry out of range
-                                                                              // The entry must take the i64 data-stack pointer; a non-`(i64) -> _` entry is rejected.
-        let mut m = entry_module();
-        m.funcs[1].params = vec![ValType::I32];
-        assert!(synth_powerbox_start(m, 1, 3, false).is_err());
     }
 }
 

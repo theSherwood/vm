@@ -1,6 +1,7 @@
-//! End-to-end C linking against the **POSIX personality** (`svm-posix`) through §7 named imports,
-//! in the **general form**: names resolve to an implementation **and its handle**
-//! ([`svm_ir::Resolved::CapBound`], via [`svm_posix::resolve_bound`]) — DESIGN.md §7 late binding.
+//! End-to-end C linking against the **POSIX personality** (`svm-posix`) through §7 named imports:
+//! each import name binds to `(HOST_FN, op)` on the granted personality handle as an
+//! instantiation-time **slot binding** ([`svm_posix::resolve`] + `Host::set_import_bindings`) —
+//! the module bytes are never rewritten (IMPORTS.md phase 4).
 //!
 //! The module's **import section is its capability manifest** — the discoverable contract between
 //! guest and host. There is no positional agreement anywhere: no powerbox slot for the personality,
@@ -8,16 +9,17 @@
 //! (guest code) gives each libc call its **real C signature** — `write(fd, buf, n)`, `open(path,
 //! flags)`, `getenv(name)`, `exit(code)` — adapting NUL-terminated strings to the personality's
 //! explicit-length `(ptr, len)` ABI (POSIX.md §4), and forwards to a `__px_`-prefixed undefined
-//! extern whose first argument is a literal `0`: the `ConstI32` **placeholder** the resolver patches
-//! to the granted handle at instantiation. Grant happens *before* resolve (the §7 "binding happens
-//! once, at instantiation" ordering); an unknown name fails closed.
+//! extern whose first argument is a literal `0`: a **dummy** handle operand, vestigial in static
+//! dispatch (the slot binding carries the granted handle — IMPORTS.md §2.5). Grant happens
+//! *before* binding (the §7 "binding happens once, at instantiation" ordering); an unknown name
+//! fails closed.
 //!
 //! The shim uses the **standard libc names** `write`/`read`/`exit` — its *definitions* shadow
 //! chibicc's Stream/Exit builtins (PROCESS.md S15 (b): a guest definition beats a compiler builtin),
 //! so `write(1, buf, n)` reaches the personality with `fd` preserved rather than the fd-dropping
 //! powerbox Stream call. The frontend `_start` is now paramless (S15 (c2)): these personality-only
 //! programs grant no powerbox, so `_start`'s by-name resolves of it stash `-errno` and are never
-//! loaded — the libc reaches the personality, bound by name (`resolver`), and the entry runs `&[]`.
+//! loaded — the libc reaches the personality through its slots (`bind_shim`), and the entry runs `&[]`.
 //!
 //! Each program runs `_start` (function 0) on **both** the interpreter and the JIT under an identical
 //! host, asserting they agree on the result *and* the observable personality state (captured stdout,
@@ -87,13 +89,23 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
-/// The §7 general-form resolver for the shim's import names: strip the `__px_` prefix (which keeps
-/// the shim's externs clear of chibicc's builtin names) and bind the bare libc name through
-/// [`svm_posix::resolve_bound`] — `(HOST_FN, op)` **plus the granted handle**, patched into each
-/// import's placeholder. Unknown names fail closed (a shim/personality mismatch).
-fn resolver(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
-    let bound = svm_posix::resolve_bound(handle);
-    move |name| bound(name.strip_prefix("__px_")?)
+/// Install the shim's import-slot bindings: strip the `__px_` prefix (which keeps the shim's
+/// externs clear of chibicc's builtin names) and map the bare libc name through
+/// [`svm_posix::resolve`] to `(HOST_FN, op)` on the granted personality `handle` — the phase-4
+/// no-rewrite binding (`Host::set_import_bindings`). A name outside the personality leaves its
+/// slot unbound (a dispatch through it is a fail-closed `CapFault`).
+fn bind_shim(m: &svm_ir::Module, host: &mut Host, handle: i32) {
+    let bindings = m
+        .imports
+        .iter()
+        .map(|i| {
+            match i.name.strip_prefix("__px_").and_then(svm_posix::resolve) {
+                Some(c) => svm_interp::BoundImport::required(c.type_id, c.op, handle),
+                None => svm_interp::BoundImport::rebindable(0, 0, None),
+            }
+        })
+        .collect();
+    host.set_import_bindings(bindings);
 }
 
 /// Grant the POSIX personality on `host`, with a window-heap region in the upper half of the guest
@@ -116,9 +128,9 @@ struct Effects {
     file_f: Option<Vec<u8>>,
 }
 
-/// Compile a C program, **grant first** on two identical hosts (resolution needs the granted
-/// handle — the §7 instantiation ordering), resolve its imports through [`resolver`], verify, then
-/// run `_start` on **both** backends and return each backend's observable effects for the caller to
+/// Compile a C program, **grant first** on two identical hosts (binding needs the granted
+/// handle — the §7 instantiation ordering), bind its import slots through [`bind_shim`], verify,
+/// then run `_start` on **both** backends and return each backend's observable effects for the caller to
 /// compare. `prep` stages each backend's personality identically before the run (seed the
 /// environment / memfs); pass a no-op when there is nothing to stage. Panics with the IR on a
 /// parse/verify/trap so failures are legible.
@@ -142,9 +154,11 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     prep(&iposix);
     prep(&jposix);
 
-    let m = svm_ir::resolve_imports_with(&raw, resolver(ipx))
-        .unwrap_or_else(|e| panic!("resolve imports: {e:?}\n--- IR ---\n{ir}"));
-    verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    // Phase 4: no rewrite — the manifest stays and each slot binds to the personality.
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    bind_shim(&raw, &mut jh, jpx);
+    let m = raw;
 
     // Interpreter — a normal return yields values; the personality's `exit` op is `Trap::Exit(code)`.
     // The paramless `_start` takes no entry args.
@@ -181,8 +195,8 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
 }
 
 /// A tiny guest libc shim (guest code) binding C's libc calls to the POSIX personality by **name
-/// only**. Each `__px_` extern's first argument is a literal `0` — the `ConstI32` placeholder the
-/// resolver patches to the granted handle ([`svm_ir::Resolved::CapBound`]); no `__vm_cap`, no slot.
+/// only**. Each `__px_` extern's first argument is a literal `0` — a dummy handle operand,
+/// vestigial in static dispatch (the slot binding carries the handle); no `__vm_cap`, no stash.
 /// The wrappers expose the **real C signatures** — `write(fd, buf, n)`, `open(path, flags)`,
 /// `getenv(name)`, `exit(code)` — adapting C's NUL-terminated `char*` convention to the personality's
 /// explicit-length `(ptr, len)` ABI (POSIX.md §4); the adaptation is guest code. `write`/`read`/`exit`

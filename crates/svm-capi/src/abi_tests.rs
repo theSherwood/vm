@@ -43,17 +43,15 @@ extern "C" fn triple(
 
 const NAMED: &str = "\
 memory 15
-export \"entry\" 0
-func (i64) -> (i64) {
-block0(v0: i64):
-  v1 = i64.const 0
-  v2 = i32.load v1
-  v3 = i64.const 5
-  v4 = call.import \"add_seven\" (i64) -> (i64) v2 (v3)
-  v5 = i64.const 4
-  v6 = i32.load v5
-  v7 = call.import \"triple\" (i64) -> (i64) v6 (v4)
-  return v7
+export \"_start\" 0
+func () -> (i64) {
+block0():
+  v0 = i32.const 0
+  v1 = i64.const 5
+  v2 = call.import \"add_seven\" (i64) -> (i64) v0 (v1)
+  v3 = i32.const 0
+  v4 = call.import \"triple\" (i64) -> (i64) v3 (v2)
+  return v4
 }
 ";
 
@@ -63,10 +61,6 @@ fn name_bound_host_fn_callbacks_run_through_the_c_abi() {
         let ir = CString::new(NAMED).unwrap();
         let m = svm_module_parse_text(ir.as_ptr());
         assert!(!m.is_null(), "parse");
-        assert_eq!(
-            svm_module_synth_powerbox_start_for_imports(m, 0, false),
-            SVM_OK
-        );
 
         let imports = svm_imports_new();
         let n_add = CString::new("add_seven").unwrap();
@@ -104,16 +98,15 @@ fn name_bound_host_fn_callbacks_run_through_the_c_abi() {
 const HELLO: &str = "\
 memory 15
 data ro 16384 \"hi from C\\n\"
-export \"entry\" 0
-func (i64) -> (i32) {
-block0(v0: i64):
-  v1 = i64.const 0
-  v2 = i32.load v1
-  v3 = i64.const 16384
-  v4 = i64.const 10
-  v5 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v4)
-  v6 = i32.const 0
-  return v6
+export \"_start\" 0
+func () -> (i32) {
+block0():
+  v0 = i32.const 0
+  v1 = i64.const 16384
+  v2 = i64.const 10
+  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = i32.const 0
+  return v4
 }
 ";
 
@@ -123,10 +116,7 @@ fn builtin_stdout_and_each_backend_via_c_abi() {
         for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
             let ir = CString::new(HELLO).unwrap();
             let m = svm_module_parse_text(ir.as_ptr());
-            assert_eq!(
-                svm_module_synth_powerbox_start_for_imports(m, 0, false),
-                SVM_OK
-            );
+            assert!(!m.is_null(), "parse");
             let imports = svm_imports_new();
             let n_write = CString::new("write").unwrap();
             assert_eq!(
@@ -169,10 +159,7 @@ fn run_config_threads_fuel_and_memory() {
         let mk = || {
             let ir = CString::new(HELLO).unwrap();
             let m = svm_module_parse_text(ir.as_ptr());
-            assert_eq!(
-                svm_module_synth_powerbox_start_for_imports(m, 0, false),
-                SVM_OK
-            );
+            assert!(!m.is_null(), "parse");
             let imports = svm_imports_new();
             let n = CString::new("write").unwrap();
             assert_eq!(svm_imports_provide_stdout(imports, n.as_ptr()), SVM_OK);
@@ -202,10 +189,6 @@ fn errors_are_fail_closed_not_panics() {
         assert!(!svm_last_error().is_null());
 
         // Null handles are tolerated.
-        assert_eq!(
-            svm_module_synth_powerbox_start(ptr::null_mut(), 0, 3, false),
-            SVM_ERR_FAILED
-        );
         assert!(svm_instantiate(ptr::null_mut()).is_null());
         svm_module_free(ptr::null_mut()); // no-op, no crash
         svm_run_free(ptr::null_mut());
@@ -213,10 +196,6 @@ fn errors_are_fail_closed_not_panics() {
         // An unbound import fails closed at instantiate.
         let ir = CString::new(NAMED).unwrap();
         let m = svm_module_parse_text(ir.as_ptr());
-        assert_eq!(
-            svm_module_synth_powerbox_start_for_imports(m, 0, false),
-            SVM_OK
-        );
         let imports = svm_imports_new(); // empty — neither name bound
         let inst = svm_instantiate_with_imports(m, imports);
         assert!(inst.is_null(), "unbound imports must fail closed");
@@ -226,15 +205,15 @@ fn errors_are_fail_closed_not_panics() {
 
 const COUNTER: &str = "\
 memory 15
-export \"init\" 0
+export \"_start\" 0
 export \"add\" 1
-func (i64) -> (i32) {
-block0(v0: i64):
-  v1 = i64.const 1024
-  v2 = i64.const 0
-  i64.store v1 v2
-  v3 = i32.const 0
-  return v3
+func () -> (i32) {
+block0():
+  v0 = i64.const 1024
+  v1 = i64.const 0
+  i64.store v0 v1
+  v2 = i32.const 0
+  return v2
 }
 func (i64, i64) -> (i64) {
 block0(v0: i64, v1: i64):
@@ -251,7 +230,6 @@ fn reactor_session_persists_state_across_calls_via_c_abi() {
     unsafe {
         let ir = CString::new(COUNTER).unwrap();
         let m = svm_module_parse_text(ir.as_ptr());
-        assert_eq!(svm_module_synth_powerbox_start(m, 0, 0, false), SVM_OK);
         let inst = svm_instantiate(m);
         assert!(!inst.is_null());
 
@@ -431,34 +409,33 @@ extern "C" fn upcase(
     1
 }
 
-// `_start` stashes (upcase@0, write@4); the entry writes "abc" to window offset 2048, calls
-// `upcase` to uppercase it in place, then streams the now-"ABC" bytes to stdout.
+// The entry writes "abc" to window offset 2048, calls `upcase` to uppercase it in place, then
+// streams the now-"ABC" bytes to stdout (both imports dispatch through their manifest slots; the
+// handle operands are dummies).
 const UPCASE_IR: &str = "\
 memory 15
-export \"entry\" 0
-func (i64) -> (i32) {
-block0(v0: i64):
-  v1 = i64.const 2048
-  v2 = i32.const 97
-  i32.store8 v1 v2
-  v3 = i64.const 2049
-  v4 = i32.const 98
-  i32.store8 v3 v4
-  v5 = i64.const 2050
-  v6 = i32.const 99
-  i32.store8 v5 v6
-  v7 = i64.const 0
-  v8 = i32.load v7
-  v9 = i64.const 2048
-  v10 = i64.const 3
-  v11 = call.import \"upcase\" (i64, i64) -> (i64) v8 (v9, v10)
-  v12 = i64.const 4
-  v13 = i32.load v12
-  v14 = i64.const 2048
-  v15 = i64.const 3
-  v16 = call.import \"write\" (i64, i64) -> (i64) v13 (v14, v15)
-  v17 = i32.const 0
-  return v17
+export \"_start\" 0
+func () -> (i32) {
+block0():
+  v0 = i64.const 2048
+  v1 = i32.const 97
+  i32.store8 v0 v1
+  v2 = i64.const 2049
+  v3 = i32.const 98
+  i32.store8 v2 v3
+  v4 = i64.const 2050
+  v5 = i32.const 99
+  i32.store8 v4 v5
+  v6 = i32.const 0
+  v7 = i64.const 2048
+  v8 = i64.const 3
+  v9 = call.import \"upcase\" (i64, i64) -> (i64) v6 (v7, v8)
+  v10 = i32.const 0
+  v11 = i64.const 2048
+  v12 = i64.const 3
+  v13 = call.import \"write\" (i64, i64) -> (i64) v10 (v11, v12)
+  v14 = i32.const 0
+  return v14
 }
 ";
 
@@ -468,10 +445,7 @@ fn host_fn_reads_and_writes_guest_memory_via_c_abi() {
         for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
             let ir = CString::new(UPCASE_IR).unwrap();
             let m = svm_module_parse_text(ir.as_ptr());
-            assert_eq!(
-                svm_module_synth_powerbox_start_for_imports(m, 0, false),
-                SVM_OK
-            );
+            assert!(!m.is_null(), "parse");
             let imports = svm_imports_new();
             let n_up = CString::new("upcase").unwrap();
             let n_write = CString::new("write").unwrap();

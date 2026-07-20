@@ -29,19 +29,17 @@ static int32_t meaning(void *ctx, uint32_t op, const int64_t *args, size_t n_arg
 static const char *IR =
     "memory 15\n"
     "data ro 16384 \"Hello from C!\\n\"\n"
-    "export \"entry\" 0\n"
-    "func (i64) -> (i64) {\n"
-    "block0(v0: i64):\n"
-    "  v1 = i64.const 0\n"
-    "  v2 = i32.load v1\n"            /* write handle (stash slot 0 = import 0) */
-    "  v3 = i64.const 16384\n"
-    "  v4 = i64.const 14\n"
-    "  v5 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v4)\n"
-    "  v6 = i64.const 4\n"
-    "  v7 = i32.load v6\n"            /* meaning handle (stash slot 1 = import 1) */
-    "  v8 = i64.const 2\n"
-    "  v9 = call.import \"meaning\" (i64) -> (i64) v7 (v8)\n"
-    "  return v9\n"
+    "export \"_start\" 0\n"
+    "func () -> (i64) {\n"
+    "block0():\n"
+    "  v0 = i32.const 0\n"            /* dummy handle operand: the slot binding dispatches */
+    "  v1 = i64.const 16384\n"
+    "  v2 = i64.const 14\n"
+    "  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)\n"
+    "  v4 = i32.const 0\n"
+    "  v5 = i64.const 2\n"
+    "  v6 = call.import \"meaning\" (i64) -> (i64) v4 (v5)\n"
+    "  return v6\n"
     "}\n";
 
 int main(void) {
@@ -50,12 +48,6 @@ int main(void) {
     fprintf(stderr, "parse: %s\n", svm_last_error());
     return 1;
   }
-  /* Two imports (write, meaning) -> two granted handles; no heap. */
-  if (svm_module_synth_powerbox_start(m, 0, 2, false) != SVM_OK) {
-    fprintf(stderr, "synth: %s\n", svm_last_error());
-    return 1;
-  }
-
   SvmImports *imports = svm_imports_new();
   svm_imports_provide_stdout(imports, "write");
   svm_imports_provide_host_fn(imports, "meaning", 0, meaning, NULL);

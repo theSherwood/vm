@@ -554,9 +554,10 @@ impl DebugCtx {
 /// state. It is a *host* capability shaped like §15 `Monitor`: it never widens the guest's
 /// authority, and attaching with no breakpoints is behavior-identical to [`run`] (S7).
 ///
-/// Single vCPU (multithreaded guests are Milestone B). The module must be **import-resolved** (no
-/// `CallImport` left — run `svm_run::resolve_capability_imports` first), as the interpreter only
-/// runs concrete `cap.call`s. The §3a source mapping (W4) and time-travel (W1) are later slices.
+/// Single vCPU (multithreaded guests are Milestone B). A manifest module's `call.import`s execute
+/// through the instantiation-time binding table ([`Host::set_import_bindings`]) exactly as under
+/// [`run`] — an unbound slot is a fail-closed `CapFault`. The §3a source mapping (W4) and
+/// time-travel (W1) are later slices.
 pub struct Inspector {
     /// The vCPU under inspection in **single-threaded** mode (`attach`/`attach_with_host`). `None`
     /// in scheduled mode, where the threads live in the scheduler and the stopped one is held by the

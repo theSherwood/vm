@@ -753,11 +753,6 @@ pub fn encode_symbol_table(entries: &[(&str, Resolved)]) -> Vec<u8> {
                 svm_encode::write_uleb(&mut out, cap.op as u64);
             }
             Resolved::Func(_) => panic!("Func is not deliverable via the guest symbol table"),
-            // A resolver-supplied handle is the *host's* instantiation-time grant (§7); a guest
-            // symbol table never carries one (it binds names, not authority).
-            Resolved::CapBound { .. } => {
-                panic!("CapBound is not deliverable via the guest symbol table")
-            }
         }
     }
     out
@@ -2554,27 +2549,11 @@ pub struct Run {
     pub stderr: Vec<u8>,
 }
 
-/// The frontend's powerbox entry shape (function 0): the three `i32` handles
-/// `_start(stdout, stdin, exit)`, or four `_start(stdout, stdin, exit, memory)` once the program
-/// uses the Memory capability (a guest heap that grows via `map`, §3e/§4). A module whose entry
-/// matches either is a runnable *program*; anything else is a bare kernel (run with [`run_kernel`]).
-pub fn is_powerbox_entry(module: &Module) -> bool {
-    // The powerbox entry imports 3–8 `i32` capability handles (stdout, stdin, exit, [memory],
-    // [addrspace], [ioring], [blocking], [jit] — §3e/§9/§12/DESIGN.md §22; a chibicc `_start` always
-    // imports the full 8). The runner grants exactly as many as the entry declares (see
-    // `run_powerbox_with_deadline`).
-    matches!(
-        module.funcs.first().map(|f| f.params.as_slice()),
-        Some(p) if (3..=8).contains(&p.len()) && p.iter().all(|t| matches!(t, ValType::I32))
-    )
-}
-
-/// A **named-export** powerbox entry (PROCESS.md S15 (c2)): a paramless `_start` (function 0) the
-/// frontend marks with `export "_start" 0`. This retires the positional powerbox — `_start` takes no
-/// handle arguments; its prologue obtains each cap **by name** (`cap.self.resolve("stdout")`, …) from
-/// the F7 name registry the runner populates when it grants the fixed set. The named export is the
-/// marker (the 3–8 `i32` params that used to tag [`is_powerbox_entry`] are gone), so the runtime still
-/// knows to grant the powerbox rather than treat func 0 as a bare kernel.
+/// The powerbox entry shape (IMPORTS.md phase 3+): a paramless `_start` (function 0) the frontend
+/// marks with `export "_start" 0`. `_start` takes no handle arguments — the module's import
+/// manifest binds each capability slot at instantiation (the positional 3–8 `i32`-handle entry
+/// died in phase 4, IMPORTS.md §2.5). The named export is the marker, so the runtime knows to
+/// grant the powerbox rather than treat func 0 as a bare kernel.
 pub fn is_named_powerbox_entry(module: &Module) -> bool {
     module.funcs.first().is_some_and(|f| f.params.is_empty())
         && module
@@ -2584,15 +2563,16 @@ pub fn is_named_powerbox_entry(module: &Module) -> bool {
 }
 
 /// The reference host's capability-import name policy (§7 "Host-defined capabilities &
-/// discoverability"): the standard `name → (type_id, op)` binding that a frontend's `extern`
-/// capability names resolve to at load. This is the default "powerbox ABI" the bundled toolchain
-/// agrees on; a *different* host is free to supply its own resolver to `svm_ir::resolve_imports`,
-/// binding these (or entirely new) names to its own capabilities — that is the §7 late binding.
+/// discoverability"): the standard `name → (type_id, op)` binding a manifest module's import
+/// names resolve to when the powerbox binds its slots ([`Instance::grant_caps`],
+/// [`run_powerbox`]). This is the default "powerbox ABI" the bundled toolchain agrees on; a
+/// *different* host binds these (or entirely new) names to its own capabilities via
+/// [`instantiate_with_imports`] — that is the §7 late binding.
 ///
-/// Names are the bare operation names (no `__vm_` prefix); the capability **handle** is supplied
-/// by the call site (the frontend's powerbox stash), never by this policy — so two names can share
-/// an interface and differ only by which handle the guest passes (e.g. `write`/`read` are both
-/// `Stream`, distinguished by the stdout vs stdin handle).
+/// Names are the bare operation names (no `__vm_` prefix); the capability **handle** is chosen
+/// by interface when the slot is bound, never by this policy — so two names can share an
+/// interface and differ only by which handle their slots bind (e.g. `write`/`read` are both
+/// `Stream`, bound to stdout vs stdin).
 pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     use svm_interp::iface;
     let (type_id, op): (u32, u32) = match name {
@@ -2624,66 +2604,6 @@ pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })
-}
-
-/// The §7 **general-form** powerbox resolver (PROCESS.md S15 (c)): binds each fixed powerbox cap
-/// **name** to its `(type_id, op)` — via [`default_cap_resolver`] — **plus the granted handle**
-/// ([`Resolved::CapBound`]), so a module whose `_start` takes **no positional handle parameters**
-/// resolves the entire powerbox by name. This is what retires the fixed 8-slot entry: the handle
-/// stops being a positional entry argument the guest threads from a stashed slot and becomes part of
-/// the instantiation-time binding, exactly as the POSIX personality already binds (`CapBound`).
-///
-/// `handles` are the granted powerbox handles in the fixed §3e slot order — stdout, stdin, exit,
-/// memory, addrspace, ioring, blocking, jit (the order [`grant_powerbox_prefix`] grants and
-/// [`POWERBOX_CAP_NAMES`] names). The handle for a name is selected by its interface, with `Stream`
-/// disambiguated by op (`write`→stdout, `read`→stdin). Names whose handle is **not** a powerbox slot
-/// — the `SharedRegion` ops, whose region handle is minted at runtime by `vm_region_create` and
-/// stays a call-site operand — return `None`, so a program using them composes this with a
-/// runtime-handle resolver (fall through to [`default_cap_resolver`] as a plain `Resolved::Cap`).
-pub fn powerbox_resolver(handles: [i32; 8]) -> impl Fn(&str) -> Option<Resolved> {
-    use svm_interp::iface;
-    let [stdout, stdin, exit, memory, addrspace, ioring, _blocking, jit] = handles;
-    move |name| {
-        let cap = default_cap_resolver(name)?;
-        let handle = match (cap.type_id, cap.op) {
-            (iface::STREAM, 1) => stdout, // write
-            (iface::STREAM, _) => stdin,  // read / close
-            (iface::EXIT, _) => exit,
-            (iface::MEMORY, _) => memory,
-            (iface::ADDRESS_SPACE, _) => addrspace,
-            (iface::IO_RING, _) => ioring,
-            (iface::JIT, _) => jit,
-            // e.g. SharedRegion: the handle is a runtime-minted region, not a powerbox slot.
-            _ => return None,
-        };
-        Some(Resolved::CapBound {
-            type_id: cap.type_id,
-            op: cap.op,
-            handle,
-        })
-    }
-}
-
-/// Lower a module's §7 named capability imports to concrete `cap.call`s using the reference host
-/// policy ([`default_cap_resolver`]), to be called **before** `verify_module` (the resolved module
-/// is what the verifier and backends run). A module with no imports is returned unchanged, so this
-/// is a no-op for the legacy inline-`cap.call` form. Fails closed on an unknown import name.
-pub fn resolve_capability_imports(module: Module) -> Result<Module, String> {
-    if module.imports.is_empty() {
-        return Ok(module);
-    }
-    svm_ir::resolve_imports(&module, default_cap_resolver).map_err(|e| match e {
-        svm_ir::ImportError::Unresolved(n) => {
-            format!("unresolved capability import `{n}` (no binding in the host policy)")
-        }
-        svm_ir::ImportError::BadImportIndex(i) => {
-            format!("call.import references out-of-range import index {i}")
-        }
-        // `resolve_imports` only ever resolves to capabilities (`Resolved::Cap`), never a slot.
-        svm_ir::ImportError::SlotHandleNotConst => {
-            "call.import resolved to a table slot with a non-constant handle".into()
-        }
-    })
 }
 
 fn typed(t: ValType, v: i64) -> Value {
@@ -2970,62 +2890,38 @@ fn value_slot(v: Value) -> i64 {
     }
 }
 
-/// Grant the MVP powerbox (§3e) — the **contiguous prefix** of `n_handles` of the eight fixed
-/// `VM_CAP_*` capabilities, in the canonical order the synthesized `_start` expects (stdout, stdin,
-/// exit, memory, addrspace, ioring, blocking, jit). Mirrors the grant order of [`run_powerbox_inner`]
-/// and the C-frontend test harness so handle values are deterministic; granted identically on the
-/// two backends' hosts, the values match (asserted by [`Instance::run_powerbox_diff`]).
-fn grant_powerbox_prefix(h: &mut Host, n_handles: usize, win: u64) -> Vec<Value> {
+/// Grant the full §3e powerbox — the eight fixed `VM_CAP_*` capabilities in canonical order
+/// (stdout, stdin, exit, memory, addrspace, ioring, blocking, jit) — returning the handles in that
+/// order for the manifest slot binding. Grants are deterministic, so two backends' hosts granted
+/// identically see matching handle values (the differential paths rely on this).
+fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 8] {
     // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
-    // `Jit` cap (slot 7) needs the canonical blob validator. Both are inert if never used.
+    // `Jit` cap needs the canonical blob validator. Both are inert if never used.
     h.set_region_factory(new_shared_region);
     h.set_jit_validator(jit_blob_validator);
     let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
-    let mut v = Vec::with_capacity(n_handles);
-    if n_handles >= 1 {
-        v.push(Value::I32(h.grant_stream(StreamRole::Out)));
-    }
-    if n_handles >= 2 {
-        v.push(Value::I32(h.grant_stream(StreamRole::In)));
-    }
-    if n_handles >= 3 {
-        v.push(Value::I32(h.grant_exit()));
-    }
-    if n_handles >= 4 {
-        v.push(Value::I32(h.grant_memory()));
-    }
-    if n_handles >= 5 {
-        v.push(Value::I32(h.grant_address_space(0, win)));
-    }
-    if n_handles >= 6 {
-        v.push(Value::I32(h.grant_io_ring()));
-    }
-    if n_handles >= 7 {
-        v.push(Value::I32(
-            h.grant_blocking(std::time::Duration::ZERO, None),
-        ));
-    }
-    if n_handles >= 8 {
+    let v = [
+        h.grant_stream(StreamRole::Out),
+        h.grant_stream(StreamRole::In),
+        h.grant_exit(),
+        h.grant_memory(),
+        h.grant_address_space(0, win),
+        h.grant_io_ring(),
+        h.grant_blocking(std::time::Duration::ZERO, None),
         // Reserve the `call_indirect` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
-        // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room. This
-        // matches `run_powerbox_inner`'s grant exactly (the two paths are now one; see F1).
-        v.push(Value::I32(
-            h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
-        ));
-    }
-    // §7 register the granted prefix under canonical names (F7) so a fixed-powerbox guest can also
-    // `cap.self`-resolve its capabilities by name, not only by stash slot. Names parallel the grant
-    // order above; only the `n_handles` actually granted are registered.
-    for (name, slot) in POWERBOX_CAP_NAMES.iter().zip(&v) {
-        if let Value::I32(handle) = slot {
-            h.register_cap_name(name, *handle);
-        }
+        // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room.
+        h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
+    ];
+    // §7 register the granted set under canonical names (F7) so a powerbox guest can also
+    // `cap.self`-resolve its capabilities by name, not only through its manifest slots.
+    for (name, handle) in POWERBOX_CAP_NAMES.iter().zip(&v) {
+        h.register_cap_name(name, *handle);
     }
     v
 }
 
 /// The canonical names of the eight fixed §3e powerbox capabilities, in grant order — the vocabulary a
-/// fixed-powerbox guest resolves against via `cap.self` (F7). A name-bound guest
+/// powerbox guest resolves against via `cap.self` (F7). A name-bound guest
 /// ([`instantiate_with_imports`]) instead resolves its own import names.
 const POWERBOX_CAP_NAMES: [&str; 8] = [
     "stdout",
@@ -3555,8 +3451,8 @@ impl Imports {
 }
 
 /// The name-bound capability set captured at [`instantiate_with_imports`]: the registry plus the
-/// module's import order (slot `i` of the powerbox stash ↔ import `i`), so grant order matches the
-/// stash layout `svm_ir::synth_powerbox_start` lays down.
+/// module's import order (binding-table slot `i` ↔ import `i`), so the installed bindings match
+/// the manifest's declaration order.
 struct NamedBinding {
     imports: Imports,
     order: Vec<String>,
@@ -3565,7 +3461,7 @@ struct NamedBinding {
 /// A resolved, verified program ready to run on **both** backends — the easy "instantiate &amp; run"
 /// default over a frontend's IR (built by [`instantiate`] / [`instantiate_with_imports`]). This is the
 /// [`run_powerbox`] / `run_c_full` experience **decoupled from any C frontend**: hand it a module whose
-/// function 0 is a powerbox `_start` (e.g. produced by [`svm_ir::synth_powerbox_start`]) and
+/// function 0 is a powerbox `_start` (a paramless exported entry over an import manifest) and
 /// [`Instance::call`] grants the capabilities, runs the entry on the interpreter *and* the JIT under
 /// identical capabilities, asserts they agree (interp == jit), and returns the captured output.
 ///
@@ -3656,16 +3552,6 @@ fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
     })
 }
 
-/// Verify `module` (the escape-freedom gate, §2a) and build an [`Instance`] over its manifest
-/// (IMPORTS.md phase 3): a **named powerbox entry** (paramless `_start`) keeps its imports —
-/// `grant_caps` binds each slot at run (`default_cap_resolver` name → `(type_id, op)`, handle by
-/// interface) and `call.import` dispatches through the bindings, the module bytes never rewritten.
-/// A legacy **positional** entry (or hand-written IR with imports and no powerbox entry) still
-/// takes the [`resolve_capability_imports`] rewrite until phase 4 retires it. Entry points are
-/// reached by name through the module's first-class [`svm_ir::Module::exports`] table.
-///
-/// Returns an `Err` (fail-closed) if a legacy rewrite finds an unbound import or the module fails
-/// verification — exactly the gates a frontend's output must pass before it can run.
 /// §2.1 fail-closed instantiation check for a manifest (named-powerbox) module: every `required`
 /// import must resolve under the reference policy ([`default_cap_resolver`]) to an interface the
 /// powerbox binds ([`Instance::grant_caps`]'s by-interface map). An unknown name, or a
@@ -3704,13 +3590,28 @@ fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
     Ok(())
 }
 
+/// Verify `module` (the escape-freedom gate, §2a) and build an [`Instance`] over its manifest: a
+/// **powerbox entry** (paramless exported `_start`) keeps its imports — `grant_caps` binds each
+/// slot at run (`default_cap_resolver` name → `(type_id, op)`, handle by interface) and
+/// `call.import` dispatches through the bindings, the module bytes never rewritten (IMPORTS.md
+/// phase 4: instantiation never rewrites). Entry points are reached by name through the module's
+/// first-class [`svm_ir::Module::exports`] table.
+///
+/// Returns an `Err` (fail-closed) if the module declares imports without the powerbox entry
+/// shape, a required import fails [`validate_powerbox_manifest`], or verification fails — exactly
+/// the gates a frontend's output must pass before it can run.
 pub fn instantiate(module: Module) -> Result<Instance, String> {
-    let module = if is_named_powerbox_entry(&module) {
+    if is_named_powerbox_entry(&module) {
         validate_powerbox_manifest(&module)?;
-        module
-    } else {
-        resolve_capability_imports(module)?
-    };
+    } else if !module.imports.is_empty() {
+        // Phase 4 (IMPORTS.md §2.5): instantiation never rewrites. A module that declares imports
+        // must carry the powerbox entry shape (paramless exported `_start`) so its slots can bind.
+        return Err(
+            "module declares imports but has no powerbox entry (paramless exported `_start`) — \
+             the runtime binds manifest slots, it does not rewrite (IMPORTS.md phase 4)"
+                .into(),
+        );
+    }
     svm_verify::verify_module(&module)
         .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
     Ok(Instance {
@@ -3721,15 +3622,14 @@ pub fn instantiate(module: Module) -> Result<Instance, String> {
 }
 
 /// Instantiate `module` against a **name-keyed capability registry** (`imports`), wasm-style: each
-/// `call.import "<name>"` is matched by name to a [`HostCap`], lowered to its `(type_id, op)`, and —
-/// at [`Instance::call`] — granted in import order so the powerbox stash slot `i`
-/// (`svm_ir::synth_powerbox_start`) holds the handle for import `i`. This is decision #2's *dynamic,
-/// name-based* binding: arbitrary names, interfaces, and counts, with the fixed §3e powerbox
-/// ([`instantiate`]) just one preset over the same machinery.
+/// `call.import "<name>"` is matched by name to a [`HostCap`] and — at [`Instance::call`] — the
+/// slot bindings are installed in import order (slot `i` ↔ import `i`). This is decision #2's
+/// *dynamic, name-based* binding: arbitrary names, interfaces, and counts, with the fixed §3e
+/// powerbox ([`instantiate`]) just one preset over the same machinery.
 ///
-/// `module` is the post-`synth_powerbox_start` module (function 0 is the `_start`; the import table is
-/// untouched by the prepend). Fails closed if an imported name has no binding in `imports`, or the
-/// resolved module fails verification.
+/// Fails closed if an imported name has no binding in `imports`, an import names an interface the
+/// slot dispatch cannot serve (use dynamic mode — `cap.call` on a live handle, IMPORTS.md §2.2),
+/// or the module fails verification.
 pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Instance, String> {
     // Capture the import order. Slot i ↔ import i (the powerbox-prefix layout, IMPORTS.md §2.1).
     let order: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
@@ -3752,58 +3652,36 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
             ));
         }
     }
-    let has_rebindable = module
-        .imports
+    // Phase 4 (IMPORTS.md §2.5): the module's bytes are never rewritten — every import must bind
+    // to an interface the slot dispatch serves. An executor-dispatch interface (`Instantiator`,
+    // `Yielder`, …) is a dynamic-mode capability: dispatch on the interface handle at the call
+    // site (§2.2/§2.3), not through a manifest slot.
+    if let Some(name) = order
         .iter()
-        .any(|i| i.mode == svm_ir::ImportMode::Rebindable);
-    // IMPORTS.md phase 1 — the **no-rewrite** path: when every import binds to a
-    // generic-dispatch interface, keep the module's bytes exactly as verified (the manifest
-    // stays; `call.import` executes through the instantiation-time binding table each run
-    // installs). The module is content-addressable across instantiations — the §1 motivation.
-    if order
-        .iter()
-        .all(|n| generic_dispatch_iface(imports.map[n].type_id))
+        .find(|n| !generic_dispatch_iface(imports.map[n.as_str()].type_id))
     {
-        svm_verify::verify_module(&module)
-            .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
-        return Ok(Instance {
-            module,
-            binding: Some(NamedBinding { imports, order }),
-            hooks: None,
-        });
+        return Err(format!(
+            "capability import `{name}` names an interface the slot dispatch cannot serve — use \
+             dynamic mode (`cap.call` on a live handle, IMPORTS.md §2.2)"
+        ));
     }
-    if has_rebindable {
-        return Err(
-            "rebindable imports require every import to bind a slot-dispatchable interface \
-             (Stream/Exit/Clock/Memory/HostFn) — the legacy rewrite path cannot serve them \
-             (IMPORTS.md phase 2)"
-                .into(),
-        );
-    }
-    // Legacy rewrite fallback: an import bound to an executor-dispatch interface (Instantiator,
-    // JIT, …) still lowers to inline `cap.call`s, which the backends' specialized arms service.
-    // Slot-binding those interfaces is phase-2 work (IMPORTS.md §2.7).
-    let resolved = svm_ir::resolve_imports(&module, |name| {
-        imports.map.get(name).map(|c| svm_ir::ResolvedCap {
-            type_id: c.type_id,
-            op: c.op,
-        })
-    })
-    .map_err(|e| format!("resolve imports: {e:?}"))?;
-    svm_verify::verify_module(&resolved)
+    // The **no-rewrite** path: keep the module's bytes exactly as verified (the manifest stays;
+    // `call.import` executes through the instantiation-time binding table each run installs). The
+    // module is content-addressable across instantiations — the §1 motivation.
+    svm_verify::verify_module(&module)
         .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
     Ok(Instance {
-        module: resolved,
+        module,
         binding: Some(NamedBinding { imports, order }),
         hooks: None,
     })
 }
 
 /// Whether `type_id` is serviced entirely by the host's **generic** capability dispatch
-/// (`Host::cap_dispatch_slots`) — the IMPORTS.md phase-1 slot-binding precondition. The executor
-/// capability variants (`Instantiator`, `Yielder`, guest-`Jit` invoke/install, `SharedRegion`
-/// grant) are special-cased in each backend's eval/compile loop and cannot yet be reached through
-/// the import-binding translation; imports naming them fall back to the legacy rewrite.
+/// (`Host::cap_dispatch_slots`) — the slot-binding precondition for a registry-bound import
+/// ([`instantiate_with_imports`]). The executor capability variants (`Instantiator`, `Yielder`,
+/// `SharedRegion` grant) are special-cased in each backend's eval/compile loop; per IMPORTS.md
+/// §2.3 they are dynamic-mode capabilities, never manifest slots.
 fn generic_dispatch_iface(type_id: u32) -> bool {
     matches!(
         type_id,
@@ -3905,12 +3783,12 @@ impl Instance {
     /// with [`RunConfig::default`] (interpreter == JIT enforced). Any other export runs as a **bare
     /// kernel** with `args` and **no host capabilities** (the escape hatch for pure functions).
     ///
-    /// Why a non-`_start` export gets no capabilities (decision F3): without `_start` having run, the
-    /// powerbox **handle stash** (window offset 0) is empty, so a granted handle would be unreachable
-    /// by the export anyway — granting caps to a one-shot kernel call would be a footgun, not a feature.
-    /// A cap-using export is meant to be reached through a [`Session`] ([`Instance::start`]): the
-    /// reactor runs `_start` once to stash the handles, then calls exports against the live window. So
-    /// the rule is: **pure function → `Instance::call`; cap-using export → `Session::call_export`.**
+    /// Why a non-`_start` export gets no capabilities (decision F3): without `_start` having run,
+    /// the module's initializer hasn't populated the window, and a one-shot kernel call has no
+    /// import bindings installed — granting caps to it would be a footgun, not a feature. A
+    /// cap-using export is meant to be reached through a [`Session`] ([`Instance::start`]): the
+    /// reactor runs `_start` once, then calls exports against the live window. So the rule is:
+    /// **pure function → `Instance::call`; cap-using export → `Session::call_export`.**
     ///
     /// For a single backend or non-default limits, use [`Instance::run`] / [`Instance::run_diff`].
     pub fn call(&self, export: &str, args: &[Value]) -> Result<Run, String> {
@@ -3918,10 +3796,8 @@ impl Instance {
             .module
             .resolve_export(export)
             .ok_or_else(|| format!("no export named `{export}`"))?;
-        let is_powerbox_func0 = fidx == 0
-            && (self.binding.is_some()
-                || is_powerbox_entry(&self.module)
-                || is_named_powerbox_entry(&self.module));
+        let is_powerbox_func0 =
+            fidx == 0 && (self.binding.is_some() || is_named_powerbox_entry(&self.module));
         if is_powerbox_func0 {
             if !args.is_empty() {
                 return Err(
@@ -3970,7 +3846,7 @@ impl Instance {
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
         host.set_quota(config.limits.quota());
-        let args = self.grant_caps(&mut host, win);
+        self.grant_caps(&mut host, win);
         for (name, cap) in extra_caps {
             let handle = (cap.grant)(&mut host, win);
             host.register_cap_name(name, handle);
@@ -3983,20 +3859,17 @@ impl Instance {
                     backend,
                     m,
                     0,
-                    &args,
+                    &[],
                     &mut fuel,
                     init_mem.as_deref(),
                     &mut host,
                 );
                 outcome_from_interp(r)
             }
-            Backend::Jit => {
-                let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-                match run_jit(m, &slots, &mut host, &config.limits, init_mem.as_deref()) {
-                    Ok(jit) => outcome_from_jit(&m.funcs[0].results, jit),
-                    Err(e) => Err(e),
-                }
-            }
+            Backend::Jit => match run_jit(m, &[], &mut host, &config.limits, init_mem.as_deref()) {
+                Ok(jit) => outcome_from_jit(&m.funcs[0].results, jit),
+                Err(e) => Err(e),
+            },
         };
         // On a trap, the guest's captured output is the single most useful diagnostic (a program that
         // wrote a progress line / an error message before dying names its own problem) — but the plain
@@ -4028,23 +3901,21 @@ impl Instance {
         hj.stdin = config.stdin.clone();
         hi.set_quota(config.limits.quota());
         hj.set_quota(config.limits.quota());
-        let args = self.grant_caps(&mut hi, win);
-        let args_j = self.grant_caps(&mut hj, win);
-        debug_assert_eq!(args, args_j, "grants must be deterministic across backends");
+        self.grant_caps(&mut hi, win);
+        self.grant_caps(&mut hj, win);
 
         let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
         let interp = run_interp(
             Backend::TreeWalk,
             m,
             0,
-            &args,
+            &[],
             &mut fuel,
             init_mem.as_deref(),
             &mut hi,
         );
 
-        let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-        let jit = run_jit(m, &slots, &mut hj, &config.limits, init_mem.as_deref())?;
+        let jit = run_jit(m, &[], &mut hj, &config.limits, init_mem.as_deref())?;
 
         let outcome = diff_outcome(&m.funcs[0].results, interp, jit)?;
         if hi.stdout != hj.stdout {
@@ -4070,10 +3941,11 @@ impl Instance {
         })
     }
 
-    /// Grant the powerbox capabilities on `h` for function 0, returning the handle vector in stash
-    /// order: the name-bound registry (import order, slot i ↔ import i) when present, else the fixed
-    /// §3e powerbox prefix.
-    fn grant_caps(&self, h: &mut Host, win: u64) -> Vec<Value> {
+    /// Grant the powerbox capabilities on `h` for function 0 and install the module's manifest
+    /// slot bindings: the name-bound registry (import order, slot i ↔ import i) when present, else
+    /// the fixed §3e powerbox. The entry takes no positional args (IMPORTS.md phase 4 — the slot
+    /// binding IS the capability delivery).
+    fn grant_caps(&self, h: &mut Host, win: u64) {
         // Hooks first: the instrumented module bakes the handle of a fresh host's first grant.
         self.grant_mem_hooks(h);
         match &self.binding {
@@ -4081,30 +3953,21 @@ impl Instance {
                 // Inert unless a granted cap needs them (region-backed / Jit caps).
                 h.set_region_factory(new_shared_region);
                 h.set_jit_validator(jit_blob_validator);
-                // Grant in import order, and register each grant under the guest's own import name in
-                // the §7 capability-name directory (F7). A **paramless** `_start` (the by-name synth,
-                // S15 (c)) resolves each by name (`cap.self.resolve`) and takes no positional args; a
-                // legacy positional entry still receives the handles as arguments, in slot order.
-                let paramless = self
-                    .module
-                    .funcs
-                    .first()
-                    .is_some_and(|f| f.params.is_empty());
-                let mut args = Vec::new();
+                // Grant in import order, and register each grant under the guest's own import name
+                // in the §7 capability-name directory (F7).
                 let mut bindings = Vec::with_capacity(b.order.len());
                 for (i, name) in b.order.iter().enumerate() {
                     let cap = &b.imports.map[name];
                     // The declared mode of import `i` (order was captured from `module.imports`,
-                    // same indices). A legacy resolved instance has an empty manifest — mode then
-                    // defaults to `required`, and the bindings vec is discarded below anyway.
+                    // same indices).
                     let rebindable = self
                         .module
                         .imports
                         .get(i)
                         .is_some_and(|im| im.mode == svm_ir::ImportMode::Rebindable);
                     // Phase-2 template-only cap: declare the interface, grant nothing — the slot
-                    // starts empty and the guest fills it with `import.attach`. Contributes no
-                    // positional arg and no name registration (there is no handle yet).
+                    // starts empty and the guest fills it with `import.attach`. No name
+                    // registration (there is no handle yet).
                     if cap.unbound {
                         bindings.push(svm_interp::BoundImport::rebindable(
                             cap.type_id,
@@ -4120,36 +3983,24 @@ impl Instance {
                     } else {
                         svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
                     });
-                    if !paramless {
-                        args.push(Value::I32(handle));
-                    }
                 }
-                // IMPORTS.md phase 1: a manifest-carrying (no-rewrite) instance executes its
-                // `call.import`s through this instantiation-time binding table — entry `i` is
-                // import `i`'s resolved `(type_id, op)` + granted handle. A legacy resolved
-                // instance has an empty manifest, making this a harmless no-op table.
+                // A manifest-carrying instance executes its `call.import`s through this
+                // instantiation-time binding table — entry `i` is import `i`'s resolved
+                // `(type_id, op)` + granted handle.
                 if !self.module.imports.is_empty() {
                     h.set_import_bindings(bindings);
                 }
-                args
             }
-            None if is_named_powerbox_entry(&self.module) => {
-                // S15 (c2) + IMPORTS.md phase 3: grant + register the full fixed powerbox, then bind
-                // the module's manifest slots — import `i`'s name maps to its `(type_id, op)` via
-                // [`default_cap_resolver`] and to the granted handle by interface (`Stream`
-                // disambiguated by op: write→stdout, read→stdin). The frontend `_start` has no
-                // resolve prologue and call sites carry a vestigial handle: the slot binding IS the
-                // dispatch. A name outside the fixed policy leaves its slot unbound (a dispatch
-                // through it is a fail-closed `CapFault`) — same failure the legacy rewrite gave at
-                // instantiation, moved to the call site. The entry takes **no** positional args.
-                let handles = grant_powerbox_prefix(h, 8, win);
-                let hv = |i: usize| match handles.get(i) {
-                    Some(Value::I32(x)) => *x,
-                    _ => 0,
-                };
-                let (stdout, stdin, exit) = (hv(0), hv(1), hv(2));
-                let (memory, addrspace, ioring, blocking, jit) =
-                    (hv(3), hv(4), hv(5), hv(6), hv(7));
+            None => {
+                // Grant + register the full fixed powerbox, then bind the module's manifest slots —
+                // import `i`'s name maps to its `(type_id, op)` via [`default_cap_resolver`] and to
+                // the granted handle by interface (`Stream` disambiguated by op: write→stdout,
+                // read→stdin). The frontend `_start` has no resolve prologue and call sites carry a
+                // vestigial handle: the slot binding IS the dispatch. A name outside the fixed
+                // policy leaves its slot unbound (a dispatch through it is a fail-closed
+                // `CapFault`).
+                let [stdout, stdin, exit, memory, addrspace, ioring, blocking, jit] =
+                    grant_powerbox_prefix(h, win);
                 if !self.module.imports.is_empty() {
                     use svm_interp::iface;
                     let bindings = self
@@ -4178,9 +4029,7 @@ impl Instance {
                         .collect();
                     h.set_import_bindings(bindings);
                 }
-                Vec::new()
             }
-            None => grant_powerbox_prefix(h, self.module.funcs[0].params.len(), win),
         }
     }
 
@@ -4427,12 +4276,12 @@ impl Instance {
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
         host.set_quota(config.limits.quota());
-        let args = self.grant_caps(&mut host, win);
+        self.grant_caps(&mut host, win);
 
-        // Run `_start` (func 0) once: stash the granted handles into the window and run the
-        // initializer. Capture the resulting window image as the session's persistent state.
+        // Run `_start` (func 0) once: run the module's initializer against the installed import
+        // bindings. Capture the resulting window image as the session's persistent state.
         let (_init, snap) =
-            run_capture_on(backend, &module, 0, &args, &[], &mut host, &config.limits)?;
+            run_capture_on(backend, &module, 0, &[], &[], &mut host, &config.limits)?;
         Ok(Session {
             module,
             backend,

@@ -1,13 +1,12 @@
 //! **Demo-artifact prep + boot-cost measurement.** Turn a raw translated `.svmb` (as emitted by
-//! `svm-llvm-translate`, with unresolved powerbox imports) into the artifact a fast-loading demo
-//! ships: capability-imports resolved, verified, re-serialized. Along the way it times each phase of
-//! the load path — decode / resolve / verify / bytecode-compile — so the one-time module-prep cost a
-//! pre-translated module still pays (vs re-translating from bitcode at load) is measured, not guessed.
+//! `svm-llvm-translate`, manifest imports intact) into the artifact a fast-loading demo ships:
+//! verified, re-serialized. Along the way it times each phase of the load path — decode / verify /
+//! bytecode-compile — so the one-time module-prep cost a pre-translated module still pays (vs
+//! re-translating from bitcode at load) is measured, not guessed.
 //!
 //!   cargo run --release -p svm-run --example prep_svmb -- <in.svmb> [out.svmb]
 //!
-//! With `out.svmb`, writes the resolved+verified module there (skips the resolve step at load — a
-//! second cost the demo need not pay each start). The `.svmb` is the browser-loadable form (see
+//! With `out.svmb`, writes the verified module there. The `.svmb` is the browser-loadable form (see
 //! `BOOTSPEED.md`); the wasm module-prep tax is measured separately by `browser/bench_prep.mjs`.
 
 use std::time::Instant;
@@ -31,17 +30,11 @@ fn main() {
         module.funcs.len()
     );
 
-    let t = Instant::now();
-    // Phase 3: a named powerbox entry keeps its manifest (the runtime binds slots at
-    // instantiation); only a legacy module still takes the rewrite.
-    let module = if svm_run::is_named_powerbox_entry(&module) {
-        module
-    } else {
-        svm_run::resolve_capability_imports(module).expect("resolve capability imports")
-    };
-    println!(
-        "  resolve caps     {:>8.1?}  (legacy modules only)",
-        t.elapsed()
+    // Phase 4: the runtime never rewrites — a powerbox entry keeps its manifest and the runtime
+    // binds slots at instantiation, so there is no resolve phase left to measure.
+    assert!(
+        module.imports.is_empty() || svm_run::is_named_powerbox_entry(&module),
+        "module declares imports but has no powerbox entry (IMPORTS.md phase 4)"
     );
 
     let t = Instant::now();

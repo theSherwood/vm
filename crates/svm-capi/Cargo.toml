@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
-# The C ABI over the `svm-run` embedding surface (POWERBOX.md Phase 5): parse/synthesize a module,
+# The C ABI over the `svm-run` embedding surface (POWERBOX.md Phase 5): parse a manifest module,
 # bind host capabilities by name (built-ins or C function pointers), instantiate, and run on any
 # backend under a uniform config — for consumers who embed from C rather than Rust. `rlib` is for the
 # in-crate ABI test; `cdylib`/`staticlib` are what a C program links against (`svm.h`).
