@@ -374,6 +374,136 @@ fn provenance_reports_platform_vs_ancestor_terminated() {
     assert!(prov(&mut child, 0x7f).is_err(), "forged handle is inert");
 }
 
+/// A stateful provider module: op func 0 bumps a counter in the provider's OWN window and
+/// returns the new count — the §3.2 v2 exporter-domain-state probe.
+fn counter_provider() -> svm_ir::Module {
+    svm_text::parse_module(
+        "memory 16\n\
+         func () -> (i64) {\n\
+         block0():\n\
+           va = i64.const 0\n\
+           vc = i64.load va\n\
+           v1 = i64.const 1\n\
+           vn = i64.add vc v1\n\
+           i64.store va vn\n\
+           return vn\n\
+         }\n",
+    )
+    .expect("provider parses")
+}
+
+#[test]
+fn an_instanced_offer_keeps_exporter_domain_state_across_calls() {
+    let provider = counter_provider();
+    svm_verify::verify_module(&provider).expect("provider verifies");
+    let mut h = Host::new();
+    let offer = h
+        .wire_impl_instance(&provider, &[0])
+        .expect("instanced offer");
+    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    // The counter lives in the provider's window, not the caller's — successive calls see it.
+    for want in 1..=3i64 {
+        assert_eq!(
+            h.cap_dispatch_slots(tid, 0, offer, &[], None),
+            Ok(vec![want]),
+            "provider state persists across dispatches"
+        );
+    }
+}
+
+#[test]
+fn a_regranted_instanced_offer_shares_one_service_instance() {
+    // §3.3 over v2: handing an instanced offer to a child aliases the SAME provider state
+    // (like a pipe's shared backing) — parent and child observe one counter.
+    let provider = counter_provider();
+    svm_verify::verify_module(&provider).expect("verifies");
+    let mut parent = Host::new();
+    let offer = parent.wire_impl_instance(&provider, &[0]).expect("offer");
+    let ptid = parent.resolve_guest_impl(offer).unwrap().type_id;
+    assert_eq!(
+        parent.cap_dispatch_slots(ptid, 0, offer, &[], None),
+        Ok(vec![1])
+    );
+
+    let (mut child, _, _) = parent
+        .spawn_named_child(&[("counter".into(), offer)], 1 << 16)
+        .expect("spawn");
+    let ch = child.resolve_cap_name("counter").expect("named");
+    let ctid = child.resolve_guest_impl(ch).unwrap().type_id;
+    assert_eq!(
+        child.cap_dispatch_slots(ctid, 0, ch, &[], None),
+        Ok(vec![2]),
+        "the child drives the same instance the parent bumped"
+    );
+    assert_eq!(
+        parent.cap_dispatch_slots(ptid, 0, offer, &[], None),
+        Ok(vec![3]),
+        "and the parent sees the child's bump"
+    );
+}
+
+#[test]
+fn a_wrap_holds_and_forwards_a_real_capability() {
+    // §3.2 v2 wrap: the wirer re-grants its own stdout INTO the provider; the provider's op
+    // resolves it by name (from its own data segment) and writes a payload from its OWN
+    // window through it — interposition holding real forwarded authority, entirely inside
+    // the provider's domain.
+    let provider = svm_text::parse_module(
+        "memory 16\n\
+         data 0 \"hi\"\n\
+         data 8 \"out\"\n\
+         func () -> (i64) {\n\
+         block0():\n\
+           vp = i64.const 8\n\
+           vn = i64.const 3\n\
+           vh = cap.self.resolve vp vn\n\
+           vbuf = i64.const 0\n\
+           vlen = i64.const 2\n\
+           vw = cap.call 0 1 (i64, i64) -> (i64) vh (vbuf, vlen)\n\
+           return vw\n\
+         }\n",
+    )
+    .expect("provider parses");
+    svm_verify::verify_module(&provider).expect("verifies");
+
+    let mut h = Host::new();
+    let out = h.grant_stream(svm_interp::StreamRole::Out);
+    let offer = h.wire_impl_instance(&provider, &[0]).expect("offer");
+    h.grant_impl_cap(offer, out, "out").expect("grantable");
+    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    assert_eq!(
+        h.cap_dispatch_slots(tid, 0, offer, &[], None),
+        Ok(vec![2]),
+        "the provider's write through the forwarded stream reports 2 bytes"
+    );
+    // The re-grant shared the wirer's stdout sink, so the provider's write lands in the
+    // wirer's captured output.
+    assert_eq!(h.stdout_bytes(), b"hi", "payload crossed the wrap");
+}
+
+#[test]
+fn grant_impl_cap_refuses_offers_and_pure_offers() {
+    // Acyclicity: a provider can never hold an offer (the deadlock-freedom invariant), and a
+    // v1 pure offer has no provider to grant into.
+    let provider = counter_provider();
+    let mut h = Host::new();
+    let instanced = h.wire_impl_instance(&provider, &[0]).expect("instanced");
+    let pure = h.wire_impl(&offer_funcs(), &[0]).expect("pure");
+    let clock = h.grant_clock();
+    assert!(
+        h.grant_impl_cap(instanced, pure, "svc").is_none(),
+        "offers never nest in providers"
+    );
+    assert!(
+        h.grant_impl_cap(pure, clock, "clk").is_none(),
+        "a pure offer has no provider instance"
+    );
+    assert!(
+        h.grant_impl_cap(instanced, clock, "clk").is_some(),
+        "a platform cap re-grants fine"
+    );
+}
+
 #[test]
 fn a_wired_offer_is_non_durable_and_drains_cleanly() {
     let mut h = Host::new();
