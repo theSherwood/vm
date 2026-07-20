@@ -593,10 +593,10 @@ fn translate_impl(
         2
     };
     let _ = max_cap_index; // the grant prefix is documentation now — bindings are by manifest name
-    // A powerbox entry is synthesized when the program needs the powerbox window: it uses a named
-    // import, `malloc`, or `__vm_blocking_handle` (which adds no import of its own).
-    // C++ static init: a program with `@llvm.global_ctors` needs a `_start` that runs the ctors before
-    // `main` (the on-ramp otherwise jumps straight to `main`), so it forces a powerbox entry too.
+                           // A powerbox entry is synthesized when the program needs the powerbox window: it uses a named
+                           // import, `malloc`, or `__vm_blocking_handle` (which adds no import of its own).
+                           // C++ static init: a program with `@llvm.global_ctors` needs a `_start` that runs the ctors before
+                           // `main` (the on-ramp otherwise jumps straight to `main`), so it forces a powerbox entry too.
     let has_global_ctors = m
         .global_vars
         .iter()
@@ -3485,13 +3485,10 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
 type StartBuilder = fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
-/// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
-/// `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root), in the `VM_CAP_*`
-/// order (stdout, stdin, exit, memory, addrspace, ioring, blocking, jit), stores each into its stash
-/// slot (offset `i*4`) so every capability call site can reload its handle, then calls the C
-/// `main(sp)` at the page-aligned data-stack base and returns its exit code. The runner grants
-/// exactly `n_handles` (a contiguous prefix, by declared arity — `run_powerbox`).
-
+/// capabilities — a **paramless** entry (IMPORTS.md phase 3): capabilities are manifest slots the
+/// host binds before entry, so there is no resolve prologue, no handle stash, and no positional
+/// handle args. It seeds the heap state, runs any C++ global ctors, then calls the C `main(sp)` at
+/// the page-aligned data-stack base and returns its exit code.
 #[allow(clippy::too_many_arguments)] // shares the StartBuilder shape with synth_start_argv (8 params)
 fn synth_start(
     main_idx: u32,
@@ -4047,27 +4044,27 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
     let g = Block {
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64], // brk, size, new, top
         insts: vec![
-            Inst::ConstI64(page - 1),            // v4
-            i64add(2, 4),                        // v5 = new + (PAGE-1)
-            Inst::ConstI64(!(page - 1)),         // v6 = ~(PAGE-1)
-            i64and(5, 6),                        // v7 = limit (page-aligned)
-            Inst::ConstI64(0),                   // v8 (spacer — keeps the block's numbering)
-            Inst::ConstI32(0),                   // v9 = vestigial handle (slot is the dispatch)
+            Inst::ConstI64(page - 1),    // v4
+            i64add(2, 4),                // v5 = new + (PAGE-1)
+            Inst::ConstI64(!(page - 1)), // v6 = ~(PAGE-1)
+            i64and(5, 6),                // v7 = limit (page-aligned)
+            Inst::ConstI64(0),           // v8 (spacer — keeps the block's numbering)
+            Inst::ConstI32(0),           // v9 = vestigial handle (slot is the dispatch)
             Inst::IntBin {
                 ty: IntTy::I64,
                 op: BinOp::Sub,
                 a: 7,
                 b: 3,
             }, // v10 = limit - top (len)
-            Inst::ConstI32(PROT_RW),             // v11 = prot
+            Inst::ConstI32(PROT_RW),     // v11 = prot
             Inst::CallImport {
                 import: vm_map_import,
                 sig: import_sig("vm_map"),
                 handle: 9,
                 args: vec![3, 10, 11],
             }, // v12 = map result (ignored)
-            Inst::ConstI64(HEAP_TOP as i64),     // v13
-            store_i64(13, 7),                    // *HEAP_TOP = limit
+            Inst::ConstI64(HEAP_TOP as i64), // v13
+            store_i64(13, 7),            // *HEAP_TOP = limit
         ],
         term: Terminator::Br {
             target: 2,
@@ -11366,7 +11363,7 @@ fn lower_vm_builtin(
     c: &crate::ll::ast::Call,
     name: &str,
 ) -> Result<bool, Error> {
-    use svm_ir::{AtomicRmwOp, LoadOp, Ordering, StoreOp};
+    use svm_ir::{AtomicRmwOp, Ordering, StoreOp};
     // All §12 atomics are sequentially consistent (the op makes the JIT emit a hardware atomic).
     let sc = Ordering::SeqCst;
     match name {
