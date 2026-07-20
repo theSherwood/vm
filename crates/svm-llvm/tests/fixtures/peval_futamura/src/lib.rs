@@ -267,6 +267,7 @@ fn build_interpreter(win_log2: u8) -> Module {
         data: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        impl_exports: Vec::new(),
         debug_info: None,
     }
 }
