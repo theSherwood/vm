@@ -2907,6 +2907,11 @@ fn run_powerbox_inner(
     // already-validated frontend output (chibicc / svm-llvm) is free insurance, not a hot-path cost.
     svm_verify::verify_module(module)
         .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
+    // §2.1 fail-closed: a manifest module's required imports must all be bindable (same gate as
+    // `instantiate` — an unknown name refuses to start, not CapFaults mid-run).
+    if is_named_powerbox_entry(module) {
+        validate_powerbox_manifest(module)?;
+    }
     // The fixed §3e powerbox preset, expressed over the converged [`Instance`] core (F1): the
     // arity-based grant ([`grant_powerbox_prefix`]) and the JIT compile→run + §5 watchdog
     // ([`run_jit`]) now live in exactly one place, shared with the frontend-independent embedding
@@ -3661,8 +3666,47 @@ fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
 ///
 /// Returns an `Err` (fail-closed) if a legacy rewrite finds an unbound import or the module fails
 /// verification — exactly the gates a frontend's output must pass before it can run.
+/// §2.1 fail-closed instantiation check for a manifest (named-powerbox) module: every `required`
+/// import must resolve under the reference policy ([`default_cap_resolver`]) to an interface the
+/// powerbox binds ([`Instance::grant_caps`]'s by-interface map). An unknown name, or a
+/// dynamic-only interface (e.g. `SharedRegion`, whose objects are runtime-minted), refuses to
+/// start the module — the `ImportError::Unresolved` semantics IMPORTS.md §2.1 keeps.
+fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
+    use svm_interp::iface;
+    for im in &module.imports {
+        if im.mode != svm_ir::ImportMode::Required {
+            continue; // a rebindable slot may legitimately start empty
+        }
+        let Some(cap) = default_cap_resolver(&im.name) else {
+            return Err(format!(
+                "unresolved capability import `{}` (no binding in the host policy)",
+                im.name
+            ));
+        };
+        let bindable = matches!(
+            cap.type_id,
+            iface::STREAM
+                | iface::EXIT
+                | iface::MEMORY
+                | iface::ADDRESS_SPACE
+                | iface::IO_RING
+                | iface::BLOCKING
+                | iface::JIT
+        );
+        if !bindable {
+            return Err(format!(
+                "capability import `{}` names a dynamic-only interface (use `cap.call` on a live \
+                 handle)",
+                im.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn instantiate(module: Module) -> Result<Instance, String> {
     let module = if is_named_powerbox_entry(&module) {
+        validate_powerbox_manifest(&module)?;
         module
     } else {
         resolve_capability_imports(module)?

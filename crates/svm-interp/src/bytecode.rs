@@ -7906,8 +7906,18 @@ impl Vm {
                     // results or advance `pc`: persist state at *this* instruction so the driver, after
                     // pushing more input, re-issues the read on resume. Gated on the stream-read op so
                     // no other cap.call pays the flag check.
-                    if *type_id == super::iface::STREAM
-                        && *op == 0
+                    // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel — read
+                    // its bound `(type_id, op)` so an imported stdin `read` parks exactly like the
+                    // resolved `cap.call` form (IMPORTS.md phase 3).
+                    let (eff_tid, eff_op) = if *type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+                        host.with(|p| p.import_binding(*op))
+                            .map(|b| (b.type_id, b.op))
+                            .unwrap_or((*type_id, *op))
+                    } else {
+                        (*type_id, *op)
+                    };
+                    if eff_tid == super::iface::STREAM
+                        && eff_op == 0
                         && host.with(|p| p.take_stdin_parked())
                     {
                         self.module = module;
