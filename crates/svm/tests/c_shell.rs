@@ -107,6 +107,7 @@ fn grant_hooks() -> GrantChildHooks {
     GrantChildHooks {
         build: svm_run::grant_child_build,
         build_named: svm_run::grant_named_child_build,
+        bind_imports: svm_run::child_bind_imports,
         release: svm_run::grant_child_release,
     }
 }
@@ -833,10 +834,8 @@ fn run_shell_ex(
     let cmd_mods: Vec<(&str, svm_ir::Module)> = cmds
         .iter()
         .map(|&(name, csrc)| {
-            let m = svm_run::resolve_capability_imports(
-                parse_module_raw(&c_to_ir_child(csrc)).expect("parse cmd"),
-            )
-            .expect("resolve cmd");
+            // Phase 3: keep the manifest — the op-13 spawn binds the child's slots.
+            let m = parse_module_raw(&c_to_ir_child(csrc)).expect("parse cmd");
             verify_module(&m).expect("verify cmd");
             (name, m)
         })

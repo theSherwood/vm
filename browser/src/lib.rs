@@ -1822,6 +1822,18 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     Some(svm_ir::ResolvedCap { type_id, op })
 }
 
+/// Prepare an on-ramp module for execution (IMPORTS.md phase 3): a **paramless** (by-name) entry
+/// runs its manifest as-is — `call.import` dispatches through the instance bindings
+/// [`grant_onramp_caps`] installs, no rewrite. A legacy **positional** entry (pre-manifest blobs)
+/// still takes the `resolve_imports` rewrite until phase 4 retires it.
+fn onramp_prepare(m: &svm_ir::Module) -> Result<svm_ir::Module, ()> {
+    let paramless = m.funcs.first().is_some_and(|f| f.params.is_empty());
+    if paramless {
+        return Ok(m.clone());
+    }
+    svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| ())
+}
+
 /// A shared **keyboard event queue** (the `keyboard` capability's backing): the host pushes packed
 /// key events, the guest drains them via `__vm_cap_resolve("keyboard")` + `poll`. `Arc<Mutex<…>>` so
 /// the cap's `HostFn` closure and the host/reactor driver share one queue. Packed event layout:
@@ -1886,6 +1898,33 @@ fn grant_onramp_caps(
     } else {
         handles.iter().map(|h| Value::I32(*h)).collect()
     };
+    // IMPORTS.md phase 3: a manifest-carrying (paramless) module executes its `call.import`s
+    // through instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
+    // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
+    // dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
+    if arity == 0 && !m.imports.is_empty() {
+        use svm_interp::iface;
+        let hv = |i: usize| handles.get(i).copied().unwrap_or(0);
+        let bindings = m
+            .imports
+            .iter()
+            .map(|im| {
+                let Some(cap) = onramp_cap_resolver(&im.name) else {
+                    return svm_interp::BoundImport::rebindable(0, 0, None);
+                };
+                let handle = match (cap.type_id, cap.op) {
+                    (iface::STREAM, 1) => hv(0),
+                    (iface::STREAM, _) => hv(1),
+                    (iface::EXIT, _) => hv(2),
+                    (iface::MEMORY, _) => hv(3),
+                    (iface::ADDRESS_SPACE, _) => hv(4),
+                    _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+                };
+                svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            })
+            .collect();
+        host.set_import_bindings(bindings);
+    }
     // `display` — the framebuffer output waist (Doom slice 1). `present(ptr, w, h)` copies the frame out.
     let frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -2047,12 +2086,9 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         stderr: Vec::new(),
         framebuffer: None,
     };
-    // Lower the on-ramp's §7 named imports (`write`/`read`/`exit`/`vm_*`) to concrete `cap.call`s
-    // before running — the step `svm-run::instantiate` does via `resolve_capability_imports`. Without
-    // it the engine sees unbound imports and fail-closes. A no-op for an import-free module.
-    let resolved = match svm_ir::resolve_imports(m, onramp_cap_resolver) {
+    let resolved = match onramp_prepare(m) {
         Ok(r) => r,
-        Err(_) => return unsupported(),
+        Err(()) => return unsupported(),
     };
     let m = &resolved;
     // A positional entry beyond the granted prefix (arity > 5) would be mis-granted; fail closed.
@@ -2122,7 +2158,7 @@ fn pg_setup(
 > {
     // Idempotent on the already-resolved `.svmb` (imports = 0); resolves a raw on-ramp module too.
     let resolved =
-        svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+        onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
     // Postgres' `_start` arity depends on the on-ramp entry convention: the current `synth_start_argv`
     // (slice S15c) emits a **paramless** `_start` that resolves its caps **by name**, while an older
     // pre-S15c artifact takes the 4-cap prefix (`stdout, stdin, exit, memory`) **positionally**. Accept
@@ -2539,7 +2575,7 @@ impl OnrampReactor {
 
     fn open_inner(m: &svm_ir::Module, fs: Option<(String, Vec<u8>)>) -> Result<OnrampReactor, i32> {
         let module =
-            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let arity = module.funcs.first().map_or(0, |f| f.params.len());
         if arity > 5 {
             return Err(STATUS_UNSUPPORTED);
@@ -2697,7 +2733,7 @@ impl SharedOnrampReactor {
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<SharedOnrampReactor, i32> {
         let module =
-            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let arity = module.funcs.first().map_or(0, |f| f.params.len());
         if arity > 5 {
             return Err(STATUS_UNSUPPORTED);
@@ -2871,7 +2907,7 @@ impl JitOnrampReactor {
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<JitOnrampReactor, i32> {
         let mut module =
-            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         // Hoist inline `cap.call`s into cross-tier wrapper functions so a hot `tick` that interleaves
         // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
         // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
@@ -3102,7 +3138,7 @@ impl JitOnrampRun {
         stdin: Vec<u8>,
     ) -> Result<JitOnrampRun, i32> {
         let mut module =
-            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         svm_wasmjit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
         if let Some(mc) = module.memory.as_mut() {

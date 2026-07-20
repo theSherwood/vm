@@ -668,7 +668,19 @@ pub struct GrantChildHooks {
     pub build: GrantChildBuilder,
     pub build_named: GrantNamedChildBuilder,
     pub release: GrantChildReleaser,
+    /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
+    /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the
+    /// interpreter's inline `Host::bind_child_manifest` at spawn.
+    pub bind_imports: ChildManifestBinder,
 }
+
+/// Bind a child module's import manifest against its built powerbox host — see
+/// [`GrantChildHooks::bind_imports`].
+pub type ChildManifestBinder = unsafe extern "C" fn(
+    parent_ctx: *mut core::ffi::c_void,
+    child_ctx: *mut core::ffi::c_void,
+    module: i64,
+);
 
 /// §9/§12 async-ring host seam. The asynchronous `IoRing.submit_async` parks a vCPU on an in-window
 /// futex completion **counter** and an offload-pool worker wakes it — but the pool lives in the

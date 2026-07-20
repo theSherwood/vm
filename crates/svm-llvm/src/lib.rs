@@ -592,9 +592,9 @@ fn translate_impl(
     } else {
         2
     };
-    let n_handles = max_cap_index + 1;
-    // A powerbox entry is synthesized when the program needs the handle stash: it uses a named import,
-    // `malloc`, or a stash-only builtin (`__vm_blocking_handle`, which adds no import of its own).
+    let _ = max_cap_index; // the grant prefix is documentation now — bindings are by manifest name
+    // A powerbox entry is synthesized when the program needs the powerbox window: it uses a named
+    // import, `malloc`, or `__vm_blocking_handle` (which adds no import of its own).
     // C++ static init: a program with `@llvm.global_ctors` needs a `_start` that runs the ctors before
     // `main` (the on-ramp otherwise jumps straight to `main`), so it forces a powerbox entry too.
     let has_global_ctors = m
@@ -936,7 +936,6 @@ fn translate_impl(
             main_idx,
             &main_results,
             entry_sp,
-            n_handles,
             heap_base,
             &ctors,
             wants_envp,
@@ -2963,30 +2962,10 @@ const HOST_FN_TYPE_ID: u32 = 13;
 /// numerically like [`HOST_FN_TYPE_ID`]; `svm-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;
 
-const STASH_STDOUT: u64 = svm_ir::POWERBOX_STASH_BASE;
-const STASH_STDIN: u64 = STASH_STDOUT + 4;
-const STASH_EXIT: u64 = STASH_STDOUT + 8;
-/// The `Memory` capability handle (`i32`) — present when the program uses `malloc` *or* a direct
-/// `<svm.h>` Memory builtin (then `_start` takes a 4th granted handle). The bump allocator + the
-/// `__vm_map`/… builtins reload it to drive `Memory` capability calls.
-const STASH_MEMORY: u64 = STASH_STDOUT + 12;
-/// The `AddressSpace` handle (slot 4) — granted when the program mints a §13/§14 `SharedRegion`
-/// (`__vm_region_create` calls `AddressSpace.create_region`). The region handle it returns is then the
-/// capability for `__vm_region_map`/`unmap`/`page_size` (not a stash slot — those take it as an arg).
-const STASH_ADDRSPACE: u64 = STASH_STDOUT + 16;
-/// The `IoRing` (slot 5) and `Blocking` (slot 6) handles — granted when the program uses the §9/§12
-/// async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap` drive `IoRing`; `__vm_blocking_handle`
-/// returns the `Blocking` handle a guest names in an SQE).
-const STASH_IORING: u64 = STASH_STDOUT + 20;
-const STASH_BLOCKING: u64 = STASH_STDOUT + 24;
-/// The `Jit` handle (slot 7) — granted when the program uses the §22 guest-driven-JIT builtins
-/// (`__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/`compile_linked`): a guest submits
-/// serialized SVM IR built in its own window and the host verifies + Cranelift-compiles it into THIS
-/// domain. Slot 4 (`AddressSpace`) stays reserved (offset 16) for the §13/§14 region builtins.
-const STASH_JIT: u64 = STASH_STDOUT + 28;
-/// End of the reserved 8-handle region (`[0, 32)`, one `i32` slot per `VM_CAP_*` index). The
-/// allocator/scratch/format state begins here, so it is collision-proof against the full handle set.
-/// This is exactly the public heap base ([`svm_ir::POWERBOX_HEAP_BRK`]).
+/// End of the low reserved region (`[0, 32)`) that held the retired capability-handle stash
+/// (IMPORTS.md phase 3 — imports are manifest slots the host binds; nothing is stashed). Kept as
+/// scratch (`__vm_blocking_handle` stages a resolve name here) and as the public heap base
+/// ([`svm_ir::POWERBOX_HEAP_BRK`]), so the layout above it is unchanged.
 const HANDLE_REGION_END: u64 = svm_ir::POWERBOX_HEAP_BRK;
 /// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state,
 /// placed just above the 8-handle region ([`svm_ir::POWERBOX_HEAP_BRK`]/[`svm_ir::POWERBOX_HEAP_TOP`]).
@@ -2995,7 +2974,6 @@ const HEAP_TOP: u64 = HEAP_BRK + 8; // 40
                                     // Pin the C `_start` layout to the public powerbox ABI so this and `svm_ir::synth_powerbox_start`
                                     // can never silently diverge (the dedup hinge: one source of truth in `svm-ir`).
 const _: () = assert!(HEAP_TOP == svm_ir::POWERBOX_HEAP_TOP);
-const _: () = assert!(STASH_STDOUT == svm_ir::POWERBOX_STASH_BASE);
 /// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
 /// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit
 /// memory). Reused per call — single-threaded, fully produced-then-consumed within one lowering.
@@ -3047,22 +3025,13 @@ const EH_EXNOBJ_SIZE: u64 = 64;
 /// Total bytes of the reserved EH region.
 const EH_REGION_SIZE: u64 = EH_EXNOBJ_O + EH_EXNOBJ_SIZE;
 
-/// Which stash slot a capability call reads its handle from.
-#[derive(Clone, Copy)]
-enum HandleSlot {
-    Stdout,
-    Stdin,
-    Exit,
-}
-
 /// A libc/POSIX function the on-ramp binds to a host capability: the import `name` the host resolves
-/// (via `default_cap_resolver`), the op `sig` (the **capability ABI**, not the C prototype), the
-/// stash slot its handle comes from, and how many leading C args to drop (the POSIX `fd`, which the
-/// capability handle subsumes — the endpoint is selected by the handle, not the fd).
+/// (via `default_cap_resolver`), the op `sig` (the **capability ABI**, not the C prototype), and how
+/// many leading C args to drop (the POSIX `fd`, which the import slot subsumes — the endpoint is
+/// selected by the binding, not the fd).
 struct CapSpec {
     name: &'static str,
     sig: svm_ir::FuncType,
-    handle: HandleSlot,
     drop_args: usize,
 }
 
@@ -3077,19 +3046,16 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
         "write" => CapSpec {
             name: "write",
             sig: ft(vec![I64, I64], vec![I64]),
-            handle: HandleSlot::Stdout,
             drop_args: 1,
         },
         "read" => CapSpec {
             name: "read",
             sig: ft(vec![I64, I64], vec![I64]),
-            handle: HandleSlot::Stdin,
             drop_args: 1,
         },
         "exit" | "_exit" | "_Exit" => CapSpec {
             name: "exit",
             sig: ft(vec![I32], vec![]),
-            handle: HandleSlot::Exit,
             drop_args: 0,
         },
         // Direct guest access to the powerbox streams: `long __vm_stream_write(long buf, long len)` /
@@ -3101,13 +3067,11 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
         "__vm_stream_write" => CapSpec {
             name: "write",
             sig: ft(vec![I64, I64], vec![I64]),
-            handle: HandleSlot::Stdout,
             drop_args: 0,
         },
         "__vm_stream_read" => CapSpec {
             name: "read",
             sig: ft(vec![I64, I64], vec![I64]),
-            handle: HandleSlot::Stdin,
             drop_args: 0,
         },
         _ => return None,
@@ -3411,11 +3375,19 @@ fn register_vm_jit_imports(
 fn vm_region_builtin_import(name: &str) -> Option<&'static str> {
     Some(match name {
         "__vm_region_create" => "vm_region_create",
+        // map/unmap/page_size dispatch on a runtime-minted region handle — the dynamic mode
+        // (`cap.call`), so they declare no manifest import.
         "__vm_region_map" => "vm_region_map",
         "__vm_region_unmap" => "vm_region_unmap",
         "__vm_region_page_size" => "vm_region_page_size",
         _ => return None,
     })
+}
+
+/// The subset of [`vm_region_builtin_import`] names that are *manifest imports* (fixed-interface
+/// dispatch); the rest are dynamic-mode `cap.call`s on a live region handle.
+fn vm_region_manifest_import(name: &str) -> Option<&'static str> {
+    (name == "__vm_region_create").then_some("vm_region_create")
 }
 
 /// Scan for the SharedRegion builtins, registering each one's §7 import. Returns whether any were used
@@ -3438,8 +3410,10 @@ fn register_vm_region_imports(
                 if defined.contains_key(&name) {
                     continue;
                 }
-                if let Some(import) = vm_region_builtin_import(&name) {
+                if vm_region_builtin_import(&name).is_some() {
                     used = true;
+                }
+                if let Some(import) = vm_region_manifest_import(&name) {
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
                         imports.push(svm_ir::Import {
@@ -3508,7 +3482,7 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
 /// `main(void)`) and [`synth_start_argv`] (`main(int, char**)`): `(main_idx, main_results, entry_sp,
 /// n_handles, heap_base, ctors) -> Func`. A `type` alias so the dispatch can pick one by function
 /// pointer without tripping `clippy::type_complexity`.
-type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32], bool, u64) -> Func;
+type StartBuilder = fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
@@ -3517,64 +3491,12 @@ type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32], bool, u
 /// slot (offset `i*4`) so every capability call site can reload its handle, then calls the C
 /// `main(sp)` at the page-aligned data-stack base and returns its exit code. The runner grants
 /// exactly `n_handles` (a contiguous prefix, by declared arity — `run_powerbox`).
-/// Emit the **by-name** powerbox prologue (PROCESS.md S15 (c)): for `i in 0..n_handles`, resolve the
-/// canonical cap name `svm_ir::POWERBOX_CAP_NAMES[i]` (`cap.self.resolve`) and stash the handle at
-/// byte offset `i*4`. Each name's bytes are staged **in its own stash slot** (offset `i*4`) — always
-/// in the mapped low reserved region `[0, 32)` (unlike the data-stack base, which svm-llvm puts at the
-/// window's mapped edge) — resolved, then overwritten by the 4-byte handle. Names are processed in
-/// order, and each slot's final write is its handle (a longer name's overhang into the next slot is
-/// overwritten when that slot is processed), so the whole `[0, n_handles*4)` stash ends correct.
-/// Appends to `insts`, threading and returning the next free `ValIdx`. Shared by `synth_start` /
-/// `synth_start_argv` so a paramless `_start` obtains its handles by name — no positional handle
-/// parameters, no implicit slot-index agreement.
-fn emit_resolve_prologue(insts: &mut Vec<Inst>, n_handles: usize, mut next: ValIdx) -> ValIdx {
-    use svm_ir::{StoreOp, POWERBOX_CAP_NAMES};
-    for (i, name) in POWERBOX_CAP_NAMES[..n_handles].iter().enumerate() {
-        let slot = (i as i64) * 4;
-        for (k, &b) in name.as_bytes().iter().enumerate() {
-            insts.push(Inst::ConstI64(slot + k as i64));
-            let addr = next;
-            next += 1;
-            insts.push(Inst::ConstI32(b as i32));
-            let val = next;
-            next += 1;
-            insts.push(Inst::Store {
-                op: StoreOp::I32_8,
-                addr,
-                value: val,
-                offset: 0,
-                align: 0,
-            });
-        }
-        insts.push(Inst::ConstI64(slot));
-        let name_ptr = next;
-        next += 1;
-        insts.push(Inst::ConstI64(name.len() as i64));
-        let name_len = next;
-        next += 1;
-        insts.push(Inst::CapSelfResolve { name_ptr, name_len });
-        let handle = next;
-        next += 1;
-        insts.push(Inst::ConstI64(slot));
-        let addr = next;
-        next += 1;
-        insts.push(Inst::Store {
-            op: StoreOp::I32,
-            addr,
-            value: handle,
-            offset: 0,
-            align: 0,
-        });
-    }
-    next
-}
 
 #[allow(clippy::too_many_arguments)] // shares the StartBuilder shape with synth_start_argv (8 params)
 fn synth_start(
     main_idx: u32,
     main_results: &[ValType],
     entry_sp: u64,
-    n_handles: usize,
     heap_base: Option<u64>,
     ctors: &[u32],
     _wants_envp: bool,
@@ -3584,10 +3506,10 @@ fn synth_start(
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
-    // A **paramless** `_start` (S15 c): resolve the granted handles **by name** into the stash slots
-    // (the name bytes staged transiently at `entry_sp`), rather than receiving them as positional args.
+    // A **paramless** `_start` (IMPORTS.md phase 3): capabilities are manifest slots the host binds
+    // before entry — no resolve prologue, no handle stash, no positional handle args.
     let params: Vec<ValType> = Vec::new();
-    let mut next: ValIdx = emit_resolve_prologue(&mut insts, n_handles, 0);
+    let mut next: ValIdx = 0;
     // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base` (the
     // window's mapped boundary — the first reserved page); the allocator `vm_map`-commits upward.
     if let Some(hb) = heap_base {
@@ -3655,7 +3577,6 @@ fn synth_start_argv(
     main_idx: u32,
     main_results: &[ValType],
     entry_sp: u64,
-    n_handles: usize,
     heap_base: Option<u64>,
     ctors: &[u32],
     wants_envp: bool,
@@ -3698,7 +3619,7 @@ fn synth_start_argv(
     // received as positional args.
     let params: Vec<ValType> = Vec::new();
     let mut insts: Vec<Inst> = Vec::new();
-    let mut next: ValIdx = emit_resolve_prologue(&mut insts, n_handles, 0);
+    let mut next: ValIdx = 0;
     if let Some(hb) = heap_base {
         for off in [HEAP_BRK, HEAP_TOP] {
             insts.push(Inst::ConstI64(off as i64));
@@ -4130,13 +4051,8 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
             i64add(2, 4),                        // v5 = new + (PAGE-1)
             Inst::ConstI64(!(page - 1)),         // v6 = ~(PAGE-1)
             i64and(5, 6),                        // v7 = limit (page-aligned)
-            Inst::ConstI64(STASH_MEMORY as i64), // v8
-            Inst::Load {
-                op: LoadOp::I32,
-                addr: 8,
-                offset: 0,
-                align: 0,
-            }, // v9 = mem handle
+            Inst::ConstI64(0),                   // v8 (spacer — keeps the block's numbering)
+            Inst::ConstI32(0),                   // v9 = vestigial handle (slot is the dispatch)
             Inst::IntBin {
                 ty: IntTy::I64,
                 op: BinOp::Sub,
@@ -11513,7 +11429,7 @@ fn lower_vm_builtin(
             if name != "__vm_unmap" {
                 args.push(ctx.operand_i32(vm_arg(c, 2)?)?); // prot
             }
-            let handle = ctx.stash_load(STASH_MEMORY);
+            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 sig: import_sig(import),
@@ -11525,7 +11441,7 @@ fn lower_vm_builtin(
         }
         "__vm_page_size" => {
             let imp = ctx.import_of("vm_page_size")?;
-            let handle = ctx.stash_load(STASH_MEMORY);
+            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 sig: import_sig("vm_page_size"),
@@ -11546,7 +11462,7 @@ fn lower_vm_builtin(
             if name == "__vm_io_submit_async" {
                 args.push(ctx.operand_i64(vm_arg(c, 2)?)?); // the completion counter pointer
             }
-            let handle = ctx.stash_load(STASH_IORING);
+            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 sig: import_sig(import),
@@ -11556,10 +11472,28 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // `__vm_blocking_handle()` returns the stashed Blocking handle (slot 6) — the `i32` a guest
-        // names in an SQE's `handle` field when building a `Blocking.work` request. Just a stash read.
+        // `__vm_blocking_handle()` returns the Blocking capability handle — the `i32` a guest
+        // names in an SQE's `handle` field when building a `Blocking.work` request. This is the one
+        // place a *handle value* (not a dispatch) is needed, so resolve it by its canonical name
+        // (`cap.self.resolve` — the discovery tier IMPORTS.md deliberately keeps): the name bytes
+        // are staged in the low reserved region, which the retired handle stash freed.
         "__vm_blocking_handle" => {
-            let r = ctx.stash_load(STASH_BLOCKING);
+            use svm_ir::StoreOp;
+            let name = "blocking";
+            for (k, &b) in name.as_bytes().iter().enumerate() {
+                let addr = ctx.const_i64(k as i64);
+                let val = ctx.push(Inst::ConstI32(b as i32));
+                ctx.push_effect(Inst::Store {
+                    op: StoreOp::I32_8,
+                    addr,
+                    value: val,
+                    offset: 0,
+                    align: 0,
+                });
+            }
+            let name_ptr = ctx.const_i64(0);
+            let name_len = ctx.const_i64(name.len() as i64);
+            let r = ctx.push(Inst::CapSelfResolve { name_ptr, name_len });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -11580,7 +11514,7 @@ fn lower_vm_builtin(
             for i in 0..argc {
                 args.push(ctx.operand_i64(vm_arg(c, i)?)?);
             }
-            let handle = ctx.stash_load(STASH_JIT);
+            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 sig: import_sig(import),
@@ -11597,7 +11531,7 @@ fn lower_vm_builtin(
         "__vm_region_create" => {
             let imp = ctx.import_of("vm_region_create")?;
             let len = ctx.operand_i64(vm_arg(c, 0)?)?;
-            let handle = ctx.stash_load(STASH_ADDRSPACE);
+            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 sig: import_sig("vm_region_create"),
@@ -11609,7 +11543,6 @@ fn lower_vm_builtin(
         }
         "__vm_region_map" | "__vm_region_unmap" | "__vm_region_page_size" => {
             let import = vm_region_builtin_import(name).expect("region builtin");
-            let imp = ctx.import_of(import)?;
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the region handle (arg 0)
             let args = match name {
                 "__vm_region_map" => vec![
@@ -11624,8 +11557,17 @@ fn lower_vm_builtin(
                 ],
                 _ => vec![], // page_size
             };
-            let r = ctx.push(Inst::CallImport {
-                import: imp,
+            // The region handle is a runtime-minted *object*, so this is the dynamic addressing
+            // mode (IMPORTS.md §2.2 — `cap.call` on the live handle, §3c-checked at use); the
+            // static manifest carries only the fixed-interface imports.
+            let op = match import {
+                "vm_region_map" => 0,
+                "vm_region_unmap" => 1,
+                _ => 3, // vm_region_page_size
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: SHARED_REGION_TYPE_ID,
+                op,
                 sig: import_sig(import),
                 handle,
                 args,
@@ -11801,18 +11743,13 @@ fn lower_vm_builtin(
         }
         // ---- §7 capability reflection ----
         "__vm_cap" => {
-            // The i-th stashed powerbox handle: an `i32.load` at byte offset `i*4` in the reserved
-            // low window (the handle stash), exactly where `_start` stored the granted handles.
-            let i = ctx.operand_i64(vm_arg(c, 0)?)?;
-            let four = ctx.const_i64(4);
-            let off = ctx.mul_i64(i, four);
-            let r = ctx.push(Inst::Load {
-                op: LoadOp::I32,
-                addr: off,
-                offset: 0,
-                align: 0,
-            });
-            ctx.bind_dest(&c.dest, r);
+            // The i-th powerbox handle. The stash is retired (IMPORTS.md phase 3), so enumerate the
+            // held table instead: `cap.self.get i` — the fixed powerbox grants in `VM_CAP_*` order,
+            // so index i is the same capability the stash slot held (the discovery tier is the one
+            // by-index surface deliberately kept).
+            let i = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let rs = ctx.push_multi(Inst::CapSelfGet { idx: i }, 2); // (handle, type_id)
+            ctx.bind_dest(&c.dest, rs[0]);
             Ok(true)
         }
         "__vm_cap_count" => {
@@ -11934,12 +11871,8 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
     // The primitive capability mapping (write/read/exit): drop the dropped args, map the rest.
     if let Some(spec) = cap_spec(name) {
         let import = ctx.import_of(spec.name)?;
-        let off = match spec.handle {
-            HandleSlot::Stdout => STASH_STDOUT,
-            HandleSlot::Stdin => STASH_STDIN,
-            HandleSlot::Exit => STASH_EXIT,
-        };
-        let handle = ctx.stash_load(off);
+        // Vestigial handle operand (the slot is the dispatch; retired at the next format bump).
+        let handle = ctx.push(Inst::ConstI32(0));
         let mut args = Vec::new();
         for (a, _attrs) in c.arguments.iter().skip(spec.drop_args) {
             args.push(ctx.operand(a)?);
@@ -15253,17 +15186,6 @@ impl<'a> BlockCtx<'a> {
         })
     }
 
-    /// Load a powerbox capability handle (`i32`) from its stash slot in the reserved low window.
-    fn stash_load(&mut self, off: u64) -> ValIdx {
-        let addr = self.const_i64(off as i64);
-        self.push(Inst::Load {
-            op: svm_ir::LoadOp::I32,
-            addr,
-            offset: 0,
-            align: 0,
-        })
-    }
-
     /// The §7 import index for an import name (registered by `collect_cap_imports`).
     fn import_of(&self, name: &str) -> Result<u32, Error> {
         self.caps
@@ -15337,7 +15259,7 @@ impl<'a> BlockCtx<'a> {
             return Ok(new_off);
         }
         let import = self.import_of("write")?;
-        let handle = self.stash_load(STASH_STDOUT);
+        let handle = self.push(Inst::ConstI32(0));
         Ok(self.push(Inst::CallImport {
             import,
             sig: import_sig("write"),

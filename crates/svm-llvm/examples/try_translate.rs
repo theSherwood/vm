@@ -28,13 +28,8 @@ fn main() {
         t0.elapsed(),
         t.module.funcs.len()
     );
-    let module = match svm_run::resolve_capability_imports(t.module) {
-        Ok(m) => m,
-        Err(e) => {
-            println!("RESOLVE ERR: {e:?}");
-            std::process::exit(1);
-        }
-    };
+    // Phase 3: the manifest binds at instantiation — no rewrite.
+    let module = t.module;
     if let Err(e) = svm_verify::verify_module(&module) {
         println!("VERIFY ERR: {e:?}");
         std::process::exit(1);

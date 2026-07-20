@@ -225,6 +225,21 @@ pub unsafe extern "C" fn cap_thunk(
         let _ = (mem_base, mem_size, mem_reserved);
         None
     };
+    // IMPORTS.md phase 3: a `call.import` dispatch arrives as the `CAP_IMPORT_TYPE_ID` sentinel
+    // (import index in `op`). Translate it through the instance's binding table *here*, before the
+    // `Jit` interception below — otherwise an imported `Jit.compile` would bypass the native
+    // servicing and dead-end in the generic Host arm. An unbound slot is a fail-closed CapFault.
+    let (type_id, op, handle) = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+        match host.import_binding(op) {
+            Some(b) => (b.type_id, b.op, b.handle),
+            None => {
+                *trap_out = TrapKind::CapFault as i64;
+                return;
+            }
+        }
+    } else {
+        (type_id, op, handle)
+    };
     // Guest-driven `Jit` (iface 11, DESIGN.md §22): serviced natively here, not in the generic
     // Host dispatch — `compile` must call into Cranelift (`define_extra` on the live
     // `CompiledModule`) and `invoke` must call the unit's trampoline over the live window,
@@ -285,6 +300,20 @@ pub unsafe extern "C" fn cap_thunk_locked(
     trap_out: *mut i64,
 ) {
     let m = &*(ctx as *const Mutex<Host>);
+    // Phase 3: translate a `CAP_IMPORT_TYPE_ID` dispatch through the binding table under a short
+    // lock (released before any re-entrant path below) — same reason as [`cap_thunk`]'s translate.
+    let (type_id, op, handle) = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+        let guard = m.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.import_binding(op) {
+            Some(b) => (b.type_id, b.op, b.handle),
+            None => {
+                *trap_out = TrapKind::CapFault as i64;
+                return;
+            }
+        }
+    } else {
+        (type_id, op, handle)
+    };
     // `Jit.invoke` (iface 11 op 1) re-enters guest code → never hold the lock across it.
     if type_id == iface::JIT && op == 1 {
         let arg_slots = if n_args == 0 {
@@ -1402,6 +1431,27 @@ pub unsafe extern "C" fn grant_child_build(
 pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
     if !ctx.is_null() {
         drop(Box::from_raw(ctx as *mut Host));
+    }
+}
+
+/// IMPORTS.md phase 3 / S2.1 — bind a spawned child module's import manifest against its freshly
+/// built powerbox (the [`svm_jit::ChildManifestBinder`] hook for op 13): resolve the granted
+/// `Module`'s retained manifest on the parent and apply the shared reference child policy on the
+/// child host ([`Host::bind_child_manifest`] — the same call the interpreter's inline spawn makes),
+/// so the two backends bind identically. A forged module handle binds nothing (the spawn itself
+/// already failed closed on it).
+///
+/// # Safety
+/// `parent_ctx`/`child_ctx` are the live parent/child `*mut Host` the op-13 runtime holds.
+pub unsafe extern "C" fn child_bind_imports(
+    parent_ctx: *mut c_void,
+    child_ctx: *mut c_void,
+    module: i64,
+) {
+    let parent = &*(parent_ctx as *mut Host);
+    let child = &mut *(child_ctx as *mut Host);
+    if let Some(imports) = parent.module_imports(module as i32) {
+        child.bind_child_manifest(&imports);
     }
 }
 
@@ -3601,20 +3651,26 @@ fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
     })
 }
 
-/// Resolve `module`'s §7 named capability imports under the reference host policy
-/// ([`resolve_capability_imports`]) and verify the result (the escape-freedom gate, §2a). Entry
-/// points are reached by name through the module's first-class [`svm_ir::Module::exports`] table — a
-/// `svm_ir::synth_powerbox_start` module registers its bootstrap as `"_start"`, and any frontend
-/// export (e.g. `"main"`) survives there too.
+/// Verify `module` (the escape-freedom gate, §2a) and build an [`Instance`] over its manifest
+/// (IMPORTS.md phase 3): a **named powerbox entry** (paramless `_start`) keeps its imports —
+/// `grant_caps` binds each slot at run (`default_cap_resolver` name → `(type_id, op)`, handle by
+/// interface) and `call.import` dispatches through the bindings, the module bytes never rewritten.
+/// A legacy **positional** entry (or hand-written IR with imports and no powerbox entry) still
+/// takes the [`resolve_capability_imports`] rewrite until phase 4 retires it. Entry points are
+/// reached by name through the module's first-class [`svm_ir::Module::exports`] table.
 ///
-/// Returns an `Err` (fail-closed) if an import is unbound or the module fails verification — exactly
-/// the gates a frontend's output must pass before it can run.
+/// Returns an `Err` (fail-closed) if a legacy rewrite finds an unbound import or the module fails
+/// verification — exactly the gates a frontend's output must pass before it can run.
 pub fn instantiate(module: Module) -> Result<Instance, String> {
-    let resolved = resolve_capability_imports(module)?;
-    svm_verify::verify_module(&resolved)
+    let module = if is_named_powerbox_entry(&module) {
+        module
+    } else {
+        resolve_capability_imports(module)?
+    };
+    svm_verify::verify_module(&module)
         .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
     Ok(Instance {
-        module: resolved,
+        module,
         binding: None,
         hooks: None,
     })
@@ -4034,9 +4090,50 @@ impl Instance {
                 args
             }
             None if is_named_powerbox_entry(&self.module) => {
-                // S15 (c2): grant + register the full fixed powerbox (the guest resolves each by name
-                // in its `_start` prologue), and hand the entry **no** positional arguments.
-                grant_powerbox_prefix(h, 8, win);
+                // S15 (c2) + IMPORTS.md phase 3: grant + register the full fixed powerbox, then bind
+                // the module's manifest slots — import `i`'s name maps to its `(type_id, op)` via
+                // [`default_cap_resolver`] and to the granted handle by interface (`Stream`
+                // disambiguated by op: write→stdout, read→stdin). The frontend `_start` has no
+                // resolve prologue and call sites carry a vestigial handle: the slot binding IS the
+                // dispatch. A name outside the fixed policy leaves its slot unbound (a dispatch
+                // through it is a fail-closed `CapFault`) — same failure the legacy rewrite gave at
+                // instantiation, moved to the call site. The entry takes **no** positional args.
+                let handles = grant_powerbox_prefix(h, 8, win);
+                let hv = |i: usize| match handles.get(i) {
+                    Some(Value::I32(x)) => *x,
+                    _ => 0,
+                };
+                let (stdout, stdin, exit) = (hv(0), hv(1), hv(2));
+                let (memory, addrspace, ioring, blocking, jit) =
+                    (hv(3), hv(4), hv(5), hv(6), hv(7));
+                if !self.module.imports.is_empty() {
+                    use svm_interp::iface;
+                    let bindings = self
+                        .module
+                        .imports
+                        .iter()
+                        .map(|im| {
+                            let Some(cap) = default_cap_resolver(&im.name) else {
+                                // Unknown name: declared but unbound — fail-closed at dispatch.
+                                return svm_interp::BoundImport::rebindable(0, 0, None);
+                            };
+                            let handle = match (cap.type_id, cap.op) {
+                                (iface::STREAM, 1) => stdout, // write
+                                (iface::STREAM, _) => stdin,  // read
+                                (iface::EXIT, _) => exit,
+                                (iface::MEMORY, _) => memory,
+                                (iface::ADDRESS_SPACE, _) => addrspace,
+                                (iface::IO_RING, _) => ioring,
+                                (iface::BLOCKING, _) => blocking,
+                                (iface::JIT, _) => jit,
+                                // e.g. SharedRegion: dynamic-mode only — never a manifest slot.
+                                _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+                            };
+                            svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                        })
+                        .collect();
+                    h.set_import_bindings(bindings);
+                }
                 Vec::new()
             }
             None => grant_powerbox_prefix(h, self.module.funcs[0].params.len(), win),

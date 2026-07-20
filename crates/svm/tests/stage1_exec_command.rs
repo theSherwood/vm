@@ -169,8 +169,8 @@ fn run_jit(cmd: &svm_ir::Module, argv: &[&[u8]]) -> JitOutcome {
 /// identically on both backends, the status tracking argv (real delivery, not a constant).
 #[test]
 fn shell_execs_compiled_command_and_collects_status() {
-    let cmd = svm_run::resolve_capability_imports(parse_module(&child_ir(CMD)).expect("parse cmd"))
-        .expect("resolve");
+    // Phase 3: keep the manifest — the op-13 spawn binds the child's slots.
+    let cmd = parse_module(&child_ir(CMD)).expect("parse cmd");
     verify_module(&cmd).expect("verify cmd");
     for argv in [&[b"cmd".as_slice()][..], &[b"cmd".as_slice(), b"hi"][..]] {
         let want = expected(argv);

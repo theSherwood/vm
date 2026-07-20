@@ -437,6 +437,32 @@ rule (§2.1).
   `svm-wasi` — its `bind` helper replaces `resolve_imports` + handle-arg —
   and the bench thunk/fast-resolver, which now map the
   `CAP_IMPORT_TYPE_ID` sentinel dispatch by arity).*
+- *`svm-llvm` — **landed.** `_start` synths dropped the by-name resolve
+  prologue and the `[0,32)` handle stash (paramless entry, zero prologue
+  instructions); every call site's vestigial handle operand is a dummy
+  const; `__vm_cap(i)` enumerates via `cap.self.get`;
+  `__vm_blocking_handle` resolves its name at the call site (the one true
+  handle-value read). The SharedRegion `map`/`unmap`/`page_size` builtins
+  moved to **dynamic mode** (`cap.call` on the live region handle, §2.2) —
+  only fixed-interface names remain manifest imports.*
+- *chibicc — **landed.** Same shape: no resolve prologue, no stash,
+  `dummy_handle()` operands, `__vm_cap` via `cap.self.get`, region ops in
+  dynamic mode, `__vm_blocking_handle` by-name at the call site.*
+- *Runtime/instantiation — **landed.** `svm_run::instantiate`, the CLI, and
+  `run_powerbox` keep the manifest for a named powerbox entry and bind each
+  slot in `grant_caps` (name → `(type_id, op)` via `default_cap_resolver`,
+  handle by interface); the legacy rewrite remains only for positional
+  entries (phase-4 deletion). The `cap_thunk`/`cap_thunk_locked` and the
+  tree-walker's special `Jit` servicing translate the
+  `CAP_IMPORT_TYPE_ID` sentinel through the binding table *before* their
+  interface interception (shared macro bodies — one implementation).
+  `svm-posix::bind` supersedes `resolve_bound` at its use sites. The
+  browser's on-ramp binds manifest modules (`onramp_prepare` keeps the
+  rewrite only for legacy positional blobs). **§2.1 child manifests:**
+  `ModuleGrant` retains the import list; an op-13 spawn binds the child's
+  slots against its granted powerbox on both backends
+  (`Host::bind_child_manifest`, the interp inline + the JIT's
+  `ChildManifestBinder` hook via `svm_run::child_bind_imports`).*
 
 **Phase 4 — deletions**: the **full §2.5 inventory** — the five headline
 conventions *and* the secondary machinery (the `synth_powerbox_start*`
