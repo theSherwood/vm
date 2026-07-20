@@ -1131,7 +1131,10 @@ pub fn compile_module_mixed_entry(
 /// and the transformed module must be the one **both** tiers use: the emitter reads it, and the host's
 /// `call_interp` runs the wrapper on the interpreter — the wrapper only exists in the outlined module.
 ///
-/// It outlines two host-boundary ops the same way: [`Inst::CapCall`] and [`Inst::CapSelfResolve`] (the
+/// It outlines three host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
+/// executable manifest import, IMPORTS.md phase 3 — the wrapper carries the `call.import` to the
+/// import-capable interpreter tier, so an import-bearing guest emits without resolution or rewrite),
+/// and [`Inst::CapSelfResolve`] (the
 /// §7 by-name capability lookup the powerbox `_start` synth uses at startup — `cap.self.resolve`). The
 /// latter matters for the on-ramp entry: `_start` is otherwise pure compute + stores, so hoisting its
 /// handful of `cap.self.resolve`s into cross-tier wrappers makes func 0 itself emittable — the last
@@ -1177,6 +1180,45 @@ pub fn outline_cap_calls(m: &mut Module) {
                         blocks: vec![block],
                     });
                     // Rewrite the call site to invoke the wrapper: prepend the handle to the op args.
+                    let mut call_args = Vec::with_capacity(1 + args.len());
+                    call_args.push(*handle);
+                    call_args.extend(args.iter().copied());
+                    *inst = Inst::Call {
+                        func: g,
+                        args: call_args,
+                    };
+                } else if let Inst::CallImport {
+                    import,
+                    sig,
+                    handle,
+                    args,
+                } = inst
+                {
+                    let g = base + wrappers.len() as u32;
+                    // Same wrapper shape as `cap.call`: (handle: i32, ...sig.params) -> sig.results.
+                    // The import index is an immediate, so it stays baked into the wrapper body; the
+                    // (vestigial) handle operand is threaded through like `cap.call`'s live one.
+                    let mut params = Vec::with_capacity(1 + sig.params.len());
+                    params.push(ValType::I32);
+                    params.extend(sig.params.iter().copied());
+                    let nparams = params.len() as u32;
+                    let wrapper_args: Vec<u32> = (1..nparams).collect();
+                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let block = Block {
+                        params: params.clone(),
+                        insts: vec![Inst::CallImport {
+                            import: *import,
+                            sig: sig.clone(),
+                            handle: 0,
+                            args: wrapper_args,
+                        }],
+                        term: Terminator::Return(ret),
+                    };
+                    wrappers.push(Func {
+                        params,
+                        results: sig.results.clone(),
+                        blocks: vec![block],
+                    });
                     let mut call_args = Vec::with_capacity(1 + args.len());
                     call_args.push(*handle);
                     call_args.extend(args.iter().copied());
@@ -1350,8 +1392,18 @@ fn emit_module(
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
 ) -> Result<Vec<u8>, Error> {
-    if !m.imports.is_empty() {
-        return Err(Error::Unsupported("unresolved imports"));
+    // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
+    // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
+    // must not happen is an import op surviving in a function this emitter actually lowers — the
+    // tierability classifier excludes them, so this is a belt-and-braces check, not a filter.
+    for &i in emitted {
+        for b in &m.funcs[i].blocks {
+            for inst in &b.insts {
+                if matches!(inst, Inst::CallImport { .. } | Inst::ImportAttach { .. }) {
+                    return Err(Error::Unsupported("import op in an emitted function"));
+                }
+            }
+        }
     }
     // `data` segments are *not* rejected: the emitted code only loads/stores, so the **host** must
     // materialize the module's data into the window before the run (as the interpreter's window
