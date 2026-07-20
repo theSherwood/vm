@@ -189,6 +189,7 @@ fn grant_hooks() -> GrantChildHooks {
     GrantChildHooks {
         build: svm_run::grant_child_build,
         build_named: svm_run::grant_named_child_build,
+        bind_imports: svm_run::child_bind_imports,
         release: svm_run::grant_child_release,
     }
 }
@@ -254,10 +255,8 @@ fn compiled_shell_execs_command_via_op13() {
     // Parse the shell raw — its imports (`__spawn`/`exec_*`/`stream_write`) are resolved per-run by
     // `resolver` against that run's handles, so the names must survive parsing.
     let shell = parse_module_raw(&c_to_ir(SHELL, false)).expect("parse shell");
-    let cmd = svm_run::resolve_capability_imports(
-        parse_module_raw(&c_to_ir(CMD, true)).expect("parse cmd"),
-    )
-    .expect("resolve cmd");
+    // Phase 3: keep the manifest — the op-13 spawn binds the child's slots.
+    let cmd = parse_module_raw(&c_to_ir(CMD, true)).expect("parse cmd");
     verify_module(&cmd).expect("verify cmd");
 
     for argv in [&["sh", "echo", "hi"][..], &["sh", "echo", "a", "bb"][..]] {

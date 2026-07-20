@@ -211,6 +211,7 @@ pub(crate) struct Nursery {
     grant_build: std::sync::atomic::AtomicUsize,
     grant_build_named: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
+    grant_bind_imports: std::sync::atomic::AtomicUsize,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -350,6 +351,7 @@ impl Nursery {
             grant_build: std::sync::atomic::AtomicUsize::new(0),
             grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
+            grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -358,13 +360,19 @@ impl Nursery {
     /// (like [`Self::set_durable`]), before any `instantiate_granted`/`instantiate_named` site can fire.
     /// `None` leaves them `0` (both ops stay an inert `CapFault`).
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r) = match hooks {
-            Some(h) => (h.build as usize, h.build_named as usize, h.release as usize),
-            None => (0, 0, 0),
+        let (b, bn, r, bi) = match hooks {
+            Some(h) => (
+                h.build as usize,
+                h.build_named as usize,
+                h.release as usize,
+                h.bind_imports as usize,
+            ),
+            None => (0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
+        self.grant_bind_imports.store(bi, Ordering::Release);
     }
 
     /// This nursery's §14 domain task id (`0` = root) — `instantiate` records it as a child's
@@ -1099,6 +1107,15 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     ) == 0
     {
         return 0; // `*trap_out` already set by the builder
+    }
+
+    // IMPORTS.md phase 3 / S2.1: bind the child module's import manifest against the powerbox just
+    // built, so its `call.import`s dispatch through instance bindings (the interpreter's inline
+    // spawn does the same via `Host::bind_child_manifest` — differential lockstep).
+    let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
+    if bind_addr != 0 {
+        let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
+        bind(rt.cap_ctx, gc.ctx, module);
     }
 
     // Compile the foreign module's entry confined to the carve, with the child powerbox ctx so its

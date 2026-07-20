@@ -5234,7 +5234,14 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
 /// A resolved §14 `Module` grant's pieces, as the eval loop carries them: the child module's
 /// functions, declared window size, and data segments (`Arc`s — spawning shares, never copies).
-type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>, bool, [u8; 32]);
+type ModArc = (
+    Arc<[Func]>,
+    Option<u8>,
+    Arc<[Data]>,
+    bool,
+    [u8; 32],
+    Arc<[svm_ir::Import]>,
+);
 
 /// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
 /// **awaiting a resume value** — i.e. parked at a `yield` (so the next `resume` delivers its argument
@@ -6015,6 +6022,129 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
             }
 
+            // The three guest-driven `Jit` ops serviced in the eval loop (not the generic
+            // host dispatch) are shared between their two dispatch forms — the resolved
+            // `cap.call` and the phase-3 executable `call.import` routed through the
+            // instance binding — as local macros, so the special semantics exist once.
+            macro_rules! jit_install_body {
+                ($h:expr, $args:expr) => {{
+                    let ch =
+                        get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
+                    let unit_funcs = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let domain = hg.resolve_jit_domain($h)?;
+                        let (cd, cu) = hg.resolve_jit_code(ch)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
+                    };
+                    // Append the unit to the **shared** domain table (module id = its 1-based
+                    // index) and fill the next empty slot — visible at once to every vCPU of the
+                    // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
+                    // so the first install lands at the same index the JIT's `install` returns.
+                    let res = match dt.install(unit_funcs) {
+                        Some(slot) => slot as i64,
+                        None => ENOSPC,
+                    };
+                    frames[top].vals.push(Reg::from_i64(res));
+                }};
+            }
+            macro_rules! jit_uninstall_body {
+                ($h:expr, $args:expr) => {{
+                    {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.resolve_jit_domain($h)?; // authority: a forged handle is inert
+                    }
+                    let slot = get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64()
+                        as usize;
+                    // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
+                    // function count) — `dt.uninstall` enforces the range + filled checks.
+                    let res = if dt.uninstall(slot, funcs.len()) {
+                        0
+                    } else {
+                        EINVAL
+                    };
+                    frames[top].vals.push(Reg::from_i64(res));
+                }};
+            }
+            macro_rules! jit_invoke_body {
+                ($h:expr, $args:expr, $sig:expr) => {{
+                    // arg0 = the CompiledCode handle; the rest are the invoke args. Args cross in
+                    // the i64-slot ABI (the handle rides the low 32 bits of its slot, like every
+                    // handle-as-arg — e.g. the Instantiator's module ops), so read it as a slot.
+                    let ch =
+                        get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
+                    let unit_funcs = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let domain = hg.resolve_jit_domain($h)?;
+                        let (cd, cu) = hg.resolve_jit_code(ch)?;
+                        // A code handle is only valid on the domain that compiled it.
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
+                    };
+                    let entry = unit_funcs.first().ok_or(Trap::CapFault)?;
+                    // Strict arity: the cap.call's declared signature must match the unit entry's
+                    // (minus the code-handle arg) — fail-closed, identically on the JIT path.
+                    if $sig.params.len() != entry.params.len() + 1
+                        || $sig.results.len() != entry.results.len()
+                    {
+                        return Err(Trap::CapFault);
+                    }
+                    // Marshal the invoke args through the i64-slot ABI (value → slot → entry-typed),
+                    // exactly the JIT trampoline's decode.
+                    let mut child_args = Vec::with_capacity(entry.params.len());
+                    for (a, ty) in $args[1..].iter().zip(entry.params.clone()) {
+                        let slot = get(&frames[top].vals, *a)?.i64();
+                        child_args.push(slot_to_val(ty, slot));
+                    }
+                    // Nested run over the SAME window/fuel/powerbox: move them into an
+                    // inline-driven child vCPU (like a §14 coroutine, but sharing the window) and
+                    // move them back whatever the outcome — the parent's snapshot/teardown still
+                    // needs them after a trap.
+                    let child_mem = mem.take();
+                    // The unit runs over the parent's world: module 0 = this vCPU's program and the
+                    // **shared, live** domain table, so the unit's `call_indirect` reaches the
+                    // original program (new→old) and any installed units (new→new, incl. one it
+                    // installs during its own invocation), matching the JIT's invoked code over the
+                    // live `fn_table`. A nested invoke costs call depth like a call, so invoke
+                    // recursion is bounded by the same stack-overflow bound as ordinary recursion.
+                    let mut child = VCpu::new_invoke(
+                        Arc::clone(&funcs),
+                        Arc::clone(dt),
+                        unit_funcs,
+                        &child_args,
+                        child_mem,
+                        Arc::clone(host),
+                        *fuel,
+                        depth + frames.len() as u32 + 1,
+                        sched.clone(),
+                        spawn_quota,
+                    );
+                    child.memop = memop;
+                    let out = run_inner(&mut child, u64::MAX);
+                    *mem = child.mem.take();
+                    *fuel = child.fuel;
+                    match out {
+                        Ok(Inner::Done(results)) => {
+                            // Results cross back as slots (arity already checked equal).
+                            for (v, ty) in results.iter().zip(&$sig.results) {
+                                frames[top]
+                                    .vals
+                                    .push(Reg::from_value(slot_to_val(*ty, val_to_slot(*v))));
+                            }
+                        }
+                        // The unit cannot park/yield (concurrency is rejected at compile);
+                        // defensive fail-closed.
+                        Ok(_) => return Err(Trap::CapFault),
+                        // A trap in invoked code is terminal for the domain (DESIGN.md §22),
+                        // matching the JIT's trap-cell propagation.
+                        Err(t) => return Err(t),
+                    }
+                }};
+            }
             match inst {
                 // Non-tail calls push a new frame and switch to it; the callee's results
                 // are appended to this frame's `vals` when it returns (see `Return`).
@@ -6165,6 +6295,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     g.data.clone(),
                                     g.durable,
                                     g.digest,
+                                    g.imports.clone(),
                                 )
                             };
                             (
@@ -6256,6 +6387,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     g.data.clone(),
                                     g.durable,
                                     g.digest,
+                                    g.imports.clone(),
                                 )
                             };
                             let grants_ptr =
@@ -6287,7 +6419,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => (o, None, 0, None, Vec::new()),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _)| f);
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _, _)| f);
                     match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
@@ -6333,7 +6465,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -6345,7 +6477,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // snapshottable as a unit. A same-module child (`None`) runs the
                             // parent's own (already instrumented) funcs — always admissible.
                             let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _)| *d);
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6362,7 +6494,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // bounded them to its declared window == the carve). RO protection of
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
-                                if let (Some((_, _, data, _, _)), Some(m)) =
+                                if let (Some((_, _, data, _, _, _)), Some(m)) =
                                     (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
@@ -6410,6 +6542,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // S2 named grant list (op 11): install each re-granted cap into the child
                                 // **under its name** (so the child resolves it by `cap.self.resolve`).
                                 // Empty for every other op.
+                                let mut named_child: Vec<i32> = Vec::new();
                                 for (name, gh) in &named {
                                     let cg = {
                                         let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -6417,7 +6550,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     };
                                     if let Some(cg) = cg {
                                         ch.register_cap_name(name, cg);
+                                        named_child.push(cg);
                                     }
+                                }
+                                // IMPORTS.md phase 3 / S2.1: bind the child module's import
+                                // manifest against its granted powerbox (the shared reference
+                                // policy on Host — same one the JIT's child builders call).
+                                if let Some((_, _, _, _, _, cimports)) = &child_mod {
+                                    ch.bind_child_manifest(cimports);
                                 }
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let mut child_args = vec![Value::I64(cinst as i64)];
@@ -6435,7 +6575,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 };
                                 let cfuncs = child_mod.as_ref().map_or_else(
                                     || Arc::clone(&funcs),
-                                    |(f, _, _, _, _)| Arc::clone(f),
+                                    |(f, _, _, _, _, _)| Arc::clone(f),
                                 );
                                 let csched = sched.clone();
                                 // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
@@ -6518,7 +6658,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             entry: entry as u32,
                                             module_digest: child_mod
                                                 .as_ref()
-                                                .map(|(_, _, _, _, d)| *d),
+                                                .map(|(_, _, _, _, d, _)| *d),
                                         });
                                         frames[top]
                                             .vals
@@ -6571,7 +6711,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // transparency), exactly as for `instantiate_module`.
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -6579,7 +6719,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // §4 enforcement, exactly as for `instantiate`: a durable domain
                             // admits only freezable (durable-attested) separate-module children.
                             let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _)| *d);
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6600,7 +6740,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // in the parent's backing while the child's pages start unmapped — so
                                 // a plugin's data segments are *supplied lazily*, page by page, as it
                                 // first touches them (the §14 parent-as-pager model, for free).
-                                if let (Some((_, _, data, _, _)), Some(m)) =
+                                if let (Some((_, _, data, _, _, _)), Some(m)) =
                                     (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
@@ -6627,7 +6767,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let cfuncs = child_mod.as_ref().map_or_else(
                                     || Arc::clone(&funcs),
-                                    |(f, _, _, _, _)| Arc::clone(f),
+                                    |(f, _, _, _, _, _)| Arc::clone(f),
                                 );
                                 // A co-fiber child is its own domain → its own dispatch table.
                                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
@@ -6787,26 +6927,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     ..
                 } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let ch =
-                        get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let unit_funcs = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                        let domain = hg.resolve_jit_domain(h)?;
-                        let (cd, cu) = hg.resolve_jit_code(ch)?;
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
-                    };
-                    // Append the unit to the **shared** domain table (module id = its 1-based
-                    // index) and fill the next empty slot — visible at once to every vCPU of the
-                    // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
-                    // so the first install lands at the same index the JIT's `install` returns.
-                    let res = match dt.install(unit_funcs) {
-                        Some(slot) => slot as i64,
-                        None => ENOSPC,
-                    };
-                    frames[top].vals.push(Reg::from_i64(res));
+                    jit_install_body!(h, args)
                 }
                 // `Jit.uninstall(slot)` (iface 11 op 4, DESIGN.md §22 reclaim): clear a
                 // previously-installed table slot so the index is reusable and a stale
@@ -6821,20 +6942,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     ..
                 } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                        hg.resolve_jit_domain(h)?; // authority: a forged handle is inert
-                    }
-                    let slot = get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64()
-                        as usize;
-                    // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
-                    // function count) — `dt.uninstall` enforces the range + filled checks.
-                    let res = if dt.uninstall(slot, funcs.len()) {
-                        0
-                    } else {
-                        EINVAL
-                    };
-                    frames[top].vals.push(Reg::from_i64(res));
+                    jit_uninstall_body!(h, args)
                 }
                 Inst::CapCall {
                     type_id: iface::JIT,
@@ -6844,79 +6952,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     sig,
                 } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    // arg0 = the CompiledCode handle; the rest are the invoke args. Args cross in
-                    // the i64-slot ABI (the handle rides the low 32 bits of its slot, like every
-                    // handle-as-arg — e.g. the Instantiator's module ops), so read it as a slot.
-                    let ch =
-                        get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let unit_funcs = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                        let domain = hg.resolve_jit_domain(h)?;
-                        let (cd, cu) = hg.resolve_jit_code(ch)?;
-                        // A code handle is only valid on the domain that compiled it.
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
-                    };
-                    let entry = unit_funcs.first().ok_or(Trap::CapFault)?;
-                    // Strict arity: the cap.call's declared signature must match the unit entry's
-                    // (minus the code-handle arg) — fail-closed, identically on the JIT path.
-                    if sig.params.len() != entry.params.len() + 1
-                        || sig.results.len() != entry.results.len()
-                    {
-                        return Err(Trap::CapFault);
-                    }
-                    // Marshal the invoke args through the i64-slot ABI (value → slot → entry-typed),
-                    // exactly the JIT trampoline's decode.
-                    let mut child_args = Vec::with_capacity(entry.params.len());
-                    for (a, ty) in args[1..].iter().zip(entry.params.clone()) {
-                        let slot = get(&frames[top].vals, *a)?.i64();
-                        child_args.push(slot_to_val(ty, slot));
-                    }
-                    // Nested run over the SAME window/fuel/powerbox: move them into an
-                    // inline-driven child vCPU (like a §14 coroutine, but sharing the window) and
-                    // move them back whatever the outcome — the parent's snapshot/teardown still
-                    // needs them after a trap.
-                    let child_mem = mem.take();
-                    // The unit runs over the parent's world: module 0 = this vCPU's program and the
-                    // **shared, live** domain table, so the unit's `call_indirect` reaches the
-                    // original program (new→old) and any installed units (new→new, incl. one it
-                    // installs during its own invocation), matching the JIT's invoked code over the
-                    // live `fn_table`. A nested invoke costs call depth like a call, so invoke
-                    // recursion is bounded by the same stack-overflow bound as ordinary recursion.
-                    let mut child = VCpu::new_invoke(
-                        Arc::clone(&funcs),
-                        Arc::clone(dt),
-                        unit_funcs,
-                        &child_args,
-                        child_mem,
-                        Arc::clone(host),
-                        *fuel,
-                        depth + frames.len() as u32 + 1,
-                        sched.clone(),
-                        spawn_quota,
-                    );
-                    child.memop = memop;
-                    let out = run_inner(&mut child, u64::MAX);
-                    *mem = child.mem.take();
-                    *fuel = child.fuel;
-                    match out {
-                        Ok(Inner::Done(results)) => {
-                            // Results cross back as slots (arity already checked equal).
-                            for (v, ty) in results.iter().zip(&sig.results) {
-                                frames[top]
-                                    .vals
-                                    .push(Reg::from_value(slot_to_val(*ty, val_to_slot(*v))));
-                            }
-                        }
-                        // The unit cannot park/yield (concurrency is rejected at compile);
-                        // defensive fail-closed.
-                        Ok(_) => return Err(Trap::CapFault),
-                        // A trap in invoked code is terminal for the domain (DESIGN.md §22),
-                        // matching the JIT's trap-cell propagation.
-                        Err(t) => return Err(t),
-                    }
+                    jit_invoke_body!(h, args, sig)
                 }
                 Inst::CapCall {
                     type_id,
@@ -6950,6 +6986,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // rewritten; the handle operand is vestigial (the binding carries the handle), so
                 // it is not read. Same shared host entry as the JIT thunk and the bytecode engine,
                 // so all three backends agree over one implementation.
+                // IMPORTS.md phase 3: an executable import bound to the guest-driven `Jit`
+                // interface must reach the special servicing above (invoke runs guest code;
+                // install/uninstall mutate the shared dispatch table — none reachable from the
+                // generic host dispatch). Route by the instance binding; the vestigial handle
+                // operand is ignored (the binding carries the real handle).
+                Inst::CallImport {
+                    import, sig, args, ..
+                } if matches!(
+                    host.lock().unwrap_or_else(|e| e.into_inner()).import_binding(*import),
+                    Some(b) if b.type_id == iface::JIT && matches!(b.op, 1 | 3 | 4)
+                ) =>
+                {
+                    let b = host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .import_binding(*import)
+                        .ok_or(Trap::CapFault)?;
+                    let h = b.handle;
+                    match b.op {
+                        3 => jit_install_body!(h, args),
+                        4 => jit_uninstall_body!(h, args),
+                        _ => jit_invoke_body!(h, args, sig),
+                    }
+                }
                 Inst::CallImport {
                     import, sig, args, ..
                 } => {
@@ -10126,6 +10186,10 @@ struct ModuleGrant {
     memory_log2: Option<u8>,
     data: Arc<[Data]>,
     exports: Arc<[svm_ir::Export]>,
+    /// The module's import manifest (IMPORTS.md phase 3 / S2.1): retained so a child spawn can
+    /// bind each slot against the child's granted powerbox - the child executes `call.import`
+    /// through these bindings; nothing is rewritten and no handle is stashed in its window.
+    imports: Arc<[svm_ir::Import]>,
     /// DURABILITY.md §4: the granting host attests this module is **freezable** (it ran
     /// `svm_durable::transform_module` on it — a compile-mode fact only the host knows, like
     /// verification). A durable domain refuses to instantiate a grant without this bit, so its
@@ -10209,6 +10273,76 @@ impl Host {
     /// granted handle. An executable [`svm_ir::CAP_IMPORT_TYPE_ID`] dispatch translates through it,
     /// so a `call.import` runs without the module ever being rewritten. Host-controlled only (the
     /// guest cannot reach this); an unbound index is a `CapFault` at use, fail-closed.
+    /// The import manifest of a granted §14 `Module`, or `None` for a forged/closed handle. The
+    /// JIT's op-13 child builder reads it (via `svm_run::child_bind_imports`) to bind the child's
+    /// slots — the same manifest the interpreter's inline spawn reads from its `ModuleGrant`.
+    pub fn module_imports(&self, handle: i32) -> Option<Arc<[svm_ir::Import]>> {
+        self.resolve_module(handle).ok().map(|g| g.imports.clone())
+    }
+
+    /// S2.1 / IMPORTS.md phase 3: bind a **child** module's import manifest against this (child)
+    /// host's granted powerbox, so the child's `call.import`s dispatch through instance bindings —
+    /// no rewrite, no window stash. The reference child policy mirrors the fixed powerbox names
+    /// (`write`/`read`/`exit`); each resolved slot binds the first granted cap of the matching
+    /// interface, in grant order (the auto-granted Instantiator/AddressSpace occupy slots 0/1, so
+    /// an S2 grant or named grant is found first for Stream/Exit). A name outside the policy, or
+    /// an interface the child was not granted, leaves the slot unbound — fail-closed at dispatch.
+    /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
+    /// lockstep).
+    pub fn bind_child_manifest(&mut self, imports: &[svm_ir::Import]) {
+        if imports.is_empty() {
+            return;
+        }
+        let policy = |name: &str| match name {
+            "write" => Some((iface::STREAM, 1u32)),
+            "read" => Some((iface::STREAM, 0u32)),
+            "exit" => Some((iface::EXIT, 0u32)),
+            _ => None,
+        };
+        let first_of = |h: &Host, tid: u32| -> Option<i32> {
+            (0..CAP).find_map(|slot| {
+                let st = &h.table[slot];
+                (st.entry.is_some() && st.type_id == tid)
+                    .then_some(((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32)
+            })
+        };
+        let bindings = imports
+            .iter()
+            .map(|im| {
+                let Some((tid, iop)) = policy(&im.name) else {
+                    return BoundImport::rebindable(0, 0, None);
+                };
+                match first_of(self, tid) {
+                    Some(c) => BoundImport::required(tid, iop, c),
+                    None => BoundImport::rebindable(0, 0, None),
+                }
+            })
+            .collect();
+        self.set_import_bindings(bindings);
+    }
+
+    /// The interface `type_id` behind a live handle, or `None` for a forged/closed one. Used by
+    /// the child-spawn manifest binding (S2.1) to select which granted child cap satisfies an
+    /// import's interface.
+    pub fn type_id_of(&self, handle: i32) -> Option<u32> {
+        let h = handle as u32;
+        let slot = (h as usize) & (CAP - 1);
+        let gen = h >> CAP_LOG2;
+        let st = &self.table[slot];
+        (st.entry.is_some() && (st.generation & GEN_MASK) == gen).then_some(st.type_id)
+    }
+
+    /// Read import slot `i`'s live binding (IMPORTS.md phase 1): `Some` only when the slot is
+    /// bound. Used by embedder thunks and the eval loop's special-op routing to translate a
+    /// `CAP_IMPORT_TYPE_ID` dispatch *before* an interface-specific interception — the same
+    /// translation [`Host::cap_dispatch_slots`] applies internally.
+    pub fn import_binding(&self, i: u32) -> Option<BoundImport> {
+        self.import_bindings
+            .get(i as usize)
+            .copied()
+            .filter(|b| b.bound)
+    }
+
     pub fn set_import_bindings(&mut self, bindings: Vec<BoundImport>) {
         debug_assert!(
             bindings
@@ -10935,6 +11069,7 @@ impl Host {
             memory_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone().into(),
             exports: m.exports.clone().into(),
+            imports: m.imports.clone().into(),
             durable,
             digest: module_digest(m),
         });

@@ -1405,7 +1405,7 @@ fn powerbox_diff_cc_flags(
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc program must produce a named-export powerbox entry (paramless _start, S15 c)"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR");
     let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run");
 
@@ -1467,7 +1467,7 @@ fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&s
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
     let t = svm_llvm::translate_ll_path(&bc).expect("translate bitcode");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR");
     let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
     let envv: Vec<&[u8]> = env.iter().map(|s| s.as_bytes()).collect();
@@ -1742,7 +1742,7 @@ fn libm_bundled_vs_native() {
 
     // Guest: translate → resolve caps → verify → run (JIT via the powerbox).
     let t = svm_llvm::translate_ll_path(&linked).expect("translate bundled libm");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify libm module");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run libm");
     assert!(
@@ -1972,7 +1972,7 @@ fn quickjs_diff(driver_rel: &str, stdin: &[u8]) {
     );
     // Guest: translate → resolve caps → verify → run under the powerbox with the same stdin, diff.
     let t = svm_llvm::translate_ll_path(&linked).expect("translate quickjs");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify quickjs module");
     let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run quickjs");
     assert_eq!(
@@ -2114,7 +2114,7 @@ fn demo_quickjs_bigint_vs_native() {
         ..Default::default()
     };
     let t = svm_llvm::translate_ll_path_with_options(&linked, opts).expect("translate bigint");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify bigint module");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run bigint");
     assert_eq!(
@@ -3541,7 +3541,7 @@ fn run_sqllogictest(max_scripts: usize) {
     }
 
     let t = svm_llvm::translate_ll_path(&bc).expect("translate sqllogictest runner");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify");
 
     for (name, path) in scripts {
@@ -4673,7 +4673,7 @@ fn demo_pg_procstub() {
         }
     }
     let t = svm_llvm::translate_ll_path(&bc).expect("translate pg_proc bitcode");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     let expected = "\
@@ -5241,7 +5241,7 @@ fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a threads/libc program must produce a powerbox entry"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR");
     let run =
         svm_run::run_powerbox_with_deadline(&module, b"", Some(std::time::Duration::from_secs(60)))
@@ -5509,7 +5509,7 @@ fn atomics_narrow_lowers_and_runs() {
         cas_loops >= 2,
         "expected the rmw + cas narrow helpers, got {cas_loops}"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     assert_eq!(run.stdout, b"175 50 1 0 123 5464\n");
@@ -5562,7 +5562,7 @@ fn atomics_wide_lowers_and_runs() {
         has_atomic,
         "expected native atomic ops in the lowered module"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     assert_eq!(run.stdout, b"10 100 1 0 99 1000000000001\n");
@@ -5600,7 +5600,7 @@ fn unresolved_extern_stub_opt_in() {
     }
     // Opt-in: translates + verifies, and runs to a clean exit — the dead stub never executes.
     let t = svm_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify stubbed module");
     let run = svm_run::run_powerbox(&module, b"").expect("run (dead stub inert)");
     assert_eq!(
@@ -5619,7 +5619,7 @@ fn unresolved_extern_stub_opt_in() {
         return;
     };
     let t2 = svm_llvm::translate_ll_path_with_options(&bc2, stub).expect("stub translate 2");
-    let module2 = svm_run::resolve_capability_imports(t2.module).expect("resolve caps 2");
+    let module2 = t2.module; // phase 3: no rewrite
     svm_verify::verify_module(&module2).expect("verify stubbed module 2");
     assert!(
         svm_run::run_powerbox(&module2, b"").is_err(),
@@ -5656,7 +5656,7 @@ fn stub_trap_names_the_extern() {
             .is_some_and(|d| d.func_names.iter().any(|f| f.name == "frobnicate_widget")),
         "the stub must be named with its missing extern in debug_info.func_names"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify stubbed module");
     let run = module
         .exports
@@ -5741,7 +5741,7 @@ fn unresolved_extern_funcptr_stub() {
         }
     }
     let t = svm_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify funcptr-stub module");
     let run = svm_run::run_powerbox(&module, b"").expect("run (funcref stub inert)");
     assert_eq!(
@@ -6301,7 +6301,7 @@ fn tail_call_lowers_and_runs() {
         n_tail >= 2,
         "expected ≥2 return_call terminators (even/odd tail calls), got {n_tail}"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR"); // checks return_call shape
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run"); // 2M-deep, constant stack
     assert_eq!(run.stdout, b"1 1\n", "mutual tail recursion result");
@@ -6756,7 +6756,7 @@ int main(void) {
         svm_run::is_named_powerbox_entry(&m),
         "a Memory-builtin program must produce a powerbox entry (granting the Memory handle)"
     );
-    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify resolved IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     assert_eq!(
@@ -7184,12 +7184,49 @@ fn grant_powerbox(
         h.grant_blocking(block, None),
         h.grant_jit(mem_log2),
     ];
-    // S15 (c): the paramless `_start` resolves each cap **by name**, so register the granted prefix
-    // under its canonical name (the entry runs with `&[]`, not these as positional args).
+    // Register each granted cap under its canonical name (`cap.self.resolve` — the discovery tier;
+    // `__vm_blocking_handle` and `__vm_cap_resolve` use it). The entry runs with `&[]`.
     for (name, &handle) in svm_ir::POWERBOX_CAP_NAMES.iter().zip(&all[..n]) {
         h.register_cap_name(name, handle);
     }
     all[..n].iter().map(|&x| Value::I32(x)).collect()
+}
+
+/// Bind `m`'s import manifest against the powerbox handles [`grant_powerbox`] granted (IMPORTS.md
+/// phase 3): import `i`'s name maps to `(type_id, op)` via `svm_run::default_cap_resolver` and to
+/// the granted handle by interface — the same mapping `svm_run`'s `grant_caps` installs. Call after
+/// `grant_powerbox` for any harness that drives `run_with_host` directly.
+fn bind_powerbox_imports(h: &mut svm_interp::Host, m: &svm_ir::Module, granted: &[Value]) {
+    use svm_interp::iface;
+    if m.imports.is_empty() {
+        return;
+    }
+    let hv = |i: usize| match granted.get(i) {
+        Some(Value::I32(x)) => *x,
+        _ => 0,
+    };
+    let bindings = m
+        .imports
+        .iter()
+        .map(|im| {
+            let Some(cap) = svm_run::default_cap_resolver(&im.name) else {
+                return svm_interp::BoundImport::rebindable(0, 0, None);
+            };
+            let handle = match (cap.type_id, cap.op) {
+                (iface::STREAM, 1) => hv(0),
+                (iface::STREAM, _) => hv(1),
+                (iface::EXIT, _) => hv(2),
+                (iface::MEMORY, _) => hv(3),
+                (iface::ADDRESS_SPACE, _) => hv(4),
+                (iface::IO_RING, _) => hv(5),
+                (iface::BLOCKING, _) => hv(6),
+                (iface::JIT, _) => hv(7),
+                _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+            };
+            svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+        })
+        .collect();
+    h.set_import_bindings(bindings);
 }
 
 /// The host's deterministic `Blocking.work(i)` result (mirrors `svm_interp::AsyncState::mix`, the
@@ -7222,22 +7259,21 @@ fn vm_async_io_runtime() {
         import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
         "expected async-ring imports, got {import_names:?}"
     );
-    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify resolved IR");
-    // The paramless `_start` resolves its 7 handles by name (S15 c) — count the `cap.self.resolve`s.
+    // Phase 3: `_start` has **no** resolve prologue — the manifest is the declaration and the host
+    // binds slots at instantiation.
     let ncaps = module.funcs[0].blocks[0]
         .insts
         .iter()
         .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
         .count();
-    assert_eq!(
-        ncaps, 7,
-        "async program must resolve the 7-handle powerbox by name"
-    );
+    assert_eq!(ncaps, 0, "phase 3: no resolve prologue in _start");
 
     let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut h = svm_interp::Host::new();
-    grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
+    let granted = grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
+    bind_powerbox_imports(&mut h, &module, &granted);
     let mut fuel = 500_000_000u64;
     let out =
         svm_interp::run_with_host(&module, 0, &[], &mut fuel, &mut h).expect("interp async run");
@@ -7278,22 +7314,21 @@ fn vm_async_work_stealing_runtime() {
         import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
         "expected async-ring imports, got {import_names:?}"
     );
-    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify resolved IR");
-    // The paramless `_start` resolves its 7 handles by name (S15 c) — count the `cap.self.resolve`s.
+    // Phase 3: `_start` has **no** resolve prologue — the manifest is the declaration and the host
+    // binds slots at instantiation.
     let ncaps = module.funcs[0].blocks[0]
         .insts
         .iter()
         .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
         .count();
-    assert_eq!(
-        ncaps, 7,
-        "async program must resolve the 7-handle powerbox by name"
-    );
+    assert_eq!(ncaps, 0, "phase 3: no resolve prologue in _start");
 
     let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut h = svm_interp::Host::new();
-    grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
+    let granted = grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
+    bind_powerbox_imports(&mut h, &module, &granted);
     let mut fuel = 1_000_000_000u64;
     let out =
         svm_interp::run_with_host(&module, 0, &[], &mut fuel, &mut h).expect("interp async run");
@@ -7322,18 +7357,21 @@ int main(void) { return (__vm_cap(6) == __vm_blocking_handle()) ? 7 : 0; }
     let Some((m, _)) = translate_verified("vm_cap_tail", src) else {
         return;
     };
+    // Phase 3: no resolve prologue — `__vm_blocking_handle` resolves at its call site, so exactly
+    // one `cap.self.resolve` appears in the whole module (in `main`, not `_start`).
     assert_eq!(
         m.funcs[0].blocks[0]
             .insts
             .iter()
             .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
             .count(),
-        7,
-        "a Blocking-handle program resolves the 7-handle powerbox by name"
+        0,
+        "phase 3: no resolve prologue in _start"
     );
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut h = svm_interp::Host::new();
-    grant_powerbox(&mut h, win, 7, std::time::Duration::ZERO);
+    let granted = grant_powerbox(&mut h, win, 7, std::time::Duration::ZERO);
+    bind_powerbox_imports(&mut h, &m, &granted);
     let mut fuel = 50_000_000u64;
     let r = svm_interp::run_with_host(&m, 0, &[], &mut fuel, &mut h).expect("interp run");
     assert_eq!(
@@ -7396,11 +7434,11 @@ int main(void) {
             .iter()
             .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
             .count(),
-        8,
-        "the Jit handle is the last VM_CAP_* index → the full 8-handle powerbox, resolved by name"
+        0,
+        "phase 3: no resolve prologue — the manifest declares the Jit imports"
     );
     // Resolves + re-verifies (every `CallImport` binds to the `Jit` capability).
-    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify resolved IR");
 }
 
@@ -7451,7 +7489,7 @@ long __vm_jit_uninstall(long slot);\n";
     let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
-    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify resolved IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     let out = String::from_utf8_lossy(&run.stdout);
@@ -7504,10 +7542,10 @@ fn vm_jit_threads_demo() {
             .iter()
             .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
             .count(),
-        8,
-        "a Jit-using program resolves the full 8-handle powerbox by name"
+        0,
+        "phase 3: no resolve prologue — the manifest declares the Jit imports"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify resolved IR");
     let run =
         svm_run::run_powerbox_with_deadline(&module, b"", Some(std::time::Duration::from_secs(60)))
@@ -7563,18 +7601,19 @@ int main(void) {
     let m = svm_llvm::translate_ll_path(&bc)
         .expect("translate bitcode")
         .module;
-    // Structural: the SharedRegion ops became their `CallImport`s, and the entry grants through
-    // AddressSpace (5 handles: stdout, stdin, exit, memory, addrspace).
+    // Structural (phase 3): `vm_region_create` (fixed AddressSpace interface) is a manifest
+    // import; map/unmap/page_size dispatch on the runtime-minted region handle — the *dynamic*
+    // addressing mode (`cap.call`), so they declare no import. And `_start` has no resolve
+    // prologue: the manifest binds at instantiation.
     let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
-    for want in [
-        "vm_region_create",
-        "vm_region_map",
-        "vm_region_unmap",
-        "vm_region_page_size",
-    ] {
+    assert!(
+        imports.contains(&"vm_region_create"),
+        "missing region import vm_region_create: {imports:?}"
+    );
+    for gone in ["vm_region_map", "vm_region_unmap", "vm_region_page_size"] {
         assert!(
-            imports.contains(&want),
-            "missing region import {want}: {imports:?}"
+            !imports.contains(&gone),
+            "{gone} is dynamic-mode (cap.call) — it must not be a manifest import: {imports:?}"
         );
     }
     assert_eq!(
@@ -7583,10 +7622,10 @@ int main(void) {
             .iter()
             .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
             .count(),
-        5,
-        "a region-minting program grants through the AddressSpace handle (5-handle entry, by name)"
+        0,
+        "phase 3: no resolve prologue in _start"
     );
-    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify resolved IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     assert_eq!(
@@ -7686,7 +7725,7 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR");
     let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run");
     assert_eq!(
@@ -7720,7 +7759,7 @@ fn check_cpp_eh_terminates(name: &str, src: &str) {
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated IR");
     let r = svm_run::run_powerbox(&module, b"");
     assert!(
@@ -8422,7 +8461,7 @@ fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> 
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: a heap-allocating Rust program must produce a powerbox entry"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated Rust IR");
     Some(
         svm_run::run_powerbox(&module, stdin)
@@ -9369,7 +9408,7 @@ fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
         svm_run::is_named_powerbox_entry(&t.module),
         "{name}: an alloc program must produce a powerbox entry (Memory granted)"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     svm_verify::verify_module(&module).expect("verify translated Rust IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     Some(match run.outcome {

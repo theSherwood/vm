@@ -74,7 +74,8 @@ fn peval_specialize_runs_in_sandbox_and_matches_host() {
         svm_run::is_named_powerbox_entry(&t.module),
         "the probe must produce a powerbox entry"
     );
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    // Phase 3 (IMPORTS.md): the manifest stays; `run_powerbox` binds each slot at instantiation.
+    let module = t.module;
     svm_verify::verify_module(&module).expect("verify the translated specializer");
 
     let run = svm_run::run_powerbox_with_deadline(

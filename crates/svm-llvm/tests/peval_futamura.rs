@@ -30,7 +30,8 @@ fn peval_guest_specializes_interpreter_and_jits_in_sandbox() {
         .size_log2;
     eprintln!("guest window size_log2 = {win_log2}");
 
-    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    // Phase 3 (IMPORTS.md): the manifest stays; `run_powerbox` binds each slot at instantiation.
+    let module = t.module;
     svm_verify::verify_module(&module).expect("verify the translated guest");
 
     let win_arg = win_log2.to_string();

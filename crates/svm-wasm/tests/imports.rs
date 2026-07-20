@@ -1,16 +1,17 @@
-//! Differential tests for **function imports / the host ABI** (the wasm `call` → SVM `cap.call`
-//! lowering). A wasm import binds to a capability by the convention `module` = decimal `type_id`,
-//! `name` = decimal `op`; the transpiler threads one capability handle **per distinct import
-//! interface (module)** as the leading params of every function, and the embedder grants one
-//! capability per interface and passes their handles as the entry's leading arguments (in
-//! first-appearance order). These tests run a transpiled import-using module on **both** backends
-//! under one reference `Host`, asserting they agree — and against a hand-computed oracle.
+//! Differential tests for **function imports / the host ABI** (the wasm `call` → SVM `call.import`
+//! lowering, IMPORTS.md phase 3). Every wasm function import becomes one named entry in the module's
+//! import manifest — `"<module>.<name>"`, for the numeric `module`=type_id/`name`=op convention and
+//! §7 named imports alike — and the host binds each slot before entry ([`Host::set_import_bindings`];
+//! slot `i` = import `i`). Nothing is threaded through the guest: functions carry exactly their wasm
+//! signatures, and a spawned thread's imports dispatch through the same instance bindings. These
+//! tests run a transpiled import-using module on **both** backends under one reference `Host`,
+//! asserting they agree — and against a hand-computed oracle.
 //!
 //! Unlike `transpile.rs`'s capability-free `run`/`eval`, these need a powerbox: the interpreter via
 //! `run_with_host`, the JIT via `compile_and_run_with_host` over the production `svm_run::cap_thunk`.
 
 use std::ffi::c_void;
-use svm_interp::{run_with_host, Host, Value};
+use svm_interp::{run_with_host, BoundImport, Host, Value};
 use svm_jit::{compile_and_run_with_host, JitOutcome};
 
 /// Serialize this binary's tests (ISSUES.md I4). `spawn_alongside_capability_import` runs 6 real
@@ -24,15 +25,16 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Transpile WAT importing one capability, verify, then run export `entry` on interp + JIT under a
-/// `Host` the same `grant` populates on each (so the handle encoding matches). The granted handle is
-/// passed as the leading argument (the threaded capability handle), followed by `extra_args`. Asserts
-/// the single i64/i32 result agrees across backends and returns it.
+/// Transpile WAT with capability imports, verify, then run export `entry` on interp + JIT under a
+/// `Host` the same `bind` populates on each — granting the capabilities and returning the manifest
+/// bindings in import order, which are installed with [`Host::set_import_bindings`] (slot `i` =
+/// import `i`; no handle args, the phase-3 ABI). Asserts the single i64/i32 result agrees across
+/// backends and returns it.
 fn run_import(
     wat: &str,
     entry: &str,
-    grant: impl Fn(&mut Host) -> i32,
-    extra_args: &[Value],
+    bind: impl Fn(&mut Host) -> Vec<BoundImport>,
+    args: &[Value],
 ) -> i64 {
     let wasm = wat::parse_str(wat).expect("assemble wat");
     let t = svm_wasm::transpile(&wasm).expect("transpile");
@@ -44,24 +46,27 @@ fn run_import(
         .unwrap_or_else(|| panic!("no export {entry}"))
         .1;
 
-    // Interpreter: grant the cap, pass its handle (i32) as the entry's leading arg.
+    // Interpreter: grant the caps and bind the manifest slots; the entry takes only its wasm params.
     let mut hi = Host::new();
-    let h = grant(&mut hi);
-    let mut iargs: Vec<Value> = vec![Value::I32(h)];
-    iargs.extend_from_slice(extra_args);
+    let bi = bind(&mut hi);
+    hi.set_import_bindings(bi.clone());
     let mut fuel = 100_000_000u64;
-    let interp = run_with_host(&t.module, idx, &iargs, &mut fuel, &mut hi).expect("interp run");
+    let interp = run_with_host(&t.module, idx, args, &mut fuel, &mut hi).expect("interp run");
 
-    // JIT: the same grant (so the handle value matches), driven through the production cap thunk.
+    // JIT: the same grants + bindings (so the handle encoding matches), driven through the
+    // production cap thunk — `call.import` dispatches host-side through the same bindings.
     let mut hj = Host::new();
-    let hj_handle = grant(&mut hj);
-    assert_eq!(h, hj_handle, "handle encoding must match across hosts");
-    let mut slots: Vec<i64> = vec![h as i64];
-    slots.extend(extra_args.iter().map(|v| match v {
-        Value::I32(x) => *x as i64,
-        Value::I64(x) => *x,
-        other => panic!("unsupported arg {other:?}"),
-    }));
+    let bj = bind(&mut hj);
+    assert_eq!(bi, bj, "binding encoding must match across hosts");
+    hj.set_import_bindings(bj);
+    let slots: Vec<i64> = args
+        .iter()
+        .map(|v| match v {
+            Value::I32(x) => *x as i64,
+            Value::I64(x) => *x,
+            other => panic!("unsupported arg {other:?}"),
+        })
+        .collect();
     let jit = match compile_and_run_with_host(
         &t.module,
         idx,
@@ -99,6 +104,12 @@ fn mix(arg: i64) -> i64 {
         .wrapping_add(1442695040888963407)
 }
 
+/// One `Blocking`-cap binding (type_id 10, op 0) for a module whose only import is `("10","0")`.
+fn bind_blocking(h: &mut Host) -> Vec<BoundImport> {
+    let bh = h.grant_blocking(std::time::Duration::ZERO, None);
+    vec![BoundImport::required(10, 0, bh)]
+}
+
 /// A `call` to an imported **no-arg** capability op (Clock.now — type_id 2, op 0, `() -> i64`):
 /// loop-call it `N` times and sum. The reference clock is deterministic (0, 1, 2, …), so the sum is
 /// `0+1+…+(N-1)` on both backends.
@@ -119,13 +130,18 @@ fn import_clock_now_loop_sum() {
     (local.get $acc)))
 "#;
     let n = 12i64;
-    let got = run_import(wat, "run", |h| h.grant_clock(), &[Value::I64(n)]);
+    let got = run_import(
+        wat,
+        "run",
+        |h| vec![BoundImport::required(2, 0, h.grant_clock())],
+        &[Value::I64(n)],
+    );
     assert_eq!(got, n * (n - 1) / 2);
 }
 
 /// A `call` to an imported op **with a scalar arg + result** (Blocking.work — type_id 10, op 0,
 /// `(i64) -> i64`, a pure deterministic `mix`): loop-call `work(i)` and sum. Exercises argument
-/// marshalling through the `cap.call` (the `hostcall` bench shape) on both backends.
+/// marshalling through the `call.import` (the `hostcall` bench shape) on both backends.
 #[test]
 fn import_blocking_work_sum() {
     let _serial = serial();
@@ -143,21 +159,16 @@ fn import_blocking_work_sum() {
     (local.get $acc)))
 "#;
     let n = 10i64;
-    let got = run_import(
-        wat,
-        "run",
-        |h| h.grant_blocking(std::time::Duration::ZERO, None),
-        &[Value::I64(n)],
-    );
+    let got = run_import(wat, "run", bind_blocking, &[Value::I64(n)]);
     let want: i64 = (0..n).map(mix).fold(0i64, |a, x| a.wrapping_add(x));
     assert_eq!(got, want);
 }
 
-/// The import handle is threaded across **calls between defined functions**: `run` calls a helper
-/// that itself calls the imported op. Proves a non-entry function still reaches the capability (the
-/// leading handle param is forwarded, not just held by the entry).
+/// The import is reachable from **calls between defined functions**: `run` calls a helper that
+/// itself calls the imported op. Under the manifest nothing is forwarded — the helper's
+/// `call.import` dispatches through the same instance bindings as the entry's would.
 #[test]
-fn import_handle_threads_through_defined_call() {
+fn import_reaches_through_defined_call() {
     let _serial = serial();
     let wat = r#"
 (module
@@ -168,20 +179,16 @@ fn import_handle_threads_through_defined_call() {
     (call $helper (local.get $a))))
 "#;
     let a = 7i64;
-    let got = run_import(
-        wat,
-        "run",
-        |h| h.grant_blocking(std::time::Duration::ZERO, None),
-        &[Value::I64(a)],
-    );
+    let got = run_import(wat, "run", bind_blocking, &[Value::I64(a)]);
     assert_eq!(got, mix(a).wrapping_add(mix(a + 1)));
 }
 
-/// `call_indirect` through the table still works when the module has imports: the threaded handle is
-/// prepended to the indirect signature + args, so a table-dispatched defined function reaches the
-/// capability. A 2-entry dispatch picks `work(arg)` vs `work(arg)+1` by index.
+/// `call_indirect` through the table still works when the module has imports: a table-dispatched
+/// defined function's `call.import` reaches the capability through the instance bindings (indirect
+/// signatures carry only wasm params now — no prepended handles). A 2-entry dispatch picks
+/// `work(arg)` vs `work(arg)+1` by index.
 #[test]
-fn import_handle_threads_through_call_indirect() {
+fn import_reaches_through_call_indirect() {
     let _serial = serial();
     let wat = r#"
 (module
@@ -194,103 +201,44 @@ fn import_handle_threads_through_call_indirect() {
   (func (export "run") (param $sel i32) (param $x i64) (result i64)
     (call_indirect (type $unary) (local.get $x) (local.get $sel))))
 "#;
-    let got_a = run_import(
-        wat,
-        "run",
-        |h| h.grant_blocking(std::time::Duration::ZERO, None),
-        &[Value::I32(0), Value::I64(5)],
-    );
+    let got_a = run_import(wat, "run", bind_blocking, &[Value::I32(0), Value::I64(5)]);
     assert_eq!(got_a, mix(5));
-    let got_b = run_import(
-        wat,
-        "run",
-        |h| h.grant_blocking(std::time::Duration::ZERO, None),
-        &[Value::I32(1), Value::I64(5)],
-    );
+    let got_b = run_import(wat, "run", bind_blocking, &[Value::I32(1), Value::I64(5)]);
     assert_eq!(got_b, mix(5).wrapping_add(1));
 }
 
-// ---- the binding surface (the convention's guard rails) ----
+// ---- the binding surface (the manifest) ----
 
-/// A non-numeric import name is now a §7 **named import** (resolved to a capability at load by the
-/// embedder, e.g. an `svm-wasi` shim), not an error: the module declares it in its import table —
-/// `"<module>.<name>"` — and call sites lower to `CallImport`. The numeric `module`=type_id /
-/// `name`=op convention still produces an inline `cap.call`.
+/// Every function import — numeric convention and §7 named alike — is declared in the module's
+/// import manifest as `"<module>.<name>"`, in import order (slot `i` = import `i`).
 #[test]
-fn import_non_numeric_name_is_a_named_import() {
+fn imports_declare_manifest_entries() {
     let _serial = serial();
     let wasm = wat::parse_str(
-        r#"(module (import "env" "host_fn" (func (result i64))) (func (export "f") (result i64) (call 0)))"#,
+        r#"(module
+             (import "2" "0" (func (result i64)))
+             (import "env" "host_fn" (func (result i64)))
+             (func (export "f") (result i64) (i64.add (call 0) (call 1))))"#,
     )
     .expect("assemble wat");
-    let t = svm_wasm::transpile(&wasm).expect("non-numeric import is a named import, not an error");
-    assert_eq!(t.module.imports.len(), 1, "one §7 named import declared");
-    assert_eq!(t.module.imports[0].name, "env.host_fn");
-}
-
-/// Run a module importing **N** capability interfaces (distinct modules): grant one capability per
-/// interface (in slot/first-appearance order), then pass the N handles as the entry's N leading args,
-/// followed by `extra_args`. Asserts interp == JIT and returns the single result.
-fn run_import_multi(
-    wat: &str,
-    entry: &str,
-    grants: &[&dyn Fn(&mut Host) -> i32],
-    extra_args: &[Value],
-) -> i64 {
-    let wasm = wat::parse_str(wat).expect("assemble wat");
     let t = svm_wasm::transpile(&wasm).expect("transpile");
-    svm_verify::verify_module(&t.module).expect("verify transpiled IR");
-    let idx = t
-        .exports
+    assert_eq!(t.module.imports.len(), 2, "one manifest entry per import");
+    assert_eq!(t.module.imports[0].name, "2.0", "numeric convention");
+    assert_eq!(t.module.imports[1].name, "env.host_fn", "§7 named");
+    assert!(t
+        .module
+        .imports
         .iter()
-        .find(|(n, _)| n == entry)
-        .unwrap_or_else(|| panic!("no export {entry}"))
-        .1;
-
-    // Interpreter: grant each cap, pass the handles (i32) as the entry's leading args, in slot order.
-    let mut hi = Host::new();
-    let handles: Vec<i32> = grants.iter().map(|g| g(&mut hi)).collect();
-    let mut iargs: Vec<Value> = handles.iter().map(|h| Value::I32(*h)).collect();
-    iargs.extend_from_slice(extra_args);
-    let mut fuel = 100_000_000u64;
-    let interp = run_with_host(&t.module, idx, &iargs, &mut fuel, &mut hi).expect("interp run");
-
-    // JIT: the same grants (so handle values match) through the production cap thunk.
-    let mut hj = Host::new();
-    let jhandles: Vec<i32> = grants.iter().map(|g| g(&mut hj)).collect();
-    assert_eq!(handles, jhandles, "handle encoding must match across hosts");
-    let mut slots: Vec<i64> = jhandles.iter().map(|h| *h as i64).collect();
-    slots.extend(extra_args.iter().map(|v| match v {
-        Value::I32(x) => *x as i64,
-        Value::I64(x) => *x,
-        other => panic!("unsupported arg {other:?}"),
-    }));
-    let jit = match compile_and_run_with_host(
-        &t.module,
-        idx,
-        &slots,
-        svm_run::cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
-    )
-    .expect("jit compile")
-    {
-        JitOutcome::Returned(v) => v,
-        other => panic!("jit did not return: {other:?}"),
-    };
-    let iv = match interp[0] {
-        Value::I64(x) => x,
-        Value::I32(x) => x as i64,
-        other => panic!("unexpected interp value {other:?}"),
-    };
-    assert_eq!(iv, jit[0], "interp != jit");
-    iv
+        .all(|i| i.mode == svm_ir::ImportMode::Required));
+    // No leading handle params anywhere: the entry's IR signature is its wasm signature.
+    assert!(t.module.funcs[t.exports[0].1 as usize].params.is_empty());
 }
 
-/// Imports spanning two distinct capability interfaces now bind to **two** handles — one per interface
-/// (module), threaded as the entry's two leading params in first-appearance order. Here Clock
-/// (type_id 2) gets slot 0 and Blocking (type_id 10) slot 1; the guest calls both in one function.
+/// Imports spanning two distinct capability interfaces bind two manifest slots — one per import, in
+/// import order. Here Clock (type_id 2) is slot 0 and Blocking (type_id 10) slot 1; the guest calls
+/// both in one function.
 #[test]
-fn import_multiple_interfaces_bind_to_distinct_handles() {
+fn import_multiple_interfaces_bind_distinct_slots() {
     let _serial = serial();
     let wat = r#"
 (module
@@ -299,23 +247,29 @@ fn import_multiple_interfaces_bind_to_distinct_handles() {
   (func (export "f") (result i64)
     (i64.add (call $now) (call $work (i64.const 5)))))
 "#;
-    // Slot 0 = Clock (first appearance), slot 1 = Blocking. The reference clock's first read is 0.
-    let got = run_import_multi(
+    // Slot 0 = Clock, slot 1 = Blocking (import order). The reference clock's first read is 0.
+    let got = run_import(
         wat,
         "f",
-        &[&|h: &mut Host| h.grant_clock(), &|h: &mut Host| {
-            h.grant_blocking(std::time::Duration::ZERO, None)
-        }],
+        |h| {
+            let c = h.grant_clock();
+            let b = h.grant_blocking(std::time::Duration::ZERO, None);
+            vec![
+                BoundImport::required(2, 0, c),
+                BoundImport::required(10, 0, b),
+            ]
+        },
         &[],
     );
     assert_eq!(got, mix(5), "clock.now (=0) + work(5) (=mix(5))");
 }
 
-/// The two handles are distinct interfaces *and distinct call paths*: a defined helper threads both
-/// handles through a normal `call`, proving the N-handle prefix rides cross-function calls (not just
-/// the entry). The helper sums clock + work; the entry calls it twice.
+/// The two slots are distinct interfaces *and distinct call paths*: a defined helper drives both
+/// imports from a normal `call` — under the manifest there is no prefix to ride; the bindings are
+/// instance state reachable from every function. The helper sums clock + work; the entry calls it
+/// twice.
 #[test]
-fn import_two_handles_thread_through_defined_call() {
+fn import_two_slots_reach_through_defined_call() {
     let _serial = serial();
     let wat = r#"
 (module
@@ -326,31 +280,35 @@ fn import_two_handles_thread_through_defined_call() {
   (func (export "f") (result i64)
     (i64.add (call $step (i64.const 5)) (call $step (i64.const 7)))))
 "#;
-    let got = run_import_multi(
+    let got = run_import(
         wat,
         "f",
-        &[&|h: &mut Host| h.grant_clock(), &|h: &mut Host| {
-            h.grant_blocking(std::time::Duration::ZERO, None)
-        }],
+        |h| {
+            let c = h.grant_clock();
+            let b = h.grant_blocking(std::time::Duration::ZERO, None);
+            vec![
+                BoundImport::required(2, 0, c),
+                BoundImport::required(10, 0, b),
+            ]
+        },
         &[],
     );
     // step(5): clock=0 + mix(5). step(7): clock=1 + mix(7). Sum = 1 + mix(5) + mix(7).
     assert_eq!(got, 1i64.wrapping_add(mix(5)).wrapping_add(mix(7)));
 }
 
-/// **`wasi:thread/spawn` *alongside* a capability import** (§12 — the per-thread handle stash). The
-/// spawning thread writes its capability handle into a reserved window slot before each spawn; the
-/// synthesized shim reads it back on the new thread and threads it into `wasi_thread_start`, so a
-/// spawned worker can `cap.call`. Here each of `n` workers computes `work(its start_arg)` (the
-/// `Blocking` capability, a deterministic `mix`) and atomically adds it to a shared sum — which is
-/// `Σ mix(i)` on every interleaving (so interp's M:N executor and the JIT's real OS threads must
-/// agree). This proves capabilities reach spawned threads, the gap this slice closes.
+/// **`wasi:thread/spawn` *alongside* a capability import** (§12). The import bindings are instance
+/// state on the shared `Host`, so a spawned worker's `call.import` dispatches through them with no
+/// per-spawn plumbing (the old window handle stash is gone — IMPORTS.md phase 3). Here each of `n`
+/// workers computes `work(its start_arg)` (the `Blocking` capability, a deterministic `mix`) and
+/// atomically adds it to a shared sum — which is `Σ mix(i)` on every interleaving (so interp's M:N
+/// executor and the JIT's real OS threads must agree).
 #[test]
 fn spawn_alongside_capability_import() {
     let _serial = serial();
     let wat = r#"
 (module
-  (import "10" "0" (func $work (param i64) (result i64)))     ;; Blocking cap (handle slot 0)
+  (import "10" "0" (func $work (param i64) (result i64)))     ;; Blocking cap (manifest slot 0)
   (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
   (memory 1 1 shared)
   (func (export "wasi_thread_start") (param $tid i32) (param $start_arg i32)
@@ -375,17 +333,12 @@ fn spawn_alongside_capability_import() {
     (i64.atomic.load (i32.const 8))))
 "#;
     let n = 6i64;
-    let got = run_import(
-        wat,
-        "run",
-        |h| h.grant_blocking(std::time::Duration::ZERO, None),
-        &[Value::I32(n as i32)],
-    );
+    let got = run_import(wat, "run", bind_blocking, &[Value::I32(n as i32)]);
     let want: i64 = (0..n).map(mix).fold(0i64, |a, x| a.wrapping_add(x));
     assert_eq!(got, want, "Σ mix(i) over {n} spawned workers using the cap");
 }
 
-/// An **imported memory** is now supported (the wasi-threads shape — the host owns the one shared
+/// An **imported memory** is supported (the wasi-threads shape — the host owns the one shared
 /// linear memory). SVM treats it exactly like a defined memory: the window's linear region at offset
 /// 0. (Imported table/global/tag stay unsupported.)
 #[test]

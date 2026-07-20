@@ -32,9 +32,15 @@ fn main() {
     );
 
     let t = Instant::now();
-    let module = svm_run::resolve_capability_imports(module).expect("resolve capability imports");
+    // Phase 3: a named powerbox entry keeps its manifest (the runtime binds slots at
+    // instantiation); only a legacy module still takes the rewrite.
+    let module = if svm_run::is_named_powerbox_entry(&module) {
+        module
+    } else {
+        svm_run::resolve_capability_imports(module).expect("resolve capability imports")
+    };
     println!(
-        "  resolve caps     {:>8.1?}  (skippable if the shipped artifact is pre-resolved)",
+        "  resolve caps     {:>8.1?}  (legacy modules only)",
         t.elapsed()
     );
 

@@ -858,7 +858,7 @@ unsafe extern "C" fn bench_thunk(
     mem_base: *mut u8,
     _mem_size: u64,
     _mem_reserved: u64,
-    _type_id: u32,
+    type_id: u32,
     op: u32,
     _handle: i32,
     args: *const i64,
@@ -868,6 +868,19 @@ unsafe extern "C" fn bench_thunk(
     trap_out: *mut i64,
 ) {
     let a = std::slice::from_raw_parts(args, n_args as usize);
+    // A transpiled kernel dispatches as `call.import` (IMPORTS.md phase 3): the thunk sees the
+    // `CAP_IMPORT_TYPE_ID` sentinel with the manifest slot as `op`. Each `HostCall` kernel imports
+    // exactly one op and the two bench ops have distinct arities, so pick by arity there; the
+    // hand-written IR's inline `cap.call 0 <op>` still selects by `op` directly.
+    let op = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+        if n_args == 2 {
+            1
+        } else {
+            0
+        }
+    } else {
+        op
+    };
     let r: i64 = match op {
         // op 1: sum the borrow buffer in place (no copy) — the §7 zero-copy I/O path.
         1 => {
@@ -914,12 +927,23 @@ unsafe extern "C" fn fast_op1(
     buf.iter().map(|&b| b as i64).sum()
 }
 unsafe extern "C" fn bench_fast_resolver(
-    _type_id: u32,
+    type_id: u32,
     op: u32,
     n_args: u32,
     n_res: u32,
 ) -> *const c_void {
-    // Only claim an op when the IR arity matches the specialized fn's (else the generic path).
+    // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel with the manifest slot as
+    // `op` (phase 3); the bench ops have distinct arities, so select by arity there. Only claim an
+    // op when the IR arity matches the specialized fn's (else the generic path).
+    let op = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+        if n_args == 2 {
+            1
+        } else {
+            0
+        }
+    } else {
+        op
+    };
     match (op, n_args, n_res) {
         (0, 1, 1) => fast_op0 as *const c_void, // x -> x+1
         (1, 2, 1) => fast_op1 as *const c_void, // sum a (ptr,len) buffer
@@ -1036,14 +1060,10 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
                 Ok((ir, entry)) => {
                     k.ir = ir;
                     k.entry = entry;
-                    // A `HostCall` kernel's wasm imports a host function, so the transpiled entry takes
-                    // the threaded capability handle as its leading param (the host-ABI convention). The
-                    // stateless `bench_thunk` ignores the handle, so any value works — pass 0.
-                    k.lead_args = if k.mode == Mode::HostCall {
-                        vec![0]
-                    } else {
-                        Vec::new()
-                    };
+                    // IMPORTS.md phase 3: the transpiled entry takes only its wasm params — a
+                    // `HostCall` kernel's import dispatches as a `call.import` (the thunk sees the
+                    // `CAP_IMPORT_TYPE_ID` sentinel and picks the op by arity), nothing is threaded.
+                    k.lead_args = Vec::new();
                 }
                 Err(e) => eprintln!(
                     "note: --from-wasm keeps `{}` hand-written (svm-wasm: {e})",

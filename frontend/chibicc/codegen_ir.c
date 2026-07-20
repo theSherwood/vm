@@ -865,12 +865,12 @@ static int widen_i64(int v, Type *ty) {
   return r;
 }
 
-// Load a stashed capability handle from the reserved region.
-static int load_handle(int slot) {
-  int a = nv++;
-  cg("  v%d = i64.const %d\n", a, slot);
+// The vestigial `call.import` handle operand (IMPORTS.md phase 3): the manifest slot is the
+// dispatch — the host binds it at instantiation — so call sites pass a dummy. (The operand is
+// retired at the next wire-format bump.)
+static int dummy_handle(void) {
   int h = nv++;
-  cg("  v%d = i32.load v%d\n", h, a);
+  cg("  v%d = i32.const 0\n", h);
   return h;
 }
 
@@ -886,7 +886,7 @@ static int gen_builtin_stream(Node *node, int slot, int op) {
   int buf, lenv;
   eval2(a->next, a->next->next, &buf, &lenv);
   int len = widen_i64(lenv, a->next->next->ty);
-  int h = load_handle(slot);
+  int h = dummy_handle();
   int r = nv++;
   // §7: reach the Stream op by *name* (host-resolved to (type_id, op) at load), not an inlined
   // cap.call. The handle still selects the endpoint (stdout vs stdin).
@@ -906,7 +906,7 @@ static int gen_builtin_exit(Node *node) {
   if (!node->args)
     error_tok(node->tok, "codegen_ir: exit(code) expects 1 argument");
   int code = gen_expr(node->args);
-  int h = load_handle(EXIT_SLOT);
+  int h = dummy_handle();
   cg("  call.import \"exit\" (i32) -> () v%d (v%d)\n", h, code);
   cg("  unreachable\n"); // Exit is noreturn (§3e)
   term = true;
@@ -929,7 +929,7 @@ static int gen_builtin_memory(Node *node, int op, int want) {
   int off = widen_i64(gen_expr(a), a->ty);
   int len = widen_i64(gen_expr(a->next), a->next->ty);
   int prot = (want == 3) ? gen_expr(a->next->next) : 0;
-  int h = load_handle(MEMORY_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   const char *name = op == 0 ? "vm_map" : op == 1 ? "vm_unmap" : "vm_protect";
   if (want == 3)
@@ -948,7 +948,7 @@ static int gen_builtin_memory(Node *node, int op, int want) {
 static int gen_builtin_page_size(Node *node) {
   if (node->args)
     error_tok(node->tok, "codegen_ir: __vm_page_size takes no arguments");
-  int h = load_handle(MEMORY_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_page_size\" () -> (i64) v%d ()\n", r, h);
   return r;
@@ -968,7 +968,7 @@ static int gen_builtin_io_submit_async(Node *node) {
   int sq = widen_i64(gen_expr(a), a->ty);
   int n = widen_i64(gen_expr(a->next), a->next->ty);
   int ctr = widen_i64(gen_expr(a->next->next), a->next->next->ty);
-  int h = load_handle(IORING_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_io_submit_async\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n",
           r, h, sq, n, ctr);
@@ -981,18 +981,36 @@ static int gen_builtin_io_reap(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_io_reap(cq, max) expects 2 arguments");
   int cq = widen_i64(gen_expr(a), a->ty);
   int mx = widen_i64(gen_expr(a->next), a->next->ty);
-  int h = load_handle(IORING_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_io_reap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
   return r;
 }
 
-// `__vm_blocking_handle()` returns the stashed Blocking capability handle (an `i32`) so the guest can
-// name it in an SQE's `handle` field when building a `Blocking.work` request.
+// `__vm_blocking_handle()` returns the Blocking capability handle (an `i32`) so the guest can
+// name it in an SQE's `handle` field when building a `Blocking.work` request. This is a real
+// *handle value* (not a dispatch), so resolve it by its canonical name (`cap.self.resolve` — the
+// discovery tier IMPORTS.md keeps); the name bytes are staged in the low reserved region that the
+// retired handle stash freed.
 static int gen_builtin_blocking_handle(Node *node) {
   if (node->args)
     error_tok(node->tok, "codegen_ir: __vm_blocking_handle() takes no arguments");
-  return load_handle(BLOCKING_SLOT);
+  static const char *nm = "blocking";
+  int len = (int)strlen(nm);
+  for (int k = 0; k < len; k++) {
+    int vp = nv++;
+    cg("  v%d = i64.const %d\n", vp, k);
+    int vc = nv++;
+    cg("  v%d = i32.const %d\n", vc, (unsigned char)nm[k]);
+    cg("  i32.store8 v%d v%d\n", vp, vc);
+  }
+  int vptr = nv++;
+  cg("  v%d = i64.const 0\n", vptr);
+  int vlen = nv++;
+  cg("  v%d = i64.const %d\n", vlen, len);
+  int vh = nv++;
+  cg("  v%d = cap.self.resolve v%d v%d\n", vh, vptr, vlen);
+  return vh;
 }
 
 // `__vm_cap(i)` returns the i-th stashed powerbox handle (an `i32`) — the reserved-region slot at
@@ -1004,13 +1022,11 @@ static int gen_builtin_cap(Node *node) {
   Node *a = node->args;
   if (!a || a->next)
     error_tok(node->tok, "codegen_ir: __vm_cap(i) expects 1 argument");
-  int i = widen_i64(gen_expr(a), a->ty);
-  int four = nv++;
-  cg("  v%d = i64.const 4\n", four);
-  int off = nv++;
-  cg("  v%d = i64.mul v%d v%d\n", off, i, four);
-  int h = nv++;
-  cg("  v%d = i32.load v%d\n", h, off);
+  int i = gen_expr(a); // the index (i32)
+  int h = nv++;        // result 0: the capability handle
+  int t = nv++;        // result 1: its type_id (unused)
+  cg("  v%d, v%d = cap.self.get v%d\n", h, t, i);
+  (void)t;
   return h;
 }
 
@@ -1112,7 +1128,7 @@ static int gen_builtin_jit_compile(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_jit_compile(blob, len) expects 2 arguments");
   int blob = widen_i64(gen_expr(a), a->ty);
   int len = widen_i64(gen_expr(a->next), a->next->ty);
-  int h = load_handle(JIT_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_jit_compile\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob,
           len);
@@ -1132,7 +1148,7 @@ static int gen_builtin_jit_compile_linked(Node *node) {
   int ir_len = widen_i64(gen_expr(a->next), a->next->ty);
   int st = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int st_len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
-  int h = load_handle(JIT_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   fprintf(o,
           "  v%d = call.import \"vm_jit_compile_linked\" (i64, i64, i64, i64) -> (i64) v%d (v%d, "
@@ -1148,7 +1164,7 @@ static int gen_builtin_jit_invoke2(Node *node) {
   int code = widen_i64(gen_expr(a), a->ty);
   int x = widen_i64(gen_expr(a->next), a->next->ty);
   int y = widen_i64(gen_expr(a->next->next), a->next->next->ty);
-  int h = load_handle(JIT_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_jit_invoke2\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r,
           h, code, x, y);
@@ -1160,7 +1176,7 @@ static int gen_builtin_jit_release(Node *node) {
   if (!a || a->next)
     error_tok(node->tok, "codegen_ir: __vm_jit_release(code) expects 1 argument");
   int code = widen_i64(gen_expr(a), a->ty);
-  int h = load_handle(JIT_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_jit_release\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
@@ -1174,7 +1190,7 @@ static int gen_builtin_jit_install(Node *node) {
   if (!a || a->next)
     error_tok(node->tok, "codegen_ir: __vm_jit_install(code) expects 1 argument");
   int code = widen_i64(gen_expr(a), a->ty);
-  int h = load_handle(JIT_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_jit_install\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
@@ -1187,7 +1203,7 @@ static int gen_builtin_jit_uninstall(Node *node) {
   if (!a || a->next)
     error_tok(node->tok, "codegen_ir: __vm_jit_uninstall(slot) expects 1 argument");
   int slot = widen_i64(gen_expr(a), a->ty);
-  int h = load_handle(JIT_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_jit_uninstall\" (i64) -> (i64) v%d (v%d)\n", r, h, slot);
   return r;
@@ -1201,6 +1217,10 @@ static int gen_builtin_jit_uninstall(Node *node) {
 //   long __vm_region_unmap(int r, long win_off, long len);                          // op 1
 //   long __vm_region_page_size(int r);             // the map granularity (op 3)
 //
+// `create` dispatches on the fixed AddressSpace interface — a manifest import. The other three
+// dispatch on the runtime-minted *region handle*, which is the dynamic addressing mode
+// (IMPORTS.md §2.2): an inline `cap.call 4 <op>` on the live handle, no manifest entry.
+//
 // `create` lowers to `cap.call 5 5` on the stashed AddressSpace handle (the memory-management
 // authority mints shareable memory); the others to `cap.call 4 <op>` on the *region* handle the
 // guest holds. Mapping the same region at two adjacent window offsets makes a wrap-around access
@@ -1210,7 +1230,7 @@ static int gen_builtin_region_create(Node *node) {
   if (!a || a->next)
     error_tok(node->tok, "codegen_ir: __vm_region_create(len) expects 1 argument");
   int len = widen_i64(gen_expr(a), a->ty);
-  int h = load_handle(ADDRSPACE_SLOT);
+  int h = dummy_handle();
   int r = nv++;
   cg("  v%d = call.import \"vm_region_create\" (i64) -> (i64) v%d (v%d)\n", r, h, len);
   return r;
@@ -1229,7 +1249,7 @@ static int gen_builtin_region_map(Node *node) {
   int len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
   int prot = gen_expr(a->next->next->next->next);
   int r = nv++;
-  cg("  v%d = call.import \"vm_region_map\" (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n",
+  cg("  v%d = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n",
           r, rh, win, roff, len, prot);
   return r;
 }
@@ -1245,8 +1265,7 @@ static int gen_builtin_region_unmap(Node *node) {
   int win = widen_i64(gen_expr(a->next), a->next->ty);
   int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int r = nv++;
-  cg("  v%d = call.import \"vm_region_unmap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win,
-          len);
+  cg("  v%d = cap.call 4 1 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win, len);
   return r;
 }
 
@@ -1256,7 +1275,7 @@ static int gen_builtin_region_page_size(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_region_page_size(r) expects 1 argument");
   int rh = gen_expr(a);
   int r = nv++;
-  cg("  v%d = call.import \"vm_region_page_size\" () -> (i64) v%d ()\n", r, rh);
+  cg("  v%d = cap.call 4 3 () -> (i64) v%d ()\n", r, rh);
   return r;
 }
 

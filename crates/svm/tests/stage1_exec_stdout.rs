@@ -168,6 +168,7 @@ fn grant_hooks() -> GrantChildHooks {
     GrantChildHooks {
         build: svm_run::grant_child_build,
         build_named: svm_run::grant_named_child_build,
+        bind_imports: svm_run::child_bind_imports,
         release: svm_run::grant_child_release,
     }
 }
@@ -223,8 +224,8 @@ fn run_jit(cmd: &svm_ir::Module, argv: &[&[u8]], wide: bool) -> (JitOutcome, Vec
 /// a re-granted capability) — the full external `echo`.
 #[test]
 fn shell_execs_command_with_inherited_stdout() {
-    let cmd = svm_run::resolve_capability_imports(parse_module(&child_ir(CMD)).expect("parse cmd"))
-        .expect("resolve");
+    // Phase 3: keep the manifest — the op-13 spawn binds the child's slots.
+    let cmd = parse_module(&child_ir(CMD)).expect("parse cmd");
     verify_module(&cmd).expect("verify cmd");
     // Each argv runs with both the canonical i32-declared op-13/join shape and the i64-widened shape a
     // chibicc frontend emits — both must agree interp==JIT.

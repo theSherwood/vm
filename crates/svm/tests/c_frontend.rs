@@ -30,15 +30,48 @@ use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§
 use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
 
-/// Parse frontend (chibicc) text IR and resolve its §7 named capability imports under the
-/// reference host policy ([`svm_run::resolve_capability_imports`]). The frontend now emits
-/// `call.import "<name>"` for capabilities instead of inline `cap.call`, so every harness parses
-/// through this — the *resolved* (import-free) module is what verifies and runs. A no-op for
-/// hand-written test IR that has no imports; an unresolved name is a frontend bug, so it panics.
+/// Parse frontend (chibicc) text IR. The frontend emits `call.import "<name>"` for capabilities
+/// against the module's manifest (IMPORTS.md phase 3) — nothing is rewritten; harnesses install
+/// the slot bindings at instantiation ([`bind_imports`], mirroring `svm_run`'s `grant_caps`).
 fn parse_module(ir: &str) -> Result<svm_ir::Module, svm_text::ParseError> {
-    let m = parse_module_raw(ir)?;
-    Ok(svm_run::resolve_capability_imports(m)
-        .unwrap_or_else(|e| panic!("resolve capability imports: {e}")))
+    parse_module_raw(ir)
+}
+
+/// Bind `m`'s import manifest against the 8 granted powerbox handles (IMPORTS.md phase 3): import
+/// `i`'s name maps to `(type_id, op)` via `svm_run::default_cap_resolver` and to the granted
+/// handle by interface — the same mapping `svm_run::Instance::grant_caps` installs. A name outside
+/// the fixed policy leaves its slot unbound (fail-closed CapFault at dispatch).
+fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
+    use svm_interp::iface;
+    if m.imports.is_empty() {
+        return;
+    }
+    let hv = |i: usize| match handles[i] {
+        Value::I32(x) => x,
+        _ => 0,
+    };
+    let bindings = m
+        .imports
+        .iter()
+        .map(|im| {
+            let Some(cap) = svm_run::default_cap_resolver(&im.name) else {
+                return svm_interp::BoundImport::rebindable(0, 0, None);
+            };
+            let handle = match (cap.type_id, cap.op) {
+                (iface::STREAM, 1) => hv(0),
+                (iface::STREAM, _) => hv(1),
+                (iface::EXIT, _) => hv(2),
+                (iface::MEMORY, _) => hv(3),
+                (iface::ADDRESS_SPACE, _) => hv(4),
+                (iface::IO_RING, _) => hv(5),
+                (iface::BLOCKING, _) => hv(6),
+                (iface::JIT, _) => hv(7),
+                _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+            };
+            svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+        })
+        .collect();
+    h.set_import_bindings(bindings);
 }
 
 /// The fixed **8-handle powerbox** — stdout, stdin, exit, memory, addrspace (§14), ioring + blocking
@@ -245,8 +278,9 @@ fn run_c_interp(src: &str) -> CRun {
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     let mut h = Host::new();
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    // Grant + register the powerbox (the paramless `_start` resolves it by name); no entry args.
-    powerbox(&mut h, win, std::time::Duration::ZERO);
+    // Grant + register the powerbox, then bind the manifest slots (phase 3); no entry args.
+    let handles = powerbox(&mut h, win, std::time::Duration::ZERO);
+    bind_imports(&mut h, &m, &handles);
     let mut fuel = 50_000_000u64;
     let outcome = match run_with_host(&m, 0, &[], &mut fuel, &mut h) {
         Ok(v) => Outcome::Returned(v),
@@ -2278,6 +2312,7 @@ fn run_jit_repl_session(
     // The fixed 8-handle powerbox a chibicc `_start` imports; the 8th (JIT) grants an invoke-only
     // domain (`table_log2 = 0`, no install table), matching the session's `table_reserve_log2` below.
     let args = powerbox(&mut host, win, std::time::Duration::ZERO);
+    bind_imports(&mut host, &m, &args);
     let Value::I32(jit_handle) = args[7] else {
         panic!("the 8th powerbox handle is the JIT domain");
     };
@@ -2439,6 +2474,8 @@ fn run_async_demo(src: &str) -> (Vec<u8>, Vec<u8>) {
         powerbox(&mut hj, win, Duration::from_millis(10)),
         "grants are deterministic"
     );
+    bind_imports(&mut hi, &m, &args);
+    bind_imports(&mut hj, &m, &args);
 
     let mut fuel = 500_000_000u64;
     let interp = run_with_host(&m, 0, &[], &mut fuel, &mut hi).expect("interp ran ok");

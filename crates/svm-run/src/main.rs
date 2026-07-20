@@ -111,10 +111,15 @@ fn try_main() -> Result<(), String> {
     };
 
     let module = load_module(Path::new(&file))?;
-    // §7: lower any named capability imports to concrete `cap.call`s under the reference host
-    // policy *before* verification (fail-closed on an unknown name). A no-op for modules that
-    // inline their capability calls (the legacy form).
-    let module = svm_run::resolve_capability_imports(module)?;
+    // IMPORTS.md phase 3: a named powerbox entry keeps its manifest — `run_powerbox` binds each
+    // slot at instantiation and `call.import` dispatches through the bindings (no rewrite). A
+    // legacy module (positional entry / hand-written IR with imports) still takes the
+    // `resolve_capability_imports` rewrite until phase 4 retires it.
+    let module = if svm_run::is_named_powerbox_entry(&module) {
+        module
+    } else {
+        svm_run::resolve_capability_imports(module)?
+    };
     verify_module(&module).map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
 
     if specialize {

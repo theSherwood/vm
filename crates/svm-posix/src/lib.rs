@@ -342,6 +342,29 @@ pub fn resolve_bound(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
     }
 }
 
+/// IMPORTS.md phase 3 — the no-rewrite successor of [`resolve_bound`]: bind a manifest module's
+/// import slots to this personality. Each import name maps through [`resolve`] to its `(HOST_FN,
+/// op)` on the granted personality `handle`, installed as instance bindings
+/// ([`Host::set_import_bindings`]) — the module bytes are never modified and its `call.import`s
+/// dispatch through the slots. Returns `false` (nothing installed, fail-closed) on a non-POSIX
+/// import name. Call **after** [`grant`], like `resolve_bound`.
+pub fn bind(m: &svm_ir::Module, host: &mut Host, handle: i32) -> bool {
+    let Some(caps) = m
+        .imports
+        .iter()
+        .map(|i| resolve(&i.name))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    host.set_import_bindings(
+        caps.iter()
+            .map(|c| svm_interp::BoundImport::required(c.type_id, c.op, handle))
+            .collect(),
+    );
+    true
+}
+
 /// Grant a POSIX personality on `host`, returning the `HOST_FN` handle and a [`Posix`] handle to its
 /// captured state. `heap_base`/`heap_end` bound the window region `malloc` hands out (both window
 /// offsets, `heap_base <= heap_end`, within the guest window and clear of the guest's static
@@ -1574,10 +1597,11 @@ block0():\n\
         let (jhh, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
         assert_eq!(h, jhh, "identical grant order → identical handle");
 
-        let resolved =
-            svm_ir::resolve_imports_with(&m, resolve_bound(h)).expect("bound imports resolve");
-        assert!(resolved.imports.is_empty(), "resolution is import-free");
-        verify_module(&resolved).expect("verify the resolved module");
+        // Phase 3: no rewrite — the manifest stays and each slot binds to the personality.
+        assert!(bind(&m, &mut ih, h), "posix names bind");
+        assert!(bind(&m, &mut jh, jhh), "posix names bind");
+        let resolved = m;
+        verify_module(&resolved).expect("verify the manifest module");
 
         // No entry args: the program holds no capability parameters — authority came in at resolve.
         let mut fuel = 5_000_000u64;
