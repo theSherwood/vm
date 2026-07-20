@@ -2157,8 +2157,7 @@ fn pg_setup(
     i32,
 > {
     // Idempotent on the already-resolved `.svmb` (imports = 0); resolves a raw on-ramp module too.
-    let resolved =
-        onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
+    let resolved = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
     // Postgres' `_start` arity depends on the on-ramp entry convention: the current `synth_start_argv`
     // (slice S15c) emits a **paramless** `_start` that resolves its caps **by name**, while an older
     // pre-S15c artifact takes the 4-cap prefix (`stdout, stdin, exit, memory`) **positionally**. Accept
@@ -2600,8 +2599,7 @@ impl OnrampReactor {
     }
 
     fn open_inner(m: &svm_ir::Module, fs: Option<(String, Vec<u8>)>) -> Result<OnrampReactor, i32> {
-        let module =
-            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let arity = module.funcs.first().map_or(0, |f| f.params.len());
         if arity > 5 {
             return Err(STATUS_UNSUPPORTED);
@@ -2758,8 +2756,7 @@ impl SharedOnrampReactor {
         backing: Option<Box<[u8]>>,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<SharedOnrampReactor, i32> {
-        let module =
-            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let arity = module.funcs.first().map_or(0, |f| f.params.len());
         if arity > 5 {
             return Err(STATUS_UNSUPPORTED);
@@ -2932,8 +2929,7 @@ impl JitOnrampReactor {
         shared_memory: bool,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<JitOnrampReactor, i32> {
-        let mut module =
-            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let mut module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         // Hoist inline `cap.call`s into cross-tier wrapper functions so a hot `tick` that interleaves
         // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
         // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
@@ -3163,8 +3159,7 @@ impl JitOnrampRun {
         shared_memory: bool,
         stdin: Vec<u8>,
     ) -> Result<JitOnrampRun, i32> {
-        let mut module =
-            onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let mut module = onramp_prepare(m).map_err(|_| STATUS_UNSUPPORTED)?;
         svm_wasmjit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
         if let Some(mc) = module.memory.as_mut() {
