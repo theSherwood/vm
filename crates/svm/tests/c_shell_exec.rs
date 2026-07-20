@@ -6,8 +6,9 @@
 //!
 //! Both the shell and the command are ordinary C. Capability wiring: `stdout` is a re-grantable
 //! `Stream` (shared sink, so the command's output and any shell output unify); `exec_stdout`/
-//! `exec_lookup` are a tiny host fn (the embedder's PATH → `Module` map); `__spawn`/`__join` bind to
-//! `cap.call 6 13`/`6 1` with the `Instantiator` baked in (`Resolved::CapBound`). Differential
+//! `exec_lookup` are a tiny host fn (the embedder's PATH → `Module` map); `__spawn`/`__join` link to
+//! `cap.call 6 13`/`6 1` (`Resolved::Cap`, link-time symbol resolution) and dispatch on the
+//! `Instantiator`/host-fn handles the guest discovers itself via `cap.self` reflection. Differential
 //! interp==JIT — the JIT is given the module resolver *and* the named-grant hooks op 13 needs.
 //!
 //! This is the frontend-drives-exec proof. Folding it into the full `c_shell.rs` builtin dispatch (its
@@ -82,7 +83,8 @@ int main(int argc, char **argv){
 
 /// The shell: `main(argc, argv)` — exec `argv[1]` as an external command, passing it `argv[1..]`.
 /// `pool` (a big writable global) both forces a window large enough for the command's carve and holds
-/// the grant record + the aligned carve. Handle wiring is via imports (see the resolver).
+/// the grant record + the aligned carve. Names link via imports (see [`link_shim`]); handles come
+/// from the guest's own cap.self reflection.
 const SHELL: &str = r#"
 /* Natural C prototypes: the child handle is a plain `long`, as a shell author would write it. chibicc
  * widens every scalar to an i64 slot, so `cap.call 6 13` is declared `(i64…) -> (i64)` even though the
@@ -90,19 +92,39 @@ const SHELL: &str = r#"
  * reads args as i64 slots and coerces the result to the declared type; the JIT's `lower_instantiator`
  * does the matching `slot_i64`/`slot_i32`/`result_as` coercions. (Before that fix the JIT CapFaulted on
  * the i64 result — no compiled-C program could drive the Instantiator on the JIT.) The handle operand
- * (`inst`) must stay `int`: `Resolved::CapBound` requires an i32 const placeholder there. */
+ * (`inst`) stays `int`: the lowered `cap.call` dispatches on it, and the shell passes the handle it
+ * discovers via cap.self reflection (`__inst()`/`__hf()`). */
 long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
 long __join(int inst, long child);
 long exec_stdout(int h);
 long exec_lookup(int h, char *name, long len);
 long stream_write(int h, void *buf, long n);
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
 static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
+/* Discover the handle of interface `want` from the domain's own capability table
+   (cap.self reflection — the discovery tier IMPORTS.md keeps). */
+static int __capof(int want) {
+  int n = __vm_cap_count();
+  int i = 0;
+  while (i < n) {
+    int t = 0;
+    int h = __vm_cap_at(i, &t);
+    if (t == want) return h;
+    i = i + 1;
+  }
+  return -1;
+}
+static int __h_hf = -1;
+static int __hf(void) { if (__h_hf < 0) __h_hf = __capof(13); return __h_hf; }   /* HOST_FN = 13 */
+static int __h_inst = -1;
+static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
 /* 384 KiB: room for the grant record/name low, a 128 KiB-aligned 128 KiB carve, all below the SP. */
 static char pool[393216];
 int main(int argc, char **argv){
-  long out = exec_stdout(0);
+  long out = exec_stdout(__hf());
   if (argc < 2) return 1;
-  long mod = exec_lookup(0, argv[1], slen(argv[1]));
+  long mod = exec_lookup(__hf(), argv[1], slen(argv[1]));
   if (mod < 0){ stream_write(out, "not found\n", 10); return 127; }
   long base = (long)pool;
   long carve = (base + 131071) & ~131071;
@@ -121,8 +143,8 @@ int main(int argc, char **argv){
   hdr[1] = 0;
   char *p = ab + 8;
   for (int i = 1; i < argc; i++){ char *s = argv[i]; long L = slen(s); for (long k=0;k<L;k++) *p++ = s[k]; *p++ = 0; }
-  long child = __spawn(0, mod, base, 1, 0, carve, 17, 0);
-  return __join(0, child);
+  long child = __spawn(__inst(), mod, base, 1, 0, carve, 17, 0);
+  return __join(__inst(), child);
 }
 "#;
 
@@ -144,33 +166,23 @@ fn exec_host(out_h: i32, echo_h: i32) -> svm_interp::HostFn {
     )
 }
 
-/// Bind the shell's imports: `stdout` handle via the call operand (`Cap`), the rest with a baked
-/// handle (`CapBound`).
-fn resolver(inst_h: i32, exec_h: i32) -> impl Fn(&str) -> Option<Resolved> {
-    move |name| match name {
-        "stream_write" => Some(Resolved::Cap(ResolvedCap { type_id: 0, op: 1 })),
-        "__spawn" => Some(Resolved::CapBound {
-            type_id: 6,
-            op: 13,
-            handle: inst_h,
-        }),
-        "__join" => Some(Resolved::CapBound {
-            type_id: 6,
-            op: 1,
-            handle: inst_h,
-        }),
-        "exec_stdout" => Some(Resolved::CapBound {
-            type_id: 13,
-            op: 0,
-            handle: exec_h,
-        }),
-        "exec_lookup" => Some(Resolved::CapBound {
-            type_id: 13,
-            op: 1,
-            handle: exec_h,
-        }),
-        _ => None,
-    }
+/// Link the shell's import names to their interfaces — link-time symbol resolution (the phase-4
+/// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__spawn`/`__join` are `Instantiator` ops
+/// (13 / 1); `exec_stdout`/`exec_lookup` are the embedder host fn's ops (0 / 1); `stream_write` is
+/// `Stream.write`. No handle is baked at link: each lowered `cap.call` dispatches on the guest's own
+/// handle operand — `stream_write`'s comes from `exec_stdout`, the rest are discovered at run time
+/// via `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3
+/// dynamic mode).
+fn link_shim(name: &str) -> Option<Resolved> {
+    let cap = match name {
+        "stream_write" => ResolvedCap { type_id: 0, op: 1 },
+        "__spawn" => ResolvedCap { type_id: 6, op: 13 },
+        "__join" => ResolvedCap { type_id: 6, op: 1 },
+        "exec_stdout" => ResolvedCap { type_id: 13, op: 0 },
+        "exec_lookup" => ResolvedCap { type_id: 13, op: 1 },
+        _ => return None,
+    };
+    Some(Resolved::Cap(cap))
 }
 
 /// The §3e args blob for `argv` (the shell's own args): `{argc, envc}` + packed NUL-terminated strings.
@@ -200,11 +212,11 @@ fn run(shell: &svm_ir::Module, cmd: &svm_ir::Module, argv: &[&str], jit: bool) -
     let mut host = Host::new();
     let _sink = host.shared_stdout(); // route the stdout Stream + re-granted child streams to one sink
     let out_h = host.grant_stream(StreamRole::Out);
-    let inst_h = host.grant_instantiator(0, win as u64);
+    let _inst_h = host.grant_instantiator(0, win as u64);
     let echo_h = host.grant_module(cmd);
-    let exec_h = host.grant_host_fn(exec_host(out_h, echo_h));
-    // Resolve the shell's imports against this run's handles.
-    let m = svm_ir::resolve_imports_with(shell, resolver(inst_h, exec_h)).expect("resolve");
+    let _exec_h = host.grant_host_fn(exec_host(out_h, echo_h));
+    // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
+    let m = svm_ir::resolve_imports_with(shell, |n| link_shim(n)).expect("resolve");
     verify_module(&m).expect("verify shell");
     // Seed the shell's own args buffer at POWERBOX_ARGS_BASE.
     let mut init = vec![0u8; win];

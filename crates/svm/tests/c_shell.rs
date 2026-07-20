@@ -6,8 +6,9 @@
 //! into once the fork/exec surface lands. The shell's libc calls reach the personality **by name**:
 //! `write`/`read`/`exit` are *defined* by the guest shim (shadowing chibicc's Stream/Exit builtins,
 //! S15b) and forward — fd preserved — to `__px_`-prefixed generic imports; `getcwd`/`chdir`/`getenv`
-//! are ordinary generic imports. The resolver binds each name to the granted personality handle
-//! (`svm_ir::Resolved::CapBound`, S15a), so there is no positional powerbox anywhere.
+//! are ordinary generic imports. The linker maps each name to its interface `(HOST_FN, op)`
+//! (`svm_ir::Resolved::Cap`, link-time symbol resolution); the guest discovers the granted handles
+//! itself via `cap.self` reflection, so there is no positional powerbox anywhere.
 //!
 //! The shell runs either a **script from preloaded stdin** (the personality's `read(0, …)` drains it)
 //! or a single `sh -c "<command>"` — its `argv` delivered by the personality's host-side argument
@@ -112,31 +113,47 @@ fn grant_hooks() -> GrantChildHooks {
     }
 }
 
-/// Bind the shim's `__px_`-prefixed import names to the personality (strip the prefix, resolve the
-/// bare libc name to `(HOST_FN, op)` + the granted handle). `__spawn`/`__join` are the shell's own
-/// `Instantiator` `cap.call`s (op 13 / op 1) — bound to the granted `Instantiator` handle, not the
-/// personality (STAGE1.md §5).
-fn resolver(px_h: i32, inst_h: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
-    let bound = svm_posix::resolve_bound(px_h);
-    move |name| match name {
-        "__spawn" => Some(svm_ir::Resolved::CapBound {
-            type_id: 6,
-            op: 13,
-            handle: inst_h,
-        }),
-        "__join" => Some(svm_ir::Resolved::CapBound {
-            type_id: 6,
-            op: 1,
-            handle: inst_h,
-        }),
-        _ => bound(name.strip_prefix("__px_")?),
-    }
+/// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
+/// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
+/// through [`svm_posix::resolve`] to `(HOST_FN, op)`; `__spawn`/`__join` are the shell's own
+/// `Instantiator` ops (13 / 1, STAGE1.md §5). No handle is baked at link: each lowered `cap.call`
+/// dispatches on the guest's own handle operand, discovered at run time via
+/// `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3
+/// dynamic mode).
+fn link_shim(name: &str) -> Option<svm_ir::Resolved> {
+    let cap = match name {
+        "__spawn" => svm_ir::ResolvedCap { type_id: 6, op: 13 },
+        "__join" => svm_ir::ResolvedCap { type_id: 6, op: 1 },
+        n => svm_posix::resolve(n.strip_prefix("__px_")?)?,
+    };
+    Some(svm_ir::Resolved::Cap(cap))
 }
 
 /// The guest libc shim (guest code): standard libc names, adapting C's NUL-terminated `char*` calls
 /// to the personality's explicit-length `(ptr, len)` ABI (POSIX.md §4). `write`/`read`/`exit` are
 /// *defined* here so their definitions shadow chibicc's builtins (S15b).
 const SHIM: &str = r#"
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
+
+/* Discover the handle of interface `want` from the domain's own capability table
+   (cap.self reflection — the discovery tier IMPORTS.md keeps). */
+static int __capof(int want) {
+  int n = __vm_cap_count();
+  int i = 0;
+  while (i < n) {
+    int t = 0;
+    int h = __vm_cap_at(i, &t);
+    if (t == want) return h;
+    i = i + 1;
+  }
+  return -1;
+}
+static int __h_px = -1;
+static int __px(void) { if (__h_px < 0) __h_px = __capof(13); return __h_px; }   /* HOST_FN = 13 */
+static int __h_inst = -1;
+static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
+
 long __px_write(int cap, long fd, long buf, long len);
 long __px_read(int cap, long fd, long buf, long len);
 long __px_open(int cap, long path, long len, long flags);
@@ -153,8 +170,8 @@ long __px_closedir(int cap, long dir);
 long __px_argc(int cap);
 long __px_argv(int cap, long i, long buf, long cap2);
 /* Personality `exec` surface (STAGE1.md §5): PATH lookup + the forwardable stdout handle. The spawn
-   itself is the shell's own `Instantiator` cap.call — `__spawn` (op 13) / `__join` (op 1), bound to the
-   granted `Instantiator` handle (not the personality), so they carry a baked handle like every import. */
+   itself is the shell's own `Instantiator` cap.call — `__spawn` (op 13) / `__join` (op 1) — dispatched
+   on the reflection-discovered `Instantiator` handle (`__inst()`), like every import here. */
 long __px_exec_lookup(int cap, long name, long len);
 long __px_exec_stdout(int cap);
 long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
@@ -162,23 +179,23 @@ long __join(int inst, long child);
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
-long write(long fd, void *buf, long n) { return __px_write(0, fd, (long)buf, n); }
-long read(long fd, void *buf, long n) { return __px_read(0, fd, (long)buf, n); }
-long open(char *path, long flags) { return __px_open(0, (long)path, slen(path), flags); }
-long close(long fd) { return __px_close(0, fd); }
-long unlink(char *path) { return __px_unlink(0, (long)path, slen(path)); }
-char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 ? buf : 0; }
-long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
-char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
-long setenv_(char *name, char *val) { return __px_setenv(0, (long)name, slen(name), (long)val, slen(val), 1); }
-void exit(int code) { __px_exit(0, code); }
+long write(long fd, void *buf, long n) { return __px_write(__px(), fd, (long)buf, n); }
+long read(long fd, void *buf, long n) { return __px_read(__px(), fd, (long)buf, n); }
+long open(char *path, long flags) { return __px_open(__px(), (long)path, slen(path), flags); }
+long close(long fd) { return __px_close(__px(), fd); }
+long unlink(char *path) { return __px_unlink(__px(), (long)path, slen(path)); }
+char *getcwd(char *buf, long size) { return __px_getcwd(__px(), (long)buf, size) > 0 ? buf : 0; }
+long chdir(char *path) { return __px_chdir(__px(), (long)path, slen(path)); }
+char *getenv(char *name) { return (char *)__px_getenv(__px(), (long)name, slen(name)); }
+long setenv_(char *name, char *val) { return __px_setenv(__px(), (long)name, slen(name), (long)val, slen(val), 1); }
+void exit(int code) { __px_exit(__px(), code); }
 /* A DIR is just the personality's stream handle (a long); readdir writes the next name. */
-long opendir(char *path) { return __px_opendir(0, (long)path, slen(path)); }
-long readdir(long dir, char *namebuf, long cap) { return __px_readdir(0, dir, (long)namebuf, cap); }
-long closedir(long dir) { return __px_closedir(0, dir); }
+long opendir(char *path) { return __px_opendir(__px(), (long)path, slen(path)); }
+long readdir(long dir, char *namebuf, long cap) { return __px_readdir(__px(), dir, (long)namebuf, cap); }
+long closedir(long dir) { return __px_closedir(__px(), dir); }
 /* The host-side argument vector (personality extension): sh reads its own argv here. */
-int argc_(void) { return (int)__px_argc(0); }
-long getarg(int i, char *buf, long cap) { return __px_argv(0, i, (long)buf, cap); }
+int argc_(void) { return (int)__px_argc(__px()); }
+long getarg(int i, char *buf, long cap) { return __px_argv(__px(), i, (long)buf, cap); }
 "#;
 
 /// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
@@ -410,7 +427,7 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
    (that needs the Power-2 `Endpoint`, STAGE1.md); the command always writes to the terminal sink. */
 static char pool[393216];
 static int spawn_cmd(long mod, int argc, char **argv) {
-  long out = __px_exec_stdout(0);
+  long out = __px_exec_stdout(__px());
   long base = (long)pool;
   long carve = (base + 131071) & ~131071;
   /* grant record at base: {name_off, name_len, out, flags}; "stdout" name follows at base+16 */
@@ -428,8 +445,8 @@ static int spawn_cmd(long mod, int argc, char **argv) {
     for (long k = 0; k < L; k++) *p++ = s[k];
     *p++ = 0;
   }
-  long child = __spawn(0, mod, base, 1, 0, carve, 17, 0);
-  return (int)__join(0, child);
+  long child = __spawn(__inst(), mod, base, 1, 0, carve, 17, 0);
+  return (int)__join(__inst(), child);
 }
 
 static int exec_line(char *line) {
@@ -611,7 +628,7 @@ static int exec_line(char *line) {
   } else {
     /* Not a builtin: look the command up in the personality's PATH registry and, if found, spawn it as
        an external child (STAGE1.md §5); otherwise the classic `<cmd>: not found`. */
-    long mod = __px_exec_lookup(0, (long)cmd, slen(cmd));
+    long mod = __px_exec_lookup(__px(), (long)cmd, slen(cmd));
     if (mod < 0) { puts_(cmd); puts_(": not found\n"); st = 127; }
     else st = spawn_cmd(mod, argc, argv);
   }
@@ -842,7 +859,8 @@ fn run_shell_ex(
         .collect();
 
     // Grant a personality + the spawn caps on one host; identical grant order across the two hosts keeps
-    // the handles equal (so one resolver binds both). The `Instantiator` (over the whole window) and a
+    // the handles equal (so the guest's reflection scan discovers the same handles on both, keeping the
+    // differential exact). The `Instantiator` (over the whole window) and a
     // forwardable stdout `Stream` back the shell's `__spawn`/`exec_stdout`; the personality's fd-1 writes
     // route to the same shared sink as the child's re-granted `Stream`, unifying their output.
     let setup = |host: &mut Host| -> (svm_posix::Posix, i32, i32) {
@@ -884,7 +902,7 @@ fn run_shell_ex(
         "identical grant order → identical handles"
     );
 
-    let m = svm_ir::resolve_imports_with(&raw, resolver(ipx, iinst))
+    let m = svm_ir::resolve_imports_with(&raw, |n| link_shim(n))
         .unwrap_or_else(|e| panic!("resolve imports: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     let init = vec![0u8; win];

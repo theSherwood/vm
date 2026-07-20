@@ -5,7 +5,8 @@
 //! the personality (`write`), looks a command up in the personality's **PATH registry** (`exec_lookup`),
 //! and re-grants the personality's forwardable stdout (`exec_stdout`) to the child — but the spawn
 //! itself is the shell's own `Instantiator.instantiate_module_named` (op 13) + `join`, driven through
-//! capability imports (`Resolved::CapBound`, the `Instantiator` baked in).
+//! capability imports (`Resolved::Cap`, link-time symbol resolution; the guest discovers the
+//! `Instantiator`/personality handles itself via `cap.self` reflection).
 //!
 //! The two stdout models are **unified**: the personality's fd-1 writes and the child's re-granted
 //! `Stream` writes both land in the `Host`'s shared sink (`Host::shared_stdout` + `Posix::set_stdout_sink`),
@@ -98,23 +99,42 @@ int  __px_argc(int h);
 long __px_argv(int h, long i, void *buf, long cap);
 long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
 long __join(int inst, long child);
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
 static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
+/* Discover the handle of interface `want` from the domain's own capability table
+   (cap.self reflection — the discovery tier IMPORTS.md keeps). */
+static int __capof(int want) {
+  int n = __vm_cap_count();
+  int i = 0;
+  while (i < n) {
+    int t = 0;
+    int h = __vm_cap_at(i, &t);
+    if (t == want) return h;
+    i = i + 1;
+  }
+  return -1;
+}
+static int __h_px = -1;
+static int __px(void) { if (__h_px < 0) __h_px = __capof(13); return __h_px; }   /* HOST_FN = 13 */
+static int __h_inst = -1;
+static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
 static int  seq(char *a, char *b){ long i=0; for(;;){ if(a[i]!=b[i]) return 0; if(!a[i]) return 1; i++; } }
 /* 384 KiB: room for the grant record/name low, a 128 KiB-aligned 128 KiB carve, all below the SP. */
 static char pool[393216];
 int main(void){
-  int n = __px_argc(0);
-  if (n < 2){ __px_write(0, 1, "usage\n", 6); return 2; }
+  int n = __px_argc(__px());
+  if (n < 2){ __px_write(__px(), 1, "usage\n", 6); return 2; }
   char cmd[256];
-  __px_argv(0, 1, cmd, 256);                 /* argv[1] = command name */
-  if (seq(cmd, "hi")){ __px_write(0, 1, "hi from shell\n", 14); return 0; }  /* a builtin */
-  long mod = __px_exec_lookup(0, cmd, slen(cmd));
+  __px_argv(__px(), 1, cmd, 256);            /* argv[1] = command name */
+  if (seq(cmd, "hi")){ __px_write(__px(), 1, "hi from shell\n", 14); return 0; }  /* a builtin */
+  long mod = __px_exec_lookup(__px(), cmd, slen(cmd));
   if (mod < 0){
-    __px_write(0, 1, cmd, slen(cmd));
-    __px_write(0, 1, ": not found\n", 12);
+    __px_write(__px(), 1, cmd, slen(cmd));
+    __px_write(__px(), 1, ": not found\n", 12);
     return 127;
   }
-  long out = __px_exec_stdout(0);
+  long out = __px_exec_stdout(__px());
   long base = (long)pool;
   long carve = (base + 131071) & ~131071;
   /* grant record at base: {name_off, name_len, out, flags} ; "stdout" name follows at base+16 */
@@ -133,36 +153,28 @@ int main(void){
   char *p = ab + 8;
   for (int i = 1; i < n; i++){
     char tmp[256];
-    long L = __px_argv(0, i, tmp, 256);
+    long L = __px_argv(__px(), i, tmp, 256);
     for (long k = 0; k < L; k++) *p++ = tmp[k];
     *p++ = 0;
   }
-  long child = __spawn(0, mod, base, 1, 0, carve, 17, 0);
-  return __join(0, child);
+  long child = __spawn(__inst(), mod, base, 1, 0, carve, 17, 0);
+  return __join(__inst(), child);
 }
 "#;
 
-/// Bind the shell's imports: every `__px_*` name routes to the personality handle (via the personality's
-/// own resolver, stripping the prefix); `__spawn`/`__join` bake the `Instantiator` (`Resolved::CapBound`).
-fn resolver(inst_h: i32, px_h: i32) -> impl Fn(&str) -> Option<Resolved> {
-    move |name| {
-        if let Some(bare) = name.strip_prefix("__px_") {
-            return svm_posix::resolve_bound(px_h)(bare);
-        }
-        match name {
-            "__spawn" => Some(Resolved::CapBound {
-                type_id: 6,
-                op: 13,
-                handle: inst_h,
-            }),
-            "__join" => Some(Resolved::CapBound {
-                type_id: 6,
-                op: 1,
-                handle: inst_h,
-            }),
-            _ => None,
-        }
-    }
+/// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
+/// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
+/// through [`svm_posix::resolve`] to `(HOST_FN, op)`; `__spawn`/`__join` are the shell's own
+/// `Instantiator` ops (13 / 1). No handle is baked at link: each lowered `cap.call` dispatches on
+/// the guest's own handle operand, discovered at run time via `__vm_cap_count`/`__vm_cap_at`
+/// reflection (§3c protection at the boundary, IMPORTS.md §2.3 dynamic mode).
+fn link_shim(name: &str) -> Option<Resolved> {
+    let cap = match name {
+        "__spawn" => svm_ir::ResolvedCap { type_id: 6, op: 13 },
+        "__join" => svm_ir::ResolvedCap { type_id: 6, op: 1 },
+        n => svm_posix::resolve(n.strip_prefix("__px_")?)?,
+    };
+    Some(Resolved::Cap(cap))
 }
 
 fn grant_hooks() -> GrantChildHooks {
@@ -182,18 +194,18 @@ fn run(shell: &svm_ir::Module, cmd: &svm_ir::Module, argv: &[&str], jit: bool) -
     let mut host = Host::new();
     let sink = host.shared_stdout(); // the child's re-granted Stream writes here…
     let out_h = host.grant_stream(StreamRole::Out);
-    let inst_h = host.grant_instantiator(0, win as u64);
+    let _inst_h = host.grant_instantiator(0, win as u64);
     let echo_h = host.grant_module(cmd);
     // The personality's heap sits in the top 64 KiB, clear of the shell's data/stack and the command
     // carve (a lean shell never `malloc`s, so this region stays untouched).
-    let (px_h, posix) =
+    let (_px_h, posix) =
         svm_posix::grant(&mut host, (win - (64 << 10)) as u64, win as u64, Vec::new());
     posix.set_stdout_sink(sink); // …and the shell's own fd-1 writes land in the same sink.
     posix.set_exec_stdout(out_h);
     posix.register_command("echo", echo_h);
     posix.set_args(argv);
 
-    let m = svm_ir::resolve_imports_with(shell, resolver(inst_h, px_h)).expect("resolve");
+    let m = svm_ir::resolve_imports_with(shell, |n| link_shim(n)).expect("resolve");
     verify_module(&m).expect("verify shell");
     let init = vec![0u8; win];
 
