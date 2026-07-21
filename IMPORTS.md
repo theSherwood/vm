@@ -655,70 +655,109 @@ the correct ocap bound.
 ### 3.5 Interface-grouped imports  [DESIGNED 2026-07-21 — next build slice]
 
 The type section's recorded next consumer (OQ3), now designed: one slot binds a
-whole interface, the op moves to the call site, and the flat one-op import
-stays as the degenerate case.
+whole interface, the op moves to the call site, and the flat one-op import is
+the degenerate case of the same mechanism.
 
-**Surface** (consumer side; settled 2026-07-21):
+**Surface** (consumer side; syntax settled 2026-07-21):
 
 ```
-type 0 (i64, i64) -> (i64)
-type 1 (i64) -> (i64)
-type 2 interface { read: 0, len: 1 }   ; op names REQUIRED; identity is still the shape
+type 0 func (i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { read: 0, len: 1 }   ; op names required
 
-import 0 "env" "fs" iface 2 required   ; grouped: one slot, the whole interface
-import 1 "env" "log" func 1 rebindable ; flat: one op, signature by type reference
+import 0 interface "env" "fs" 2 required   ; grouped: one slot, the whole requirement
+import 1 func "env" "log" 1 rebindable     ; flat: a singleton requirement
 
-func 0 () -> (i64) {                   ; function definitions are numbered too
-block0:
-  v1 = i64.const 4096
-  v2 = i64.const 64
-  v3 = call.import 0.read (v1, v2)     ; by name — resolved to the op index at parse
-  v4 = call.import 0.1 (v1)            ; or positional — identical wire form
-  v5 = call.import [v6] iface 2 . read (v1, v2)  ; dynamic: handle from a value,
-  return v5                            ; interface by type-section ref, use-site checked
+func 0 () -> (i64) {
+  block 0 {
+    v1 = i64.const 4096
+    v2 = i64.const 64
+    v3 = call.import 0.read (v1, v2)   ; by name — resolved to the op index at parse
+    v4 = call.import 0.1 (v1)          ; or positional — identical wire form
+    v5 = call.import [v6] interface 2 . read (v1, v2)  ; dynamic: handle from a
+    return v5                          ; value, requirement by type-section ref
+  }
 }
 ```
 
 **Text-format rules (settled with the surface):**
 
-- **Every definition carries its index** as a *checked positional label* —
-  `type 0`, `import 1`, `func 0`; the parser verifies label = position and
-  errors otherwise. The wire stays positional; this is pure text-format
-  legibility (greppable references, stable diffs, precise errors).
+- **One declaration grammar:** `keyword index [kind] [names] payload`. Every
+  definition — `type`, `import`, `func`, `export`, `block` — carries its
+  index as a *checked positional label* (the parser verifies label =
+  position; the wire stays positional — pure legibility: greppable
+  references, stable diffs, precise errors). Exactly two kind keywords,
+  **`func`** and **`interface`**, used identically in `type`, `import`, and
+  `export`; the spellings `iface` and `impl` are retired (Rust follows:
+  `ImplExport.iface` → `interface`; the `iface::` constants module renames in
+  a follow-up).
+- **One grouping construct:** `{ }` — function bodies, blocks, interface
+  declarations, offer maps; indentation is never significant. One map syntax,
+  `{ name: idx, … }` (in `type … interface` the values are type indices; in
+  `export … interface` they are func indices — the kind keyword up front says
+  which). One signature syntax, `(params) -> (results)`, appearing only in
+  `type … func` entries; everything else references a type index.
 - **Import names are two-level**: `("env", "fs")` — the first level names the
   provider binding point, the second the bundle (grouped) or op (flat).
-  Resolver vocabulary, never identity.
-- **Interface op names are required** in the declaration and carried on the
-  wire, but **excluded from the intern key**: usage may be positional (`0.1`)
-  or by name (`0.read`) — the name resolves to the op index at parse — and two
-  shapes differing only in op names intern to the same `type_id`. D46 schema
-  reflection returns the names; interposition invisibility survives (a
-  provider naming an op differently still matches — shape decides).
-- **Index spaces stay per-section** (types / imports / funcs). Import index =
-  handle-table slot is ABI (plus the reserved child prefix); folding types
-  into the import numbering would put a "subtract the definitions above me"
-  step into the slot path for zero semantic gain.
+  Resolver vocabulary.
+- **Index spaces stay per-section** (types / imports / funcs / exports).
+  Import index = handle-table slot is ABI (plus the reserved child prefix);
+  folding types into the import numbering would put a "subtract the
+  definitions above me" step into the slot path for zero semantic gain.
 - **There is deliberately no `import type`.** Under structural identity a type
   import is redundant — declaring the shape locally *is* having the type
   (same interned id, D59) — and load-time verification needs concrete shapes.
   Cross-suite shape dedup is the linker's job (it already merges type
   sections, §2.5); the abstract-type use case is served by capability handles.
 
+**Coverage binding — the binding relation (settled 2026-07-21).** A consumer's
+interface declaration is a **requirement set**, not a claimed identity: "ops
+with these names and these signatures." Binding succeeds iff the provider
+**covers** it — every consumer `(name, sig)` has a same-named,
+signature-equal op in the provider's interface; extra provider ops are
+ignored; a missing name or a signature mismatch fails closed. At bind time
+the host computes a per-slot **op remap** (consumer-local index → provider
+index) and freezes it; call sites use the consumer's own numbering.
+
+- **Forward compatibility, both directions:** providers evolve by *adding*
+  ops without breaking any consumer; consumers declare only what they use and
+  tolerate any covering provider. Coverage is name-keyed, so declaration
+  *order* never matters for binding (it only assigns consumer-local indices).
+- **Names are the binding contract; `type_id` stays shape-only** — the ELF
+  split: link by symbol name, run by address. Matching must be by name
+  because signature-only subset matching is ambiguous the moment two ops
+  share a signature (`read`/`write`). The price, stated plainly: renaming an
+  op is a breaking provider change, like renaming an exported symbol. An
+  interposer declares the same names as what it wraps, so interposition
+  invisibility is unaffected.
+- **A flat `func` import is a singleton requirement set** — wasm's per-op
+  import is the degenerate case of the same mechanism, not a competing mode.
+  Grouped adds what wasm cannot express: one slot, one fail-closed act, one
+  attach, one provenance answer, one revocation point for a coherent bundle.
+- **Exact matching is the trivial case** (coverage happens to be total); no
+  second mechanism exists.
+- The coverage walk runs only at **binding acts** — instantiation,
+  `import.attach`, child-manifest binding, wiring — once per binding, off the
+  hot path. `required` slots stay devirtualizable (the remap is an instance
+  constant).
+
 **Semantics:**
 
-- A grouped slot's binding state is `(type_id, handle)` — no per-slot op. The
-  static form's verifier check resolves `import 0` → `types[2]` → op 1 →
-  `types[1]`, all at load; execution passes the op immediate through the
-  existing `cap_dispatch_slots(CAP_IMPORT_TYPE_ID, slot, op, …)` path (the
-  `op` argument exists today and is always `0` — it starts carrying
-  information).
-- The dynamic form checks `entry.type_id == intern(types[2])` plus generation
-  at the use site — the same §3c check, now *expressible for interned
-  interfaces*. This closes the recorded encoding gap: `cap.call` needs a
-  compile-time `type_id` immediate, which a guest cannot know for a wired
-  offer; a type-section reference is resolvable at instantiation. `cap.call`
-  stays as the escape hatch for undeclared grants and the reserved self
-  namespace.
+- A grouped slot's binding state is `(type_id, handle, remap)`. The static
+  form's verifier check resolves `import 0` → `types[2]` → op → signature,
+  all at load; execution passes the remapped op through the existing
+  `cap_dispatch_slots(CAP_IMPORT_TYPE_ID, slot, op, …)` path (the `op`
+  argument exists today and is always `0` — it starts carrying information).
+- The dynamic form (`call.import [v] interface k . op`) keeps the **exact-id
+  fast path**: `entry.type_id == intern(types[k])` plus generation at the use
+  site — the same §3c check, now *expressible for interned interfaces*. This
+  closes the recorded encoding gap: `cap.call` needs a compile-time `type_id`
+  immediate, which a guest cannot know for a wired offer; a type-section
+  reference is resolvable at instantiation. To drive a
+  covering-but-not-equal capability discovered at runtime, attach it to a
+  rebindable slot — the coverage walk happens once, there — then use static
+  calls. `cap.call` stays as the escape hatch for undeclared grants and the
+  reserved self namespace.
 - **Intern pre-seeding.** Built-in interfaces publish canonical shapes,
   pre-seeded into the per-host intern, so a structurally equal guest
   declaration interns *to the built-in id* (D59 extended across the
@@ -726,71 +765,121 @@ block0:
   semantics are per-registration embedder code with no canonical shape; it
   binds by name through the registry, the (trusted) embedder asserting the
   shape it implements.
-- **Reflection gains one authority-neutral op:** `cap.self.type_id k` —
-  intern *this module's* `types[k]`, return the runtime id. Lookup becomes
-  shape-indexed: iterate `cap.self.get`, compare ids, `import.attach` the
-  match into a grouped rebindable slot; attach checks the whole interface in
-  one act (`entry.type_id == intern(slot's declared entry)`). `resolve`
-  (by name) is unchanged; D46 op-schema reflection reads the same intern
-  table backwards (shapes are stored for pre-seeded and guest ids alike).
+- **Reflection gains two authority-neutral ops:** `cap.self.type_id k` —
+  intern *this module's* `types[k]`, return the runtime id (exact-shape
+  discovery: iterate `cap.self.get`, compare ids) — and `cap.self.covers
+  vh, k` — "does the capability behind this handle cover my `types[k]`?"
+  (subset discovery; a failed `import.attach` works as the probe even
+  without it). `import.attach` on a grouped slot runs the coverage walk in
+  one act. `resolve` (by name) is unchanged; D46 schema reflection returns
+  op names alongside signatures (both are stored for pre-seeded and guest
+  ids alike).
 - **Child manifests** (§3.3): a grouped import matches a named grant by one
-  interned-id comparison — `bind_child_manifest`'s per-op signature probe
-  collapses (wiring already checked the whole shape).
+  name-keyed coverage walk — `bind_child_manifest`'s per-op signature probe
+  becomes exactly that walk, computing the remap as it goes.
 
-**Wire (v7 — one bump, four riders):** `Import` replaces its inline `FuncType`
-with `shape: Func(typeidx) | Iface(typeidx)` and gains the second name level;
-`TypeEntry::Interface` elements become `(name, typeidx)` pairs (names
+**Offer exposure — who may wire (settled 2026-07-21).** Declaring an offer
+confers nothing (§3.2); *wirable* offers are capabilities, and the initial
+holder is the domain that implements them:
+
+- **`export.handle k` → `i32`** (mirror of `import.handle i`): the exporting
+  domain reifies its own export entry `k` as an ordinary capability handle.
+  Wiring rights propagate only by granting that handle: down to its own
+  children at spawn (bind their manifests with it), up to its parent or out
+  to a sibling *iff it chooses to send it*.
+- **No guest-reachable op harvests another domain's offers.** A parent
+  holding a child's `Instantiator` cannot enumerate-and-wire the child's
+  declared offers; the declaration in the module bytes is inert until the
+  implementing domain (or the TCB) reifies it. This is what lets a domain
+  with a potentially hostile parent still serve its *own* children: the
+  parent never receives the offer handle, so it has nothing to bind.
+- **The embedder is the exception because it is the TCB:** host-side Rust
+  (`wire_impl*`, the registry) wires declared offers directly — necessary
+  for provider modules that serve before they run, and no loss of security,
+  since the host can do anything regardless.
+- **Honest limit:** this controls who can *call through* your offers. In
+  window-exposed tiers a §14 parent already reads and writes the child's
+  entire carve — export protection cannot create confidentiality the memory
+  model doesn't provide. That is `attest`'s job: a child that finds itself
+  window-exposed to an untrusted parent should refuse to hold secrets at
+  all; distrust means separate processes (§1a). The two compose: attest
+  tells you which world you are in; `export.handle` keeps offer wiring
+  consent-based in the worlds where isolation is real.
+
+**Wire (v7 — one bump, five riders):** `Import` replaces its inline `FuncType`
+with `shape: Func(typeidx) | Interface(typeidx)` and gains the second name
+level; `TypeEntry::Interface` elements become `(name, typeidx)` pairs (names
 required); `CallImport` gains an `op` immediate and **drops the vestigial
 handle operand** (whose retirement was already scheduled for "the next wire
-bump" — this is it); dynamic mode gains the type-section-reference form.
-Backend cost is the op immediate threading through the one generic dispatch;
-JIT devirtualization of `required` grouped slots stays legal per §2.2
-(immutable binding, load-time op resolution).
+bump" — this is it); dynamic mode gains the type-section-reference form;
+`export.handle` joins `import.handle`. Backend cost is the op immediate plus
+one remap load threading through the one generic dispatch; JIT
+devirtualization of `required` grouped slots stays legal per §2.2 (immutable
+binding, bind-time-constant remap).
 
 **Host-side provider, Rust** (embedder registry — sketch):
 
 ```rust
 let fs_shape = IfaceShape::new()      // op names required, mirroring the text form
+    .op("open", sig_open())
     .op("read", sig_read())
+    .op("write", sig_write())
     .op("len", sig_len());
 Imports::new()
     // host-native: the (trusted) embedder asserts the shape it implements
     .provide("fs", HostCap::iface(&fs_shape, fs_handle))
-    // or a guest offer as the provider — the shape comes from the offer itself
+    // or a guest offer as the provider — shape and names come from the offer
     .provide("fs", HostCap::impl_service(&fs_module, "fs")?)
 ```
 
-Instantiation interns the consumer's declared entry and requires the provided
-capability's `type_id` to equal it — the same fail-closed structural check as
-`wire_impl`, applied at the registry boundary.
+Instantiation runs the coverage walk: every `(name, sig)` the consumer's
+declared entry requires must appear in the provided shape — the same
+fail-closed check as `wire_impl`, applied at the registry boundary. A
+consumer requiring only `{ read, len }` binds against this four-op provider.
 
-**Parent domain with a nested child, svm-ir** (the §3.3 wrap, grouped):
+**Parent domain with a nested child, svm-ir** (the §3.3 wrap, grouped —
+subset consumer):
 
 ```
-; ---- parent (the provider) ----
-type 0 (i64, i64) -> (i64)
-type 1 interface { log: 0 }
-func 0 (i64, i64) -> (i64) { ... }     ; the interposer (record, then forward)
-export "log" impl 1 : log=0            ; the offer: op `log` -> func 0
-                                       ; (positional `impl 1 : 0` also accepted)
-; parent main: its offer, granted under the child's import name, is what
-; manifest binding accepts (wrap/override); an aliased own-binding forwards;
-; no grant under the name + `required` ⇒ the spawn fails closed (§3.3).
+; ---- parent (the provider; here also an interposer) ----
+type 0 func (i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { log: 0, flush: 1 }
 
-; ---- child (the consumer) ----
-type 0 (i64, i64) -> (i64)
-type 1 interface { log: 0 }
-import 0 "parent" "log" iface 1 required   ; slot 2 at runtime (reserved child prefix)
+func 0 (i64, i64) -> (i64) {
+  block 0 (v0: i64, v1: i64) {
+    ; record, then forward
+  }
+}
+func 1 (i64) -> (i64) { ... }
 
-  v3 = call.import 0.log (v1, v2)      ; by name — or positionally, `0.0`
+export 0 interface "log" 2 { log: 0, flush: 1 }
+; parent main: reify `export.handle 0`, grant it under the child's import
+; name; manifest binding accepts it (wrap/override); an aliased own-binding
+; forwards; no grant under the name + `required` ⇒ the spawn fails closed.
+
+; ---- child (the consumer — requires only the op it uses) ----
+type 0 func (i64, i64) -> (i64)
+type 1 interface { log: 0 }
+
+import 0 interface "parent" "log" 1 required   ; slot 2 at runtime (child prefix)
+
+func 0 (i64, i64) -> (i64) {
+  block 0 (v0: i64, v1: i64) {
+    v2 = call.import 0.log (v0, v1)    ; by name — or positionally, `0.0`
+    return v2
+  }
+}
 ```
 
-The punchline is the two `type 1 interface` declarations: different sections,
-same shape ⇒ same interned id (D59) — parent and child agree on the interface
-with no shared registry, and even the op *names* need not agree (shape decides;
-names are per-module vocabulary). Provenance reports the wrapped binding
-ancestor-terminated at depth 1: the child can see *that* it is interposed,
-never *what* the interposer does.
+The child's one-op requirement binds against the parent's two-op offer —
+coverage, remap `[0→0]`. The offer flows the other way just as well: a child
+reifying its own offer and sending the handle *up* (a return value, a pipe)
+is how a child chooses to serve its parent — exposure is always
+module→holder, authority flow is per-wiring, consent-based via
+`export.handle`. Provenance reports the wrapped binding ancestor-terminated
+at depth 1: the child can see *that* it is interposed, never *what* the
+interposer does.
 
 ---
 

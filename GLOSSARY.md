@@ -88,9 +88,14 @@ The system is four ideas wearing many names:
   domain already holds, type-checked fail-closed. The "reflect, decide, attach once,
   then ordinary calls" pattern.
 - **grouped import** — (designed: IMPORTS.md §3.5) an import slot binding a *whole
-  interface* rather than one op: `import 0 "env" "fs" iface 2`, called as
+  interface* rather than one op: `import 0 interface "env" "fs" 2`, called as
   `call.import 0.read` (by op name) or `call.import 0.1` (positional). Today's
-  flat named import is the one-op case.
+  flat named import is the singleton case of the same mechanism.
+- **coverage binding** — (designed: §3.5) the binding relation for grouped imports:
+  a consumer's interface declaration is a *requirement set*; binding succeeds iff
+  the provider covers it (every required op present, same name, equal signature —
+  extra provider ops ignored), with a per-slot op remap frozen at bind time. Names
+  are the binding contract; `type_id` identity stays shape-only.
 - **`cap.call`** — the wire form of dynamic-mode dispatch: `(type_id, op, sig)`
   immediates plus a runtime handle. Retired as a *concept* (it's just dynamic mode);
   kept as the encoding and the escape hatch for undeclared grants.
@@ -116,7 +121,12 @@ The system is four ideas wearing many names:
 - **impl export / offer** — a declaration that this module *implements* an interface:
   `export "adder" impl 0 : 3 4` — "my funcs 3 and 4 implement interface #0," verifier-
   checked exactly. An *offer* because declaring it confers nothing: it is an
-  advertisement, callable by no one until wired.
+  advertisement, callable by no one until wired. (§3.5 retires the `impl` spelling:
+  `export 0 interface "adder" 2 { add: 3, sub: 4 }`.)
+- **`export.handle`** — (designed: §3.5) reify one of *this module's own* offers as an
+  ordinary capability handle — the only guest-reachable source of wiring rights, so
+  offer wiring is consent-based: a domain's offers reach exactly whom it sends the
+  handle to (its children, or upward only by choice).
 - **wire / wiring** — the authority-moving act that accepts an offer: someone holding
   both ends (embedder registry, parent at spawn, `Host::wire_impl*`) mints the table
   entry that makes the offer's functions callable from a consumer's domain, after a
