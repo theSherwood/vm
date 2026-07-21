@@ -860,6 +860,10 @@ fn tokenize(src: &str) -> Result<(Vec<Tok>, Vec<u32>), ParseError> {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
                     emit!(Tok::Arrow);
                     i += 2;
+                } else if bytes[i + 1..].starts_with(b"inf") {
+                    // `-inf`, as the float printer's `{:?}` emits it.
+                    emit!(Tok::Float(f64::NEG_INFINITY));
+                    i += 4;
                 } else {
                     let (tok, ni) = lex_number(bytes, i)?;
                     emit!(tok);
@@ -3179,6 +3183,11 @@ impl<'a> Parser<'a> {
         match self.next()? {
             Tok::Float(v) => Ok(*v),
             Tok::Int(v) => Ok(*v as f64),
+            // Non-finite literals, as the printer's `{:?}` emits them (`inf` / `NaN`; the
+            // lexer handles `-inf`). All NaN text is the canonical quiet NaN — payload bits
+            // do not survive text (binary is the lossless carrier).
+            Tok::Ident(s) if s == "inf" => Ok(f64::INFINITY),
+            Tok::Ident(s) if s == "NaN" => Ok(f64::NAN),
             other => err(format!("expected number, found {other:?}")),
         }
     }
