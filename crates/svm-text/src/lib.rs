@@ -2057,7 +2057,7 @@ impl<'a> Parser<'a> {
             }
             ops[pos] = f;
         }
-        if ops.iter().any(|&f| f == u32::MAX) {
+        if ops.contains(&u32::MAX) {
             return err("offer op map must bind every op of the declared interface");
         }
         Ok(ops)

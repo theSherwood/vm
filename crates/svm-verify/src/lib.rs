@@ -313,7 +313,7 @@ pub fn manifest_complete(m: &Module) -> bool {
 /// Resolve import `import`'s op-`op` signature through the type section (the §3.5 view):
 /// a flat `func` import has exactly op 0; a grouped import resolves its interface element.
 fn import_op_sig<'a>(
-    imports: &'a [svm_ir::Import],
+    imports: &[svm_ir::Import],
     ts: &'a [svm_ir::TypeEntry],
     import: u32,
     op: u32,
@@ -329,7 +329,7 @@ fn import_op_sig<'a>(
 
 /// Resolve interface entry `t`'s op-`op` signature, or `None` if `t` is not a well-formed
 /// interface reference or `op` is out of range.
-fn iface_op_sig<'a>(ts: &'a [svm_ir::TypeEntry], t: u32, op: u32) -> Option<&'a svm_ir::FuncType> {
+fn iface_op_sig(ts: &[svm_ir::TypeEntry], t: u32, op: u32) -> Option<&svm_ir::FuncType> {
     match ts.get(t as usize)? {
         svm_ir::TypeEntry::Interface(elems) => match ts.get(elems.get(op as usize)?.ty as usize)? {
             svm_ir::TypeEntry::Func(ft) => Some(ft),
