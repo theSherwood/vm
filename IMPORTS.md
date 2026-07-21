@@ -1072,14 +1072,22 @@ buffers; and guest services layered on guest services.
   spawning vCPUs; handlers are just more work items. Other guest fibers
   in the domain are untouched: they never see handlers except through
   memory.
-- **Synchrony is the platform primitive; asynchrony is protocol.** Every
-  cross-domain call is synchronous to its caller: the calling *fiber*
-  parks until results return (its vCPU multiplexes on). A callee wanting
-  async semantics builds it in the interface — accept, record, return
-  early, deliver later through a `cap` callback or a pipe (split-phase by
-  choice, not by force). The type system deliberately does not encode
-  "may park" on ops — the same honesty as posix and wasm; annotate later
-  only if a consumer demands it.
+- **Synchrony is a fiber-level property; asynchrony is protocol.** Every
+  cross-domain call is synchronous to *the calling fiber* — its program
+  order is call → results, nothing of that fiber runs in between — and
+  implies nothing beyond it: A[f1] parking on a call into B leaves A[f2]
+  running, A's other vCPUs running, and A[f1]'s own vCPU multiplexing onto
+  other runnable fibers; on B's side the dispatch queues until a service
+  point opens. Two corollaries: **a domain serves while it waits** (with
+  A[f1] parked, A's loop fiber in `svc.wait` still admits handlers — the
+  re-entry story above); and **non-blocking calls need no platform
+  primitive** — spawn a fiber to make the synchronous call, and the park
+  is confined to it (fiber-level synchrony + cheap fibers, the Go recipe).
+  A callee wanting async *semantics* builds it in the interface — accept,
+  record, return early, deliver later through a `cap` callback or a pipe
+  (split-phase by choice, not by force). The type system deliberately does
+  not encode "may park" on ops — the same honesty as posix and wasm;
+  annotate later only if a consumer demands it.
 - **Termination: `exit` is still `exit`.** A domain ends immediately on
   explicit exit; its outstanding offer handles go stale through the
   generation bump, so callers get a clean probeable `CapFault`, never a
