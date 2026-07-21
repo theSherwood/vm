@@ -439,7 +439,7 @@ block0(v0: i32, v1: i32):
 fn link_merges_impl_surfaces_across_units() {
     let provider = unit(
         "type (i32, i32) -> (i32)\n\
-         interface { 0 }\n\
+         interface { add: 0 }\n\
          export \"adder\" impl 1 : 0\n\n\
          func (i32, i32) -> (i32) {\n\
          block0(v0: i32, v1: i32):\n\
@@ -460,7 +460,7 @@ fn link_merges_impl_surfaces_across_units() {
     let offer = m
         .resolve_impl_export("adder")
         .expect("offer survives the merge");
-    assert_eq!(offer.iface, 1);
+    assert_eq!(offer.interface, 1);
     assert_eq!(
         offer.ops,
         vec![1],
@@ -470,7 +470,7 @@ fn link_merges_impl_surfaces_across_units() {
     // An offer name colliding with a function export symbol fails closed.
     let clash = unit(
         "type (i32, i32) -> (i32)\n\
-         interface { 0 }\n\
+         interface { add: 0 }\n\
          export \"add\" impl 1 : 0\n\n\
          func (i32, i32) -> (i32) {\n\
          block0(v0: i32, v1: i32):\n\

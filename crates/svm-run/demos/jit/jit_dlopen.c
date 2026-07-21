@@ -78,7 +78,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 6); // format v6 (v5 sections + the interface section)
+  eb(buf, 7); // format v7 (§3.5: shape-referencing imports + named interface elements)
   eb(buf, 1);
   eb(buf, 16);
   eb(buf, 0);
@@ -117,21 +117,27 @@ static long emit_binop(char *buf, int opcode) {
 // Values: v0,v1 = params; v2 = handle const; v3 = mul(a,a); v4 = handle const; v5 = add(v3,b).
 static long emit_poly(char *buf) {
   emit_header(buf);
-  eb(buf, 2); // 2 imports
+  eb(buf, 2); // 2 imports (v7: ns + name + shape ref)
+  eb(buf, 0); // ns length (unnamespaced)
   eb(buf, 3); // "mul"
   eb(buf, 'm');
   eb(buf, 'u');
   eb(buf, 'l');
-  emit_i64_pair_sig(buf);
-  eb(buf, 0); // mode: required (v4)
+  eb(buf, 0);   // shape tag: func
+  uleb(buf, 0); //   -> type entry 0
+  eb(buf, 0);   // mode: required (v4)
+  eb(buf, 0); // ns length (unnamespaced)
   eb(buf, 3); // "add"
   eb(buf, 'a');
   eb(buf, 'd');
   eb(buf, 'd');
-  emit_i64_pair_sig(buf);
-  eb(buf, 0); // mode: required (v4)
+  eb(buf, 0);   // shape tag: func
+  uleb(buf, 0); //   -> type entry 0
+  eb(buf, 0);   // mode: required (v4)
   eb(buf, 0); // 0 exports (v3 export section)
-  eb(buf, 0); // 0 interfaces (v6 interface section)
+  eb(buf, 1); // 1 type entry (v7 type section)
+  eb(buf, 0); //   tag: Func
+  emit_i64_pair_sig(buf);
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
@@ -144,6 +150,7 @@ static long emit_poly(char *buf) {
   sleb(buf, 0);
   eb(buf, 0x7C); // v3 = call.import "mul" (import 0) (a, a)
   uleb(buf, 0);
+  uleb(buf, 0); // consumer-local op 0 (v7)
   emit_i64_pair_sig(buf);
   uleb(buf, 2); // handle = v2
   eb(buf, 2);   // 2 args
@@ -153,6 +160,7 @@ static long emit_poly(char *buf) {
   sleb(buf, 0);
   eb(buf, 0x7C); // v5 = call.import "add" (import 1) (v3, b)
   uleb(buf, 1);
+  uleb(buf, 0); // consumer-local op 0 (v7)
   emit_i64_pair_sig(buf);
   uleb(buf, 4); // handle = v4
   eb(buf, 2);   // 2 args

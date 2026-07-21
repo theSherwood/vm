@@ -245,7 +245,12 @@ fn a_wired_import_slot_runs_on_both_engines() {
         let mut h = Host::new();
         let handle = h.wire_impl(&offer_funcs(), &[1]).expect("offer");
         let b = h
-            .bound_import_for_impl(handle, 0, m.import_op_sig(0, 0).expect("flat import"), false)
+            .bound_import_for_impl(
+                handle,
+                0,
+                m.import_op_sig(0, 0).expect("flat import"),
+                false,
+            )
             .expect("slot sig matches the offer op");
         h.set_import_bindings(vec![b]);
         h

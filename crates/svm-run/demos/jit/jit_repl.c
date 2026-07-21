@@ -94,7 +94,7 @@ static long emit_unit(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 6); // format v6 (v5 sections + the interface section)
+  eb(buf, 7); // format v7 (§3.5: shape-referencing imports + named interface elements)
   // Memory descriptor: present, size_log2 16 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(buf, 1);

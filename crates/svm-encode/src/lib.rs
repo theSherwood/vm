@@ -107,10 +107,12 @@ mod op {
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
     pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, op (v7), sig, handle, arg idx-list
-    pub const CALL_IMPORT_DYN: u8 = 0xD1; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
-    pub const EXPORT_HANDLE: u8 = 0xD2; // v7 §3.5: impl-export idx -> i32 handle
-    pub const CAP_SELF_TYPE_ID: u8 = 0xD3; // v7 §3.5: type idx -> i32 runtime type_id
-    pub const CAP_SELF_COVERS: u8 = 0xD4; // v7 §3.5: handle operand, type idx -> i32 covers
+                                      // v7 §3.5 opcodes live in the low band (0x0A..=0x0D): every 0x1X..0xFX slot above is
+                                      // either assigned or inside a computed range (CAST/FTOI/ITOF/LOAD families, SIMD prefix).
+    pub const CALL_IMPORT_DYN: u8 = 0x0A; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
+    pub const EXPORT_HANDLE: u8 = 0x0B; // v7 §3.5: impl-export idx -> i32 handle
+    pub const CAP_SELF_TYPE_ID: u8 = 0x0C; // v7 §3.5: type idx -> i32 runtime type_id
+    pub const CAP_SELF_COVERS: u8 = 0x0D; // v7 §3.5: handle operand, type idx -> i32 covers
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
     pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
     pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len

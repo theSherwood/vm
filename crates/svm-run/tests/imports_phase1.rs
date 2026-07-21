@@ -127,8 +127,14 @@ fn out_of_range_import_fails_verification() {
 #[test]
 fn sig_mismatch_fails_verification() {
     let mut m = parse_module(NAMED_START).expect("parse");
-    // Flip the declared sig of import 0 ("write") so the call site no longer matches.
-    m.imports[0].sig.results.clear();
+    // Flip the declared sig of import 0 ("write") so the call site no longer matches:
+    // repoint the import's shape at a fresh, different Func type entry (§3.5 — signatures
+    // live in the type section).
+    let bad = m.intern_func_type(svm_ir::FuncType {
+        params: vec![],
+        results: vec![],
+    });
+    m.imports[0].shape = svm_ir::ImportShape::Func(bad);
     let Err(err) = instantiate_with_imports(m, registry()) else {
         panic!("sig mismatch must fail verify");
     };

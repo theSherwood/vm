@@ -11,7 +11,7 @@ use svm_text::parse_module;
 /// The provider: func 1 implements `add(a, b) = a + b`; the offer's op 0 names it.
 const PROVIDER: &str = "\
 type (i64, i64) -> (i64)
-interface { 0 }
+interface { add: 0 }
 export \"adder\" impl 1 : 1
 
 func (i64) -> (i64) {
@@ -111,7 +111,7 @@ fn offer_signature_mismatch_fails_instantiation_closed() {
 const STATEFUL_PROVIDER: &str = "\
 memory 16
 type () -> (i64)
-interface { 0 }
+interface { add: 0 }
 export \"counter\" impl 1 : 0
 
 func () -> (i64) {

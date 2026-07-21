@@ -402,6 +402,7 @@ fn directed_rule_rejects() {
         vec![],
         vec![Inst::CallImport {
             import: 0,
+            op: 0,
             sig: FuncType {
                 params: vec![],
                 results: vec![],
@@ -426,6 +427,7 @@ fn directed_rule_rejects() {
                 Inst::ConstI32(0), // vestigial handle operand (IMPORTS.md §2.5)
                 Inst::CallImport {
                     import: 0,
+                    op: 0,
                     sig,
                     handle: 0,
                     args: vec![],
@@ -439,39 +441,21 @@ fn directed_rule_rejects() {
         results: vec![],
     };
     let mut m = module(vec![import_call(unit_sig.clone())]);
-    m.imports = vec![svm_ir::Import {
-        name: "ping".into(),
-        sig: unit_sig.clone(),
-        mode: svm_ir::ImportMode::Required,
-    }];
+    m.add_func_import("", "ping", unit_sig.clone(), svm_ir::ImportMode::Required);
     accept(&m, "manifest-bearing call.import");
     // Same module, call-site sig disagrees with the manifest's declaration.
     let mut m = module(vec![import_call(FuncType {
         params: vec![],
         results: vec![V::I32],
     })]);
-    m.imports = vec![svm_ir::Import {
-        name: "ping".into(),
-        sig: unit_sig.clone(),
-        mode: svm_ir::ImportMode::Required,
-    }];
+    m.add_func_import("", "ping", unit_sig.clone(), svm_ir::ImportMode::Required);
     reject(&m, "import sig mismatch", |e| {
         matches!(e, VerifyError::ImportSigMismatch { .. })
     });
     // Two manifest entries sharing a name.
     let mut m = module(vec![import_call(unit_sig.clone())]);
-    m.imports = vec![
-        svm_ir::Import {
-            name: "ping".into(),
-            sig: unit_sig.clone(),
-            mode: svm_ir::ImportMode::Required,
-        },
-        svm_ir::Import {
-            name: "ping".into(),
-            sig: unit_sig,
-            mode: svm_ir::ImportMode::Required,
-        },
-    ];
+    m.add_func_import("", "ping", unit_sig.clone(), svm_ir::ImportMode::Required);
+    m.add_func_import("", "ping", unit_sig, svm_ir::ImportMode::Required);
     reject(&m, "duplicate import name", |e| {
         matches!(e, VerifyError::DuplicateImport { .. })
     });
@@ -495,18 +479,15 @@ fn directed_rule_rejects() {
         results: vec![V::I64],
     };
     let mut m = module(vec![attach_fn.clone()]);
-    m.imports = vec![svm_ir::Import {
-        name: "out".into(),
-        sig: stream_sig.clone(),
-        mode: svm_ir::ImportMode::Rebindable,
-    }];
+    m.add_func_import(
+        "",
+        "out",
+        stream_sig.clone(),
+        svm_ir::ImportMode::Rebindable,
+    );
     accept(&m, "attach to a rebindable import");
     let mut m = module(vec![attach_fn.clone()]);
-    m.imports = vec![svm_ir::Import {
-        name: "out".into(),
-        sig: stream_sig,
-        mode: svm_ir::ImportMode::Required,
-    }];
+    m.add_func_import("", "out", stream_sig, svm_ir::ImportMode::Required);
     reject(&m, "attach to a required import", |e| {
         matches!(e, VerifyError::AttachNotRebindable { .. })
     });
@@ -568,13 +549,16 @@ fn directed_rule_rejects() {
                 params: vec![],
                 results: vec![],
             }),
-            svm_ir::TypeEntry::Interface(vec![0]),
+            svm_ir::TypeEntry::Interface(vec![svm_ir::IfaceOp {
+                name: "log".into(),
+                ty: 0,
+            }]),
         ];
         m
     };
-    let offer = |iface: u32, ops: Vec<u32>| svm_ir::ImplExport {
+    let offer = |interface: u32, ops: Vec<u32>| svm_ir::ImplExport {
         name: "logger".into(),
-        iface,
+        interface,
         ops,
     };
     let mut m = offer_module();
@@ -615,7 +599,16 @@ fn directed_rule_rejects() {
         matches!(e, VerifyError::ImplExportIfaceMismatch { op: 0, .. })
     });
     let mut m = offer_module();
-    m.types[1] = svm_ir::TypeEntry::Interface(vec![0, 0]); // declares 2 ops; offer implements 1
+    m.types[1] = svm_ir::TypeEntry::Interface(vec![
+        svm_ir::IfaceOp {
+            name: "a".into(),
+            ty: 0,
+        },
+        svm_ir::IfaceOp {
+            name: "b".into(),
+            ty: 0,
+        },
+    ]); // declares 2 ops; offer implements 1
     m.impl_exports.push(offer(1, vec![0]));
     reject(&m, "impl export op-count mismatch", |e| {
         matches!(e, VerifyError::ImplExportIfaceMismatch { .. })
@@ -695,7 +688,7 @@ fn mutate(m: &mut Module, kind: u64) {
                             ValType::F32 => ValType::F64,
                             ValType::F64 => ValType::V128,
                             ValType::V128 => ValType::Ref,
-                            ValType::Ref => ValType::I32,
+                            ValType::Ref | ValType::Cap => ValType::I32,
                         };
                         return;
                     }
