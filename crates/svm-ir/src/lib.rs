@@ -2729,7 +2729,7 @@ pub struct Module {
     /// consumer-only module.
     pub impl_exports: Vec<ImplExport>,
     /// The module-level **type section** (IMPORTS.md OQ3, wire v6): the one place shapes are
-    /// declared. A [`TypeDef::Func`] entry is a function signature; a [`TypeDef::Interface`]
+    /// declared. A [`TypeEntry::Func`] entry is a function signature; a [`TypeEntry::Interface`]
     /// entry is a *tuple of indices to `Func` entries* — a capability interface — so each
     /// signature is written once and shared. Identity is structural per D59 (the host interns
     /// shapes to runtime `type_id`s at wiring; two modules declaring the same shape mean the
@@ -3013,21 +3013,6 @@ pub struct Export {
     pub func: FuncIdx,
 }
 
-/// A provider-side interface **offer** (IMPORTS.md §3.2): this module declares it *implements* an
-/// interface, one function per operation — `ops[i]` is the funcidx implementing op `i`, and op
-/// `i`'s signature **is** that function's declared type (derived, never duplicated; a structural
-/// interface per D59, so there is no nominal interface name beyond the export's `name`).
-///
-/// Declaring an offer confers nothing: authority moves only when a wiring party (the host, or a
-/// parent holding both ends) connects the offer to an importer's slot, minting a table entry that
-/// trampolines into these functions in *this* module's domain — the signature check at wiring is
-/// structural and fail-closed. The verifier checks each funcidx is in range, `ops` is non-empty,
-/// and the name is unique across both export namespaces; backends ignore the table (dispatch goes
-/// through the host-owned handle table, never through the offer).
-///
-/// (Amendment to the §3.2 sketch, which drew a single `(op, args…)` dispatch func: guest functions
-/// have fixed signatures, so one-func-per-op is what keeps the check exact — no padded marshaling
-/// convention, and the trampoline invokes the op's function directly with the call's arguments.)
 /// One entry in the module-level type section ([`Module::types`]): every declared shape is
 /// either a function signature or an interface built from them. One index space, so imports,
 /// call sites, and impl exports can all reference the same entries (D59: identity is the
@@ -3042,11 +3027,25 @@ pub enum TypeEntry {
     Interface(Vec<u32>),
 }
 
+/// A provider-side interface **offer** (IMPORTS.md §3.2): this module declares it *implements*
+/// the interface named by `iface`, one function per operation — `ops[i]` is the funcidx
+/// implementing op `i`.
+///
+/// Declaring an offer confers nothing: authority moves only when a wiring party (the host, or a
+/// parent holding both ends) connects the offer to an importer's slot, minting a table entry that
+/// trampolines into these functions in *this* module's domain — the signature check at wiring is
+/// structural and fail-closed. The verifier checks each funcidx is in range, `ops` is non-empty,
+/// and the name is unique across both export namespaces; backends ignore the table (dispatch goes
+/// through the host-owned handle table, never through the offer).
+///
+/// (Amendment to the §3.2 sketch, which drew a single `(op, args…)` dispatch func: guest functions
+/// have fixed signatures, so one-func-per-op is what keeps the check exact — no padded marshaling
+/// convention, and the trampoline invokes the op's function directly with the call's arguments.)
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ImplExport {
     pub name: String,
     /// The declared interface — an index into [`Module::types`] that must name a
-    /// [`TypeDef::Interface`]. The verifier checks the offer *implements* it exactly:
+    /// [`TypeEntry::Interface`]. The verifier checks the offer *implements* it exactly:
     /// `ops.len()` equals the interface's op count and each `funcs[ops[i]]`'s declared type
     /// equals the interface's op-`i` signature — so "implemented the wrong interface" is a
     /// verify error, not a wiring surprise.
