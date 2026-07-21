@@ -503,7 +503,7 @@ leaving the tree with five conventions instead of four.
 
 ---
 
-## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 v1 landed (exporter-domain state pending); §3.4 built]
+## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 designed — next build slice]
 
 ### 3.1 Binding provenance in `cap.self.attest`
 
@@ -652,6 +652,109 @@ Three tiers of guest access, all over one table:
 The manifest bounds *requirements*, not *reach*. Reach is bounded by grants —
 the correct ocap bound.
 
+### 3.5 Interface-grouped imports  [DESIGNED 2026-07-21 — next build slice]
+
+The type section's recorded next consumer (OQ3), now designed: one slot binds a
+whole interface, the op moves to the call site, and the flat one-op import
+stays as the degenerate case.
+
+**Surface** (consumer side):
+
+```
+type (i64, i64) -> (i64)          ; types[0]
+type (i64) -> (i64)               ; types[1]
+interface { 0, 1 }                ; types[2]
+
+import 0 "fs" iface 2 required    ; grouped: one slot, the whole interface
+import 1 "log" (i64) -> (i64) rebindable   ; flat form unchanged (one-op case)
+
+  v5 = call.import 0.1 (v1)       ; static: op immediate; sig = types[1], checked at load
+  v6 = call.import [v7] iface 2 . 0 (v1, v2)  ; dynamic: handle from a value,
+                                  ; interface by type-section ref, use-site checked
+```
+
+**Semantics:**
+
+- A grouped slot's binding state is `(type_id, handle)` — no per-slot op. The
+  static form's verifier check resolves `import 0` → `types[2]` → op 1 →
+  `types[1]`, all at load; execution passes the op immediate through the
+  existing `cap_dispatch_slots(CAP_IMPORT_TYPE_ID, slot, op, …)` path (the
+  `op` argument exists today and is always `0` — it starts carrying
+  information).
+- The dynamic form checks `entry.type_id == intern(types[2])` plus generation
+  at the use site — the same §3c check, now *expressible for interned
+  interfaces*. This closes the recorded encoding gap: `cap.call` needs a
+  compile-time `type_id` immediate, which a guest cannot know for a wired
+  offer; a type-section reference is resolvable at instantiation. `cap.call`
+  stays as the escape hatch for undeclared grants and the reserved self
+  namespace.
+- **Intern pre-seeding.** Built-in interfaces publish canonical shapes,
+  pre-seeded into the per-host intern, so a structurally equal guest
+  declaration interns *to the built-in id* (D59 extended across the
+  host-native/guest-impl divide). `HOST_FN` is the deliberate exception — its
+  semantics are per-registration embedder code with no canonical shape; it
+  binds by name through the registry, the (trusted) embedder asserting the
+  shape it implements.
+- **Reflection gains one authority-neutral op:** `cap.self.type_id k` —
+  intern *this module's* `types[k]`, return the runtime id. Lookup becomes
+  shape-indexed: iterate `cap.self.get`, compare ids, `import.attach` the
+  match into a grouped rebindable slot; attach checks the whole interface in
+  one act (`entry.type_id == intern(slot's declared entry)`). `resolve`
+  (by name) is unchanged; D46 op-schema reflection reads the same intern
+  table backwards (shapes are stored for pre-seeded and guest ids alike).
+- **Child manifests** (§3.3): a grouped import matches a named grant by one
+  interned-id comparison — `bind_child_manifest`'s per-op signature probe
+  collapses (wiring already checked the whole shape).
+
+**Wire (v7 — one bump, three riders):** `Import` gains
+`shape: Inline(FuncType) | Iface(u32)`; `CallImport` gains an `op` immediate
+and **drops the vestigial handle operand** (whose retirement was already
+scheduled for "the next wire bump" — this is it); dynamic mode gains the
+type-section-reference form. Backend cost is the op immediate threading
+through the one generic dispatch; JIT devirtualization of `required` grouped
+slots stays legal per §2.2 (immutable binding, load-time op resolution).
+
+**Host-side provider, Rust** (embedder registry — sketch):
+
+```rust
+let fs_shape: &[FuncType] = &[sig_read(), sig_write()];   // the shape, once
+Imports::new()
+    // host-native: the (trusted) embedder asserts the shape it implements
+    .provide("fs", HostCap::iface(fs_shape, fs_handle))
+    // or a guest offer as the provider — the shape comes from the offer itself
+    .provide("fs", HostCap::impl_service(&fs_module, "fs")?)
+```
+
+Instantiation interns the consumer's declared entry and requires the provided
+capability's `type_id` to equal it — the same fail-closed structural check as
+`wire_impl`, applied at the registry boundary.
+
+**Parent domain with a nested child, svm-ir** (the §3.3 wrap, grouped):
+
+```
+; ---- parent ----
+type (i64, i64) -> (i64)          ; types[0]
+interface { 0 }                   ; types[1]
+func (i64, i64) -> (i64) { ... }  ; func 0: the interposer (log, then forward)
+export "log" impl 1 : 0           ; the offer
+; parent main: its offer, granted under the child's import name, is what
+; manifest binding accepts (wrap/override); an aliased own-binding forwards;
+; no grant under the name + `required` ⇒ the spawn fails closed (§3.3).
+
+; ---- child ----
+type (i64, i64) -> (i64)          ; types[0]
+interface { 0 }                   ; types[1]
+import 0 "log" iface 1 required   ; slot 2 at runtime (reserved child prefix)
+
+  v3 = call.import 0.0 (v1, v2)   ; op 0 through the grouped slot
+```
+
+The punchline is the two `interface { 0 }` declarations: different sections,
+same shape ⇒ same interned id (D59) — parent and child agree on the interface
+with no shared registry and no names beyond the slot's. Provenance reports the
+wrapped binding ancestor-terminated at depth 1: the child can see *that* it is
+interposed, never *what* the interposer does.
+
 ---
 
 ## 4. Interactions with settled decisions
@@ -779,7 +882,8 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    **type-referencing call sites** (the `op`-immediate form, §2.1) are the
    recorded next consumers of the section and were deliberately not built
    here (they touch the binding tables and all three backends' `call.import`
-   lowering — their own slice, when a consumer demands them).
+   lowering — their own slice, when a consumer demands them). *Since
+   designed: §3.5 (2026-07-21).*
 4. ~~`import.attach` concurrency semantics under §12 threads~~ — **RESOLVED
    (specified):** every capability dispatch — `import.attach` and
    `call.import` alike — executes under the domain's one `Host` lock, so
@@ -801,6 +905,30 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    of v6 — the interface section), and with the rewrite deleted the digest
    is per-module instead of per-instantiation, a strict improvement. No
    codec change was needed.
+7. **Globals (wasm parity) — OPEN, design wanted (2026-07-21).** svm-ir has
+   no globals of any kind: state is SSA values, the window, or host-side
+   capability state. Wasm uses globals for three distinct jobs, and any
+   design should treat them separately rather than import the feature
+   wholesale: **(a) linker constants** (`__heap_base`, `__stack_pointer` as
+   an immutable base) — today answered by data segments, entry arguments, or
+   host-side configuration (posix `grant(heap_base, …)`); **(b)
+   embedder-supplied configuration values** at instantiation — today
+   squeezed through the same channels, awkwardly; **(c) shared mutable
+   registers** between linked instances (the dynamic-linking stack pointer) —
+   today a plain memory cell in the shared window, since shared-everything
+   linking is same-domain here. Design questions: immutable value imports
+   only (spawn-time constants — pure value plumbing, no authority, no new
+   state class) vs mutable globals (a register file beside the window — a
+   new state class touching all three backends, snapshots, and the digest);
+   window-backed (a linker-reserved address — no new machinery, but
+   occupies guest address space) vs register-backed (fast and clean, but
+   new machinery everywhere); and whether they enter the import/export
+   system — if so they should be type-section entries like everything else
+   (a `value` case beside `Func`/`Interface`), groupable per §3.5. Recorded
+   lean: start with **immutable spawn-time value imports** (covers (a) and
+   (b), which is all current frontends need) and add mutable globals only
+   when a concrete linking consumer demands them — the prime directive
+   applies.
 
 ---
 

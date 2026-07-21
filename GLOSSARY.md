@@ -87,6 +87,9 @@ The system is four ideas wearing many names:
 - **`import.attach`** — fill (or refill) a `rebindable` slot with a capability the
   domain already holds, type-checked fail-closed. The "reflect, decide, attach once,
   then ordinary calls" pattern.
+- **grouped import** — (designed: IMPORTS.md §3.5) an import slot binding a *whole
+  interface* rather than one op: `import 0 "fs" iface 2`, called as
+  `call.import 0.<op>`. Today's flat named import is the one-op case.
 - **`cap.call`** — the wire form of dynamic-mode dispatch: `(type_id, op, sig)`
   immediates plus a runtime handle. Retired as a *concept* (it's just dynamic mode);
   kept as the encoding and the escape hatch for undeclared grants.
