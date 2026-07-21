@@ -137,16 +137,19 @@ The system is four ideas wearing many names:
 - **instanced offer / provider instance** — a wired offer with its own **provider
   domain**: a persistent window (seeded from the provider module's memory + data
   declarations) and powerbox that every op runs over, so state survives across calls.
-  Shared (aliased) across re-grants, like a pipe's backing.
+  Shared (aliased) across re-grants, like a pipe's backing. (Interim: IMPORTS.md
+  §3.6's unified model dissolves the separate instance — one world per domain.)
 - **provider-pays** — the §5.3 metering rule: an instanced provider funds its own
   dispatch compute from a drainable, wirer-priced fuel reserve; a dry reserve is a
   probeable fault until topped up.
-- **reactor domain** — (designed: IMPORTS.md §3.6) a domain serving offers from its
-  *live* world instead of a passive instance: dispatches run as handler fibers over
-  the live window, interleaved only at suspension points. Makes blocking guest
-  ops (interposed stdin `read`) and service-on-service layering expressible.
-  Re-entry (A→B→A) is just a fresh handler fiber; call cycles are recursion,
-  bounded by fuel + the fiber quota — they fault, never hang.
+- **unified execution model / reactor** — (designed: IMPORTS.md §3.6, the end
+  state) one world per domain: `main` and offer-dispatch handler fibers run over
+  the *same* window and powerbox, interleaved only at suspension points; a domain
+  keeps serving after `main` returns for as long as its handles are held. Makes
+  blocking guest ops (interposed stdin `read`) and service-on-service layering
+  expressible. Re-entry (A→B→A) is just a fresh handler fiber; call cycles are
+  recursion, bounded by fuel + the fiber quota — they fault, never hang. Isolated
+  service state, when wanted, is explicit: spawn a child.
 
 ## Guest JIT (§22)
 

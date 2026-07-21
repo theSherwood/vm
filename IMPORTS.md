@@ -503,7 +503,7 @@ leaving the tree with five conventions instead of four.
 
 ---
 
-## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 designed — next build slice; §3.6 designed — awaits the shell personality]
+## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 designed — next build slice; §3.6 designed — the end-state execution model, awaits the shell personality]
 
 ### 3.1 Binding provenance in `cap.self.attest`
 
@@ -822,24 +822,24 @@ holder is the domain that implements them:
   `Instantiator.join` interpret arguments as handles); unmarked integers keep
   the existing inertness. In guest code `cap` is `i32`-width data; only
   boundaries treat it specially.
-- **What offer calls run over (restating §3.2 v2 for `export.handle`).**
-  There is no re-entry into the exporting domain's *live* run — that is the
-  deadlock hole (its vCPU may be blocked, its `Host` lock held). Offers
-  execute over the domain's **provider instance**: one persistent service
-  state per domain — own window, own powerbox, own lock, provider-pays fuel —
-  shared by *all* offers the domain reifies (so one offer's writes are
-  visible to another's reads), with the instance's import slots **aliasing
-  the reifier's bindings as of reification** (a wrap forwards through the
-  authority the domain actually holds). Deadlock-free by construction:
-  providers never hold offers (acyclicity) and the lock order is domain →
-  provider. The cost, stated plainly: the live run's window and the instance
-  window are disjoint — a domain whose live computation must influence its
-  service answers routes through shared capabilities (a pipe, a stream) or
-  bakes state into data segments. The service **outlives the live run**:
-  entry returns, the instance keeps serving as long as anyone holds its
-  handles — the reactor split (entry = setup, instance = ongoing service).
+- **What offer calls run over — as built (v2) vs the end state (§3.6).** As
+  built, offers execute over a **passive provider instance**: a second
+  window + powerbox distinct from the live run — own lock, provider-pays
+  fuel, shared by all offers the domain reifies, its import slots aliasing
+  the reifier's bindings as of reification, deadlock-free by construction
+  (providers never hold offers; lock order domain → provider). This bought
+  exporter-domain execution with no fiber machinery — **implementation
+  sequencing, not principle**. The end state is §3.6's **unified model**:
+  one world per domain, offers served as handler fibers over the *same*
+  window and powerbox as `main`; the separate-instance concept dissolves (a
+  provider wired from bytes is simply a domain whose `main` never ran). The
+  passive instance approximates the unified model exactly for the common
+  provider — a domain with no concurrently active live run — and diverges
+  for a domain that serves *while* running; the divergence is documented
+  below and is the motivation for unifying.
 
-**What no-re-entry forbids, concretely.** The tempting-but-wrong version:
+**The two-world divergence, concretely (interim — dissolves under §3.6).**
+The tempting-but-natural version, which the as-built split silently breaks:
 
 ```
 func 0 () -> (i64) {                ; stats.get — an offer impl
@@ -1024,27 +1024,33 @@ live run is over but its provider instance keeps serving both C's `log`
 calls and P's `count` calls — the counter they share lives in the instance,
 not in the finished run.
 
-### 3.6 Reactor domains — serving from the live world  [DESIGNED 2026-07-21; awaits the shell personality]
+### 3.6 The unified execution model — one world per domain  [DESIGNED 2026-07-21; subsumes the two-world split when the fiber slice lands]
 
-§3.5's passive instances are deadlock-free by construction, but three things
-are inexpressible over them, and the first is fatal to anything shell-like:
-an offer op that **blocks on the live run** (an interposed stdin `read` — a
-posix child calling `read(0, …)` expects to block, and transparent
-interposition cannot demand caller-side cooperation, so split-phase is a
-non-starter); zero-copy access to live-window buffers; and guest services
-layered on guest services (the offers-in-providers refusal). Note what is
-*not* the problem: live-run re-entry cycles (A-live → B-live → A-live) never
-arise under §3.5, because offers never execute in live runs at all — the
-restriction traded those cycles away, and this section buys the
-expressiveness back with the §12 fiber machinery.
+The end state, settled after review: **a domain is a program over one
+world** — one window, one powerbox. `main` runs; if the domain has reified
+offers, dispatches run as handler fibers over that *same* world — while
+`main` computes, after it returns (the domain persists as a service for as
+long as anyone holds its handles), or never (a provider wired from bytes is
+a domain whose `main` never ran — setup is data segments, or a designated
+init export). There is no second state: what `main` writes, handlers read.
+A domain that *wants* isolated service state says so explicitly — spawn a
+child and hand out the child's offer. §3.5's passive instance is the landed
+interim implementation of exactly the degenerate case (no concurrently
+active live run) and dissolves as a concept when this lands; `export.handle`
+has one semantics, no mode flag.
 
-- **Two backings per offer, chosen at reification.** `export.handle k` →
-  passive instance (default; §3.5 unchanged). `export.handle k live` → the
-  offer is backed by the **live domain**: each dispatch runs as a *handler
-  fiber* over the live window and powerbox, interleaved with the live run
-  (and other handlers) only at suspension points — explicit yields and
-  blocking ops. Cooperative scheduling: no instruction-level interleaving;
-  cross-yield invariants are the guest's to keep, as in any event loop.
+What this makes expressible (fatal gaps of the two-world split, the first
+fatal to anything shell-like): an offer op that **blocks on live activity**
+(an interposed stdin `read` — a posix child calling `read(0, …)` expects to
+block, and transparent interposition cannot demand caller-side cooperation,
+so split-phase is a non-starter); zero-copy service access to the domain's
+buffers; and guest services layered on guest services.
+
+- **Scheduling.** Each dispatch is a *handler fiber* over the domain's
+  window and powerbox, interleaved with `main` (and other handlers) only at
+  suspension points — explicit yields and blocking ops. Cooperative: no
+  instruction-level interleaving; cross-yield invariants are the guest's to
+  keep, as in any event loop.
 - **Blocking becomes expressible.** A handler parks on guest state
   (`memory.wait`) and the live run wakes it (`memory.notify`), or vice
   versa. The interposed `read` then blocks its *caller* exactly as a
@@ -1067,24 +1073,26 @@ expressiveness back with the §12 fiber machinery.
   the guest's locking discipline to keep, as in every reentrant system; the
   rule of thumb is the usual one — don't hold guest locks across
   cross-domain calls — and fuel remains the backstop for getting it wrong.
-- **Service-on-service unlocks — for reactors.** The offers-in-providers
-  refusal stays for passive instances; a reactor's handlers hold and call
-  whatever the live domain holds, including other domains' offers. Layered
-  guest services (a shell's pipeline stages, fs-on-blockdev) become
+- **Service-on-service unlocks.** The offers-in-providers refusal was a
+  property of the interim passive instance; under the unified model handlers
+  hold and call whatever the domain holds, including other domains' offers.
+  Layered guest services (a shell's pipeline stages, fs-on-blockdev) become
   expressible, with cycles handled as above — recursion, bounded, faulting.
-- **Metering:** the reactor serves on its own domain fuel — §5.3
-  provider-pays generalizes unchanged (its code, its choice to serve live).
-  A parked caller burns nothing while parked.
+- **Metering:** the domain serves on its own fuel — §5.3 provider-pays
+  generalizes unchanged (its code, its choice to serve). A parked caller
+  burns nothing while parked.
 - **Unchanged:** provenance, attest, coverage binding, the `cap` type, and
-  the consent rule — `export.handle`, with either backing, remains the only
-  path to a domain's service.
+  the consent rule — `export.handle` remains the only path to a domain's
+  service.
 
 Cost, honestly: fiber-per-dispatch scheduling and caller parking touch the
-dispatch path on all three backends — a slice far larger than passive
-instances, with new cross-domain blocking semantics to differential-test.
-It stays designed-not-built until its consumer (the shell personality,
-STAGE1) is ready to drive it; passive instances remain the default and the
-common case.
+dispatch path on all three backends — a slice far larger than the passive
+instance was, with new cross-domain blocking semantics to
+differential-test. Sequencing: the landed passive instance keeps serving
+the no-live-run case correctly today and is *behaviorally identical* to the
+unified model there, so nothing regresses; the fiber slice replaces it
+when its consumer (the shell personality, STAGE1) is ready to drive it, and
+the instance concept is deleted rather than kept as a second mode.
 
 ---
 
