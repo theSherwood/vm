@@ -248,13 +248,19 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
 /// checkable per-module property — tooling can report it, and a host policy may require it for
 /// high-assurance slots. Reflection (`cap.self.*`) is authority-neutral and does not affect the
 /// bit: discovering a handle confers nothing without a `cap.call` to drive it, which the bit
-/// catches. Modules needing open-world discovery (shells, plugin hosts) legitimately report
-/// `false` — their egress is bounded by grants instead (the ocap bound).
+/// catches. That exemption extends to a `cap.call` whose `type_id` **immediate** is the reserved
+/// [`svm_ir::CAP_SELF_TYPE_ID`] — the self namespace's dispatch-form ops (e.g. §3.1
+/// `provenance`) are the same authority-neutral reflection, statically identifiable from the
+/// immediate, so querying them does not cost the completeness bit. Modules needing open-world
+/// discovery (shells, plugin hosts) legitimately report `false` — their egress is bounded by
+/// grants instead (the ocap bound).
 pub fn manifest_complete(m: &Module) -> bool {
     m.funcs.iter().all(|f| {
-        f.blocks
-            .iter()
-            .all(|b| !b.insts.iter().any(|i| matches!(i, Inst::CapCall { .. })))
+        f.blocks.iter().all(|b| {
+            !b.insts.iter().any(
+                |i| matches!(i, Inst::CapCall { type_id, .. } if *type_id != svm_ir::CAP_SELF_TYPE_ID),
+            )
+        })
     })
 }
 

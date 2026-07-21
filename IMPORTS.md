@@ -511,7 +511,10 @@ leaving the tree with five conventions instead of four.
 op 5, reached via dynamic dispatch on the reserved `cap.self` id (no new instruction, no
 wire change): `0` = platform-terminated, `d ≥ 1` = ancestor-terminated `d` domain
 boundaries up (1 where the offer was wired, +1 per §3.3 re-grant hop). A forged/closed
-handle is an inert `CapFault`. PROCESS.md §6's growth-criterion list updated to name it.*
+handle is an inert `CapFault`. PROCESS.md §6's growth-criterion list updated to name it.
+`manifest_complete()` exempts `cap.call`s on the reserved self-namespace immediate:
+completeness measures capability **egress**, and the self namespace is authority-neutral
+reflection — a manifest-complete module may query provenance without losing the bit.*
 
 Extends `PROCESS.md` §6 (and shares its status and its sign-off requirements).
 The handle table is host-owned, so the TCB knows, per entry, whether its
