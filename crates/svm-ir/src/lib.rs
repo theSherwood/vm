@@ -70,6 +70,14 @@ pub enum ValType {
     /// indistinguishable from an `i64` — it lowers as `i64` in the JIT and as the opaque
     /// `Value::Ref` in the interp. Conservative GC needs none of this; it scans raw words.
     Ref,
+    /// A **capability handle** slot (IMPORTS.md §3.5, wire v7 reservation). In guest code it is
+    /// indistinguishable from an `i32` (the packed `(generation, slot)` handle value) and lowers
+    /// exactly as `i32` everywhere. The marker exists for *boundaries*: a `cap`-declared
+    /// parameter or result tells the host to translate the handle between domains (resolve in
+    /// the sender's table, re-grant into the receiver's) — the guest↔guest half of "objects are
+    /// arguments". Translation machinery is the recorded follow-up; today this is a pure
+    /// reservation, like [`ValType::Ref`].
+    Cap,
 }
 
 impl ValType {
@@ -82,6 +90,7 @@ impl ValType {
             ValType::F64 => "f64",
             ValType::V128 => "v128",
             ValType::Ref => "ref",
+            ValType::Cap => "cap",
         }
     }
 
@@ -95,6 +104,7 @@ impl ValType {
             "f64" => ValType::F64,
             "v128" => ValType::V128,
             "ref" => ValType::Ref,
+            "cap" => ValType::Cap,
             _ => return None,
         })
     }
@@ -1729,20 +1739,50 @@ pub enum Inst {
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
-    /// Call a host capability by **name** — the §7 late-binding import. `import` indexes
-    /// [`Module::imports`] (which supplies the name); `handle` is vestigial in static mode
-    /// (the slot binding carries the granted handle — frontends emit a dummy const and
-    /// backends ignore it; retired at the next wire-format bump, IMPORTS.md §2.5); `args`
-    /// are the op arguments; `sig` is a self-describing copy of the import's op signature
-    /// (mirroring `cap.call`/`call_indirect`, so result counting needs no module context).
-    /// It deliberately carries **no** `type_id`/`op`: those are bound at instantiation
-    /// through the domain's import-binding table ([`CAP_IMPORT_TYPE_ID`]), installed by the
-    /// host when it grants the manifest's slots — the module bytes are never rewritten.
+    /// Call a host capability through an **import slot** — the §7 late-binding import,
+    /// reshaped by IMPORTS.md §3.5 (wire v7). `import` indexes [`Module::imports`]; `op` is
+    /// the **consumer-local op index** into the import's declared interface (always `0` for a
+    /// flat [`ImportShape::Func`] import) — dispatch remaps it to the provider's op through
+    /// the slot's bind-time remap; `args` are the op arguments; `sig` is a self-describing
+    /// copy of the op's signature (mirroring `cap.call`/`call_indirect`, so result counting
+    /// needs no module context — the verifier checks it equals the type-section resolution).
+    /// `handle` is dummy in manifest (static) modules — backends ignore it — but **live in
+    /// link-form modules**: the §7 loader ABI ([`resolve_imports_with`]) reads it as the cap
+    /// symbol's handle and as the `Slot` patch target, so its retirement is deferred until
+    /// that ABI migrates to manifest/attach (recorded in IMPORTS.md §3.5). It deliberately
+    /// carries **no** `type_id`: bound at instantiation through the domain's import-binding
+    /// table ([`CAP_IMPORT_TYPE_ID`]) — the module bytes are never rewritten.
     CallImport {
         import: u32,
+        op: u32,
         sig: FuncType,
         handle: ValIdx,
         args: Vec<ValIdx>,
+    },
+    /// **Dynamic-mode** interface dispatch by type-section reference (IMPORTS.md §3.5): drive
+    /// the capability behind a runtime `handle` value as interface `ty` (an index into
+    /// [`Module::types`] naming a [`TypeEntry::Interface`]), op `op`. The use-site check is
+    /// exact-id: the entry's `type_id` must equal the intern of `types[ty]` (resolved once at
+    /// instantiation), plus the §3c generation check. This closes the recorded encoding gap —
+    /// `cap.call` needs a compile-time `type_id` immediate a guest cannot know for a wired
+    /// offer; a type-section reference is resolvable at instantiation. `sig` is the
+    /// self-describing copy; the verifier checks it equals `types[ty]`'s op-`op` signature.
+    /// Costs the manifest-complete bit, like every dynamic-mode site.
+    CallImportDyn {
+        ty: u32,
+        op: u32,
+        sig: FuncType,
+        handle: ValIdx,
+        args: Vec<ValIdx>,
+    },
+    /// `export.handle` (IMPORTS.md §3.5): reify **this module's own** impl export `export`
+    /// (an index into [`Module::impl_exports`]) as an ordinary capability handle — the only
+    /// guest-reachable source of offer wiring rights (offer exposure is consent-based: bytes
+    /// are ambient, instances are consensual). All offers a domain reifies share its one
+    /// service state; re-reifying the same export returns a handle to the same backing.
+    /// Result is `i32` (the packed handle), or `-errno` on an out-of-range index.
+    ExportHandle {
+        export: u32,
     },
     /// `import.attach` (IMPORTS.md phase 2): (re)bind **rebindable** import slot `import` to the
     /// capability behind `handle` — an `i32` handle value the domain already holds (typically
@@ -1794,6 +1834,23 @@ pub enum Inst {
         handle: ValIdx,
         buf_ptr: ValIdx,
         buf_cap: ValIdx,
+    },
+    /// `cap.self.type_id <ty>` (IMPORTS.md §3.5): intern **this module's** type-section entry
+    /// `ty` (a [`TypeEntry::Interface`]) in the domain's host and return the runtime `type_id`
+    /// as `i32`. Authority-neutral pure reflection — the shape is already the module's own
+    /// declaration. Enables shape-indexed discovery: iterate `cap.self.get`, compare ids.
+    /// Out-of-range / non-interface `ty` is a verify error, not a runtime probe.
+    CapSelfTypeId {
+        ty: u32,
+    },
+    /// `cap.self.covers v<h>, <ty>` (IMPORTS.md §3.5): does the live capability behind `handle`
+    /// **cover** this module's interface `types[ty]` (every required op present by name with an
+    /// equal signature)? Result `i32`: `1` covers, `0` does not, `-errno` for a dead/forged
+    /// handle. Authority-neutral subset discovery — the probe form of coverage binding (a
+    /// failed `import.attach` is the probe without it).
+    CapSelfCovers {
+        handle: ValIdx,
+        ty: u32,
     },
     /// §6 (PROCESS.md) capability **attestation** (`cap.self.attest`) — the non-interposable **trust
     /// anchor**. Reports the calling domain's platform-vouched provenance as a packed `i32`:
@@ -2370,7 +2427,10 @@ impl Inst {
             Inst::Call { .. }
             | Inst::CallIndirect { .. }
             | Inst::CallImport { .. }
+            | Inst::CallImportDyn { .. }
             | Inst::CapCall { .. } => fx(true, true, true, true),
+            // `export.handle` mints/aliases host capability state (a grant into the own table).
+            Inst::ExportHandle { .. } => fx(false, false, false, true),
             // `import.attach` mutates host binding state (no guest-memory access, but ordering
             // against every `call.import` matters) — conservative full clobber, like the calls.
             Inst::ImportAttach { .. } => fx(true, true, true, true),
@@ -2399,6 +2459,9 @@ impl Inst {
             Inst::CapSelfGet { .. } => fx(true, false, false, true), // out-of-range idx traps
             Inst::CapSelfResolve { .. } => fx(false, true, false, true), // reads a name from guest mem (OOB → -errno)
             Inst::CapSelfLabel { .. } => fx(false, false, true, true), // writes the label into guest mem (OOB → -errno)
+            // §3.5 reflection: `type_id` interns into the host table (mutable runtime state);
+            // `covers` probes a handle (dead handle → -errno, no trap).
+            Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => fx(false, false, false, true),
         }
     }
 
@@ -2428,11 +2491,15 @@ impl Inst {
             Inst::CapSelfCount
             | Inst::CapSelfResolve { .. }
             | Inst::CapSelfLabel { .. }
-            | Inst::CapSelfAttest => 1,
+            | Inst::CapSelfAttest
+            | Inst::CapSelfTypeId { .. }
+            | Inst::CapSelfCovers { .. }
+            | Inst::ExportHandle { .. } => 1,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),
             Inst::CallImport { sig, .. } => sig.results.len(),
+            Inst::CallImportDyn { sig, .. } => sig.results.len(),
             _ => 1,
         }
     }
@@ -2767,13 +2834,92 @@ impl Module {
         match self.types.get(idx as usize)? {
             TypeEntry::Interface(elems) => elems
                 .iter()
-                .map(|&t| match self.types.get(t as usize)? {
+                .map(|e| match self.types.get(e.ty as usize)? {
                     TypeEntry::Func(ft) => Some(ft),
                     TypeEntry::Interface(_) => None,
                 })
                 .collect(),
             TypeEntry::Func(_) => None,
         }
+    }
+
+    /// Resolve interface entry `idx` to its **named** op list `(name, signature)`, or `None`
+    /// if `idx` is out of range, names a `Func`, or any element reference is not a `Func`
+    /// entry. The coverage-binding view (IMPORTS.md §3.5).
+    pub fn interface_named_ops(&self, idx: u32) -> Option<Vec<(&str, &FuncType)>> {
+        match self.types.get(idx as usize)? {
+            TypeEntry::Interface(elems) => elems
+                .iter()
+                .map(|e| match self.types.get(e.ty as usize)? {
+                    TypeEntry::Func(ft) => Some((e.name.as_str(), ft)),
+                    TypeEntry::Interface(_) => None,
+                })
+                .collect(),
+            TypeEntry::Func(_) => None,
+        }
+    }
+
+    /// The signature of op `op` of import `i`, resolved through the type section: a
+    /// [`ImportShape::Func`] import has exactly op `0`; a grouped import resolves the
+    /// interface element. `None` for out-of-range indices or non-well-formed references.
+    pub fn import_op_sig(&self, i: u32, op: u32) -> Option<&FuncType> {
+        match self.imports.get(i as usize)?.shape {
+            ImportShape::Func(t) => match (op, self.types.get(t as usize)?) {
+                (0, TypeEntry::Func(ft)) => Some(ft),
+                _ => None,
+            },
+            ImportShape::Interface(t) => {
+                let ops = self.interface_named_ops(t)?;
+                ops.get(op as usize).map(|&(_, ft)| ft)
+            }
+        }
+    }
+
+    /// The full requirement set of import `i` as named ops: a flat import is the singleton
+    /// `[(name, sig)]` (its op name is the import's second-level name); a grouped import is
+    /// its interface's named op list.
+    pub fn import_named_ops(&self, i: u32) -> Option<Vec<(&str, &FuncType)>> {
+        let im = self.imports.get(i as usize)?;
+        match im.shape {
+            ImportShape::Func(t) => match self.types.get(t as usize)? {
+                TypeEntry::Func(ft) => Some(vec![(im.name.as_str(), ft)]),
+                TypeEntry::Interface(_) => None,
+            },
+            ImportShape::Interface(t) => self.interface_named_ops(t),
+        }
+    }
+
+    /// Intern `ft` into the type section (linear-scan dedup — sections are small), returning
+    /// its index. The builder-side helper that keeps each signature written once.
+    pub fn intern_func_type(&mut self, ft: FuncType) -> u32 {
+        if let Some(i) = self
+            .types
+            .iter()
+            .position(|t| matches!(t, TypeEntry::Func(f) if *f == ft))
+        {
+            return i as u32;
+        }
+        self.types.push(TypeEntry::Func(ft));
+        (self.types.len() - 1) as u32
+    }
+
+    /// Push a flat func import (interning its signature), returning the import index. The
+    /// mechanical migration path from the v6 inline-signature shape.
+    pub fn add_func_import(
+        &mut self,
+        ns: impl Into<String>,
+        name: impl Into<String>,
+        sig: FuncType,
+        mode: ImportMode,
+    ) -> u32 {
+        let t = self.intern_func_type(sig);
+        self.imports.push(Import {
+            ns: ns.into(),
+            name: name.into(),
+            shape: ImportShape::Func(t),
+            mode,
+        });
+        (self.imports.len() - 1) as u32
     }
 }
 
@@ -2975,20 +3121,38 @@ pub struct SsaLoc {
     pub value: u32,
 }
 
-/// A named capability import (§7). `name` is the symbolic tag the host resolves at
-/// instantiation; `sig` is the operation signature (op args → results, excluding the
-/// handle). Declared in [`Module::imports`] and referenced by index from
+/// A named capability import (§7, reshaped by IMPORTS.md §3.5 / wire v7). The name is
+/// **two-level** — `ns` names the provider binding point, `name` the op (flat) or bundle
+/// (grouped); resolver vocabulary, never identity (`ns` may be empty). The signature lives in
+/// the module's type section: [`ImportShape::Func`] is a flat one-op import referencing a
+/// [`TypeEntry::Func`]; [`ImportShape::Interface`] is a **grouped** import — one slot binding a
+/// whole interface, referencing a [`TypeEntry::Interface`] that states the *requirement set*
+/// the binding must cover (coverage binding: name-keyed, signature-equal, extra provider ops
+/// ignored). Declared in [`Module::imports`] and referenced by index from
 /// [`Inst::CallImport`]. Listing a module's imports is the up-front, fail-closed
 /// "what capabilities does this need?" check (a missing binding never silently no-ops).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Import {
+    /// Namespace level of the two-level name (`("env", "fs")`); empty = unnamespaced.
+    pub ns: String,
     pub name: String,
-    pub sig: FuncType,
+    /// What this import requires, as a type-section reference.
+    pub shape: ImportShape,
     /// How the slot binds (IMPORTS.md phase 2): [`ImportMode::Required`] is bound fail-closed at
     /// instantiation and immutable for the instance's lifetime; [`ImportMode::Rebindable`] is
     /// declared and typed but may start empty and be (re)bound at runtime via
     /// [`Inst::ImportAttach`]. Calling through an empty slot traps (`CapFault`).
     pub mode: ImportMode,
+}
+
+/// An import's requirement, by type-section index (IMPORTS.md §3.5). `Func(t)` must name a
+/// [`TypeEntry::Func`] (a flat one-op import — the singleton requirement set); `Interface(t)`
+/// must name a [`TypeEntry::Interface`] (a grouped import — the whole requirement set behind
+/// one slot). The verifier checks the reference kind; binding checks coverage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImportShape {
+    Func(u32),
+    Interface(u32),
 }
 
 /// A declared import's binding mode (IMPORTS.md §2.1). `Required` is the wasm-like default: a
@@ -3022,9 +3186,20 @@ pub struct Export {
 pub enum TypeEntry {
     /// A function signature.
     Func(FuncType),
-    /// A capability interface: an ordered tuple of indices to [`TypeEntry::Func`] entries —
-    /// op `i`'s signature is the `i`-th referenced entry. Interfaces never nest.
-    Interface(Vec<u32>),
+    /// A capability interface: an ordered tuple of **named** ops, each referencing a
+    /// [`TypeEntry::Func`] entry for its signature. Op names are required (wire v7) and are the
+    /// binding-time contract (coverage matching is name-keyed); they are **excluded from the
+    /// structural intern key** — runtime `type_id` identity stays shape-only (D59). Interfaces
+    /// never nest.
+    Interface(Vec<IfaceOp>),
+}
+
+/// One named op of a [`TypeEntry::Interface`]: `name` is the coverage-matching key (required,
+/// non-identity); `ty` indexes the [`TypeEntry::Func`] carrying the op's signature.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IfaceOp {
+    pub name: String,
+    pub ty: u32,
 }
 
 /// A provider-side interface **offer** (IMPORTS.md §3.2): this module declares it *implements*
@@ -3049,7 +3224,7 @@ pub struct ImplExport {
     /// `ops.len()` equals the interface's op count and each `funcs[ops[i]]`'s declared type
     /// equals the interface's op-`i` signature — so "implemented the wrong interface" is a
     /// verify error, not a wiring surprise.
-    pub iface: u32,
+    pub interface: u32,
     pub ops: Vec<FuncIdx>,
 }
 
@@ -3319,11 +3494,23 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             }
         }
     }
+    // Per-unit type-section bases (prefix sums), so instruction-level type references
+    // (`call.import` dynamic mode, `cap.self.type_id`/`covers`) reindex alongside funcidxs.
+    let tbases: Vec<u32> = units
+        .iter()
+        .scan(0u32, |acc, u| {
+            let b = *acc;
+            *acc += u.module.types.len() as u32;
+            Some(b)
+        })
+        .collect();
     // Per unit: place its data, apply its relocations, reindex its functions, resolve its imports.
     let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
     let mut data: Vec<Data> = Vec::new();
-    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
+    for (u, ((&fbase, &dbase), &tbase)) in units.iter().zip(fbases.iter().zip(&dbases).zip(&tbases))
+    {
         let mut m = u.module.clone();
+        offset_type_indices(&mut m, tbase);
         // Relocate this unit's data segments into its assigned window region…
         for d in &mut m.data {
             d.offset += dbase;
@@ -3363,10 +3550,18 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
     let mut merged_impls: Vec<ImplExport> = Vec::new();
     for (u, &fbase) in units.iter().zip(&fbases) {
         let tbase = merged_types.len() as u32;
-        merged_types.extend(u.module.types.iter().map(|t| match t {
-            TypeEntry::Func(ft) => TypeEntry::Func(ft.clone()),
-            TypeEntry::Interface(elems) => {
-                TypeEntry::Interface(elems.iter().map(|&e| tbase + e).collect())
+        merged_types.extend(u.module.types.iter().map(|t| {
+            match t {
+                TypeEntry::Func(ft) => TypeEntry::Func(ft.clone()),
+                TypeEntry::Interface(elems) => TypeEntry::Interface(
+                    elems
+                        .iter()
+                        .map(|e| IfaceOp {
+                            name: e.name.clone(),
+                            ty: tbase + e.ty,
+                        })
+                        .collect(),
+                ),
             }
         }));
         for e in &u.module.impl_exports {
@@ -3378,7 +3573,7 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             }
             merged_impls.push(ImplExport {
                 name: e.name.clone(),
-                iface: tbase + e.iface,
+                interface: tbase + e.interface,
                 ops: e.ops.iter().map(|&f| fbase + f).collect(),
             });
         }
@@ -3423,6 +3618,28 @@ fn apply_reloc(m: &mut Module, r: &DataReloc, base: u64) -> Result<(), LinkError
 /// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call_indirect`/`cont.*` dispatch on
 /// runtime funcref *values*, not static indices, so they are untouched. `call.import` carries an
 /// import index (not a function index) and is likewise untouched — it is resolved separately.
+/// Add `offset` to every **type-section index** carried by an instruction (`call.import`
+/// dynamic mode, `cap.self.type_id`, `cap.self.covers`) — the merged-module type reindex.
+/// Section-level references (`ImportShape`, `ImplExport::interface`, interface elements) are
+/// remapped where their sections merge, not here.
+fn offset_type_indices(m: &mut Module, offset: u32) {
+    if offset == 0 {
+        return;
+    }
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                match inst {
+                    Inst::CallImportDyn { ty, .. }
+                    | Inst::CapSelfTypeId { ty }
+                    | Inst::CapSelfCovers { ty, .. } => *ty += offset,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 fn offset_func_indices(m: &mut Module, offset: u32) {
     if offset == 0 {
         return;
@@ -3479,6 +3696,7 @@ mod import_tests {
                 Inst::CallImport {
                     // v3 = write(handle=v0, v1, v2)
                     import: 0,
+                    op: 0,
                     sig: sig_write.clone(),
                     handle: 0,
                     args: vec![1, 2],
@@ -3487,6 +3705,7 @@ mod import_tests {
                 Inst::CallImport {
                     // exit(handle=v0, v4)
                     import: 1,
+                    op: 0,
                     sig: sig_exit.clone(),
                     handle: 0,
                     args: vec![4],
@@ -3494,7 +3713,7 @@ mod import_tests {
             ],
             term: Terminator::Unreachable,
         };
-        Module {
+        let mut m = Module {
             types: vec![],
             funcs: vec![Func {
                 params: vec![ValType::I32],
@@ -3503,22 +3722,14 @@ mod import_tests {
             }],
             memory: None,
             data: vec![],
-            imports: vec![
-                Import {
-                    name: "write".into(),
-                    sig: sig_write,
-                    mode: ImportMode::Required,
-                },
-                Import {
-                    name: "exit".into(),
-                    sig: sig_exit,
-                    mode: ImportMode::Required,
-                },
-            ],
+            imports: vec![],
             exports: vec![],
             impl_exports: vec![],
             debug_info: None,
-        }
+        };
+        m.add_func_import("", "write", sig_write, ImportMode::Required);
+        m.add_func_import("", "exit", sig_exit, ImportMode::Required);
+        m
     }
 
     // The host policy under test: "write" → (Stream=0, op 1), "exit" → (Exit=1, op 0).

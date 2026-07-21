@@ -64,6 +64,7 @@ mod op {
     pub const T_F64: u8 = 3;
     pub const T_V128: u8 = 4;
     pub const T_REF: u8 = 5; // opaque 64-bit reference (GC forward-compat reservation)
+    pub const T_CAP: u8 = 6; // capability-handle marker (§3.5, i32-width; translation deferred)
 
     // Constants.
     pub const CONST_I32: u8 = 0x10;
@@ -105,7 +106,11 @@ mod op {
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
-    pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, sig, handle, arg idx-list
+    pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, op (v7), sig, handle, arg idx-list
+    pub const CALL_IMPORT_DYN: u8 = 0xD1; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
+    pub const EXPORT_HANDLE: u8 = 0xD2; // v7 §3.5: impl-export idx -> i32 handle
+    pub const CAP_SELF_TYPE_ID: u8 = 0xD3; // v7 §3.5: type idx -> i32 runtime type_id
+    pub const CAP_SELF_COVERS: u8 = 0xD4; // v7 §3.5: handle operand, type idx -> i32 covers
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
     pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
     pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
@@ -223,6 +228,12 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // runtime-`Module` analogue of a link unit's exports — so an embedder can `call("main")` by name.
 // The decoder accepts only the exact current `VERSION`, so the bump simply retires v2 readers; there
 // is no in-place v2 blob to stay compatible with.
+// v7 (IMPORTS.md §3.5) reshapes the import section — two-level names (`ns`, `name`) and a
+// type-section **shape reference** (`func <t>` / `interface <t>`) replacing the inline signature —
+// gives interface elements **required op names** (the coverage-binding contract), adds the
+// `call.import` consumer-local `op` immediate, the dynamic-mode `call.import` form (type-section
+// reference + runtime handle), `export.handle`, the `cap.self.type_id`/`covers` reflection ops,
+// and reserves the `cap` value type (i32-width handle marker, translation deferred).
 // v6 adds the **interface section** (OQ3: module-level interface declarations — each entry an
 // ordered op-signature list) and the impl-export `iface` reference (an offer declares which
 // interface it implements; the verifier checks it does, exactly).
@@ -236,7 +247,7 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -258,6 +269,8 @@ pub enum DecodeError {
     BadDataFlag(u8),
     /// An import's binding-mode byte (v4) was neither 0 (required) nor 1 (rebindable).
     BadImportMode(u8),
+    /// An import's shape tag byte (v7) was neither 0 (func) nor 1 (interface).
+    BadImportShape(u8),
     /// A type-section entry carried an unknown tag byte (v6: 0 = Func, 1 = Interface).
     BadTypeTag(u8),
     /// An import name's length-prefixed bytes were not valid UTF-8.
@@ -339,9 +352,21 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     // symbols, for a loader to bind by name (DESIGN.md §22 host-assisted resolve).
     write_uleb(&mut out, m.imports.len() as u64);
     for imp in &m.imports {
+        // v7: two-level name (`ns` may be empty), then the shape reference — tag byte
+        // (0 = func, 1 = interface) + uleb type-section index. Signatures live in the type
+        // section; the wire never duplicates them.
+        write_str(&mut out, &imp.ns);
         write_str(&mut out, &imp.name);
-        write_types(&mut out, &imp.sig.params);
-        write_types(&mut out, &imp.sig.results);
+        match imp.shape {
+            svm_ir::ImportShape::Func(t) => {
+                out.push(0);
+                write_uleb(&mut out, t as u64);
+            }
+            svm_ir::ImportShape::Interface(t) => {
+                out.push(1);
+                write_uleb(&mut out, t as u64);
+            }
+        }
         // v4: the binding mode (0 = required, 1 = rebindable — IMPORTS.md phase 2).
         out.push(match imp.mode {
             svm_ir::ImportMode::Required => 0,
@@ -367,10 +392,13 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
                 write_types(&mut out, &sig.results);
             }
             svm_ir::TypeEntry::Interface(elems) => {
+                // v7: each element is a **named** op — required name + uleb index to a Func
+                // entry. Names are the coverage-binding contract, excluded from the intern key.
                 out.push(1);
                 write_uleb(&mut out, elems.len() as u64);
-                for &e in elems {
-                    write_uleb(&mut out, e as u64);
+                for e in elems {
+                    write_str(&mut out, &e.name);
+                    write_uleb(&mut out, e.ty as u64);
                 }
             }
         }
@@ -381,7 +409,7 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     write_uleb(&mut out, m.impl_exports.len() as u64);
     for e in &m.impl_exports {
         write_str(&mut out, &e.name);
-        write_uleb(&mut out, e.iface as u64);
+        write_uleb(&mut out, e.interface as u64);
         write_uleb(&mut out, e.ops.len() as u64);
         for &f in &e.ops {
             write_uleb(&mut out, f as u64);
@@ -556,16 +584,41 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         // unresolved on the wire so a loader can bind it by name (DESIGN.md §22 host-assisted resolve).
         Inst::CallImport {
             import,
+            op,
             sig,
             handle,
             args,
         } => {
-            out.push(op::CALL_IMPORT);
+            out.push(self::op::CALL_IMPORT);
             write_uleb(out, *import as u64);
+            // v7: the consumer-local op immediate (0 for flat imports).
+            write_uleb(out, *op as u64);
             write_types(out, &sig.params);
             write_types(out, &sig.results);
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
+        }
+        // v7 dynamic-mode dispatch by type-section reference (§3.5): interface index, op,
+        // self-describing sig, runtime handle operand, args.
+        Inst::CallImportDyn {
+            ty,
+            op,
+            sig,
+            handle,
+            args,
+        } => {
+            out.push(self::op::CALL_IMPORT_DYN);
+            write_uleb(out, *ty as u64);
+            write_uleb(out, *op as u64);
+            write_types(out, &sig.params);
+            write_types(out, &sig.results);
+            write_uleb(out, *handle as u64);
+            write_idxs(out, args);
+        }
+        // v7 `export.handle` (§3.5): reify own impl export as a capability handle.
+        Inst::ExportHandle { export } => {
+            out.push(op::EXPORT_HANDLE);
+            write_uleb(out, *export as u64);
         }
         // `import.attach` (v4, IMPORTS.md phase 2): rebind a rebindable import slot to a held
         // capability — import idx, then the handle value's operand index.
@@ -595,6 +648,16 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *handle as u64);
             write_uleb(out, *buf_ptr as u64);
             write_uleb(out, *buf_cap as u64);
+        }
+        // v7 §3.5 reflection: intern own type entry / probe coverage of a held handle.
+        Inst::CapSelfTypeId { ty } => {
+            out.push(op::CAP_SELF_TYPE_ID);
+            write_uleb(out, *ty as u64);
+        }
+        Inst::CapSelfCovers { handle, ty } => {
+            out.push(op::CAP_SELF_COVERS);
+            write_uleb(out, *handle as u64);
+            write_uleb(out, *ty as u64);
         }
         Inst::VcpuTlsGet => out.push(op::VCPU_TLS_GET),
         Inst::DurableShadowBase => out.push(op::DURABLE_SHADOW_BASE),
@@ -1541,6 +1604,7 @@ fn type_tag(t: ValType) -> u8 {
         ValType::F64 => op::T_F64,
         ValType::V128 => op::T_V128,
         ValType::Ref => op::T_REF,
+        ValType::Cap => op::T_CAP,
     }
 }
 
@@ -1616,10 +1680,14 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     let nimports = c.count()?;
     let mut imports = Vec::new();
     for _ in 0..nimports {
+        // v7: two-level name, then the shape tag + type-section index (range-checked by the
+        // verifier, not here — the decoder stays a pure fail-closed byte reader).
+        let ns = c.str()?;
         let name = c.str()?;
-        let sig = FuncType {
-            params: decode_types(&mut c)?,
-            results: decode_types(&mut c)?,
+        let shape = match c.byte()? {
+            0 => svm_ir::ImportShape::Func(c.uleb()? as u32),
+            1 => svm_ir::ImportShape::Interface(c.uleb()? as u32),
+            b => return Err(DecodeError::BadImportShape(b)),
         };
         // v4: the binding mode byte (0 = required, 1 = rebindable); anything else fails closed.
         let mode = match c.byte()? {
@@ -1627,7 +1695,12 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
             1 => svm_ir::ImportMode::Rebindable,
             b => return Err(DecodeError::BadImportMode(b)),
         };
-        imports.push(Import { name, sig, mode });
+        imports.push(Import {
+            ns,
+            name,
+            shape,
+            mode,
+        });
     }
     // Export section (v3): mirrors the encoder. Grows on demand (the count is attacker-influenced).
     // Funcidx range + name uniqueness are the verifier's job, not the decoder's (it stays a pure,
@@ -1654,7 +1727,10 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
                 let nelems = c.count()?;
                 let mut elems = Vec::new();
                 for _ in 0..nelems {
-                    elems.push(c.uleb()? as u32);
+                    // v7: required op name + Func-entry index.
+                    let name = c.str()?;
+                    let ty = c.uleb()? as u32;
+                    elems.push(svm_ir::IfaceOp { name, ty });
                 }
                 svm_ir::TypeEntry::Interface(elems)
             }
@@ -1667,13 +1743,17 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     let mut impl_exports = Vec::new();
     for _ in 0..nimpl {
         let name = c.str()?;
-        let iface = c.uleb()? as u32;
+        let interface = c.uleb()? as u32;
         let nops = c.count()?;
         let mut ops = Vec::new();
         for _ in 0..nops {
             ops.push(c.uleb()? as FuncIdx);
         }
-        impl_exports.push(svm_ir::ImplExport { name, iface, ops });
+        impl_exports.push(svm_ir::ImplExport {
+            name,
+            interface,
+            ops,
+        });
     }
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
@@ -1989,12 +2069,29 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         },
         op::CALL_IMPORT => Inst::CallImport {
             import: c.idx()?,
+            op: c.idx()?,
             sig: FuncType {
                 params: decode_types(c)?,
                 results: decode_types(c)?,
             },
             handle: c.idx()?,
             args: decode_idxs(c)?,
+        },
+        op::CALL_IMPORT_DYN => Inst::CallImportDyn {
+            ty: c.idx()?,
+            op: c.idx()?,
+            sig: FuncType {
+                params: decode_types(c)?,
+                results: decode_types(c)?,
+            },
+            handle: c.idx()?,
+            args: decode_idxs(c)?,
+        },
+        op::EXPORT_HANDLE => Inst::ExportHandle { export: c.idx()? },
+        op::CAP_SELF_TYPE_ID => Inst::CapSelfTypeId { ty: c.idx()? },
+        op::CAP_SELF_COVERS => Inst::CapSelfCovers {
+            handle: c.idx()?,
+            ty: c.idx()?,
         },
         op::IMPORT_ATTACH => Inst::ImportAttach {
             import: c.idx()?,
@@ -2276,6 +2373,7 @@ fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
         op::T_F64 => ValType::F64,
         op::T_V128 => ValType::V128,
         op::T_REF => ValType::Ref,
+        op::T_CAP => ValType::Cap,
         other => return Err(DecodeError::BadType(other)),
     })
 }
@@ -2669,23 +2767,27 @@ mod debug_tests {
                 }],
             });
         }
+        let iop = |n: &str| svm_ir::IfaceOp {
+            name: n.to_string(),
+            ty: 0,
+        };
         m.types = vec![
             svm_ir::TypeEntry::Func(svm_ir::FuncType {
                 params: vec![],
                 results: vec![],
             }),
-            svm_ir::TypeEntry::Interface(vec![0, 0]),
-            svm_ir::TypeEntry::Interface(vec![0]),
+            svm_ir::TypeEntry::Interface(vec![iop("put"), iop("flush")]),
+            svm_ir::TypeEntry::Interface(vec![iop("drop")]),
         ];
         m.impl_exports = vec![
             svm_ir::ImplExport {
                 name: "logger".to_string(),
-                iface: 1,
+                interface: 1,
                 ops: vec![1, 2],
             },
             svm_ir::ImplExport {
                 name: "sink".to_string(),
-                iface: 2,
+                interface: 2,
                 ops: vec![0],
             },
         ];
