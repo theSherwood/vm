@@ -579,8 +579,9 @@ parent's resources. Not a loophole; the point of the model.
    no nominal interface name (`Log` above was illustrative): interface identity is the
    structural op-signature list, interned per-host to a `type_id`
    (`Host::intern_interface`, id-equality ≡ structural equality — D59 applied to capability
-   interfaces). *v6 addendum:* the OQ3 **interface section** has since landed — a module
-   declares its interfaces (`interface { ... }`) and each offer names the one it implements
+   interfaces). *v6 addendum:* the OQ3 **type section** has since landed — a module
+   declares its shapes in one index space (`type (sig)` entries + `interface { idx, ... }`
+   tuples over them) and each offer names the interface entry it implements
    (`export "n" impl <iface> : <funcidx>...`), verifier-checked exactly; the host-side intern
    remains the runtime identity.
 2. **v1 executes a wired op as a *pure dispatch*, not in the exporter's domain.** Wiring
@@ -763,17 +764,20 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    imports are unrelated to SVM capability imports, and capability dispatch
    bounces to the interpreter tier).
 3. ~~Wire format for the manifest's interface declarations~~ — **RESOLVED
-   (wire v6, 2026-07-20): the interned interface section landed.** A module
-   may declare interfaces (`interface { (params) -> (results), ... }` — each
-   an ordered op-signature list; declarations only, no code) and every `impl`
-   export names the one it implements (`export "n" impl <iface> : <funcidx>...`),
-   with both verifiers checking the implementation matches the declaration
-   exactly. Entries are deliberately *not* dedup-canonicalized on the wire —
-   identity is structural (D59) and the host intern canonicalizes at wiring;
-   the linker merges sections across units with index-offset remapping.
-   Imports still carry the inline per-op `FuncType` (the status-quo shape);
-   **interface-grouped imports** (the `op`-immediate form, §2.1) are the
-   recorded next consumer of the section and were deliberately not built
+   (wire v6, 2026-07-20): the single type section landed.** A module declares
+   shapes in one index space — `type (params) -> (results)` entries are
+   function signatures, `interface { 0, 1 }` entries are tuples of indices to
+   `type` entries — so each signature is written once and shared. Every
+   `impl` export names the interface entry it implements
+   (`export "n" impl <iface> : <funcidx>...`), with both verifiers checking
+   the implementation matches exactly (and that interface entries reference
+   only `Func` entries — interfaces never nest). Entries are deliberately
+   *not* dedup-canonicalized on the wire — identity is structural (D59) and
+   the host intern canonicalizes at wiring; the linker merges sections across
+   units with index-offset remapping. Imports still carry the inline per-op
+   `FuncType` (the status-quo shape); **interface-grouped imports** and
+   **type-referencing call sites** (the `op`-immediate form, §2.1) are the
+   recorded next consumers of the section and were deliberately not built
    here (they touch the binding tables and all three backends' `call.import`
    lowering — their own slice, when a consumer demands them).
 4. ~~`import.attach` concurrency semantics under §12 threads~~ — **RESOLVED

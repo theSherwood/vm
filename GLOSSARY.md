@@ -4,6 +4,28 @@ Concise definitions for the project's working vocabulary. One or two lines each;
 authoritative detail lives in `DESIGN.md`, `IMPORTS.md`, and `PROCESS.md` — this file is
 for reading those without a decoder ring.
 
+## The conceptual map (read this first)
+
+The system is four ideas wearing many names:
+
+1. **One format, two roles.** A *module* is the only code format. Instantiated with its
+   own window and powerbox it is a *domain*; grafted into an existing domain (guest-JIT
+   submission) it is a *unit*. Same bytes, same verifier, different role.
+2. **Two call paths.** Every call is either *capability-addressed* (through the
+   host-owned handle table, use-site checked: `call.import`, dispatch-form `cap.call`,
+   `Jit.invoke`) or *funcref-addressed* (through the domain's function table:
+   `call_indirect`, installed units). Invoke/install are not new concepts — they are
+   compiled code entering these two existing paths.
+3. **Two binding times.** Authority is connected either at *spawn/wiring time* (the
+   embedder registry, a parent binding a child's manifest, accepting an offer) or at
+   *runtime* (`import.attach` into a rebindable slot — the capability "global", written
+   by the guest from what it already holds). Declaration never moves authority; only
+   binding acts do.
+4. **Structural types all the way down.** A *type* is a function signature; an
+   *interface* is a tuple of them. Identity is always by shape, never by name (D59) —
+   which is what makes interposition, testing, and virtualization typewise invisible,
+   with provenance as the one honest bit on top.
+
 ## Core runtime
 
 - **domain** — one isolated unit of execution: a module's code + its window + its
@@ -36,8 +58,8 @@ for reading those without a decoder ring.
   and re-checked at every use. Small constants for the built-ins (`iface::STREAM = 0` …);
   interned per-host for guest-implemented interfaces.
 - **`iface`** — two related uses: (1) the `svm_interp::iface` module of built-in type_id
-  constants; (2) the `ImplExport::iface` field — an index into the module's interface
-  section saying which declared interface the export implements.
+  constants; (2) the `ImplExport::iface` field — an index into the module's type section
+  naming the interface entry the export implements.
 - **intern (structural)** — the map from an interface's *shape* (its op-signature list)
   to its runtime `type_id`, maintained per-host: structurally identical shapes get the
   same id (D59: id-equality ≡ structural equality). Why interfaces need no names.
@@ -80,10 +102,13 @@ for reading those without a decoder ring.
 
 - **export** — a named function entry point: `export "main" 0`. Lets the host (or
   linker) call a function by name. Nothing capability-flavored about it.
-- **interface** (section) — a module-level declaration of a *shape*: an ordered list of
-  op signatures, `interface { (i64, i64) -> (i64), ... }`. Declarations only — no code,
-  no authority, no nominal identity (two modules declaring the same shape mean the same
-  interface).
+- **type section** — the one place a module declares shapes: `type (params) -> (results)`
+  entries are function signatures; `interface { 0, 1 }` entries are tuples of indices to
+  them. One index space, each signature written once. Declarations only — no code, no
+  authority, no nominal identity (two modules declaring the same shape mean the same
+  type).
+- **interface** — a type-section entry that is a tuple of function-signature entries: a
+  capability's shape, op by op. Not a separate concept from types — the composite case.
 - **impl export / offer** — a declaration that this module *implements* an interface:
   `export "adder" impl 0 : 3 4` — "my funcs 3 and 4 implement interface #0," verifier-
   checked exactly. An *offer* because declaring it confers nothing: it is an

@@ -19,7 +19,7 @@ mod common;
 /// `() -> i32` whose body is the constant product `21 * 2`. A correct specializer folds it.
 fn oracle_module() -> Module {
     Module {
-        interfaces: vec![],
+        types: vec![],
         impl_exports: vec![],
         funcs: vec![Func {
             params: vec![],

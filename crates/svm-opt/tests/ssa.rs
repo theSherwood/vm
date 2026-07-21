@@ -24,7 +24,7 @@ fn assert_roundtrip(m: &Module) {
 
 fn one_func_module(f: Func) -> Module {
     Module {
-        interfaces: vec![],
+        types: vec![],
         funcs: vec![f],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![],
@@ -174,7 +174,7 @@ fn multi_result_call_identity_and_defs() {
         }],
     };
     let m = Module {
-        interfaces: vec![],
+        types: vec![],
         funcs: vec![caller, callee],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![],

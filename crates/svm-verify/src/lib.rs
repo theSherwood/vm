@@ -126,8 +126,9 @@ pub enum VerifyError {
     /// Two export entries share a name. Function exports and impl exports (interface offers,
     /// IMPORTS.md §3.2) are one namespace: the host addresses both by name.
     DuplicateImplExport { export: u32 },
-    /// An [`Module::impl_exports`] offer's `iface` names an entry past the end of
-    /// [`Module::interfaces`].
+    /// An [`Module::impl_exports`] offer's `iface` does not name a well-formed
+    /// [`svm_ir::TypeDef::Interface`] in [`Module::types`] (out of range, a `Func` entry, or
+    /// an interface whose elements don't all name `Func` entries).
     ImplExportIfaceOutOfRange { export: u32, iface: u32 },
     /// An [`Module::impl_exports`] offer does not implement its declared interface: the op
     /// count differs, or op `op`'s function type differs from the interface's op-`op`
@@ -210,9 +211,10 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
             }
         }
         // v6 (OQ3): the offer must implement its **declared** interface exactly — same op
-        // count, and op `i`'s function type equal to the interface's op-`i` signature. Makes
-        // "implemented the wrong interface" a verify error, not a wiring surprise.
-        let Some(iface) = m.interfaces.get(e.iface as usize) else {
+        // count, and op `i`'s function type equal to the interface's op-`i` signature
+        // (resolved through the type section's one index space). Makes "implemented the
+        // wrong interface" a verify error, not a wiring surprise.
+        let Some(iface) = m.interface_ops(e.iface) else {
             return Err(VerifyError::ImplExportIfaceOutOfRange {
                 export: ei as u32,
                 iface: e.iface,
@@ -224,7 +226,7 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
                 op: e.ops.len().min(iface.len()) as u32,
             });
         }
-        for (oi, (&f, want)) in e.ops.iter().zip(iface).enumerate() {
+        for (oi, (&f, want)) in e.ops.iter().zip(&iface).enumerate() {
             let ft = &m.funcs[f as usize];
             if ft.params != want.params || ft.results != want.results {
                 return Err(VerifyError::ImplExportIfaceMismatch {

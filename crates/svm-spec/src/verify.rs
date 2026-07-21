@@ -69,10 +69,11 @@ pub fn verify(m: &Module) -> R {
             }
         }
         // v6 (OQ3): the offer implements its declared interface exactly — op count and each
-        // op's function type equal to the interface's signature.
-        let Some(iface) = m.interfaces.get(e.iface as usize) else {
+        // op's function type equal to the interface's signature, resolved through the type
+        // section's one index space (an interface is a tuple of Func-entry indices).
+        let Some(iface) = m.interface_ops(e.iface) else {
             return Err(format!(
-                "impl export {i} interface {} out of range",
+                "impl export {i} interface {} is not a well-formed interface entry",
                 e.iface
             ));
         };
@@ -83,7 +84,7 @@ pub fn verify(m: &Module) -> R {
                 iface.len()
             ));
         }
-        for (oi, (&f, want)) in e.ops.iter().zip(iface).enumerate() {
+        for (oi, (&f, want)) in e.ops.iter().zip(&iface).enumerate() {
             let ft = &m.funcs[f as usize];
             if ft.params != want.params || ft.results != want.results {
                 return Err(format!(

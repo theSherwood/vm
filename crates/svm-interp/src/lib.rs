@@ -10321,7 +10321,7 @@ fn module_digest(m: &Module) -> [u8; 32] {
         // Interface offers and the interface section are semantic (they are what wiring
         // resolves against), so they ride the identity digest like function exports do.
         impl_exports: m.impl_exports.clone(),
-        interfaces: m.interfaces.clone(),
+        types: m.types.clone(),
         imports: Vec::new(),
         debug_info: None,
     };

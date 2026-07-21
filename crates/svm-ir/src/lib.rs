@@ -2728,14 +2728,15 @@ pub struct Module {
     /// a namespace with [`Module::exports`]; backends ignore the table. Empty for the common
     /// consumer-only module.
     pub impl_exports: Vec<ImplExport>,
-    /// The module-level **interface section** (IMPORTS.md OQ3, wire v6): each entry is an
-    /// ordered list of op signatures — a capability interface as a *shape* (identity is
-    /// structural per D59; the host interns shapes to runtime `type_id`s at wiring, so two
-    /// modules declaring the same shape mean the same interface). Referenced today by
-    /// [`ImplExport::iface`] (offers declare what they implement, verifier-checked);
-    /// interface-grouped imports (§2.1's op-immediate form) are the recorded next consumer.
-    /// Declarations only — no code, no funcidxs; backends ignore the section.
-    pub interfaces: Vec<Vec<FuncType>>,
+    /// The module-level **type section** (IMPORTS.md OQ3, wire v6): the one place shapes are
+    /// declared. A [`TypeDef::Func`] entry is a function signature; a [`TypeDef::Interface`]
+    /// entry is a *tuple of indices to `Func` entries* — a capability interface — so each
+    /// signature is written once and shared. Identity is structural per D59 (the host interns
+    /// shapes to runtime `type_id`s at wiring; two modules declaring the same shape mean the
+    /// same interface). Referenced today by [`ImplExport::iface`]; interface-grouped imports
+    /// and type-referencing call sites (§2.1) are the recorded next consumers. Declarations
+    /// only — no code, no funcidxs; backends ignore the section.
+    pub types: Vec<TypeEntry>,
     /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
     /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
     /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
@@ -2757,6 +2758,22 @@ impl Module {
     /// or `None` if no offer carries `name`. Verifier-unique, so the first match is the only match.
     pub fn resolve_impl_export(&self, name: &str) -> Option<&ImplExport> {
         self.impl_exports.iter().find(|e| e.name == name)
+    }
+
+    /// Resolve type-section entry `idx` as an interface: the ordered op signatures it names,
+    /// or `None` if `idx` is out of range, not a [`TypeDef::Interface`], or any element fails
+    /// to name a [`TypeDef::Func`] entry. The verifiers' and hosts' one lookup.
+    pub fn interface_ops(&self, idx: u32) -> Option<Vec<&FuncType>> {
+        match self.types.get(idx as usize)? {
+            TypeEntry::Interface(elems) => elems
+                .iter()
+                .map(|&t| match self.types.get(t as usize)? {
+                    TypeEntry::Func(ft) => Some(ft),
+                    TypeEntry::Interface(_) => None,
+                })
+                .collect(),
+            TypeEntry::Func(_) => None,
+        }
     }
 }
 
@@ -3011,14 +3028,28 @@ pub struct Export {
 /// (Amendment to the §3.2 sketch, which drew a single `(op, args…)` dispatch func: guest functions
 /// have fixed signatures, so one-func-per-op is what keeps the check exact — no padded marshaling
 /// convention, and the trampoline invokes the op's function directly with the call's arguments.)
+/// One entry in the module-level type section ([`Module::types`]): every declared shape is
+/// either a function signature or an interface built from them. One index space, so imports,
+/// call sites, and impl exports can all reference the same entries (D59: identity is the
+/// shape, so an index is pure interning — never a nominal type). Distinct from the
+/// debug-info [`TypeDef`] (DEBUGGING.md's source-type table), which is strippable tooling.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypeEntry {
+    /// A function signature.
+    Func(FuncType),
+    /// A capability interface: an ordered tuple of indices to [`TypeEntry::Func`] entries —
+    /// op `i`'s signature is the `i`-th referenced entry. Interfaces never nest.
+    Interface(Vec<u32>),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ImplExport {
     pub name: String,
-    /// The declared interface — an index into [`Module::interfaces`]. The verifier checks the
-    /// offer *implements* it exactly: `ops.len()` equals the interface's op count and each
-    /// `funcs[ops[i]]`'s declared type equals the interface's op-`i` signature — so
-    /// "implemented the wrong interface" is a verify error, not a wiring surprise. Identity
-    /// stays structural (D59): the index names a shape, never a nominal type.
+    /// The declared interface — an index into [`Module::types`] that must name a
+    /// [`TypeDef::Interface`]. The verifier checks the offer *implements* it exactly:
+    /// `ops.len()` equals the interface's op count and each `funcs[ops[i]]`'s declared type
+    /// equals the interface's op-`i` signature — so "implemented the wrong interface" is a
+    /// verify error, not a wiring surprise.
     pub iface: u32,
     pub ops: Vec<FuncIdx>,
 }
@@ -3323,17 +3354,22 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         funcs.extend(resolved.funcs);
         data.extend(resolved.data);
     }
-    // Merge the units' impl surfaces (offers + the interface section, IMPORTS.md §3.2/OQ3):
-    // interfaces concatenate with a per-unit index offset (declarations only — identity is
+    // Merge the units' impl surfaces (offers + the type section, IMPORTS.md §3.2/OQ3): type
+    // entries concatenate with a per-unit index offset (declarations only — identity is
     // structural, so cross-unit duplicates are harmless; the host intern canonicalizes at
-    // wiring), and each offer reindexes its interface reference and its op funcidxs. Offer
-    // names share the export namespace, so a collision is the same `DuplicateSymbol` a
-    // function export would raise.
-    let mut merged_interfaces: Vec<Vec<FuncType>> = Vec::new();
+    // wiring), interface entries reindex their element references, and each offer reindexes
+    // its interface reference and its op funcidxs. Offer names share the export namespace,
+    // so a collision is the same `DuplicateSymbol` a function export would raise.
+    let mut merged_types: Vec<TypeEntry> = Vec::new();
     let mut merged_impls: Vec<ImplExport> = Vec::new();
     for (u, &fbase) in units.iter().zip(&fbases) {
-        let ibase = merged_interfaces.len() as u32;
-        merged_interfaces.extend(u.module.interfaces.iter().cloned());
+        let tbase = merged_types.len() as u32;
+        merged_types.extend(u.module.types.iter().map(|t| match t {
+            TypeEntry::Func(ft) => TypeEntry::Func(ft.clone()),
+            TypeEntry::Interface(elems) => {
+                TypeEntry::Interface(elems.iter().map(|&e| tbase + e).collect())
+            }
+        }));
         for e in &u.module.impl_exports {
             if funcs_tab.contains_key(&e.name)
                 || data_tab.contains_key(&e.name)
@@ -3343,7 +3379,7 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             }
             merged_impls.push(ImplExport {
                 name: e.name.clone(),
-                iface: ibase + e.iface,
+                iface: tbase + e.iface,
                 ops: e.ops.iter().map(|&f| fbase + f).collect(),
             });
         }
@@ -3361,7 +3397,7 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
         // `merge_impl_surfaces`; a link unit's own module may carry both.
         impl_exports: merged_impls,
-        interfaces: merged_interfaces,
+        types: merged_types,
         // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
         debug_info: None,
     })
@@ -3460,7 +3496,7 @@ mod import_tests {
             term: Terminator::Unreachable,
         };
         Module {
-            interfaces: vec![],
+            types: vec![],
             funcs: vec![Func {
                 params: vec![ValType::I32],
                 results: vec![],

@@ -336,7 +336,7 @@ mod tests {
             }, // v4
         ];
         Module {
-            interfaces: vec![],
+            types: vec![],
             funcs: vec![Func {
                 params: vec![],
                 results: vec![ValType::I64],

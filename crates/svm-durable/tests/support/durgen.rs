@@ -317,7 +317,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: Vec::new(),
-        interfaces: Vec::new(),
+        types: Vec::new(),
         debug_info: None,
     }
 }
@@ -423,7 +423,7 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: Vec::new(),
-        interfaces: Vec::new(),
+        types: Vec::new(),
         debug_info: None,
     }
 }
@@ -561,7 +561,7 @@ pub fn gen_fiber_module(g: &mut Gen) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: Vec::new(),
-        interfaces: Vec::new(),
+        types: Vec::new(),
         debug_info: None,
     }
 }
@@ -754,7 +754,7 @@ pub fn gen_recycle_fiber_module(g: &mut Gen) -> RecycleModule {
             imports: Vec::new(),
             exports: Vec::new(),
             impl_exports: Vec::new(),
-            interfaces: Vec::new(),
+            types: Vec::new(),
             debug_info: None,
         },
         arm: throwaways as i64 + 2,

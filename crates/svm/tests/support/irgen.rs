@@ -981,7 +981,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: Vec::new(),
-        interfaces: Vec::new(),
+        types: Vec::new(),
         debug_info: None,
     }
 }

@@ -89,15 +89,25 @@ pub fn print_module(m: &Module) -> String {
         }
         s.push('\n');
     }
-    // The interface section (OQ3, v6), one declaration per line in index order:
-    // `interface { (params) -> (results), ... }` — op signatures only, no code.
-    if !m.interfaces.is_empty() {
-        for iface in &m.interfaces {
-            let ops: Vec<String> = iface
-                .iter()
-                .map(|sig| format!("({}) -> ({})", types(&sig.params), types(&sig.results)))
-                .collect();
-            let _ = writeln!(s, "interface {{ {} }}", ops.join(", "));
+    // The type section (OQ3, v6), one entry per line in index order: `type (params) ->
+    // (results)` declares a function signature; `interface { 0, 1 }` declares an interface
+    // as a tuple of indices to earlier `type` entries. One index space, no code.
+    if !m.types.is_empty() {
+        for t in &m.types {
+            match t {
+                svm_ir::TypeEntry::Func(sig) => {
+                    let _ = writeln!(
+                        s,
+                        "type ({}) -> ({})",
+                        types(&sig.params),
+                        types(&sig.results)
+                    );
+                }
+                svm_ir::TypeEntry::Interface(elems) => {
+                    let idxs: Vec<String> = elems.iter().map(|e| e.to_string()).collect();
+                    let _ = writeln!(s, "interface {{ {} }}", idxs.join(", "));
+                }
+            }
         }
         s.push('\n');
     }
@@ -967,7 +977,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut data: Vec<Data> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
     let mut impl_exports: Vec<ImplExport> = Vec::new();
-    let mut interfaces: Vec<Vec<FuncType>> = Vec::new();
+    let mut type_entries: Vec<svm_ir::TypeEntry> = Vec::new();
     let mut dbg_files: Vec<String> = Vec::new();
     let mut dbg_locs: Vec<Loc> = Vec::new();
     let mut dbg_types: Vec<TypeDef> = Vec::new();
@@ -1213,18 +1223,27 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     bytes,
                 });
             }
-            // The interface section (OQ3, v6): `interface { (params) -> (results), ... }` —
-            // one declaration per line, indexed by order of appearance.
+            // The type section (OQ3, v6): `type (params) -> (results)` declares a function
+            // signature entry; `interface { 0, 1 }` declares an interface entry as a tuple of
+            // indices to earlier `type` entries. One index space, by order of appearance.
+            Some(Tok::Ident(s)) if s == "type" => {
+                p.next()?;
+                let params = p.parse_type_list()?;
+                p.expect(&Tok::Arrow)?;
+                let results = p.parse_type_list()?;
+                type_entries.push(svm_ir::TypeEntry::Func(FuncType { params, results }));
+            }
             Some(Tok::Ident(s)) if s == "interface" => {
                 p.next()?;
                 p.expect(&Tok::LBrace)?;
-                let mut ops = Vec::new();
+                let mut elems = Vec::new();
                 if !matches!(p.peek(), Some(Tok::RBrace)) {
                     loop {
-                        let params = p.parse_type_list()?;
-                        p.expect(&Tok::Arrow)?;
-                        let results = p.parse_type_list()?;
-                        ops.push(FuncType { params, results });
+                        let n = p.parse_int()?;
+                        let e = u32::try_from(n).map_err(|_| {
+                            ParseError(format!("interface type index out of range: {n}"))
+                        })?;
+                        elems.push(e);
                         if matches!(p.peek(), Some(Tok::Comma)) {
                             p.next()?;
                         } else {
@@ -1233,7 +1252,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     }
                 }
                 p.expect(&Tok::RBrace)?;
-                interfaces.push(ops);
+                type_entries.push(svm_ir::TypeEntry::Interface(elems));
             }
             // First-class function export `export "<name>" <funcidx>`, or an interface offer
             // (IMPORTS.md §3.2) `export "<name>" impl <iface> : <funcidx>...`.
@@ -1303,7 +1322,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         imports: std::mem::take(&mut p.imports),
         exports,
         impl_exports,
-        interfaces,
+        types: type_entries,
         debug_info,
     })
 }
@@ -1350,7 +1369,13 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_int()?;
                 p.parse_str()?;
             }
-            // `interface { ... }` — skip the brace-matched declaration in the header prescan.
+            // `type (params) -> (results)` / `interface { ... }` — skip in the header prescan.
+            Some(Tok::Ident(s)) if s == "type" => {
+                p.next()?;
+                p.parse_type_list()?;
+                p.expect(&Tok::Arrow)?;
+                p.parse_type_list()?;
+            }
             Some(Tok::Ident(s)) if s == "interface" => {
                 p.next()?;
                 p.expect(&Tok::LBrace)?;
@@ -2851,9 +2876,10 @@ block0(v0: i64):
         // Interface offers (IMPORTS.md §3.2): `export "<name>" impl <funcidx>...` — one funcidx
         // per op; op signatures are the named functions' declared types.
         let src = "\
-interface { (i64) -> (i64), (i64) -> (i64) }
+type (i64) -> (i64)
+interface { 0, 0 }
 export \"main\" 0
-export \"logger\" impl 0 : 1 0
+export \"logger\" impl 1 : 1 0
 
 func (i64) -> (i64) {
 block0(v0: i64):

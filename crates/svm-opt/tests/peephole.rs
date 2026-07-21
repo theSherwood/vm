@@ -17,7 +17,7 @@ fn bin(op: BinOp, a: u32, b: u32) -> Inst {
 
 fn module(f: Func) -> Module {
     Module {
-        interfaces: vec![],
+        types: vec![],
         funcs: vec![f],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![],

@@ -438,8 +438,9 @@ block0(v0: i32, v1: i32):
 #[test]
 fn link_merges_impl_surfaces_across_units() {
     let provider = unit(
-        "interface { (i32, i32) -> (i32) }\n\
-         export \"adder\" impl 0 : 0\n\n\
+        "type (i32, i32) -> (i32)\n\
+         interface { 0 }\n\
+         export \"adder\" impl 1 : 0\n\n\
          func (i32, i32) -> (i32) {\n\
          block0(v0: i32, v1: i32):\n\
            v2 = i32.add v0 v1\n\
@@ -451,11 +452,15 @@ fn link_merges_impl_surfaces_across_units() {
     // `other` first, so the provider's funcs and interface reindex across a nonzero offset.
     let m = svm_ir::link(&[other, provider]).expect("links");
     svm_verify::verify_module(&m).expect("merged module verifies");
-    assert_eq!(m.interfaces.len(), 1, "interface section merged");
+    assert_eq!(
+        m.types.len(),
+        2,
+        "type section merged (one Func + one Interface)"
+    );
     let offer = m
         .resolve_impl_export("adder")
         .expect("offer survives the merge");
-    assert_eq!(offer.iface, 0);
+    assert_eq!(offer.iface, 1);
     assert_eq!(
         offer.ops,
         vec![1],
@@ -464,8 +469,9 @@ fn link_merges_impl_surfaces_across_units() {
 
     // An offer name colliding with a function export symbol fails closed.
     let clash = unit(
-        "interface { (i32, i32) -> (i32) }\n\
-         export \"add\" impl 0 : 0\n\n\
+        "type (i32, i32) -> (i32)\n\
+         interface { 0 }\n\
+         export \"add\" impl 1 : 0\n\n\
          func (i32, i32) -> (i32) {\n\
          block0(v0: i32, v1: i32):\n\
            v2 = i32.add v0 v1\n\

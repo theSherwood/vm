@@ -258,6 +258,8 @@ pub enum DecodeError {
     BadDataFlag(u8),
     /// An import's binding-mode byte (v4) was neither 0 (required) nor 1 (rebindable).
     BadImportMode(u8),
+    /// A type-section entry carried an unknown tag byte (v6: 0 = Func, 1 = Interface).
+    BadTypeTag(u8),
     /// An import name's length-prefixed bytes were not valid UTF-8.
     BadUtf8,
     /// Bytes remained after a complete module was decoded.
@@ -353,14 +355,24 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
         write_str(&mut out, &e.name);
         write_uleb(&mut out, e.func as u64);
     }
-    // Interface section (v6, OQ3): count, then each interface's op count and per-op
-    // params/results type lists — declarations only, no code.
-    write_uleb(&mut out, m.interfaces.len() as u64);
-    for iface in &m.interfaces {
-        write_uleb(&mut out, iface.len() as u64);
-        for sig in iface {
-            write_types(&mut out, &sig.params);
-            write_types(&mut out, &sig.results);
+    // Type section (v6, OQ3): count, then each entry tagged — 0 = a function signature
+    // (params/results type lists), 1 = an interface (a tuple of uleb indices to Func
+    // entries). One index space; declarations only, no code.
+    write_uleb(&mut out, m.types.len() as u64);
+    for t in &m.types {
+        match t {
+            svm_ir::TypeEntry::Func(sig) => {
+                out.push(0);
+                write_types(&mut out, &sig.params);
+                write_types(&mut out, &sig.results);
+            }
+            svm_ir::TypeEntry::Interface(elems) => {
+                out.push(1);
+                write_uleb(&mut out, elems.len() as u64);
+                for &e in elems {
+                    write_uleb(&mut out, e as u64);
+                }
+            }
         }
     }
     // Impl-export section (v5; +iface in v6): count, then each offer's `name`, its declared
@@ -1627,20 +1639,27 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         let func = c.uleb()? as FuncIdx;
         exports.push(Export { name, func });
     }
-    // Interface section (v6): mirrors the encoder. Grows on demand (attacker-influenced
-    // counts); all cross-reference checks are the verifier's job.
-    let nifaces = c.count()?;
-    let mut interfaces = Vec::new();
-    for _ in 0..nifaces {
-        let nops = c.count()?;
-        let mut ops = Vec::new();
-        for _ in 0..nops {
-            ops.push(svm_ir::FuncType {
+    // Type section (v6): mirrors the encoder. Grows on demand (attacker-influenced
+    // counts); all cross-reference checks are the verifier's job. An unknown tag fails
+    // closed.
+    let ntypes = c.count()?;
+    let mut types = Vec::new();
+    for _ in 0..ntypes {
+        types.push(match c.byte()? {
+            0 => svm_ir::TypeEntry::Func(svm_ir::FuncType {
                 params: decode_types(&mut c)?,
                 results: decode_types(&mut c)?,
-            });
-        }
-        interfaces.push(ops);
+            }),
+            1 => {
+                let nelems = c.count()?;
+                let mut elems = Vec::new();
+                for _ in 0..nelems {
+                    elems.push(c.uleb()? as u32);
+                }
+                svm_ir::TypeEntry::Interface(elems)
+            }
+            b => return Err(DecodeError::BadTypeTag(b)),
+        });
     }
     // Impl-export section (v5; +iface in v6): mirrors the encoder. Funcidx/iface range,
     // non-empty ops, and name uniqueness are the verifier's job, not the decoder's.
@@ -1678,7 +1697,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         imports,
         exports,
         impl_exports,
-        interfaces,
+        types,
         debug_info,
     })
 }
@@ -2570,7 +2589,7 @@ mod debug_tests {
 
     fn module(debug_info: Option<DebugInfo>) -> Module {
         Module {
-            interfaces: vec![],
+            types: vec![],
             funcs: vec![],
             memory: None,
             data: vec![],
@@ -2650,31 +2669,23 @@ mod debug_tests {
                 }],
             });
         }
-        m.interfaces = vec![
-            vec![
-                svm_ir::FuncType {
-                    params: vec![],
-                    results: vec![],
-                },
-                svm_ir::FuncType {
-                    params: vec![],
-                    results: vec![],
-                },
-            ],
-            vec![svm_ir::FuncType {
+        m.types = vec![
+            svm_ir::TypeEntry::Func(svm_ir::FuncType {
                 params: vec![],
                 results: vec![],
-            }],
+            }),
+            svm_ir::TypeEntry::Interface(vec![0, 0]),
+            svm_ir::TypeEntry::Interface(vec![0]),
         ];
         m.impl_exports = vec![
             svm_ir::ImplExport {
                 name: "logger".to_string(),
-                iface: 0,
+                iface: 1,
                 ops: vec![1, 2],
             },
             svm_ir::ImplExport {
                 name: "sink".to_string(),
-                iface: 1,
+                iface: 2,
                 ops: vec![0],
             },
         ];

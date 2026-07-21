@@ -563,10 +563,13 @@ fn directed_rule_rejects() {
     // function exports and offers. An in-range, interface-matching offer is VALID.
     let offer_module = || {
         let mut m = module(vec![func(vec![], vec![], vec![], T::Return(vec![]))]);
-        m.interfaces = vec![vec![FuncType {
-            params: vec![],
-            results: vec![],
-        }]];
+        m.types = vec![
+            svm_ir::TypeEntry::Func(FuncType {
+                params: vec![],
+                results: vec![],
+            }),
+            svm_ir::TypeEntry::Interface(vec![0]),
+        ];
         m
     };
     let offer = |iface: u32, ops: Vec<u32>| svm_ir::ImplExport {
@@ -575,15 +578,15 @@ fn directed_rule_rejects() {
         ops,
     };
     let mut m = offer_module();
-    m.impl_exports.push(offer(0, vec![0]));
+    m.impl_exports.push(offer(1, vec![0]));
     accept(&m, "well-formed impl export");
     let mut m = offer_module();
-    m.impl_exports.push(offer(0, vec![0, 5]));
+    m.impl_exports.push(offer(1, vec![0, 5]));
     reject(&m, "impl export op out of range", |e| {
         matches!(e, VerifyError::ImplExportFuncOutOfRange { op: 1, .. })
     });
     let mut m = offer_module();
-    m.impl_exports.push(offer(0, vec![]));
+    m.impl_exports.push(offer(1, vec![]));
     reject(&m, "impl export with no ops", |e| {
         matches!(e, VerifyError::ImplExportEmpty { .. })
     });
@@ -593,24 +596,33 @@ fn directed_rule_rejects() {
     reject(&m, "impl export interface out of range", |e| {
         matches!(e, VerifyError::ImplExportIfaceOutOfRange { iface: 9, .. })
     });
+    // A `Func` entry is not an interface; referencing it as one is refused.
     let mut m = offer_module();
-    m.interfaces[0][0].results = vec![V::I64]; // interface says () -> (i64); func is () -> ()
     m.impl_exports.push(offer(0, vec![0]));
+    reject(
+        &m,
+        "impl export references a Func entry as its interface",
+        |e| matches!(e, VerifyError::ImplExportIfaceOutOfRange { iface: 0, .. }),
+    );
+    let mut m = offer_module();
+    // Interface op 0 now says () -> (i64); the func is () -> ().
+    m.types[0] = svm_ir::TypeEntry::Func(FuncType {
+        params: vec![],
+        results: vec![V::I64],
+    });
+    m.impl_exports.push(offer(1, vec![0]));
     reject(&m, "impl export does not match its interface", |e| {
         matches!(e, VerifyError::ImplExportIfaceMismatch { op: 0, .. })
     });
     let mut m = offer_module();
-    m.interfaces[0].push(FuncType {
-        params: vec![],
-        results: vec![],
-    }); // interface declares 2 ops; the offer implements 1
-    m.impl_exports.push(offer(0, vec![0]));
+    m.types[1] = svm_ir::TypeEntry::Interface(vec![0, 0]); // declares 2 ops; offer implements 1
+    m.impl_exports.push(offer(1, vec![0]));
     reject(&m, "impl export op-count mismatch", |e| {
         matches!(e, VerifyError::ImplExportIfaceMismatch { .. })
     });
     let mut m = offer_module();
     for _ in 0..2 {
-        m.impl_exports.push(offer(0, vec![0]));
+        m.impl_exports.push(offer(1, vec![0]));
     }
     reject(&m, "duplicate impl export", |e| {
         matches!(e, VerifyError::DuplicateImplExport { .. })
@@ -620,7 +632,7 @@ fn directed_rule_rejects() {
         name: "logger".into(),
         func: 0,
     });
-    m.impl_exports.push(offer(0, vec![0]));
+    m.impl_exports.push(offer(1, vec![0]));
     reject(
         &m,
         "impl export name collides with a function export",
