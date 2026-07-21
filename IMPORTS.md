@@ -787,16 +787,22 @@ holder is the domain that implements them:
   Wiring rights propagate only by granting that handle: down to its own
   children at spawn (bind their manifests with it), up to its parent or out
   to a sibling *iff it chooses to send it*.
-- **No guest-reachable op harvests another domain's offers.** A parent
-  holding a child's `Instantiator` cannot enumerate-and-wire the child's
-  declared offers; the declaration in the module bytes is inert until the
-  implementing domain (or the TCB) reifies it. This is what lets a domain
-  with a potentially hostile parent still serve its *own* children: the
-  parent never receives the offer handle, so it has nothing to bind.
-- **The embedder is the exception because it is the TCB:** host-side Rust
-  (`wire_impl*`, the registry) wires declared offers directly — necessary
-  for provider modules that serve before they run, and no loss of security,
-  since the host can do anything regardless.
+- **One rule, not two export semantics: bytes are ambient, instances are
+  consensual.** Every export — `func` or `interface` — is an inert
+  declaration in the module *bytes*, visible to whoever holds the bytes.
+  Invoking a `func` export (a spawn entry, the embedder's `call("main")`)
+  creates or enters *the caller's own instantiation* — caller's window,
+  caller's bindings, caller's fuel; no pre-existing state of any exporting
+  domain is involved, because none exists. Likewise, anyone holding the
+  bytes (the embedder registry via `wire_impl*`/`impl_service`, or a parent
+  holding a `Module` grant) may wire an offer as **its own** provider
+  instance — your *code*, but the wirer's authority, seed state, and fuel;
+  harmless to the authoring domain. What consent guards is *this domain's*
+  instance — the one backed by its aliased imports and accumulated service
+  state — and `export.handle` is the only path to it. No guest-reachable op
+  harvests it: a parent holding a child's `Instantiator` cannot
+  enumerate-and-wire the child's *live* offers. A hostile parent can always
+  run your code; it can never reach into your service.
 - **Honest limit:** this controls who can *call through* your offers. In
   window-exposed tiers a §14 parent already reads and writes the child's
   entire carve — export protection cannot create confidentiality the memory
@@ -832,6 +838,45 @@ holder is the domain that implements them:
   bakes state into data segments. The service **outlives the live run**:
   entry returns, the instance keeps serving as long as anyone holds its
   handles — the reactor split (entry = setup, instance = ongoing service).
+
+**What no-re-entry forbids, concretely.** The tempting-but-wrong version:
+
+```
+func 0 () -> (i64) {                ; stats.get — an offer impl
+  block 0 { v0 = i64.load ...TICK... return v0 }  ; reads the INSTANCE window
+}
+func 2 () -> () {                   ; the live loop
+  block 0 { ... i64.store TICK, t ... }           ; writes the LIVE window
+}
+; nothing faults — `get` just reports 0 forever. Two worlds.
+```
+
+The workarounds, in preference order:
+
+1. **Be a client of your own service.** The domain attaches its own
+   `export.handle` to a rebindable slot and *calls its own offer* to write
+   (`self_stats.bump()` per tick) — legal, deadlock-free (lock order is
+   domain → provider; the live run is just another caller), and the instance
+   becomes the one shared cell both worlds see through the same door. Cost:
+   one dispatch per write.
+2. **A shared stream/pipe** both sides hold — for flowing data and event
+   patterns.
+3. **Reify-time seeding** (data segments into the instance) — for config and
+   constants.
+4. **Split-phase** for request/response *with* the live run: the offer op
+   records the request in instance state (or takes a `cap` callback) and
+   returns "pending"; the live loop polls and responds. An offer op must
+   never block waiting on the live domain — that recreates the exact cycle
+   this design removes.
+
+What remains inexpressible even with workarounds: a service call
+synchronously observing or mutating the live run's control flow ("pause
+yourself now" — that is `Instantiator`'s job, host-side), and zero-copy
+sharing of live-window buffers with the service (copy through a pipe, or
+restructure so the instance owns the buffer). The designed-later fiber
+reactor (§12 machinery: park the live run in a suspended fiber, deliver
+dispatches as resumptions at its yield points) would lift these — unbuilt
+until a concrete consumer demands it.
 
 **Wire (v7 — one bump, six riders):** `Import` replaces its inline `FuncType`
 with `shape: Func(typeidx) | Interface(typeidx)` and gains the second name
