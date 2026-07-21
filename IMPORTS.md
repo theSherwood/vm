@@ -805,17 +805,45 @@ holder is the domain that implements them:
   all; distrust means separate processes (§1a). The two compose: attest
   tells you which world you are in; `export.handle` keeps offer wiring
   consent-based in the worlds where isolation is real.
+- **The `cap` value type — boundary translation (settled 2026-07-21).** A raw
+  `i32` handle crossing domains is deliberately inert (it would index the
+  *receiver's* table — the forgeability guarantee). Authority crosses only
+  where a signature says so: a parameter or result declared `cap` makes the
+  host translate at the capability-call / entry-result boundary — resolve in
+  the sender's table (must be live), re-grant into the receiver's, substitute
+  the receiver-local packed handle. This is the guest↔guest half of §2.3's
+  "objects are arguments" (today only trusted built-ins like
+  `Instantiator.join` interpret arguments as handles); unmarked integers keep
+  the existing inertness. In guest code `cap` is `i32`-width data; only
+  boundaries treat it specially.
+- **What offer calls run over (restating §3.2 v2 for `export.handle`).**
+  There is no re-entry into the exporting domain's *live* run — that is the
+  deadlock hole (its vCPU may be blocked, its `Host` lock held). Offers
+  execute over the domain's **provider instance**: one persistent service
+  state per domain — own window, own powerbox, own lock, provider-pays fuel —
+  shared by *all* offers the domain reifies (so one offer's writes are
+  visible to another's reads), with the instance's import slots **aliasing
+  the reifier's bindings as of reification** (a wrap forwards through the
+  authority the domain actually holds). Deadlock-free by construction:
+  providers never hold offers (acyclicity) and the lock order is domain →
+  provider. The cost, stated plainly: the live run's window and the instance
+  window are disjoint — a domain whose live computation must influence its
+  service answers routes through shared capabilities (a pipe, a stream) or
+  bakes state into data segments. The service **outlives the live run**:
+  entry returns, the instance keeps serving as long as anyone holds its
+  handles — the reactor split (entry = setup, instance = ongoing service).
 
-**Wire (v7 — one bump, five riders):** `Import` replaces its inline `FuncType`
+**Wire (v7 — one bump, six riders):** `Import` replaces its inline `FuncType`
 with `shape: Func(typeidx) | Interface(typeidx)` and gains the second name
 level; `TypeEntry::Interface` elements become `(name, typeidx)` pairs (names
 required); `CallImport` gains an `op` immediate and **drops the vestigial
 handle operand** (whose retirement was already scheduled for "the next wire
 bump" — this is it); dynamic mode gains the type-section-reference form;
-`export.handle` joins `import.handle`. Backend cost is the op immediate plus
-one remap load threading through the one generic dispatch; JIT
-devirtualization of `required` grouped slots stays legal per §2.2 (immutable
-binding, bind-time-constant remap).
+`export.handle` joins `import.handle`; **`cap` joins the value types**
+(`i32`-width in guest code; special only at boundaries). Backend cost is the
+op immediate plus one remap load threading through the one generic dispatch;
+JIT devirtualization of `required` grouped slots stays legal per §2.2
+(immutable binding, bind-time-constant remap).
 
 **Host-side provider, Rust** (embedder registry — sketch):
 
@@ -874,12 +902,82 @@ func 0 (i64, i64) -> (i64) {
 
 The child's one-op requirement binds against the parent's two-op offer —
 coverage, remap `[0→0]`. The offer flows the other way just as well: a child
-reifying its own offer and sending the handle *up* (a return value, a pipe)
-is how a child chooses to serve its parent — exposure is always
+reifying its own offer and returning the handle *up* through a `cap`-typed
+result is how a child chooses to serve its parent — exposure is always
 module→holder, authority flow is per-wiring, consent-based via
 `export.handle`. Provenance reports the wrapped binding ancestor-terminated
 at depth 1: the child can see *that* it is interposed, never *what* the
 interposer does.
+
+**The full triangle** (worked example: P above, M in the middle, C below —
+one passthrough down, one wrap down, a *different* offer up):
+
+```
+; ---- P: M's parent ----
+type 0 func () -> (i64)
+type 1 interface { count: 0 }                 ; what P wants FROM M
+import 2 interface "m" "metrics" 1 rebindable ; starts EMPTY — filled only if M delivers
+; (P also holds a stream "out" and an Instantiator "kids"; decls elided)
+
+  v0 = call.import kids.spawn (...)   ; spawn M; §3.3: forward own "out" to M
+  v1 = call.import kids.join (v0)     ; M's entry result is `cap` -> host-translated
+  import.attach 2 v1                  ; coverage-checked against P's interface 1
+  v2 = call.import 2.count ()         ; P drives M's metrics
+
+; ---- M: the middle domain ----
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0 }             ; consumes (from P)
+type 2 interface { log: 0 }               ; offers DOWN (wrap of write)
+type 3 func () -> (i64)
+type 4 interface { count: 3 }             ; offers UP (a different capability)
+
+import 0 interface "p" "out"  1 required
+import 1 interface "p" "kids" ... required
+
+func 0 (i64, i64) -> (i64) {              ; log impl: bump counter, forward
+  block 0 (v0: i64, v1: i64) {
+    ; ...increment counter in M's provider-instance memory...
+    v2 = call.import 0.write (v0, v1)     ; instance slot aliases M's "out"
+    return v2
+  }
+}
+func 1 () -> (i64) { block 0 { ... } }    ; count impl: read the counter
+
+export 0 interface "log"     2 { log: 0 }
+export 1 interface "metrics" 4 { count: 1 }
+export 2 func "main" 2                    ; M's entry — what spawn runs
+
+func 2 () -> (cap) {                      ; the setup run
+  block 0 {
+    v0 = import.handle 0                  ; the ORIGINAL stream    (passthrough)
+    v1 = export.handle 0                  ; M's log wrap           (for C)
+    v2 = export.handle 1                  ; M's metrics            (for P)
+    v3 = call.import 1.spawn (...)        ; spawn C
+    v4 = call.import 1.grant (v3, v0)     ; C's "out" <- passthrough
+    v5 = call.import 1.grant (v3, v1)     ; C's "log" <- the wrap
+    return v2                             ; metrics goes UP — only because M returns it
+  }
+}
+
+; ---- C: M's child ----
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0 }
+type 2 interface { log: 0 }
+import 0 interface "m" "out" 1 required   ; passthrough: provenance = the original's
+import 1 interface "m" "log" 2 required   ; wrap: provenance = ancestor depth 1
+
+  v2 = call.import 0.write (v0, v1)       ; straight to the original stream
+  v3 = call.import 1.log (v0, v1)         ; through M's counter, then the stream
+```
+
+Everything load-bearing is visible here: `metrics` reaches P *only* because
+M's entry returns it through a `cap`-typed result (an unmarked `i64` would
+arrive as an inert number); `log` never flows up, so P has nothing to bind;
+C's two imports answer provenance differently (the passthrough keeps the
+original's answer; the wrap reports depth 1); and after `main` returns, M's
+live run is over but its provider instance keeps serving both C's `log`
+calls and P's `count` calls — the counter they share lives in the instance,
+not in the finished run.
 
 ---
 
