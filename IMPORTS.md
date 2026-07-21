@@ -1046,11 +1046,33 @@ block, and transparent interposition cannot demand caller-side cooperation,
 so split-phase is a non-starter); zero-copy service access to the domain's
 buffers; and guest services layered on guest services.
 
-- **Scheduling.** Each dispatch is a *handler fiber* over the domain's
-  window and powerbox, interleaved with `main` (and other handlers) only at
-  suspension points — explicit yields and blocking ops. Cooperative: no
-  instruction-level interleaving; cross-yield invariants are the guest's to
-  keep, as in any event loop.
+- **Scheduling — explicit service points, host-run.** The scheduler lives
+  host-side (the same machinery that already parks and wakes vCPUs at
+  blocking ops — no new TCB category), but *when handlers may run* is
+  guest-controlled. Dispatches **queue** (bounded, fail-closed: a full
+  queue is a probeable fault at the caller) and run as handler fibers over
+  the domain's window and powerbox only at **service points**: `svc.wait`
+  (park until at least one dispatch arrives, run it) and `svc.poll` (run
+  everything pending, return) — or after the entry returns, which leaves
+  the gate permanently open (the pure-provider case authors zero loop
+  code). A domain's *own* parks — `memory.wait`, a blocking platform read —
+  are **not** service points: blocking for your own reasons never invites
+  reentrancy. Cooperative within the domain, no instruction-level
+  interleaving, and handler interleaving is *greppable* — it happens
+  exactly at `svc.*` lines and nowhere else.
+- **The dual-role domain authors its own loop** — the shell shape:
+  `loop { svc.wait(…); own work }`, with `svc.wait` doubling as the
+  multiplex point (park until a dispatch *or* a watched capability is
+  ready — the waitset detail is pinned when the slice is built). A handler
+  that parks mid-op (the interposed blocking `read`, waiting for input the
+  live loop hasn't produced yet) resumes at a subsequent service point
+  after being notified.
+- **Entry and lifecycle — no magic names.** The entry is whatever export
+  the spawner or wirer designates (true today already); `"main"` for
+  programs and `"init"` (or none — data segments may be the whole setup)
+  for providers is *convention, not semantics*. A domain is reclaimed when
+  its entry has returned, its dispatch queue is drained, and no offer
+  handles remain outstanding; until then it exists as a service.
 - **Blocking becomes expressible.** A handler parks on guest state
   (`memory.wait`) and the live run wakes it (`memory.notify`), or vice
   versa. The interposed `read` then blocks its *caller* exactly as a
