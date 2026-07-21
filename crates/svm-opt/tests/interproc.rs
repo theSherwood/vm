@@ -99,11 +99,14 @@ fn impl_export_ops_are_dfe_roots() {
                 params: vec![ValType::I32],
                 results: vec![ValType::I32],
             }),
-            svm_ir::TypeEntry::Interface(vec![0]),
+            svm_ir::TypeEntry::Interface(vec![svm_ir::IfaceOp {
+                name: "add".into(),
+                ty: 0,
+            }]),
         ],
         impl_exports: vec![svm_ir::ImplExport {
             name: "adder".into(),
-            iface: 1,
+            interface: 1,
             ops: vec![3],
         }],
         ..Default::default()

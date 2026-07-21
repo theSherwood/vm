@@ -2210,6 +2210,8 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfAttest
+        | Inst::CapSelfTypeId { .. }
+        | Inst::ExportHandle { .. }
         | Inst::VcpuTlsGet
         | Inst::DurableShadowBase
         | Inst::AtomicFence { .. }
@@ -2381,7 +2383,10 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
                 *v = f(*v);
             }
         }
-        Inst::CapCall { handle, args, .. } | Inst::CallImport { handle, args, .. } => {
+        Inst::CapSelfCovers { handle, .. } => *handle = f(*handle),
+        Inst::CapCall { handle, args, .. }
+        | Inst::CallImport { handle, args, .. }
+        | Inst::CallImportDyn { handle, args, .. } => {
             *handle = f(*handle);
             for v in args.iter_mut() {
                 *v = f(*v);

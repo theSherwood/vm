@@ -1190,6 +1190,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                     };
                 } else if let Inst::CallImport {
                     import,
+                    op,
                     sig,
                     handle,
                     args,
@@ -1209,6 +1210,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                         params: params.clone(),
                         insts: vec![Inst::CallImport {
                             import: *import,
+                            op: *op,
                             sig: sig.clone(),
                             handle: 0,
                             args: wrapper_args,
@@ -1807,7 +1809,7 @@ fn emit_func(
         .map(|b| block_value_types(m, b))
         .collect::<Result<_, _>>()?;
     // Pool size per type = the max count of that type in any single block.
-    const NTYPES: usize = 6; // I32, I64, F32, F64, V128, Ref (the ValType variants)
+    const NTYPES: usize = 7; // I32, I64, F32, F64, V128, Ref, Cap (the ValType variants)
     let type_slot = |t: ValType| -> usize {
         match t {
             ValType::I32 => 0,
@@ -1816,6 +1818,7 @@ fn emit_func(
             ValType::F64 => 3,
             ValType::V128 => 4,
             ValType::Ref => 5,
+            ValType::Cap => 6, // §3.5 i32-width handle marker
         }
     };
     let mut pool: [u32; NTYPES] = [0; NTYPES];

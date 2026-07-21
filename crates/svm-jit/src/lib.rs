@@ -737,6 +737,8 @@ fn clif_ty(t: ValType) -> Type {
         ValType::V128 => I8X16,
         // An opaque `ref` lowers exactly as `i64` (GC forward-compat reservation, GC.md §6).
         ValType::Ref => I64,
+        // §3.5 `cap` is i32-width handle data (translation reservation).
+        ValType::Cap => I32,
     }
 }
 
@@ -4476,6 +4478,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::CallIndirect { .. }
                 | Inst::CapCall { .. }
                 | Inst::CallImport { .. }
+                | Inst::CallImportDyn { .. }
+                | Inst::ExportHandle { .. }
+                | Inst::CapSelfTypeId { .. }
+                | Inst::CapSelfCovers { .. }
                 | Inst::ImportAttach { .. }
                 | Inst::RefFunc { .. }
                 | Inst::IntBin { .. }
@@ -5261,7 +5267,11 @@ fn lower_block(
         // is not read (constant 0, like `cap.self.*`); the module bytes are never rewritten, so the
         // compiled code is identical across instantiations (the binding is host-side state).
         if let Inst::CallImport {
-            import, sig, args, ..
+            import,
+            op,
+            sig,
+            args,
+            ..
         } = inst
         {
             let h0 = b.ins().iconst(I32, 0);
@@ -5270,10 +5280,75 @@ fn lower_block(
                 b,
                 lower,
                 svm_ir::CAP_IMPORT_TYPE_ID,
-                *import,
+                // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
+                *import | (*op << 16),
                 sig,
                 h0,
                 args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
+        // `(type_idx | op << 16)`; the handle operand is live (the value being driven).
+        if let Inst::CallImportDyn {
+            ty,
+            op,
+            sig,
+            handle,
+            args,
+        } = inst
+        {
+            let h = get(&vals, *handle)?;
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_DYN_TYPE_ID,
+                *ty | (*op << 16),
+                sig,
+                h,
+                args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §3.5 self-namespace extensions — the shared dispatch entry with `CAP_SELF_TYPE_ID` and
+        // op packed `(selfop | idx << 8)`: 6 = `cap.self.type_id`, 7 = `cap.self.covers`
+        // (handle as the one argument), 8 = `export.handle`. One `i32` result each.
+        if matches!(
+            inst,
+            Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. }
+        ) {
+            let h0 = b.ins().iconst(I32, 0);
+            let i32_result = FuncType {
+                params: vec![],
+                results: vec![ValType::I32],
+            };
+            let (op, sig, call_args): (u32, FuncType, &[u32]) = match inst {
+                Inst::CapSelfTypeId { ty } => (6 | (*ty << 8), i32_result.clone(), &[]),
+                Inst::CapSelfCovers { handle, ty } => (
+                    7 | (*ty << 8),
+                    FuncType {
+                        params: vec![ValType::I32],
+                        results: vec![ValType::I32],
+                    },
+                    std::slice::from_ref(handle),
+                ),
+                Inst::ExportHandle { export } => (8 | (*export << 8), i32_result.clone(), &[]),
+                _ => unreachable!(),
+            };
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                op,
+                &sig,
+                h0,
+                call_args,
                 &mut vals,
             )?;
             ubs.resize(vals.len(), UB_TOP);
@@ -7817,7 +7892,7 @@ fn guard_atomic_align(b: &mut FunctionBuilder, lower: &Lower, phys: Value, width
 fn decode_slot(b: &mut FunctionBuilder, slot: Value, ty: ValType) -> Value {
     match ty {
         ValType::I64 | ValType::Ref => slot, // `ref` is an opaque i64 in the cap ABI
-        ValType::I32 => b.ins().ireduce(I32, slot),
+        ValType::I32 | ValType::Cap => b.ins().ireduce(I32, slot),
         ValType::F32 => {
             let i = b.ins().ireduce(I32, slot);
             b.ins().bitcast(F32, MemFlags::new(), i)

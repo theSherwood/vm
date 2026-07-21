@@ -1227,7 +1227,7 @@ fn pool(t: ValType) -> Vec<SpecVal> {
         ValType::I64 => I64_INPUTS.iter().map(|&x| SpecVal::I64(x)).collect(),
         ValType::F32 => F32_INPUTS.iter().map(|&x| SpecVal::F32(x)).collect(),
         ValType::F64 => F64_INPUTS.iter().map(|&x| SpecVal::F64(x)).collect(),
-        ValType::V128 | ValType::Ref => unreachable!("no slice-1 row takes {t:?}"),
+        ValType::V128 | ValType::Ref | ValType::Cap => unreachable!("no slice-1 row takes {t:?}"),
     }
 }
 
@@ -1452,7 +1452,7 @@ fn store_val_pool(t: ValType) -> Vec<SpecVal> {
         .into_iter()
         .map(SpecVal::F64)
         .collect(),
-        ValType::V128 | ValType::Ref => unreachable!("no slice-5 store of {t:?}"),
+        ValType::V128 | ValType::Ref | ValType::Cap => unreachable!("no slice-5 store of {t:?}"),
     }
 }
 
@@ -1729,12 +1729,16 @@ pub fn coverage(inst: &Inst) -> Class {
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } | Inst::DurableShadowBase => Class::Control,
         Inst::CapCall { .. }
         | Inst::CallImport { .. }
+        | Inst::CallImportDyn { .. }
+        | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. } => Class::Host,
+        | Inst::CapSelfLabel { .. }
+        | Inst::CapSelfTypeId { .. }
+        | Inst::CapSelfCovers { .. } => Class::Host,
         Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }

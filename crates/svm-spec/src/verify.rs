@@ -42,9 +42,29 @@ pub fn verify(m: &Module) -> R {
             return Err(format!("duplicate import name {:?}", imp.name));
         }
     }
+    // §3.5 import shapes: every import references a well-formed type-section entry of its
+    // declared kind.
+    for (i, imp) in m.imports.iter().enumerate() {
+        let ok = match imp.shape {
+            svm_ir::ImportShape::Func(t) => {
+                matches!(m.types.get(t as usize), Some(svm_ir::TypeEntry::Func(_)))
+            }
+            svm_ir::ImportShape::Interface(t) => m.interface_ops(t).is_some(),
+        };
+        if !ok {
+            return Err(format!("import {i} shape reference is not well-formed"));
+        }
+    }
     for (fi, f) in m.funcs.iter().enumerate() {
-        verify_func(f, &m.funcs, &m.imports, m.memory.is_some())
-            .map_err(|e| format!("fn{fi}: {e}"))?;
+        verify_func(
+            f,
+            &m.funcs,
+            &m.imports,
+            &m.types,
+            m.impl_exports.len(),
+            m.memory.is_some(),
+        )
+        .map_err(|e| format!("fn{fi}: {e}"))?;
     }
     // Exports name real functions, uniquely.
     for (i, e) in m.exports.iter().enumerate() {
@@ -71,10 +91,10 @@ pub fn verify(m: &Module) -> R {
         // v6 (OQ3): the offer implements its declared interface exactly — op count and each
         // op's function type equal to the interface's signature, resolved through the type
         // section's one index space (an interface is a tuple of Func-entry indices).
-        let Some(iface) = m.interface_ops(e.iface) else {
+        let Some(iface) = m.interface_ops(e.interface) else {
             return Err(format!(
                 "impl export {i} interface {} is not a well-formed interface entry",
-                e.iface
+                e.interface
             ));
         };
         if e.ops.len() != iface.len() {
@@ -101,7 +121,14 @@ pub fn verify(m: &Module) -> R {
     Ok(())
 }
 
-fn verify_func(f: &Func, funcs: &[Func], imports: &[Import], has_memory: bool) -> R {
+fn verify_func(
+    f: &Func,
+    funcs: &[Func],
+    imports: &[Import],
+    tsec: &[svm_ir::TypeEntry],
+    n_impl: usize,
+    has_memory: bool,
+) -> R {
     // §3b rule 2: the entry block's params equal the function signature's params.
     match f.blocks.first() {
         Some(entry) if entry.params == f.params => {}
@@ -111,11 +138,45 @@ fn verify_func(f: &Func, funcs: &[Func], imports: &[Import], has_memory: bool) -
     for b in &f.blocks {
         let mut types: Vec<ValType> = b.params.clone();
         for inst in &b.insts {
-            check_inst(inst, &mut types, funcs, imports, has_memory, b, &fn_results)?;
+            check_inst(
+                inst,
+                &mut types,
+                funcs,
+                imports,
+                tsec,
+                n_impl,
+                has_memory,
+                b,
+                &fn_results,
+            )?;
         }
         check_term(&b.term, &types, f, funcs)?;
     }
     Ok(())
+}
+
+/// Resolve interface entry `t`'s op-`op` signature through the type section, or `None` when
+/// `t` is not a well-formed interface reference or `op` is out of range (§3.5).
+fn iface_op_sig(tsec: &[svm_ir::TypeEntry], t: u32, op: u32) -> Option<&svm_ir::FuncType> {
+    match tsec.get(t as usize)? {
+        svm_ir::TypeEntry::Interface(elems) => {
+            match tsec.get(elems.get(op as usize)?.ty as usize)? {
+                svm_ir::TypeEntry::Func(ft) => Some(ft),
+                svm_ir::TypeEntry::Interface(_) => None,
+            }
+        }
+        svm_ir::TypeEntry::Func(_) => None,
+    }
+}
+
+/// Whether `t` names a well-formed interface entry (every element a `Func` reference).
+fn iface_well_formed(tsec: &[svm_ir::TypeEntry], t: u32) -> bool {
+    match tsec.get(t as usize) {
+        Some(svm_ir::TypeEntry::Interface(elems)) => elems
+            .iter()
+            .all(|e| matches!(tsec.get(e.ty as usize), Some(svm_ir::TypeEntry::Func(_)))),
+        _ => false,
+    }
 }
 
 /// §3b rule 3: operand `v` is defined strictly earlier and has exactly type `want`.
@@ -141,11 +202,14 @@ fn need_memory(has_memory: bool) -> R {
 /// One instruction: check operands, append result type(s). Exhaustive over `Inst`, so
 /// a new instruction forces a rule decision here (the same forcing function as
 /// [`crate::coverage`]).
+#[allow(clippy::too_many_arguments)]
 fn check_inst(
     inst: &Inst,
     types: &mut Vec<ValType>,
     funcs: &[Func],
     imports: &[Import],
+    tsec: &[svm_ir::TypeEntry],
+    n_impl: usize,
     has_memory: bool,
     block: &Block,
     fn_results: &[usize],
@@ -364,6 +428,7 @@ fn check_inst(
         // fail-closed. Operand typing mirrors `cap.call` (handle i32 + args per sig).
         Inst::CallImport {
             import,
+            op,
             sig,
             handle,
             args,
@@ -373,12 +438,73 @@ fn check_inst(
                     "unresolved import {import} (out of manifest range)"
                 ));
             };
-            if decl.sig != *sig {
+            // §3.5: resolve the consumer-local op through the declared shape and the type
+            // section — a flat `func` import has exactly op 0; a grouped import its
+            // interface's op list. The self-describing sig must equal the resolution.
+            let want_sig = match decl.shape {
+                svm_ir::ImportShape::Func(t) => match (op, tsec.get(t as usize)) {
+                    (0, Some(svm_ir::TypeEntry::Func(ft))) => Some(ft),
+                    _ => None,
+                },
+                svm_ir::ImportShape::Interface(t) => iface_op_sig(tsec, t, *op),
+            };
+            let Some(want_sig) = want_sig else {
+                return Err(format!(
+                    "import {import} op {op} out of range for its shape"
+                ));
+            };
+            if want_sig != sig {
                 return Err(format!("import {import} signature mismatch with manifest"));
             }
             w(*handle, V::I32)?;
             check_args(types, args, &sig.params)?;
             sig.results.clone()
+        }
+        // §3.5 dynamic-mode dispatch by type-section reference: well-formed interface, op in
+        // range, sig equal to the resolution; handle is a forgeable i32 (runtime §3c check).
+        Inst::CallImportDyn {
+            ty,
+            op,
+            sig,
+            handle,
+            args,
+        } => {
+            let Some(want_sig) = iface_op_sig(tsec, *ty, *op) else {
+                return Err(format!(
+                    "call.import.dyn type {ty} op {op} is not a well-formed interface op"
+                ));
+            };
+            if want_sig != sig {
+                return Err(format!("call.import.dyn type {ty} signature mismatch"));
+            }
+            w(*handle, V::I32)?;
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
+        }
+        // §3.5 `export.handle`: index must name a declared impl export; appends the handle.
+        Inst::ExportHandle { export } => {
+            if *export as usize >= n_impl {
+                return Err(format!("export.handle {export} out of range"));
+            }
+            vec![V::I32]
+        }
+        // §3.5 reflection: both reference a well-formed interface of this module.
+        Inst::CapSelfTypeId { ty } => {
+            if !iface_well_formed(tsec, *ty) {
+                return Err(format!(
+                    "cap.self.type_id {ty} is not a well-formed interface"
+                ));
+            }
+            vec![V::I32]
+        }
+        Inst::CapSelfCovers { handle, ty } => {
+            if !iface_well_formed(tsec, *ty) {
+                return Err(format!(
+                    "cap.self.covers {ty} is not a well-formed interface"
+                ));
+            }
+            w(*handle, V::I32)?;
+            vec![V::I32]
         }
         // Phase-2 `import.attach` (IMPORTS.md): the index must name a declared **rebindable**
         // import; the handle operand is a forgeable i32 (validity is the runtime §3c check).

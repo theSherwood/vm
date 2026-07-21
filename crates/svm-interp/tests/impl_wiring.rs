@@ -245,7 +245,7 @@ fn a_wired_import_slot_runs_on_both_engines() {
         let mut h = Host::new();
         let handle = h.wire_impl(&offer_funcs(), &[1]).expect("offer");
         let b = h
-            .bound_import_for_impl(handle, 0, &m.imports[0].sig, false)
+            .bound_import_for_impl(handle, 0, m.import_op_sig(0, 0).expect("flat import"), false)
             .expect("slot sig matches the offer op");
         h.set_import_bindings(vec![b]);
         h
@@ -289,7 +289,7 @@ fn an_offer_regrants_into_a_child_one_hop_deeper() {
 
 #[test]
 fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
-    use svm_ir::{Import, ImportMode};
+    use svm_ir::ImportMode;
     let mut parent = Host::new();
     let funcs = offer_funcs();
     let handle = parent.wire_impl(&funcs, &[1, 0]).expect("offer");
@@ -299,46 +299,53 @@ fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
             .expect("spawn")
             .0
     };
-    let import = |name: &str, params: Vec<ValType>, mode: ImportMode| Import {
-        name: name.into(),
-        sig: sig(params, vec![ValType::I64]),
-        mode,
+    // §3.5: manifest signatures live in the type section; build (imports, types) together.
+    let manifest = |specs: &[(&str, Vec<ValType>, ImportMode)]| {
+        let mut m = svm_ir::Module::default();
+        for (name, params, mode) in specs {
+            m.add_func_import("", *name, sig(params.clone(), vec![ValType::I64]), *mode);
+        }
+        (m.imports, m.types)
     };
 
     // A named offer binds the slot to its first signature-matching op (op 0 here: (i64,i64)).
     let mut child = spawn(&mut parent);
+    let (imps, tys) = manifest(&[(
+        "add",
+        vec![ValType::I64, ValType::I64],
+        ImportMode::Required,
+    )]);
     child
-        .bind_child_manifest(&[import(
-            "add",
-            vec![ValType::I64, ValType::I64],
-            ImportMode::Required,
-        )])
+        .bind_child_manifest(&imps, &tys)
         .expect("named offer binds");
     let b = child.import_binding(0).expect("slot bound");
     assert_eq!(b.op, 0, "first sig-matching op");
 
     // §3.3 withhold: a required import with nothing to bind fails the spawn closed...
     let mut child = spawn(&mut parent);
+    let (imps, tys) = manifest(&[("fs", vec![ValType::I64], ImportMode::Required)]);
     assert_eq!(
-        child.bind_child_manifest(&[import("fs", vec![ValType::I64], ImportMode::Required)]),
+        child.bind_child_manifest(&imps, &tys),
         Err(0),
         "required + unmatched refuses the manifest"
     );
     // ...a name-matched offer with NO signature-matching op also refuses (never silently binds)...
     let mut child = spawn(&mut parent);
+    let (imps, tys) = manifest(&[(
+        "add",
+        vec![ValType::I32, ValType::I32],
+        ImportMode::Required,
+    )]);
     assert_eq!(
-        child.bind_child_manifest(&[import(
-            "add",
-            vec![ValType::I32, ValType::I32],
-            ImportMode::Required,
-        )]),
+        child.bind_child_manifest(&imps, &tys),
         Err(0),
         "sig mismatch on a named offer refuses"
     );
     // ...while a rebindable slot just starts empty.
     let mut child = spawn(&mut parent);
+    let (imps, tys) = manifest(&[("fs", vec![ValType::I64], ImportMode::Rebindable)]);
     child
-        .bind_child_manifest(&[import("fs", vec![ValType::I64], ImportMode::Rebindable)])
+        .bind_child_manifest(&imps, &tys)
         .expect("rebindable withhold is an empty slot, not a refusal");
     assert!(child.import_binding(0).is_none(), "slot starts empty");
 }

@@ -311,6 +311,7 @@ pub fn struct_rows() -> Vec<StructRow> {
             vec![i32t],
             Inst::CallImport {
                 import: 0,
+                op: 0,
                 sig: ft_void.clone(),
                 handle: 0,
                 args: vec![],
@@ -679,12 +680,16 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::RefFunc { .. }
         | Inst::CapCall { .. }
         | Inst::CallImport { .. }
+        | Inst::CallImportDyn { .. }
+        | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
         | Inst::CapSelfLabel { .. }
+        | Inst::CapSelfTypeId { .. }
+        | Inst::CapSelfCovers { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }

@@ -53,6 +53,14 @@ pub const CAP_IMPORT_TYPE_ID: u32 = u32::MAX - 2;
 /// named slot (no new grant-graph edge, the D37 argument). Returns `0` ok / `-errno`.
 pub const CAP_IMPORT_ATTACH_TYPE_ID: u32 = u32::MAX - 3;
 
+/// Reserved pseudo-`type_id` for **dynamic-mode dispatch by type-section reference**
+/// ([`Inst::CallImportDyn`], IMPORTS.md §3.5). The `op` packs `(type_idx | op << 16)`; the handle
+/// operand is the live handle value. Serviced host-side: the domain's registered self-module
+/// interface shape at `type_idx` is interned to its structural `type_id` and the dispatch
+/// re-enters with `(that id, op, handle)` — the ordinary §3c use-site check does the rest. One
+/// shared entry keeps the three backends in lockstep, like [`CAP_IMPORT_TYPE_ID`].
+pub const CAP_DYN_TYPE_ID: u32 = u32::MAX - 4;
+
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
 /// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
 /// raw bytes whose lane interpretation is per-op, never per-value.
