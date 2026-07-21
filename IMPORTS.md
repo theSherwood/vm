@@ -503,7 +503,7 @@ leaving the tree with five conventions instead of four.
 
 ---
 
-## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 designed — next build slice]
+## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 designed — next build slice; §3.6 designed — awaits the shell personality]
 
 ### 3.1 Binding provenance in `cap.self.attest`
 
@@ -869,14 +869,14 @@ The workarounds, in preference order:
    never block waiting on the live domain — that recreates the exact cycle
    this design removes.
 
-What remains inexpressible even with workarounds: a service call
-synchronously observing or mutating the live run's control flow ("pause
-yourself now" — that is `Instantiator`'s job, host-side), and zero-copy
-sharing of live-window buffers with the service (copy through a pipe, or
-restructure so the instance owns the buffer). The designed-later fiber
-reactor (§12 machinery: park the live run in a suspended fiber, deliver
-dispatches as resumptions at its yield points) would lift these — unbuilt
-until a concrete consumer demands it.
+What remains inexpressible even with workarounds: an offer op that must
+**block on the live run** (an interposed stdin `read` — split-phase requires
+the *caller* to cooperate, and a posix child calling `read(0, …)` expects to
+block; transparent interposition cannot demand caller changes), zero-copy
+sharing of live-window buffers with the service, and guest services layered
+on guest services (the offers-in-providers refusal). These are lifted by
+**reactor domains** — §3.6, designed for exactly this; anything shell-like
+is its consumer.
 
 **Wire (v7 — one bump, six riders):** `Import` replaces its inline `FuncType`
 with `shape: Func(typeidx) | Interface(typeidx)` and gains the second name
@@ -1023,6 +1023,60 @@ original's answer; the wrap reports depth 1); and after `main` returns, M's
 live run is over but its provider instance keeps serving both C's `log`
 calls and P's `count` calls — the counter they share lives in the instance,
 not in the finished run.
+
+### 3.6 Reactor domains — serving from the live world  [DESIGNED 2026-07-21; awaits the shell personality]
+
+§3.5's passive instances are deadlock-free by construction, but three things
+are inexpressible over them, and the first is fatal to anything shell-like:
+an offer op that **blocks on the live run** (an interposed stdin `read` — a
+posix child calling `read(0, …)` expects to block, and transparent
+interposition cannot demand caller-side cooperation, so split-phase is a
+non-starter); zero-copy access to live-window buffers; and guest services
+layered on guest services (the offers-in-providers refusal). Note what is
+*not* the problem: live-run re-entry cycles (A-live → B-live → A-live) never
+arise under §3.5, because offers never execute in live runs at all — the
+restriction traded those cycles away, and this section buys the
+expressiveness back with the §12 fiber machinery.
+
+- **Two backings per offer, chosen at reification.** `export.handle k` →
+  passive instance (default; §3.5 unchanged). `export.handle k live` → the
+  offer is backed by the **live domain**: each dispatch runs as a *handler
+  fiber* over the live window and powerbox, interleaved with the live run
+  (and other handlers) only at suspension points — explicit yields and
+  blocking ops. Cooperative scheduling: no instruction-level interleaving;
+  cross-yield invariants are the guest's to keep, as in any event loop.
+- **Blocking becomes expressible.** A handler parks on guest state
+  (`memory.wait`) and the live run wakes it (`memory.notify`), or vice
+  versa. The interposed `read` then blocks its *caller* exactly as a
+  platform stream read would — the caller's vCPU parks at the host boundary,
+  which is already a concept, not new machinery.
+- **Deadlock: detection replaces prevention.** Live-backed offers make call
+  cycles constructible (A's handler calls B; B's handler calls back into A
+  while A is parked). The host keeps the cross-domain **wait-for graph** —
+  one edge per parked reactor dispatch, added at park, removed at return; a
+  call whose edge would close a cycle faults immediately (probeable
+  `CapFault`, like a dry fuel reserve) instead of hanging. Cheap by
+  construction: edges exist only for parked reactor calls, and the graph is
+  as small as the parked-call count. Passive instances keep their
+  by-construction guarantee; only opted-in reactors buy detection.
+- **Service-on-service unlocks — for reactors.** The offers-in-providers
+  refusal stays for passive instances; a reactor's handlers hold and call
+  whatever the live domain holds, including other domains' offers, under the
+  same cycle detection. Layered guest services (a shell's pipeline stages,
+  fs-on-blockdev) become expressible.
+- **Metering:** the reactor serves on its own domain fuel — §5.3
+  provider-pays generalizes unchanged (its code, its choice to serve live).
+  A parked caller burns nothing while parked.
+- **Unchanged:** provenance, attest, coverage binding, the `cap` type, and
+  the consent rule — `export.handle`, with either backing, remains the only
+  path to a domain's service.
+
+Cost, honestly: fiber-per-dispatch scheduling, caller parking, and the
+wait-for graph touch the dispatch path on all three backends — a slice far
+larger than passive instances, with new cross-domain blocking semantics to
+differential-test. It stays designed-not-built until its consumer (the
+shell personality, STAGE1) is ready to drive it; passive instances remain
+the default and the common case.
 
 ---
 

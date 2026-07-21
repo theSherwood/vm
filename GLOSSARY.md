@@ -141,6 +141,12 @@ The system is four ideas wearing many names:
 - **provider-pays** — the §5.3 metering rule: an instanced provider funds its own
   dispatch compute from a drainable, wirer-priced fuel reserve; a dry reserve is a
   probeable fault until topped up.
+- **reactor domain** — (designed: IMPORTS.md §3.6) a domain serving offers from its
+  *live* world instead of a passive instance: dispatches run as handler fibers over
+  the live window, interleaved only at suspension points. Makes blocking guest
+  ops (interposed stdin `read`) and service-on-service layering expressible;
+  deadlock prevention gives way to wait-for-graph detection (cycles fault, never
+  hang).
 
 ## Guest JIT (§22)
 
