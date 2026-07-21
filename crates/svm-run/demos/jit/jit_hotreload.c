@@ -78,7 +78,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 5); // format v5 (v4 sections + the impl-export section)
+  eb(buf, 6); // format v6 (v5 sections + the interface section)
   eb(buf, 1);
   eb(buf, 16);
   eb(buf, 0);
@@ -95,6 +95,7 @@ static long emit_adder(char *buf, long k) {
   emit_header(buf);
   eb(buf, 0); // 0 imports
   eb(buf, 0); // 0 exports (v3 export section)
+  eb(buf, 0); // 0 interfaces (v6 interface section)
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
@@ -123,6 +124,7 @@ static long emit_caller(char *buf) {
   emit_i64_pair_sig(buf);
   eb(buf, 0); // mode: required (v4)
   eb(buf, 0); // 0 exports (v3 export section)
+  eb(buf, 0); // 0 interfaces (v6 interface section)
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);

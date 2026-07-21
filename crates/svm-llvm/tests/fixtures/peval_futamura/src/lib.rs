@@ -260,6 +260,7 @@ fn build_interpreter(win_log2: u8) -> Module {
         blocks: vec![entry, loop_blk, addb, mulb, addk, mulk, end],
     };
     Module {
+        interfaces: vec![],
         funcs: vec![interp],
         memory: Some(Memory {
             size_log2: win_log2,

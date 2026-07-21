@@ -223,6 +223,9 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // runtime-`Module` analogue of a link unit's exports — so an embedder can `call("main")` by name.
 // The decoder accepts only the exact current `VERSION`, so the bump simply retires v2 readers; there
 // is no in-place v2 blob to stay compatible with.
+// v6 adds the **interface section** (OQ3: module-level interface declarations — each entry an
+// ordered op-signature list) and the impl-export `iface` reference (an offer declares which
+// interface it implements; the verifier checks it does, exactly).
 // v5 adds the **impl-export section** (provider-side interface offers, IMPORTS.md §3.2): name +
 // one funcidx per op — op signatures derive from the named functions' declared types, so the wire
 // carries indices only, never duplicated signatures.
@@ -233,7 +236,7 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -350,11 +353,23 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
         write_str(&mut out, &e.name);
         write_uleb(&mut out, e.func as u64);
     }
-    // Impl-export section (v5): count, then each offer's `name` and its per-op funcidx list —
-    // op `i`'s signature is `funcs[ops[i]]`'s declared type, so no signatures are written here.
+    // Interface section (v6, OQ3): count, then each interface's op count and per-op
+    // params/results type lists — declarations only, no code.
+    write_uleb(&mut out, m.interfaces.len() as u64);
+    for iface in &m.interfaces {
+        write_uleb(&mut out, iface.len() as u64);
+        for sig in iface {
+            write_types(&mut out, &sig.params);
+            write_types(&mut out, &sig.results);
+        }
+    }
+    // Impl-export section (v5; +iface in v6): count, then each offer's `name`, its declared
+    // interface index, and its per-op funcidx list — op `i`'s signature is `funcs[ops[i]]`'s
+    // declared type, verifier-checked against the declared interface.
     write_uleb(&mut out, m.impl_exports.len() as u64);
     for e in &m.impl_exports {
         write_str(&mut out, &e.name);
+        write_uleb(&mut out, e.iface as u64);
         write_uleb(&mut out, e.ops.len() as u64);
         for &f in &e.ops {
             write_uleb(&mut out, f as u64);
@@ -1612,18 +1627,34 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         let func = c.uleb()? as FuncIdx;
         exports.push(Export { name, func });
     }
-    // Impl-export section (v5): mirrors the encoder. Funcidx range, non-empty ops, and name
-    // uniqueness are the verifier's job, not the decoder's.
+    // Interface section (v6): mirrors the encoder. Grows on demand (attacker-influenced
+    // counts); all cross-reference checks are the verifier's job.
+    let nifaces = c.count()?;
+    let mut interfaces = Vec::new();
+    for _ in 0..nifaces {
+        let nops = c.count()?;
+        let mut ops = Vec::new();
+        for _ in 0..nops {
+            ops.push(svm_ir::FuncType {
+                params: decode_types(&mut c)?,
+                results: decode_types(&mut c)?,
+            });
+        }
+        interfaces.push(ops);
+    }
+    // Impl-export section (v5; +iface in v6): mirrors the encoder. Funcidx/iface range,
+    // non-empty ops, and name uniqueness are the verifier's job, not the decoder's.
     let nimpl = c.count()?;
     let mut impl_exports = Vec::new();
     for _ in 0..nimpl {
         let name = c.str()?;
+        let iface = c.uleb()? as u32;
         let nops = c.count()?;
         let mut ops = Vec::new();
         for _ in 0..nops {
             ops.push(c.uleb()? as FuncIdx);
         }
-        impl_exports.push(svm_ir::ImplExport { name, ops });
+        impl_exports.push(svm_ir::ImplExport { name, iface, ops });
     }
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
@@ -1647,6 +1678,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         imports,
         exports,
         impl_exports,
+        interfaces,
         debug_info,
     })
 }
@@ -2538,6 +2570,7 @@ mod debug_tests {
 
     fn module(debug_info: Option<DebugInfo>) -> Module {
         Module {
+            interfaces: vec![],
             funcs: vec![],
             memory: None,
             data: vec![],
@@ -2617,13 +2650,31 @@ mod debug_tests {
                 }],
             });
         }
+        m.interfaces = vec![
+            vec![
+                svm_ir::FuncType {
+                    params: vec![],
+                    results: vec![],
+                },
+                svm_ir::FuncType {
+                    params: vec![],
+                    results: vec![],
+                },
+            ],
+            vec![svm_ir::FuncType {
+                params: vec![],
+                results: vec![],
+            }],
+        ];
         m.impl_exports = vec![
             svm_ir::ImplExport {
                 name: "logger".to_string(),
+                iface: 0,
                 ops: vec![1, 2],
             },
             svm_ir::ImplExport {
                 name: "sink".to_string(),
+                iface: 1,
                 ops: vec![0],
             },
         ];

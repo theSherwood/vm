@@ -126,6 +126,13 @@ pub enum VerifyError {
     /// Two export entries share a name. Function exports and impl exports (interface offers,
     /// IMPORTS.md §3.2) are one namespace: the host addresses both by name.
     DuplicateImplExport { export: u32 },
+    /// An [`Module::impl_exports`] offer's `iface` names an entry past the end of
+    /// [`Module::interfaces`].
+    ImplExportIfaceOutOfRange { export: u32, iface: u32 },
+    /// An [`Module::impl_exports`] offer does not implement its declared interface: the op
+    /// count differs, or op `op`'s function type differs from the interface's op-`op`
+    /// signature (structural, exact — IMPORTS.md OQ3/v6).
+    ImplExportIfaceMismatch { export: u32, op: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -199,6 +206,30 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
                     export: ei as u32,
                     op: oi as u32,
                     func: f,
+                });
+            }
+        }
+        // v6 (OQ3): the offer must implement its **declared** interface exactly — same op
+        // count, and op `i`'s function type equal to the interface's op-`i` signature. Makes
+        // "implemented the wrong interface" a verify error, not a wiring surprise.
+        let Some(iface) = m.interfaces.get(e.iface as usize) else {
+            return Err(VerifyError::ImplExportIfaceOutOfRange {
+                export: ei as u32,
+                iface: e.iface,
+            });
+        };
+        if e.ops.len() != iface.len() {
+            return Err(VerifyError::ImplExportIfaceMismatch {
+                export: ei as u32,
+                op: e.ops.len().min(iface.len()) as u32,
+            });
+        }
+        for (oi, (&f, want)) in e.ops.iter().zip(iface).enumerate() {
+            let ft = &m.funcs[f as usize];
+            if ft.params != want.params || ft.results != want.results {
+                return Err(VerifyError::ImplExportIfaceMismatch {
+                    export: ei as u32,
+                    op: oi as u32,
                 });
             }
         }

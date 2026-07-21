@@ -89,11 +89,24 @@ pub fn print_module(m: &Module) -> String {
         }
         s.push('\n');
     }
-    // Interface offers (IMPORTS.md §3.2), one per line: `export "<name>" impl <funcidx>...` —
-    // one funcidx per op, in op order; the op signatures are the named functions' types.
+    // The interface section (OQ3, v6), one declaration per line in index order:
+    // `interface { (params) -> (results), ... }` — op signatures only, no code.
+    if !m.interfaces.is_empty() {
+        for iface in &m.interfaces {
+            let ops: Vec<String> = iface
+                .iter()
+                .map(|sig| format!("({}) -> ({})", types(&sig.params), types(&sig.results)))
+                .collect();
+            let _ = writeln!(s, "interface {{ {} }}", ops.join(", "));
+        }
+        s.push('\n');
+    }
+    // Interface offers (IMPORTS.md §3.2), one per line:
+    // `export "<name>" impl <iface> : <funcidx>...` — the declared interface index, then one
+    // funcidx per op in op order (each function's type must equal the interface's op signature).
     if !m.impl_exports.is_empty() {
         for e in &m.impl_exports {
-            let _ = write!(s, "export \"{}\" impl", e.name);
+            let _ = write!(s, "export \"{}\" impl {} :", e.name, e.iface);
             for &f in &e.ops {
                 let _ = write!(s, " {f}");
             }
@@ -954,6 +967,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut data: Vec<Data> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
     let mut impl_exports: Vec<ImplExport> = Vec::new();
+    let mut interfaces: Vec<Vec<FuncType>> = Vec::new();
     let mut dbg_files: Vec<String> = Vec::new();
     let mut dbg_locs: Vec<Loc> = Vec::new();
     let mut dbg_types: Vec<TypeDef> = Vec::new();
@@ -1199,14 +1213,41 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     bytes,
                 });
             }
+            // The interface section (OQ3, v6): `interface { (params) -> (results), ... }` —
+            // one declaration per line, indexed by order of appearance.
+            Some(Tok::Ident(s)) if s == "interface" => {
+                p.next()?;
+                p.expect(&Tok::LBrace)?;
+                let mut ops = Vec::new();
+                if !matches!(p.peek(), Some(Tok::RBrace)) {
+                    loop {
+                        let params = p.parse_type_list()?;
+                        p.expect(&Tok::Arrow)?;
+                        let results = p.parse_type_list()?;
+                        ops.push(FuncType { params, results });
+                        if matches!(p.peek(), Some(Tok::Comma)) {
+                            p.next()?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                p.expect(&Tok::RBrace)?;
+                interfaces.push(ops);
+            }
             // First-class function export `export "<name>" <funcidx>`, or an interface offer
-            // (IMPORTS.md §3.2) `export "<name>" impl <funcidx>...` — one funcidx per op.
+            // (IMPORTS.md §3.2) `export "<name>" impl <iface> : <funcidx>...`.
             Some(Tok::Ident(s)) if s == "export" => {
                 p.next()?;
                 let name = String::from_utf8(p.parse_str()?)
                     .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
                 if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
                     p.next()?;
+                    let n = p.parse_int()?;
+                    let iface = u32::try_from(n).map_err(|_| {
+                        ParseError(format!("impl export interface out of range: {n}"))
+                    })?;
+                    p.expect(&Tok::Colon)?;
                     let mut ops = Vec::new();
                     while matches!(p.peek(), Some(Tok::Int(_))) {
                         let n = p.parse_int()?;
@@ -1215,7 +1256,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                         })?;
                         ops.push(f);
                     }
-                    impl_exports.push(ImplExport { name, ops });
+                    impl_exports.push(ImplExport { name, iface, ops });
                 } else {
                     let n = p.parse_int()?;
                     let func = u32::try_from(n)
@@ -1262,6 +1303,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         imports: std::mem::take(&mut p.imports),
         exports,
         impl_exports,
+        interfaces,
         debug_info,
     })
 }
@@ -1308,13 +1350,24 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_int()?;
                 p.parse_str()?;
             }
-            // `export "<name>" <funcidx>` / `export "<name>" impl <funcidx>...` — skip past it
-            // in the header prescan.
+            // `interface { ... }` — skip the brace-matched declaration in the header prescan.
+            Some(Tok::Ident(s)) if s == "interface" => {
+                p.next()?;
+                p.expect(&Tok::LBrace)?;
+                while !matches!(p.peek(), Some(Tok::RBrace)) {
+                    p.next()?;
+                }
+                p.expect(&Tok::RBrace)?;
+            }
+            // `export "<name>" <funcidx>` / `export "<name>" impl <iface> : <funcidx>...` —
+            // skip past it in the header prescan.
             Some(Tok::Ident(s)) if s == "export" => {
                 p.next()?;
                 p.parse_str()?;
                 if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
                     p.next()?;
+                    p.parse_int()?;
+                    p.expect(&Tok::Colon)?;
                     while matches!(p.peek(), Some(Tok::Int(_))) {
                         p.parse_int()?;
                     }
@@ -2798,8 +2851,9 @@ block0(v0: i64):
         // Interface offers (IMPORTS.md §3.2): `export "<name>" impl <funcidx>...` — one funcidx
         // per op; op signatures are the named functions' declared types.
         let src = "\
+interface { (i64) -> (i64), (i64) -> (i64) }
 export \"main\" 0
-export \"logger\" impl 1 0
+export \"logger\" impl 0 : 1 0
 
 func (i64) -> (i64) {
 block0(v0: i64):

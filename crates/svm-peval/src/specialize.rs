@@ -346,6 +346,7 @@ pub fn specialize_with_config(
         // Interface offers are dropped for the same reason (their op funcidxs are stale).
         exports: vec![],
         impl_exports: vec![],
+        interfaces: vec![],
         debug_info: None,
     })
 }

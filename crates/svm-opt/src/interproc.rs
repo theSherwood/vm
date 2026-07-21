@@ -172,6 +172,7 @@ pub fn dead_func_elim(m: &Module) -> Module {
         .iter()
         .map(|e| svm_ir::ImplExport {
             name: e.name.clone(),
+            iface: e.iface, // interface indices are untouched by func renumbering
             ops: e.ops.iter().map(|&f| map[f as usize]).collect(),
         })
         .collect();
@@ -183,6 +184,7 @@ pub fn dead_func_elim(m: &Module) -> Module {
         imports: m.imports.clone(),
         exports,
         impl_exports,
+        interfaces: m.interfaces.clone(),
         debug_info: None, // positions go stale once functions are renumbered
     }
 }
@@ -617,6 +619,7 @@ pub fn inline_calls(m: &Module) -> Module {
         imports: m.imports.clone(),
         exports: m.exports.clone(),
         impl_exports: m.impl_exports.clone(),
+        interfaces: m.interfaces.clone(),
         debug_info: None, // instruction positions shift once bodies are spliced
     }
 }
@@ -911,6 +914,7 @@ pub fn const_prop(m: &Module) -> Module {
         imports: m.imports.clone(),
         exports: m.exports.clone(),
         impl_exports: m.impl_exports.clone(),
+        interfaces: m.interfaces.clone(),
         debug_info: None, // instruction positions shift in a specialized entry block
     }
 }
@@ -1013,6 +1017,7 @@ pub fn devirtualize(m: &Module) -> Module {
         imports: m.imports.clone(),
         exports: m.exports.clone(),
         impl_exports: m.impl_exports.clone(),
+        interfaces: m.interfaces.clone(),
         debug_info: None, // an instruction/terminator changed
     }
 }

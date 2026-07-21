@@ -331,6 +331,7 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
         imports: m.imports.clone(),
         exports: m.exports.clone(),
         impl_exports: m.impl_exports.clone(),
+        interfaces: m.interfaces.clone(),
         debug_info: None,
     };
     // Dead-function elimination (OPT.md Phase 3) is the one module-level pass — it drops functions no

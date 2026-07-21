@@ -1120,6 +1120,7 @@ fn translate_impl(
     }
     Ok(Translated {
         module: Module {
+            interfaces: vec![],
             impl_exports: vec![],
             funcs,
             memory,

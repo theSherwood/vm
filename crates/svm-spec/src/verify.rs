@@ -68,6 +68,29 @@ pub fn verify(m: &Module) -> R {
                 ));
             }
         }
+        // v6 (OQ3): the offer implements its declared interface exactly — op count and each
+        // op's function type equal to the interface's signature.
+        let Some(iface) = m.interfaces.get(e.iface as usize) else {
+            return Err(format!(
+                "impl export {i} interface {} out of range",
+                e.iface
+            ));
+        };
+        if e.ops.len() != iface.len() {
+            return Err(format!(
+                "impl export {i} implements {} ops but its interface declares {}",
+                e.ops.len(),
+                iface.len()
+            ));
+        }
+        for (oi, (&f, want)) in e.ops.iter().zip(iface).enumerate() {
+            let ft = &m.funcs[f as usize];
+            if ft.params != want.params || ft.results != want.results {
+                return Err(format!(
+                    "impl export {i} op {oi} does not match its declared interface signature"
+                ));
+            }
+        }
         if m.impl_exports[..i].iter().any(|o| o.name == e.name)
             || m.exports.iter().any(|o| o.name == e.name)
         {

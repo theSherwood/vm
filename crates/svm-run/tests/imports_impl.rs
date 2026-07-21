@@ -10,7 +10,8 @@ use svm_text::parse_module;
 
 /// The provider: func 1 implements `add(a, b) = a + b`; the offer's op 0 names it.
 const PROVIDER: &str = "\
-export \"adder\" impl 1
+interface { (i64, i64) -> (i64) }
+export \"adder\" impl 0 : 1
 
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -108,7 +109,8 @@ fn offer_signature_mismatch_fails_instantiation_closed() {
 /// the §3.2 v2 exporter-domain-state service, offered as `export "counter" impl 0`.
 const STATEFUL_PROVIDER: &str = "\
 memory 16
-export \"counter\" impl 0
+interface { () -> (i64) }
+export \"counter\" impl 0 : 0
 
 func () -> (i64) {
 block0():

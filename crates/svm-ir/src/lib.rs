@@ -2728,6 +2728,14 @@ pub struct Module {
     /// a namespace with [`Module::exports`]; backends ignore the table. Empty for the common
     /// consumer-only module.
     pub impl_exports: Vec<ImplExport>,
+    /// The module-level **interface section** (IMPORTS.md OQ3, wire v6): each entry is an
+    /// ordered list of op signatures — a capability interface as a *shape* (identity is
+    /// structural per D59; the host interns shapes to runtime `type_id`s at wiring, so two
+    /// modules declaring the same shape mean the same interface). Referenced today by
+    /// [`ImplExport::iface`] (offers declare what they implement, verifier-checked);
+    /// interface-grouped imports (§2.1's op-immediate form) are the recorded next consumer.
+    /// Declarations only — no code, no funcidxs; backends ignore the section.
+    pub interfaces: Vec<Vec<FuncType>>,
     /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
     /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
     /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
@@ -3006,6 +3014,12 @@ pub struct Export {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ImplExport {
     pub name: String,
+    /// The declared interface — an index into [`Module::interfaces`]. The verifier checks the
+    /// offer *implements* it exactly: `ops.len()` equals the interface's op count and each
+    /// `funcs[ops[i]]`'s declared type equals the interface's op-`i` signature — so
+    /// "implemented the wrong interface" is a verify error, not a wiring surprise. Identity
+    /// stays structural (D59): the index names a shape, never a nominal type.
+    pub iface: u32,
     pub ops: Vec<FuncIdx>,
 }
 
@@ -3309,6 +3323,31 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         funcs.extend(resolved.funcs);
         data.extend(resolved.data);
     }
+    // Merge the units' impl surfaces (offers + the interface section, IMPORTS.md §3.2/OQ3):
+    // interfaces concatenate with a per-unit index offset (declarations only — identity is
+    // structural, so cross-unit duplicates are harmless; the host intern canonicalizes at
+    // wiring), and each offer reindexes its interface reference and its op funcidxs. Offer
+    // names share the export namespace, so a collision is the same `DuplicateSymbol` a
+    // function export would raise.
+    let mut merged_interfaces: Vec<Vec<FuncType>> = Vec::new();
+    let mut merged_impls: Vec<ImplExport> = Vec::new();
+    for (u, &fbase) in units.iter().zip(&fbases) {
+        let ibase = merged_interfaces.len() as u32;
+        merged_interfaces.extend(u.module.interfaces.iter().cloned());
+        for e in &u.module.impl_exports {
+            if funcs_tab.contains_key(&e.name)
+                || data_tab.contains_key(&e.name)
+                || merged_impls.iter().any(|o| o.name == e.name)
+            {
+                return Err(LinkError::DuplicateSymbol(e.name.clone()));
+            }
+            merged_impls.push(ImplExport {
+                name: e.name.clone(),
+                iface: ibase + e.iface,
+                ops: e.ops.iter().map(|&f| fbase + f).collect(),
+            });
+        }
+    }
     Ok(Module {
         funcs,
         // The merged window is the largest any unit declared (they share one linear memory).
@@ -3319,9 +3358,10 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         data,
         imports: Vec::new(),
         exports,
-        // Merging per-unit impl exports (offers, §3.2) into a linked module is a follow-up; a
-        // link unit has no `impl` surface yet.
-        impl_exports: Vec::new(),
+        // Interfaces + impl exports (offers, §3.2) merge across units below — see
+        // `merge_impl_surfaces`; a link unit's own module may carry both.
+        impl_exports: merged_impls,
+        interfaces: merged_interfaces,
         // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
         debug_info: None,
     })
@@ -3420,6 +3460,7 @@ mod import_tests {
             term: Terminator::Unreachable,
         };
         Module {
+            interfaces: vec![],
             funcs: vec![Func {
                 params: vec![ValType::I32],
                 results: vec![],

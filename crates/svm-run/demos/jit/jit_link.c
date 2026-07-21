@@ -85,7 +85,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 5);  // format v5 (import/export/impl-export sections + the per-import mode byte)
+  eb(buf, 6);  // format v6 (import/export/interface/impl-export sections + the mode byte)
   eb(buf, 1);  // memory present
   eb(buf, 16); // size_log2 = 16 (must match this module's 64 KiB window)
   eb(buf, 0);  // no data segments
@@ -106,6 +106,7 @@ static long emit_service(char *buf) {
   emit_header(buf);
   eb(buf, 0); // 0 imports
   eb(buf, 0); // 0 exports (v3 export section)
+  eb(buf, 0); // 0 interfaces (v6)
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
@@ -139,6 +140,7 @@ static long emit_client(char *buf) {
   emit_i64_pair_sig(buf); // the import's op signature
   eb(buf, 0);             // mode: required (v4)
   eb(buf, 0);             // 0 exports (v3 export section)
+  eb(buf, 0);             // 0 interfaces (v6 interface section)
   eb(buf, 0);             // 0 impl exports (v5 impl-export section)
   eb(buf, 1);             // 1 function
   emit_i64_pair_sig(buf);

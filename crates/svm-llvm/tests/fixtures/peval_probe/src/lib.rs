@@ -71,6 +71,7 @@ pub fn build_module() -> Module {
         }],
     };
     Module {
+        interfaces: vec![],
         funcs: vec![f],
         memory: None,
         data: Vec::new(),

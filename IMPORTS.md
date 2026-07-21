@@ -576,7 +576,10 @@ parent's resources. Not a loophole; the point of the model.
    no nominal interface name (`Log` above was illustrative): interface identity is the
    structural op-signature list, interned per-host to a `type_id`
    (`Host::intern_interface`, id-equality ≡ structural equality — D59 applied to capability
-   interfaces; the OQ3 interned-section wire format remains open, this intern is host-side).
+   interfaces). *v6 addendum:* the OQ3 **interface section** has since landed — a module
+   declares its interfaces (`interface { ... }`) and each offer names the one it implements
+   (`export "n" impl <iface> : <funcidx>...`), verifier-checked exactly; the host-side intern
+   remains the runtime identity.
 2. **v1 executes a wired op as a *pure dispatch*, not in the exporter's domain.** Wiring
    (`Host::wire_impl` + `bound_import_for_impl`, surfaced as
    `svm_run::HostCap::impl_offer`) is exactly as designed: authority moves only at the wiring
@@ -756,21 +759,41 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    in phase 3; the browser adds no independent assumption (its `env.*` wasm
    imports are unrelated to SVM capability imports, and capability dispatch
    bounces to the interpreter tier).
-3. Wire format for the manifest's interface declarations: reuse the inline
-   `FuncType` list per import (status quo shape) vs an interned interface
-   section (§13's deferred idea). Phase 2 wants this for interface-grouped
-   imports (the `op`-immediate form, §2.1) and op-schema checks.
-4. `import.attach` concurrency semantics under §12 threads (the table is
-   `Arc<Mutex<Host>>` shared across vCPUs — audited — so attach is
-   serialized; specify the ordering guarantee observed by concurrent
-   `call.import` on the same slot).
-5. Whether dynamic mode keeps the `cap.call` mnemonic on the wire for
-   compatibility during migration, or renames at a format bump.
-6. Snapshot digest wiring once the rewrite is removed: freeze/restore must be
-   handed the same manifest-carrying module on both sides (the existing
-   digest gate enforces this; a doc/wiring note, not a codec change — the
-   digest becomes per-module instead of per-instantiation, a strict
-   improvement).
+3. ~~Wire format for the manifest's interface declarations~~ — **RESOLVED
+   (wire v6, 2026-07-20): the interned interface section landed.** A module
+   may declare interfaces (`interface { (params) -> (results), ... }` — each
+   an ordered op-signature list; declarations only, no code) and every `impl`
+   export names the one it implements (`export "n" impl <iface> : <funcidx>...`),
+   with both verifiers checking the implementation matches the declaration
+   exactly. Entries are deliberately *not* dedup-canonicalized on the wire —
+   identity is structural (D59) and the host intern canonicalizes at wiring;
+   the linker merges sections across units with index-offset remapping.
+   Imports still carry the inline per-op `FuncType` (the status-quo shape);
+   **interface-grouped imports** (the `op`-immediate form, §2.1) are the
+   recorded next consumer of the section and were deliberately not built
+   here (they touch the binding tables and all three backends' `call.import`
+   lowering — their own slice, when a consumer demands them).
+4. ~~`import.attach` concurrency semantics under §12 threads~~ — **RESOLVED
+   (specified):** every capability dispatch — `import.attach` and
+   `call.import` alike — executes under the domain's one `Host` lock, so
+   attach is **atomic with respect to concurrent calls on the same slot**: a
+   concurrent `call.import` observes either the entire old binding or the
+   entire new one (`(type_id, op, handle, bound)` read as a unit under the
+   lock), never a torn mixture; attaches from different vCPUs serialize in
+   lock-acquisition order, and there is no fairness guarantee beyond the
+   lock's. This is the guarantee the shared dispatch entry has mechanically
+   provided since phase 2; it is now pinned as spec rather than accident.
+5. ~~`cap.call` mnemonic at a format bump~~ — **RESOLVED (phase 2, restated):
+   `cap.call` keeps its mnemonic and wire form** — it simply *is* dynamic
+   mode (dispatch on a live handle value); two bumps (v5, v6) have since
+   shipped without renaming it, confirming the decision.
+6. ~~Snapshot digest wiring~~ — **RESOLVED (doc note, as designed):**
+   freeze/restore must be handed the same manifest-carrying module on both
+   sides; the existing digest gate enforces this mechanically (the §4
+   `module_digest` covers functions, memory, data, exports, offers, and — as
+   of v6 — the interface section), and with the rewrite deleted the digest
+   is per-module instead of per-instantiation, a strict improvement. No
+   codec change was needed.
 
 ---
 

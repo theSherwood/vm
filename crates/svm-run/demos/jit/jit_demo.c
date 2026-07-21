@@ -128,7 +128,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 5); // format v5 (v4 sections + the impl-export section)
+  eb(buf, 6); // format v6 (v5 sections + the interface section)
   // Memory descriptor: present, size_log2 16. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
   // program like this one at the 64 KiB default (a mismatch is a clean -22, not an escape).
@@ -137,6 +137,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 0); // no data segments (the validator rejects them anyway)
   eb(buf, 0); // no imports — this unit is self-contained (v2 import section)
   eb(buf, 0); // no exports — invoked by handle, not by name (v3 export section)
+  eb(buf, 0); // no interfaces (v6 interface section)
   eb(buf, 0); // no impl exports (v5 impl-export section)
   eb(buf, 1); // one function
   // params (nparams × i64), results (i64) — type tag 1 = i64.
