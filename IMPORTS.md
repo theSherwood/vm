@@ -715,16 +715,23 @@ adds a new guest→host interaction channel whose unique value over
 until a concrete consumer demands it. Adding it later is easy; removing it is
 not.
 
-### 5.3 Interposition metering — decision needed, no code
+### 5.3 Interposition metering — RESOLVED: the provider pays (2026-07-20)
 
 When a child calls a parent-implemented binding, the parent's dispatch runs —
-on whose fuel/quota? §15's principle ("monitoring is reading the meters on
-capabilities you granted") suggests the parent pays (its code, its choice to
-interpose — which also prices interposition honestly), but that lets an
-adversarial child drain a parent's budget by hammering a wrapped import. The
-likely answer is: the crossing charges the *child's* quota, metered visibly to
-the parent. To be decided explicitly when §3.2 is built, not inherited from
-whatever the trampoline happens to do.
+on whose fuel/quota? **Decided: the provider pays** — its code, its choice to
+interpose, which prices interposition honestly (§15's "monitoring is reading
+the meters on capabilities you granted"). The drain-by-hammering concern is
+the provider's to manage with the tools it already has: it can track per-child
+request rates, rate-limit, or kill the child (`Instantiator.kill`) — the
+platform's job is only to meter honestly, not to police usage policy.
+
+*As built:* an instanced provider carries a drainable **fuel reserve**
+(wirer-set via `Host::set_impl_fuel_reserve`, read via
+`Host::impl_fuel_remaining` — the wirer's meter); each dispatch is funded from
+it, capped per-call, and a dry reserve is an inert probeable `CapFault` until
+topped up (provider state survives the dry spell). A pure (non-instanced)
+offer has no provider domain to drain and keeps the flat per-call cap the
+wirer accepted at wiring.
 
 ### 5.4 Runtime acquisition (`Resolver`) — unchanged, still host-layer
 
