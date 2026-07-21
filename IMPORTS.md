@@ -1046,33 +1046,53 @@ block, and transparent interposition cannot demand caller-side cooperation,
 so split-phase is a non-starter); zero-copy service access to the domain's
 buffers; and guest services layered on guest services.
 
-- **Scheduling — explicit service points, host-run.** The scheduler lives
-  host-side (the same machinery that already parks and wakes vCPUs at
-  blocking ops — no new TCB category), but *when handlers may run* is
-  guest-controlled. Dispatches **queue** (bounded, fail-closed: a full
-  queue is a probeable fault at the caller) and run as handler fibers over
-  the domain's window and powerbox only at **service points**: `svc.wait`
-  (park until at least one dispatch arrives, run it) and `svc.poll` (run
-  everything pending, return) — or after the entry returns, which leaves
-  the gate permanently open (the pure-provider case authors zero loop
-  code). A domain's *own* parks — `memory.wait`, a blocking platform read —
-  are **not** service points: blocking for your own reasons never invites
-  reentrancy. Cooperative within the domain, no instruction-level
-  interleaving, and handler interleaving is *greppable* — it happens
-  exactly at `svc.*` lines and nowhere else.
-- **The dual-role domain authors its own loop** — the shell shape:
-  `loop { svc.wait(…); own work }`, with `svc.wait` doubling as the
-  multiplex point (park until a dispatch *or* a watched capability is
-  ready — the waitset detail is pinned when the slice is built). A handler
-  that parks mid-op (the interposed blocking `read`, waiting for input the
-  live loop hasn't produced yet) resumes at a subsequent service point
-  after being notified.
-- **Entry and lifecycle — no magic names.** The entry is whatever export
-  the spawner or wirer designates (true today already); `"main"` for
-  programs and `"init"` (or none — data segments may be the whole setup)
-  for providers is *convention, not semantics*. A domain is reclaimed when
-  its entry has returned, its dispatch queue is drained, and no offer
-  handles remain outstanding; until then it exists as a service.
+- **Scheduling — explicit service points, per-vCPU, host-run.** The
+  scheduler lives host-side (the same machinery that already parks and
+  wakes vCPUs at blocking ops — no new TCB category), but *when handlers
+  may run* is guest-controlled. Dispatches **queue** (bounded, fail-closed:
+  a full queue is a probeable fault at the caller). `svc.wait` and
+  `svc.poll` **park the calling fiber** — the vCPU idles only if it has no
+  other runnable fiber, ordinary §12 multiplexing. Handler fibers execute
+  *only inside `svc.*` windows*, on the vCPU that opened them: a fresh
+  dispatch (or a previously parked handler that has since been notified)
+  runs to completion or to its next park; the window closes and control
+  returns to the loop (`svc.poll`: run all runnable, return; `svc.wait`:
+  park until something is runnable, run it, return). A domain's *own*
+  parks — `memory.wait`, a blocking platform read — are **not** service
+  points: blocking for your own reasons never invites reentrancy, and
+  handler interleaving is *greppable* — exactly the `svc.*` lines.
+- **One loop or a pool — the guest chooses.** One vCPU in
+  `loop { svc.wait(…); own work }` is the classic sequential event loop
+  (the shell shape): handlers never overlap, no locks needed, `svc.wait`
+  doubling as the multiplex point (park until a dispatch *or* a watched
+  capability is ready — waitset detail pinned when the slice is built).
+  N vCPUs sitting in `svc.wait` are a worker pool: handlers run in true
+  parallel and the guest synchronizes with the same §12 tools it already
+  owes its own threads — it opted into shared-memory concurrency by
+  spawning vCPUs; handlers are just more work items. Other guest fibers
+  in the domain are untouched: they never see handlers except through
+  memory.
+- **Synchrony is the platform primitive; asynchrony is protocol.** Every
+  cross-domain call is synchronous to its caller: the calling *fiber*
+  parks until results return (its vCPU multiplexes on). A callee wanting
+  async semantics builds it in the interface — accept, record, return
+  early, deliver later through a `cap` callback or a pipe (split-phase by
+  choice, not by force). The type system deliberately does not encode
+  "may park" on ops — the same honesty as posix and wasm; annotate later
+  only if a consumer demands it.
+- **Termination: `exit` is still `exit`.** A domain ends immediately on
+  explicit exit; its outstanding offer handles go stale through the
+  generation bump, so callers get a clean probeable `CapFault`, never a
+  hang — death is revocation (D37). "Entry returned" keeps the domain
+  alive *only if* it reified offers that are still held — the runtime then
+  provides the implicit serve loop, dispatches serialized one at a time
+  (exactly the passive instance's observable behavior, which is why the
+  interim is equivalence there, not approximation). A program that never
+  reified an offer ends when `main` returns, precisely as today.
+- **Entry naming — no magic names.** The entry is whatever export the
+  spawner or wirer designates (true today already); `"main"` for programs
+  and `"init"` (or none — data segments may be the whole setup) for
+  providers is *convention, not semantics*.
 - **Blocking becomes expressible.** A handler parks on guest state
   (`memory.wait`) and the live run wakes it (`memory.notify`), or vice
   versa. The interposed `read` then blocks its *caller* exactly as a
