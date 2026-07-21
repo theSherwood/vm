@@ -742,3 +742,84 @@ fn verifier_agreement_on_generated_modules() {
         }
     }
 }
+
+/// §3.5 (wire v7): grouped-import shapes, consumer-local op immediates, and the new
+/// self-namespace ops — accept/reject legs on both verifiers.
+#[test]
+fn spec_agreement_on_v7_grouped_surface() {
+    use svm_ir::Terminator as T;
+    use ValType as V;
+    let i64_sig = FuncType {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+    };
+    let grouped_call = |op: u32| {
+        func(
+            vec![],
+            vec![],
+            vec![
+                Inst::ConstI32(0),
+                Inst::ConstI64(1),
+                Inst::CallImport {
+                    import: 0,
+                    op,
+                    sig: i64_sig.clone(),
+                    handle: 0,
+                    args: vec![1],
+                },
+            ],
+            T::Return(vec![]),
+        )
+    };
+    let base = |op: u32| {
+        let mut m = module(vec![grouped_call(op)]);
+        m.types = vec![
+            svm_ir::TypeEntry::Func(i64_sig.clone()),
+            svm_ir::TypeEntry::Interface(vec![svm_ir::IfaceOp {
+                name: "dbl".into(),
+                ty: 0,
+            }]),
+        ];
+        m.imports = vec![svm_ir::Import {
+            ns: "env".into(),
+            name: "svc".into(),
+            shape: svm_ir::ImportShape::Interface(1),
+            mode: svm_ir::ImportMode::Required,
+        }];
+        m
+    };
+    accept(&base(0), "grouped import + in-range op immediate");
+    reject(&base(1), "op immediate past the interface", |e| {
+        matches!(e, VerifyError::ImportOpOutOfRange { op: 1, .. })
+    });
+    // A grouped import whose shape reference names a Func entry is not well-formed.
+    let mut m = base(0);
+    m.imports[0].shape = svm_ir::ImportShape::Interface(0);
+    reject(&m, "interface shape naming a Func entry", |e| {
+        matches!(
+            e,
+            VerifyError::ImportShapeInvalid { .. } | VerifyError::ImportOpOutOfRange { .. }
+        )
+    });
+    // `export.handle` must name a declared impl export.
+    let m = module(vec![func(
+        vec![],
+        vec![],
+        vec![Inst::ExportHandle { export: 0 }],
+        T::Return(vec![]),
+    )]);
+    reject(&m, "export.handle past the offer table", |e| {
+        matches!(e, VerifyError::ExportHandleOutOfRange { .. })
+    });
+    // `cap.self.type_id` must reference a well-formed interface entry.
+    let m = module(vec![func(
+        vec![],
+        vec![],
+        vec![Inst::CapSelfTypeId { ty: 0 }],
+        T::Return(vec![]),
+    )]);
+    reject(&m, "cap.self.type_id with no such interface", |e| {
+        matches!(e, VerifyError::DynIfaceInvalid { .. })
+    });
+    let _ = V::I32;
+}

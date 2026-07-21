@@ -565,3 +565,132 @@ fn a_wired_offer_is_non_durable_and_drains_cleanly() {
     h.capture_durable_handles()
         .expect("table is snapshottable once drained");
 }
+
+// ---- §3.5: grouped imports, coverage binding, reflection, export.handle ----
+
+/// A provider module with a named two-op interface and an offer:
+/// op `add(a, b) = a + b` (func 0), op `dbl(a) = a + a` (func 1).
+fn provider_module() -> svm_ir::Module {
+    svm_text::parse_module(
+        "type 0 func (i64, i64) -> (i64)\n\
+         type 1 func (i64) -> (i64)\n\
+         type 2 interface { add: 0, dbl: 1 }\n\
+         export 0 interface \"svc\" 2 { add: 0, dbl: 1 }\n\n\
+         func (i64, i64) -> (i64) {\n\
+         block0(va: i64, vb: i64):\n\
+           vs = i64.add va vb\n\
+           return vs\n\
+         }\n\n\
+         func (i64) -> (i64) {\n\
+         block0(va: i64):\n\
+           vs = i64.add va va\n\
+           return vs\n\
+         }\n",
+    )
+    .expect("provider parses")
+}
+
+#[test]
+fn grouped_import_coverage_binds_a_subset_with_a_remap() {
+    // The parent reifies its own offer (`export.handle` semantics, host-side), grants it to
+    // a child under a name; the child's grouped import requires ONLY `dbl` — a subset of the
+    // provider's two ops — and coverage binding freezes the remap [0 -> 1].
+    let pm = Arc::new(provider_module());
+    svm_verify::verify_module(&pm).expect("provider verifies");
+    let mut parent = Host::new();
+    parent.set_self_module(&pm);
+    let h = parent.reify_export(0).expect("reify own offer");
+    let (mut child, _ci, _ca) = parent
+        .spawn_named_child(&[("svc".into(), h)], 1 << 16)
+        .expect("spawn");
+
+    let cm = svm_text::parse_module(
+        "type 0 func (i64) -> (i64)\n\
+         type 1 interface { dbl: 0 }\n\
+         import 0 interface \"svc\" 1\n\n\
+         func (i64) -> (i64) {\n\
+         block0(va: i64):\n\
+           vh = i32.const 0\n\
+           vr = call.import 0.dbl vh (va)\n\
+           return vr\n\
+         }\n",
+    )
+    .expect("consumer parses");
+    svm_verify::verify_module(&cm).expect("consumer verifies");
+    child
+        .bind_child_manifest(&cm.imports, &cm.types)
+        .expect("subset requirement covers");
+
+    // Consumer-local op 0 remaps to provider op 1 (`dbl`) — on both engines.
+    let args = [Value::I64(21)];
+    let mut fuel = 1_000_000u64;
+    let tree = svm_interp::run_with_host(&cm, 0, &args, &mut fuel, &mut child);
+    assert_eq!(tree, Ok(vec![Value::I64(42)]), "tree-walker remap dispatch");
+    let mut fuel_b = 1_000_000u64;
+    let byte =
+        svm_interp::bytecode::compile_and_run_with_host(&cm, 0, &args, &mut fuel_b, &mut child)
+            .expect("bytecode-eligible");
+    assert_eq!(byte, Ok(vec![Value::I64(42)]), "bytecode remap dispatch");
+}
+
+#[test]
+fn reflection_and_dyn_dispatch_run_over_the_registered_self_module() {
+    // One module exercises the §3.5 self surface end to end: `cap.self.type_id` interns its
+    // own declared shape, `export.handle` reifies its own offer (memoized), `cap.self.covers`
+    // confirms the reified capability covers the shape, and `call.import.dyn` drives it by
+    // type-section reference — identically on both engines.
+    let src = "type 0 func (i64, i64) -> (i64)\n\
+         type 1 func (i64) -> (i64)\n\
+         type 2 interface { add: 0, dbl: 1 }\n\
+         export 0 interface \"svc\" 2 { add: 0, dbl: 1 }\n\n\
+         func (i64, i64) -> (i64) {\n\
+         block0(va: i64, vb: i64):\n\
+           vs = i64.add va vb\n\
+           return vs\n\
+         }\n\n\
+         func (i64) -> (i64) {\n\
+         block0(va: i64):\n\
+           vs = i64.add va va\n\
+           return vs\n\
+         }\n\n\
+         func (i64, i64) -> (i64) {\n\
+         block0(va: i64, vb: i64):\n\
+           vt = cap.self.type_id 2\n\
+           vh = export.handle 0\n\
+           vc = cap.self.covers vh 2\n\
+           vr = call.import.dyn 2.add vh (va, vb)\n\
+           vcov = i64.extend_i32_u vc\n\
+           vsum = i64.add vr vcov\n\
+           return vsum\n\
+         }\n";
+    let m = Arc::new(svm_text::parse_module(src).expect("parses"));
+    svm_verify::verify_module(&m).expect("verifies");
+    // Dynamic-mode dispatch costs the manifest-completeness bit, like cap.call.
+    assert!(!svm_verify::manifest_complete(&m), "dyn mode costs the bit");
+
+    let run = |use_bytecode: bool| {
+        let mut h = Host::new();
+        h.set_self_module(&m);
+        let args = [Value::I64(40), Value::I64(1)];
+        let mut fuel = 1_000_000u64;
+        if use_bytecode {
+            svm_interp::bytecode::compile_and_run_with_host(&m, 2, &args, &mut fuel, &mut h)
+                .expect("bytecode-eligible")
+        } else {
+            svm_interp::run_with_host(&m, 2, &args, &mut fuel, &mut h)
+        }
+    };
+    // add(40, 1) = 41, covers = 1 → 42.
+    assert_eq!(run(false), Ok(vec![Value::I64(42)]), "tree-walker");
+    assert_eq!(run(true), Ok(vec![Value::I64(42)]), "bytecode engine");
+
+    // Re-reifying returns the same handle (one shared service state per domain).
+    let mut h = Host::new();
+    h.set_self_module(&m);
+    let h1 = h.reify_export(0).expect("first reify");
+    let h2 = h.reify_export(0).expect("second reify");
+    assert_eq!(h1, h2, "export.handle is memoized per offer");
+    // An unregistered domain fails closed (probeable, never a hang).
+    let mut bare = Host::new();
+    assert!(bare.reify_export(0).is_err(), "no self module ⇒ CapFault");
+}

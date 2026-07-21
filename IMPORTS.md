@@ -503,7 +503,7 @@ leaving the tree with five conventions instead of four.
 
 ---
 
-## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 designed — next build slice; §3.6 designed — the end-state execution model, awaits the shell personality]
+## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 built (wire v7); §3.6 designed — the end-state execution model, awaits the shell personality]
 
 ### 3.1 Binding provenance in `cap.self.attest`
 
@@ -652,7 +652,7 @@ Three tiers of guest access, all over one table:
 The manifest bounds *requirements*, not *reach*. Reach is bounded by grants —
 the correct ocap bound.
 
-### 3.5 Interface-grouped imports  [DESIGNED 2026-07-21 — next build slice]
+### 3.5 Interface-grouped imports  [BUILT 2026-07-21 (wire v7) — as-built notes at the end]
 
 The type section's recorded next consumer (OQ3), now designed: one slot binds a
 whole interface, the op moves to the call site, and the flat one-op import is
@@ -1023,6 +1023,31 @@ original's answer; the wrap reports depth 1); and after `main` returns, M's
 live run is over but its provider instance keeps serving both C's `log`
 calls and P's `count` calls — the counter they share lives in the instance,
 not in the finished run.
+
+**As built (2026-07-21, wire v7).** Everything above is landed — coverage binding with
+bind-time remaps (child manifests + host wiring; name-less legacy wires fall back to
+first-signature-position matching), the settled declaration surface (indices, kinds,
+required op names, `{ name: idx }` maps, legacy sugar kept where free), the `op`
+immediate, `call.import.dyn`, `export.handle` (memoized; one shared service state per
+domain), `cap.self.type_id`/`covers`, and `ValType::Cap` as an i32-width reservation —
+verified by both verifiers, executed by all three backends through the one generic
+dispatch (the import dispatch packs `slot | op << 16`; dyn packs `ty | op << 16` under
+a reserved id; the self extensions pack `selfop | idx << 8`). Deliberate deferrals,
+each with its reason recorded:
+
+- **The vestigial `call.import` handle operand is retained**, not retired: it is *live*
+  in link-form modules (the §7 loader ABI reads it as the cap-symbol handle and the
+  `Slot` patch target), so its retirement rides the future migration of that ABI to
+  manifest/attach — not this bump.
+- **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
+  the type is reserved and lowers as `i32` everywhere.
+- **Text cosmetics** — braced numbered blocks, `func N` labels — are a follow-up print
+  pass; the parser accepts todays's bodies unchanged.
+- **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
+  built-in shapes await their consumers; grouped binding works today through child
+  manifests and host-side wiring.
+- **`import.attach` on grouped rebindable slots** currently takes the exact-id path
+  (attach-time coverage walk + remap refresh is a small follow-up).
 
 ### 3.6 The unified execution model — one world per domain  [DESIGNED 2026-07-21; subsumes the two-world split when the fiber slice lands]
 
