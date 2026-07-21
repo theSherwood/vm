@@ -658,20 +658,51 @@ The type section's recorded next consumer (OQ3), now designed: one slot binds a
 whole interface, the op moves to the call site, and the flat one-op import
 stays as the degenerate case.
 
-**Surface** (consumer side):
+**Surface** (consumer side; settled 2026-07-21):
 
 ```
-type (i64, i64) -> (i64)          ; types[0]
-type (i64) -> (i64)               ; types[1]
-interface { 0, 1 }                ; types[2]
+type 0 (i64, i64) -> (i64)
+type 1 (i64) -> (i64)
+type 2 interface { read: 0, len: 1 }   ; op names REQUIRED; identity is still the shape
 
-import 0 "fs" iface 2 required    ; grouped: one slot, the whole interface
-import 1 "log" (i64) -> (i64) rebindable   ; flat form unchanged (one-op case)
+import 0 "env" "fs" iface 2 required   ; grouped: one slot, the whole interface
+import 1 "env" "log" func 1 rebindable ; flat: one op, signature by type reference
 
-  v5 = call.import 0.1 (v1)       ; static: op immediate; sig = types[1], checked at load
-  v6 = call.import [v7] iface 2 . 0 (v1, v2)  ; dynamic: handle from a value,
-                                  ; interface by type-section ref, use-site checked
+func 0 () -> (i64) {                   ; function definitions are numbered too
+block0:
+  v1 = i64.const 4096
+  v2 = i64.const 64
+  v3 = call.import 0.read (v1, v2)     ; by name — resolved to the op index at parse
+  v4 = call.import 0.1 (v1)            ; or positional — identical wire form
+  v5 = call.import [v6] iface 2 . read (v1, v2)  ; dynamic: handle from a value,
+  return v5                            ; interface by type-section ref, use-site checked
+}
 ```
+
+**Text-format rules (settled with the surface):**
+
+- **Every definition carries its index** as a *checked positional label* —
+  `type 0`, `import 1`, `func 0`; the parser verifies label = position and
+  errors otherwise. The wire stays positional; this is pure text-format
+  legibility (greppable references, stable diffs, precise errors).
+- **Import names are two-level**: `("env", "fs")` — the first level names the
+  provider binding point, the second the bundle (grouped) or op (flat).
+  Resolver vocabulary, never identity.
+- **Interface op names are required** in the declaration and carried on the
+  wire, but **excluded from the intern key**: usage may be positional (`0.1`)
+  or by name (`0.read`) — the name resolves to the op index at parse — and two
+  shapes differing only in op names intern to the same `type_id`. D46 schema
+  reflection returns the names; interposition invisibility survives (a
+  provider naming an op differently still matches — shape decides).
+- **Index spaces stay per-section** (types / imports / funcs). Import index =
+  handle-table slot is ABI (plus the reserved child prefix); folding types
+  into the import numbering would put a "subtract the definitions above me"
+  step into the slot path for zero semantic gain.
+- **There is deliberately no `import type`.** Under structural identity a type
+  import is redundant — declaring the shape locally *is* having the type
+  (same interned id, D59) — and load-time verification needs concrete shapes.
+  Cross-suite shape dedup is the linker's job (it already merges type
+  sections, §2.5); the abstract-type use case is served by capability handles.
 
 **Semantics:**
 
@@ -706,21 +737,25 @@ import 1 "log" (i64) -> (i64) rebindable   ; flat form unchanged (one-op case)
   interned-id comparison — `bind_child_manifest`'s per-op signature probe
   collapses (wiring already checked the whole shape).
 
-**Wire (v7 — one bump, three riders):** `Import` gains
-`shape: Inline(FuncType) | Iface(u32)`; `CallImport` gains an `op` immediate
-and **drops the vestigial handle operand** (whose retirement was already
-scheduled for "the next wire bump" — this is it); dynamic mode gains the
-type-section-reference form. Backend cost is the op immediate threading
-through the one generic dispatch; JIT devirtualization of `required` grouped
-slots stays legal per §2.2 (immutable binding, load-time op resolution).
+**Wire (v7 — one bump, four riders):** `Import` replaces its inline `FuncType`
+with `shape: Func(typeidx) | Iface(typeidx)` and gains the second name level;
+`TypeEntry::Interface` elements become `(name, typeidx)` pairs (names
+required); `CallImport` gains an `op` immediate and **drops the vestigial
+handle operand** (whose retirement was already scheduled for "the next wire
+bump" — this is it); dynamic mode gains the type-section-reference form.
+Backend cost is the op immediate threading through the one generic dispatch;
+JIT devirtualization of `required` grouped slots stays legal per §2.2
+(immutable binding, load-time op resolution).
 
 **Host-side provider, Rust** (embedder registry — sketch):
 
 ```rust
-let fs_shape: &[FuncType] = &[sig_read(), sig_write()];   // the shape, once
+let fs_shape = IfaceShape::new()      // op names required, mirroring the text form
+    .op("read", sig_read())
+    .op("len", sig_len());
 Imports::new()
     // host-native: the (trusted) embedder asserts the shape it implements
-    .provide("fs", HostCap::iface(fs_shape, fs_handle))
+    .provide("fs", HostCap::iface(&fs_shape, fs_handle))
     // or a guest offer as the provider — the shape comes from the offer itself
     .provide("fs", HostCap::impl_service(&fs_module, "fs")?)
 ```
@@ -732,28 +767,30 @@ capability's `type_id` to equal it — the same fail-closed structural check as
 **Parent domain with a nested child, svm-ir** (the §3.3 wrap, grouped):
 
 ```
-; ---- parent ----
-type (i64, i64) -> (i64)          ; types[0]
-interface { 0 }                   ; types[1]
-func (i64, i64) -> (i64) { ... }  ; func 0: the interposer (log, then forward)
-export "log" impl 1 : 0           ; the offer
+; ---- parent (the provider) ----
+type 0 (i64, i64) -> (i64)
+type 1 interface { log: 0 }
+func 0 (i64, i64) -> (i64) { ... }     ; the interposer (record, then forward)
+export "log" impl 1 : log=0            ; the offer: op `log` -> func 0
+                                       ; (positional `impl 1 : 0` also accepted)
 ; parent main: its offer, granted under the child's import name, is what
 ; manifest binding accepts (wrap/override); an aliased own-binding forwards;
 ; no grant under the name + `required` ⇒ the spawn fails closed (§3.3).
 
-; ---- child ----
-type (i64, i64) -> (i64)          ; types[0]
-interface { 0 }                   ; types[1]
-import 0 "log" iface 1 required   ; slot 2 at runtime (reserved child prefix)
+; ---- child (the consumer) ----
+type 0 (i64, i64) -> (i64)
+type 1 interface { log: 0 }
+import 0 "parent" "log" iface 1 required   ; slot 2 at runtime (reserved child prefix)
 
-  v3 = call.import 0.0 (v1, v2)   ; op 0 through the grouped slot
+  v3 = call.import 0.log (v1, v2)      ; by name — or positionally, `0.0`
 ```
 
-The punchline is the two `interface { 0 }` declarations: different sections,
+The punchline is the two `type 1 interface` declarations: different sections,
 same shape ⇒ same interned id (D59) — parent and child agree on the interface
-with no shared registry and no names beyond the slot's. Provenance reports the
-wrapped binding ancestor-terminated at depth 1: the child can see *that* it is
-interposed, never *what* the interposer does.
+with no shared registry, and even the op *names* need not agree (shape decides;
+names are per-module vocabulary). Provenance reports the wrapped binding
+ancestor-terminated at depth 1: the child can see *that* it is interposed,
+never *what* the interposer does.
 
 ---
 
