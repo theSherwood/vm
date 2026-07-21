@@ -1050,20 +1050,28 @@ expressiveness back with the §12 fiber machinery.
   versa. The interposed `read` then blocks its *caller* exactly as a
   platform stream read would — the caller's vCPU parks at the host boundary,
   which is already a concept, not new machinery.
-- **Deadlock: detection replaces prevention.** Live-backed offers make call
-  cycles constructible (A's handler calls B; B's handler calls back into A
-  while A is parked). The host keeps the cross-domain **wait-for graph** —
-  one edge per parked reactor dispatch, added at park, removed at return; a
-  call whose edge would close a cycle faults immediately (probeable
-  `CapFault`, like a dry fuel reserve) instead of hanging. Cheap by
-  construction: edges exist only for parked reactor calls, and the graph is
-  as small as the parked-call count. Passive instances keep their
-  by-construction guarantee; only opted-in reactors buy detection.
+- **Re-entry is a new fiber, not a deadlock.** A's fiber calling B parks at
+  a suspension point — and parked fibers are exactly what suspension points
+  release, so when B's handler calls back into A, the dispatch runs as a
+  *fresh* handler fiber A[f2] while A[f1] stays parked. Call **cycles are
+  recursion, not deadlock**: A→B→A→B… deepens the fiber/park chain and is
+  bounded the way recursion always is — fuel plus the domain's existing
+  fiber quota (`max_fibers`); exhaustion faults the innermost call
+  (probeable), never hangs. No wait-for graph, no detection machinery,
+  nothing added to the TCB.
+- **The honest hazard is reentrancy, not deadlock** — the classic event-loop
+  footgun: a handler holding a *guest-level* lock (a mutex in guest memory)
+  across a cross-domain call self-deadlocks when the re-entrant handler
+  tries to take it (`memory.wait` on a cell only the parked fiber will
+  release — which it never will, since it is waiting on the caller). That is
+  the guest's locking discipline to keep, as in every reentrant system; the
+  rule of thumb is the usual one — don't hold guest locks across
+  cross-domain calls — and fuel remains the backstop for getting it wrong.
 - **Service-on-service unlocks — for reactors.** The offers-in-providers
   refusal stays for passive instances; a reactor's handlers hold and call
-  whatever the live domain holds, including other domains' offers, under the
-  same cycle detection. Layered guest services (a shell's pipeline stages,
-  fs-on-blockdev) become expressible.
+  whatever the live domain holds, including other domains' offers. Layered
+  guest services (a shell's pipeline stages, fs-on-blockdev) become
+  expressible, with cycles handled as above — recursion, bounded, faulting.
 - **Metering:** the reactor serves on its own domain fuel — §5.3
   provider-pays generalizes unchanged (its code, its choice to serve live).
   A parked caller burns nothing while parked.
@@ -1071,12 +1079,12 @@ expressiveness back with the §12 fiber machinery.
   the consent rule — `export.handle`, with either backing, remains the only
   path to a domain's service.
 
-Cost, honestly: fiber-per-dispatch scheduling, caller parking, and the
-wait-for graph touch the dispatch path on all three backends — a slice far
-larger than passive instances, with new cross-domain blocking semantics to
-differential-test. It stays designed-not-built until its consumer (the
-shell personality, STAGE1) is ready to drive it; passive instances remain
-the default and the common case.
+Cost, honestly: fiber-per-dispatch scheduling and caller parking touch the
+dispatch path on all three backends — a slice far larger than passive
+instances, with new cross-domain blocking semantics to differential-test.
+It stays designed-not-built until its consumer (the shell personality,
+STAGE1) is ready to drive it; passive instances remain the default and the
+common case.
 
 ---
 

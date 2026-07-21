@@ -144,9 +144,9 @@ The system is four ideas wearing many names:
 - **reactor domain** — (designed: IMPORTS.md §3.6) a domain serving offers from its
   *live* world instead of a passive instance: dispatches run as handler fibers over
   the live window, interleaved only at suspension points. Makes blocking guest
-  ops (interposed stdin `read`) and service-on-service layering expressible;
-  deadlock prevention gives way to wait-for-graph detection (cycles fault, never
-  hang).
+  ops (interposed stdin `read`) and service-on-service layering expressible.
+  Re-entry (A→B→A) is just a fresh handler fiber; call cycles are recursion,
+  bounded by fuel + the fiber quota — they fault, never hang.
 
 ## Guest JIT (§22)
 
