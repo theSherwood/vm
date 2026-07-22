@@ -147,7 +147,7 @@ pub fn print_module(m: &Module) -> String {
         if i > 0 {
             s.push('\n');
         }
-        print_func(&mut s, f, &fn_results, m);
+        print_func_at(&mut s, f, &fn_results, m, Some(i));
     }
     print_debug_info(&mut s, m);
     s
@@ -292,10 +292,13 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
-fn print_func(s: &mut String, f: &Func, fn_results: &[usize], m: &Module) {
+fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx: Option<usize>) {
+    // §3.5 settled surface: every definition carries its checked positional label, and one
+    // brace construct groups everything — `func N (…) -> (…) { block N (…) { … } }`.
+    let label = idx.map(|i| format!("{i} ")).unwrap_or_default();
     let _ = writeln!(
         s,
-        "func ({}) -> ({}) {{",
+        "func {label}({}) -> ({}) {{",
         types(&f.params),
         types(&f.results)
     );
@@ -307,21 +310,22 @@ fn print_func(s: &mut String, f: &Func, fn_results: &[usize], m: &Module) {
             .enumerate()
             .map(|(i, t)| format!("v{}: {}", i, t.as_str()))
             .collect();
-        let _ = writeln!(s, "block{}({}):", bi, params.join(", "));
+        let _ = writeln!(s, "  block {} ({}) {{", bi, params.join(", "));
 
         let mut next = b.params.len() as u32; // next value index in this block
         for inst in &b.insts {
             let n = inst.result_count(fn_results);
             if n == 0 {
                 // No-result instruction (`store`, void `call`): no `vN =` binding.
-                let _ = writeln!(s, "  {}", print_inst(inst, m));
+                let _ = writeln!(s, "    {}", print_inst(inst, m));
             } else {
                 let lhs: Vec<String> = (0..n).map(|k| format!("v{}", next + k as u32)).collect();
-                let _ = writeln!(s, "  {} = {}", lhs.join(", "), print_inst(inst, m));
+                let _ = writeln!(s, "    {} = {}", lhs.join(", "), print_inst(inst, m));
                 next += n as u32;
             }
         }
-        let _ = writeln!(s, "  {}", print_term(&b.term));
+        let _ = writeln!(s, "    {}", print_term(&b.term));
+        s.push_str("  }\n");
     }
     s.push_str("}\n");
 }
@@ -702,7 +706,7 @@ fn memarg(offset: u64, align: u8) -> String {
 
 fn print_term(t: &Terminator) -> String {
     match t {
-        Terminator::Br { target, args } => format!("br block{target}{}", arglist(args)),
+        Terminator::Br { target, args } => format!("br {target}{}", arglist(args)),
         Terminator::BrIf {
             cond,
             then_blk,
@@ -710,7 +714,7 @@ fn print_term(t: &Terminator) -> String {
             else_blk,
             else_args,
         } => format!(
-            "br_if v{cond} block{then_blk}{} block{else_blk}{}",
+            "br_if v{cond} {then_blk}{} {else_blk}{}",
             arglist(then_args),
             arglist(else_args)
         ),
@@ -721,10 +725,10 @@ fn print_term(t: &Terminator) -> String {
         } => {
             let ts: Vec<String> = targets
                 .iter()
-                .map(|(t, args)| format!("block{t}{}", arglist(args)))
+                .map(|(t, args)| format!("{t}{}", arglist(args)))
                 .collect();
             format!(
-                "br_table v{idx} [{}] block{}{}",
+                "br_table v{idx} [{}] {}{}",
                 ts.join(", "),
                 default.0,
                 arglist(&default.1)
@@ -1581,6 +1585,9 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
             }
             Some(Tok::Ident(s)) if s == "func" => {
                 p.next()?;
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?;
+                }
                 let _params = p.parse_type_list()?;
                 p.expect(&Tok::Arrow)?;
                 out.push(p.parse_type_list()?.len());
@@ -1795,10 +1802,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_func(&mut self, func_idx: u32) -> Result<Func, ParseError> {
-        // `func (types) -> (types) { blocks }`
+        // `func [N] (types) -> (types) { blocks }` — the §3.5 surface carries the index as a
+        // checked positional label; the label-less legacy form stays accepted.
         let kw = self.ident()?;
         if kw != "func" {
             return err(format!("expected `func`, found `{kw}`"));
+        }
+        if matches!(self.peek(), Some(Tok::Int(_))) {
+            let n = self.parse_int()?;
+            if n < 0 || n as u32 != func_idx {
+                return err(format!(
+                    "func label {n} out of order (this is func {func_idx})"
+                ));
+            }
         }
         let params = self.parse_type_list()?;
         self.expect(&Tok::Arrow)?;
@@ -1810,7 +1826,7 @@ impl<'a> Parser<'a> {
             if self.at_end() {
                 return err("unterminated function body");
             }
-            pblocks.push(self.parse_block()?);
+            pblocks.push(self.parse_block(pblocks.len() as u32)?);
         }
         self.expect(&Tok::RBrace)?;
 
@@ -2081,10 +2097,25 @@ impl<'a> Parser<'a> {
         ValType::from_str(&s).ok_or_else(|| ParseError(format!("unknown type `{s}`")))
     }
 
-    fn parse_block(&mut self) -> Result<PBlock, ParseError> {
-        // `label(name: type, ...):` then instruction lines, then a terminator.
+    fn parse_block(&mut self, block_idx: u32) -> Result<PBlock, ParseError> {
+        // §3.5 surface: `block N (name: type, ...) { insts… term }` — the index is a checked
+        // positional label and the body is braced (labels are the index's decimal string, so
+        // numeric branch targets resolve). Legacy: `label(name: type, ...):` then instruction
+        // lines up to a terminator.
         let header_line = self.cur_line();
         let label = self.ident()?;
+        let braced = label == "block" && matches!(self.peek(), Some(Tok::Int(_)));
+        let label = if braced {
+            let n = self.parse_int()?;
+            if n < 0 || n as u32 != block_idx {
+                return err(format!(
+                    "block label {n} out of order (this is block {block_idx})"
+                ));
+            }
+            n.to_string()
+        } else {
+            label
+        };
         // Per-block value-name table; parameters take indices 0..k.
         let mut names: HashMap<String, u32> = HashMap::new();
         let mut params = Vec::new();
@@ -2110,7 +2141,11 @@ impl<'a> Parser<'a> {
             params.push(t);
         }
         self.expect(&Tok::RParen)?;
-        self.expect(&Tok::Colon)?;
+        if braced {
+            self.expect(&Tok::LBrace)?;
+        } else {
+            self.expect(&Tok::Colon)?;
+        }
 
         let mut insts = Vec::new();
         let mut next_idx = params.len() as u32;
@@ -2133,6 +2168,9 @@ impl<'a> Parser<'a> {
             ) {
                 let term = self.parse_term(&names)?;
                 dbg.term_line = cur;
+                if braced {
+                    self.expect(&Tok::RBrace)?;
+                }
                 return Ok(PBlock {
                     label,
                     params,
@@ -3087,7 +3125,13 @@ impl<'a> Parser<'a> {
 
     /// Parse `label(arg, arg, ...)`.
     fn parse_edge(&mut self, names: &HashMap<String, u32>) -> Result<PEdge, ParseError> {
-        let label = self.ident()?;
+        // §3.5 surface: numeric targets (`br 1 (…)`) — the label is the index's decimal
+        // string, matching braced `block N` headers. Legacy ident labels stay accepted.
+        let label = if matches!(self.peek(), Some(Tok::Int(_))) {
+            self.parse_int()?.to_string()
+        } else {
+            self.ident()?
+        };
         let args = self.parse_value_list(names)?;
         Ok((label, args))
     }
