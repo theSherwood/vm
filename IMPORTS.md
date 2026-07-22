@@ -847,7 +847,30 @@ holder is the domain that implements them:
   copy); a forged/dead cap is a fail-closed `CapFault`. The verifiers make `cap`
   value-compatible with `i32` wherever operands flow while keeping the marker
   distinct in signatures. The **entry-result (`Instantiator.join`) boundary**
-  remains a follow-up.
+  is a **deferred follow-up — deferred on purpose, to §3.6, not merely unbuilt**
+  (investigated 2026-07-22). The offer-call boundary is cheap because it lives in
+  the *one* shared generic dispatch (`cap_dispatch_slots`): an offer body always
+  runs via the reference interpreter, so a single translation covers all three
+  backends. `Instantiator.join` has no such shared seam — its result is delivered
+  by each executor's **private child-lifecycle scheduler** (the tree-walker's
+  `run_inner`, the four bytecode schedulers — cooperative `drive`, true-parallel,
+  the `Vcpu` reactor, the debug run — and the JIT's `instantiator_rt`). Translating
+  there would need per-scheduler child-`Host` **retention past completion** (the
+  child powerbox is torn down when the child finishes — `drop(v)` in the
+  tree-walker, the closure return in the parallel path, `release(gc.ctx)` at
+  instantiate in the JIT), the join call's result-`cap`-ness **threaded across the
+  async park/resume** (the call sig is lost at the park), a widening of the JIT's
+  currently fail-closed op-1 result contract, and a **new host re-grant callback**
+  in the JIT embedding hooks — ~800 loc across the most sensitive code, almost all
+  of it interim-architecture plumbing. Under **§3.6** the natural way a capability
+  leaves a child is through the child's *offers* (`export.handle` + a `cap`-typed
+  argument/offer call), which ride the same shared offer-call dispatch that already
+  translates — so the unified model routes "get a cap out of a child" through the
+  path we already built and makes the entry-result channel a narrow convenience, a
+  shared-dispatch addition there rather than a five-executor one. With no concrete
+  consumer forcing it today (caps already cross *into* and *between* domains via
+  offer arguments), the prime directive says wait: build it at the §3.6 seam, not
+  across the interim schedulers it dissolves.
 - **What offer calls run over — as built (v2) vs the end state (§3.6).** As
   built, offers execute over a **passive provider instance**: a second
   window + powerbox distinct from the live run — own lock, provider-pays
@@ -1102,7 +1125,13 @@ with its reason recorded:
   treat `cap` and `i32` as value-compatible wherever operands flow (a `cap` is usable as
   a handle, an `i32` fills a `cap` slot), while keeping them **distinct in signatures**
   so structural interface matching and the translation itself still key on the marker.
-  The §14 entry-result (`Instantiator.join`) path remains a follow-up.
+  The §14 entry-result (`Instantiator.join`) path is a **deliberate deferral to §3.6**
+  (investigated 2026-07-22): join has no shared dispatch seam — it would need
+  child-`Host` retention + async sig-threading + a JIT contract widen + a new JIT
+  re-grant hook across all five private schedulers (~800 loc of interim plumbing),
+  whereas the unified model already moves caps out of a child through its offers over
+  the shared dispatch. No consumer forces it today; build it at the §3.6 seam. See the
+  §3.5 as-built note above for the full rationale.
 - **[BUILT 2026-07-22] Registry-grouped host caps (`HostCap::iface`).** A host-native
   handle can be offered as a *whole interface* (`Imports::provide("fs",
   HostCap::iface(&shape, grant))`), its `IfaceShape` listing op names + signatures in
