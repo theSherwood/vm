@@ -58,14 +58,16 @@ const report = (name, ok, detail) => {
 // alu i64-LCG: pure compute, one i64 param — the headline JIT-vs-interp equality + speedup probe.
 const ALU = `
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 6364136223846793005
   v11 = i64.mul v8 v10
   v12 = i64.const 1442695040888963407
@@ -73,39 +75,46 @@ block2(v7: i64, v8: i64, v9: i64):
   v14 = i64.add v13 v9
   v15 = i64.const 1
   v16 = i64.add v9 v15
-  br block1(v7, v14, v16)
-block3(v17: i64):
+  br 1(v7, v14, v16)
+}
+block 3 (v17: i64) {
   return v17
+  }
 }`;
 
 // A store→load through the confined window — proves the emitted mask+guard shares the cdylib memory.
 const MEM = `
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 8
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9
   v13 = i64.const 1
   v14 = i64.add v9 v13
-  br block1(v7, v12, v14)
-block3(v15: i64):
+  br 1(v7, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }`;
 
 // A guest `unreachable`: the JIT must trap where the interpreter traps (STATUS_TRAP == 3).
 const TRAP = `
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   unreachable
+  }
 }`;
 
 // Mixed-tier (slice 3c): an integer caller (JITted) sums a SIMD leaf f(i)=2i over 0..n. The leaf
@@ -114,28 +123,33 @@ block0(v0: i64):
 // so a float leaf would be JITted directly rather than crossing tiers.)
 const MIXED = `
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = call 1 (v9)
   v11 = i64.add v8 v10
   v12 = i64.const 1
   v13 = i64.add v9 v12
-  br block1(v7, v11, v13)
-block3(v14: i64):
+  br 1(v7, v11, v13)
+}
+block 3 (v14: i64) {
   return v14
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i64x2.add v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }`;
 
 // call_indirect (slice: next): a loop dispatches to f(i)=2i or f(i)=i+100 by index parity through
@@ -143,14 +157,16 @@ block0(v0: i64):
 // interpreter's identity table. All-in-subset (three integer funcs), so it JITs whole-module.
 const DISPATCH = `
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 1
   v11 = i64.and v9 v10
   v12 = i64.const 1
@@ -160,21 +176,25 @@ block2(v7: i64, v8: i64, v9: i64):
   v16 = i64.add v8 v15
   v17 = i64.const 1
   v18 = i64.add v9 v17
-  br block1(v7, v16, v18)
-block3(v19: i64):
+  br 1(v7, v16, v18)
+}
+block 3 (v19: i64) {
   return v19
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 2
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i64.add v0 v1
   return v2
+  }
 }`;
 
 // SIMD (slice: next): a v128 kernel — splat the arg across i32x4 lanes, run lane arithmetic +
@@ -184,7 +204,7 @@ block0(v0: i64):
 const SIMD = `
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i32x4.splat v1
   v3 = i32.const 3
@@ -201,6 +221,7 @@ block0(v0: i64):
   v13 = i32.add v12 v11
   v14 = i64.extend_i32_s v13
   return v14
+  }
 }`;
 
 async function main() {

@@ -97,7 +97,7 @@ try {
 
   // A parse error pins the offending line in that card's editor: a bad opcode on line 3 (unique token).
   await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
-    'func () -> (i64) {\nblock0():\n  v0 = i64.notanopcode 1\n  return v0\n}'), card('hello'));
+    'func () -> (i64) {\nblock 0 () {\n  v0 = i64.notanopcode 1\n  return v0\n  }\n}'), card('hello'));
   await runCard(page, 'hello');
   const mark = await page.evaluate((sel) => {
     const cm = document.querySelector(`${sel} .CodeMirror`).CodeMirror;
@@ -113,7 +113,7 @@ try {
     : fail(`error decoration: ${JSON.stringify(mark)}`);
   // Editing clears the decoration.
   await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
-    'func () -> (i64) {\nblock0():\n  v0 = i64.const 1\n  return v0\n}'), card('hello'));
+    'func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}'), card('hello'));
   const cleared = await page.evaluate((sel) => !document.querySelector(`${sel} .cm-error-widget`), card('hello'));
   cleared ? ok('error decoration clears on edit') : fail('error decoration not cleared on edit');
 

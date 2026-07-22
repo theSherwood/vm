@@ -25,11 +25,12 @@ const EXAMPLES = {
     src: `memory 16
 data 0 "hello, world!\\n"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 14
   v3 = cap.call 0 1 (i64, i64) -> (i64) v0(v1, v2)
   return v3
+  }
 }
 `,
   },
@@ -40,14 +41,16 @@ block0(v0: i32):
       'interleaving.',
     src: `memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 500
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -57,15 +60,18 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
+  br 1(v12)
+}
+block 3 () {
   v13 = i64.const 0
-  br block4(v13)
-block4(v14: i64):
+  br 4(v13)
+}
+block 4 (v14: i64) {
   v15 = i64.const 8
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14) block6()
-block5(v17: i64):
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -74,29 +80,35 @@ block5(v17: i64):
   v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
-  br block4(v25)
-block6():
+  br 4(v25)
+}
+block 6 () {
   v26 = i64.const 0
   v27 = i64.atomic.load v26
   return v27
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 0
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 `,
   },
@@ -107,15 +119,17 @@ block2():
     src: `memory 16
 data 0 "tick\\n"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
   v1 = i64.const 0
-  br block1(v1, vh0)
-block1(vi: i64, vhh: i64):
+  br 1(v1, vh0)
+}
+block 1 (vi: i64, vhh: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u vi v2
-  br_if v3 block2(vi, vhh) block3()
-block2(vi2: i64, vhh2: i64):
+  br_if v3 2(vi, vhh) 3()
+}
+block 2 (vi2: i64, vhh2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
@@ -125,15 +139,18 @@ block2(vi2: i64, vhh2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vhh2)
-block3():
+  br 1(v9, vhh2)
+}
+block 3 () {
   v10 = i64.const 0
-  br block4(v10)
-block4(vj: i64):
+  br 4(v10)
+}
+block 4 (vj: i64) {
   v11 = i64.const 8
   v12 = i64.lt_u vj v11
-  br_if v12 block5(vj) block6()
-block5(vj2: i64):
+  br_if v12 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -142,14 +159,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vh: i64):
+block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 5
@@ -159,6 +178,7 @@ block0(vsp: i64, vh: i64):
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
   return v4
+  }
 }
 `,
   },
@@ -168,19 +188,21 @@ block0(vsp: i64, vh: i64):
       '(a freshly raced dispatch slot) and call_indirect it — service(6,7) = 142, folded to 1136.',
     src: `memory 16
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   vje = i64.extend_i32_u v0
   vce = i64.extend_i32_u v1
   vc32 = i64.const 32
   vchi = i64.shl vce vc32
   vpacked = i64.or vchi vje
   vi0 = i64.const 0
-  br block1(vi0, vpacked)
-block1(vi: i64, vp: i64):
+  br 1(vi0, vpacked)
+}
+block 1 (vi: i64, vp: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vp) block3()
-block2(vi2: i64, vp2: i64):
+  br_if vlt 2(vi, vp) 3()
+}
+block 2 (vi2: i64, vp2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
@@ -190,15 +212,18 @@ block2(vi2: i64, vp2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vp2)
-block3():
+  br 1(v9, vp2)
+}
+block 3 () {
   vj0 = i64.const 0
-  br block4(vj0)
-block4(vj: i64):
+  br 4(vj0)
+}
+block 4 (vj: i64) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj) block6()
-block5(vj2: i64):
+  br_if vlt2 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -207,14 +232,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vp: i64):
+block 0 (vsp: i64, vp: i64) {
   vmask = i64.const 4294967295
   vjit64 = i64.and vp vmask
   vjit = i32.wrap_i64 vjit64
@@ -230,6 +257,7 @@ block0(vsp: i64, vp: i64):
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
+  }
 }
 `,
   },
@@ -240,14 +268,16 @@ block0(vsp: i64, vp: i64):
       'sums 8 × 5 = 40.',
     src: `memory 20
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vi0 = i64.const 0
-  br block1(vi0, v0)
-block1(vi: i64, vinst: i32):
+  br 1(vi0, v0)
+}
+block 1 (vi: i64, vinst: i32) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vinst) block3(vinst)
-block2(vi2: i64, vinst2: i32):
+  br_if vlt 2(vi, vinst) 3(vinst)
+}
+block 2 (vi2: i64, vinst2: i32) {
   vone = i64.const 1
   viplus = i64.add vi2 vone
   v64k = i64.const 65536
@@ -262,16 +292,19 @@ block2(vi2: i64, vinst2: i32):
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
-  br block1(vinext, vinst2)
-block3(vinst3: i32):
+  br 1(vinext, vinst2)
+}
+block 3 (vinst3: i32) {
   vj0 = i64.const 0
   vs0 = i64.const 0
-  br block4(vj0, vs0, vinst3)
-block4(vj: i64, vs: i64, vinst4: i32):
+  br 4(vj0, vs0, vinst3)
+}
+block 4 (vj: i64, vs: i64, vinst4: i32) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
-block5(vj2: i64, vs2: i64, vinst5: i32):
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16
@@ -281,14 +314,17 @@ block5(vj2: i64, vs2: i64, vinst5: i32):
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br block4(vjn, vsn, vinst5)
-block6(vs3: i64):
+  br 4(vjn, vsn, vinst5)
+}
+block 6 (vs3: i64) {
   return vs3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 5
   return v1
+  }
 }
 `,
   },
@@ -306,17 +342,20 @@ block0(v0: i64):
       'VS Code speaks, driven over the wasm FFI.',
     src: `; Sum i = n..1 into acc. Click the gutter to set a breakpoint, then press Debug.
 func () -> (i64) {
-block0():
+block 0 () {
   n = i64.const 5
   acc0 = i64.const 0
-  br block1(n, acc0)
-block1(i: i64, acc: i64):
+  br 1(n, acc0)
+}
+block 1 (i: i64, acc: i64) {
   sum = i64.add acc i
   one = i64.const 1
   next = i64.sub i one
-  br_if next block1(next, sum) block2(sum)
-block2(r: i64):
+  br_if next 1(next, sum) 2(sum)
+}
+block 2 (r: i64) {
   return r
+  }
 }
 `,
   },
@@ -337,23 +376,26 @@ block2(r: i64):
 ; instant a store changes it — stop reason "data breakpoint".
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   a0 = i64.const 0
   z = i64.const 0
   i64.store a0 z
-  br block1(z)
-block1(i: i64):
+  br 1(z)
+}
+block 1 (i: i64) {
   a1 = i64.const 0
   one = i64.const 1
   n = i64.add i one
   i64.store a1 n
   limit = i64.const 3
   done = i64.ge_s n limit
-  br_if done block2(n) block1(n)
-block2(r: i64):
+  br_if done 2(n) 1(n)
+}
+block 2 (r: i64) {
   a2 = i64.const 0
   out = i64.load a2
   return out
+  }
 }
 
 debug.file 0 "counter.svm"
@@ -393,7 +435,7 @@ debug.var 0 "count" fixed 0 "long" 0
 ; placed in the worker — press Debug, then use the thread selector that appears.
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   sp = i64.const 0
   one = i64.const 1
   h0 = thread.spawn 1 sp one
@@ -403,13 +445,15 @@ block0():
   addr = i64.const 0
   total = i64.atomic.load addr
   return total
+  }
 }
 func (i64, i64) -> (i64) {
-block0(sp: i64, inc: i64):
+block 0 (sp: i64, inc: i64) {
   addr = i64.const 0
   old = i64.atomic.rmw.add addr inc
   z = i64.const 0
   return z
+  }
 }
 `,
   },
@@ -429,7 +473,7 @@ block0(sp: i64, inc: i64):
 ; on the worker's read (line 28) — it fires once the root's notify wakes it.
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   a8 = i64.const 8
   val = i64.const 987654
   i64.atomic.store.release a8 val
@@ -443,9 +487,10 @@ block0():
   woke = atomic.notify a0n n1
   r = thread.join h
   return r
+  }
 }
 func (i64, i64) -> (i64) {
-block0(sp: i64, arg: i64):
+block 0 (sp: i64, arg: i64) {
   a0 = i64.const 0
   exp = i32.const 0
   tmo = i64.const 1000000000
@@ -453,6 +498,7 @@ block0(sp: i64, arg: i64):
   a8 = i64.const 8
   got = i64.atomic.load.acquire a8
   return got
+  }
 }
 `,
   },
@@ -472,7 +518,7 @@ block0(sp: i64, arg: i64):
 ; fiber suspends 11 back, then on the next resume returns 25 — the root sums
 ; them (→ 36). The breakpoint on line 19 fires once cont.resume enters the fiber.
 func () -> (i64) {
-block0():
+block 0 () {
   mk = ref.func 1
   z = i64.const 0
   gen = cont.new mk z
@@ -482,15 +528,17 @@ block0():
   s1, v1 = cont.resume gen b
   sum = i64.add v0 v1
   return sum
+  }
 }
 func (i64, i64) -> (i64) {
-block0(sp: i64, arg: i64):
+block 0 (sp: i64, arg: i64) {
   one = i64.const 1
   bumped = i64.add arg one
   got = suspend bumped
   five = i64.const 5
   out = i64.add got five
   return out
+  }
 }
 `,
   },
@@ -512,7 +560,7 @@ block0(sp: i64, arg: i64):
 ; once a worker’s cont.resume enters the fiber — a *worker* vCPU, not the root.
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   sp = i64.const 0
   a = i64.const 0
   w0 = thread.spawn 1 sp a
@@ -522,9 +570,10 @@ block0():
   addr = i64.const 0
   total = i64.atomic.load addr
   return total
+  }
 }
 func (i64, i64) -> (i64) {
-block0(sp: i64, arg: i64):
+block 0 (sp: i64, arg: i64) {
   mk = ref.func 2
   z = i64.const 0
   gen = cont.new mk z
@@ -536,15 +585,17 @@ block0(sp: i64, arg: i64):
   rmw = i64.atomic.rmw.add addr v1
   zero = i64.const 0
   return zero
+  }
 }
 func (i64, i64) -> (i64) {
-block0(sp2: i64, arg2: i64):
+block 0 (sp2: i64, arg2: i64) {
   one = i64.const 1
   bumped = i64.add arg2 one
   got = suspend bumped
   five = i64.const 5
   out = i64.add got five
   return out
+  }
 }
 `,
   },
