@@ -416,10 +416,10 @@ try {
       vars: document.querySelector(`${sel} .dbg-vars`).textContent,
     };
   }, ftCard);
-  // ≥3 live chips (root + two workers), the stop is inside the fiber (line 35), and the stopped vCPU is a
+  // ≥3 live chips (root + two workers), the stop is inside the fiber (line 37), and the stopped vCPU is a
   // worker (thread id ≠ 1, the root).
-  ftPaused.count >= 3 && ftPaused.stopLine && /line 35\b/.test(ftPaused.vars) && ftPaused.stopped !== '1'
-    ? ok(`fibers+threads card: a worker (thread ${ftPaused.stopped}) stopped inside its fiber (line 35)`)
+  ftPaused.count >= 3 && ftPaused.stopLine && /line 37\b/.test(ftPaused.vars) && ftPaused.stopped !== '1'
+    ? ok(`fibers+threads card: a worker (thread ${ftPaused.stopped}) stopped inside its fiber (line 37)`)
     : fail(`fibers+threads paused: ${JSON.stringify(ftPaused)}`);
   await page.click(`${ftCard} .dbg-controls button[data-cmd="continue"]`);
   await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),

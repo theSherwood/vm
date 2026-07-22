@@ -545,18 +545,18 @@ block 0 (sp: i64, arg: i64) {
 
   'Debugger (SVM — fibers + threads)': {
     debug: true,
-    bp: 34, // a breakpoint pre-placed on line 35 (0-based 34), inside the fiber body
+    bp: 36, // a breakpoint pre-placed on line 37 (0-based 36), inside the fiber body
     mode: 'plain',
     desc: 'Fibers composed with threads on the scheduled bytecode engine. Two worker threads each run a ' +
       '§12 generator fiber: the worker cont.new’s the fiber, cont.resume’s it twice (it suspends 11, then ' +
       'returns 25), and atomically adds the 25 into mem[0] — two workers → 50. A breakpoint sits inside ' +
-      'the fiber body (line 35): press Debug and a *worker* vCPU (not the root) stops there, its own ' +
+      'the fiber body (line 37): press Debug and a *worker* vCPU (not the root) stops there, its own ' +
       'fiber frame live. The thread selector switches between the workers; Continue lets the other ' +
       'worker’s fiber hit it too, then the run finishes. ◀◀ Reverse replays the whole schedule — ' +
       'fibers-on-threads included — deterministically. Fibers and threads, composed under one debugger.',
     src: `; Two worker threads, each running a generator fiber. Each worker cont.new’s a
 ; fiber, resumes it twice (it suspends 11, then returns 25), and atomically adds
-; the returned 25 into mem[0]. Two workers → 50. The breakpoint on line 35 fires
+; the returned 25 into mem[0]. Two workers → 50. The breakpoint on line 37 fires
 ; once a worker’s cont.resume enters the fiber — a *worker* vCPU, not the root.
 memory 16
 func () -> (i64) {
