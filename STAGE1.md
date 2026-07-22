@@ -212,6 +212,12 @@ keystone of self-similarity. It is **not built**. Until it lands:
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
    plan"). This is the jump from sequential spawn/wait to true concurrency.
+   **[PROMOTED 2026-07-22 — an svm-owned todo, consumer-pinned.]** jacl (the
+   first shell-like language targeting svm) needs concurrent stages soon after
+   sequential; this does not wait for a further request. The remaining build is
+   step 2 of the revised plan (OS-thread children in own guarded windows; the
+   canonical-key futex, step 1, landed as S1b) — sequential-first, concurrency
+   promptly after.
 7. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
    piece for shells that fork *themselves*.
 

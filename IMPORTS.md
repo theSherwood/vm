@@ -847,7 +847,30 @@ holder is the domain that implements them:
   copy); a forged/dead cap is a fail-closed `CapFault`. The verifiers make `cap`
   value-compatible with `i32` wherever operands flow while keeping the marker
   distinct in signatures. The **entry-result (`Instantiator.join`) boundary**
-  remains a follow-up.
+  is a **deferred follow-up — deferred on purpose, to §3.6, not merely unbuilt**
+  (investigated 2026-07-22). The offer-call boundary is cheap because it lives in
+  the *one* shared generic dispatch (`cap_dispatch_slots`): an offer body always
+  runs via the reference interpreter, so a single translation covers all three
+  backends. `Instantiator.join` has no such shared seam — its result is delivered
+  by each executor's **private child-lifecycle scheduler** (the tree-walker's
+  `run_inner`, the four bytecode schedulers — cooperative `drive`, true-parallel,
+  the `Vcpu` reactor, the debug run — and the JIT's `instantiator_rt`). Translating
+  there would need per-scheduler child-`Host` **retention past completion** (the
+  child powerbox is torn down when the child finishes — `drop(v)` in the
+  tree-walker, the closure return in the parallel path, `release(gc.ctx)` at
+  instantiate in the JIT), the join call's result-`cap`-ness **threaded across the
+  async park/resume** (the call sig is lost at the park), a widening of the JIT's
+  currently fail-closed op-1 result contract, and a **new host re-grant callback**
+  in the JIT embedding hooks — ~800 loc across the most sensitive code, almost all
+  of it interim-architecture plumbing. Under **§3.6** the natural way a capability
+  leaves a child is through the child's *offers* (`export.handle` + a `cap`-typed
+  argument/offer call), which ride the same shared offer-call dispatch that already
+  translates — so the unified model routes "get a cap out of a child" through the
+  path we already built and makes the entry-result channel a narrow convenience, a
+  shared-dispatch addition there rather than a five-executor one. With no concrete
+  consumer forcing it today (caps already cross *into* and *between* domains via
+  offer arguments), the prime directive says wait: build it at the §3.6 seam, not
+  across the interim schedulers it dissolves.
 - **What offer calls run over — as built (v2) vs the end state (§3.6).** As
   built, offers execute over a **passive provider instance**: a second
   window + powerbox distinct from the live run — own lock, provider-pays
@@ -1102,7 +1125,13 @@ with its reason recorded:
   treat `cap` and `i32` as value-compatible wherever operands flow (a `cap` is usable as
   a handle, an `i32` fills a `cap` slot), while keeping them **distinct in signatures**
   so structural interface matching and the translation itself still key on the marker.
-  The §14 entry-result (`Instantiator.join`) path remains a follow-up.
+  The §14 entry-result (`Instantiator.join`) path is a **deliberate deferral to §3.6**
+  (investigated 2026-07-22): join has no shared dispatch seam — it would need
+  child-`Host` retention + async sig-threading + a JIT contract widen + a new JIT
+  re-grant hook across all five private schedulers (~800 loc of interim plumbing),
+  whereas the unified model already moves caps out of a child through its offers over
+  the shared dispatch. No consumer forces it today; build it at the §3.6 seam. See the
+  §3.5 as-built note above for the full rationale.
 - **[BUILT 2026-07-22] Registry-grouped host caps (`HostCap::iface`).** A host-native
   handle can be offered as a *whole interface* (`Imports::provide("fs",
   HostCap::iface(&shape, grant))`), its `IfaceShape` listing op names + signatures in
@@ -1273,6 +1302,49 @@ the no-live-run case correctly today and is *behaviorally identical* to the
 unified model there, so nothing regresses; the fiber slice replaces it
 when its consumer (the shell personality, STAGE1) is ready to drive it, and
 the instance concept is deleted rather than kept as a second mode.
+
+**Consumer pinning — jacl (2026-07-22).** The shell personality now has a
+named first consumer: **jacl** (theSherwood/jacl_impl), a shell-like language
+whose core goals are domain orchestration, child-I/O interposition, and
+coordination across domains of varying mutual trust. Its answers settle the
+§3.6 open questions that were "pinned when the slice is built":
+
+- **Waitset: minimal — no select/poll-set primitive.** One fiber per
+  thing-awaited (fiber-level synchrony, already this section's model);
+  `svc.wait`/`svc.poll` exist *solely* for handler admission. A timeout is a
+  fiber parked on `memory.wait` with `timeout_ns` (exists today). jacl adapts
+  to this shape rather than asking for a richer waitset.
+- **Reentrancy: confirmed as designed.** A→B→A runs as a fresh handler fiber
+  A[f2] while A[f1] stays parked — the consumer independently specified
+  exactly the "re-entry is a new fiber" semantics above. Closed.
+- **Cross-trust liveness: racing fibers + revocation-unparks.** No substrate
+  timeouts (the L4 lesson stands). A supervisor fiber races the untrusted
+  wait: it parks on a timer and, on expiry, **revokes the connection** —
+  closing/rebinding the client handle its sibling is parked through, which
+  completes that fiber's parked call with a probeable `CapFault`-style error.
+  The fiber is never killed: it wakes on its own error path and releases what
+  it holds — cancellation as a returned value, not `fiber.cancel`'s
+  killed-while-holding-locks tar pit. This is D37 death-is-revocation turned
+  inward (holder hangs up instead of provider dying; the servicer's late
+  reply lands inert via the existing generation check). Granularity is
+  per-connection; per-call granularity = per-call attenuated handles. **The
+  one new substrate item: a parked cross-domain call must observe revocation
+  of the handle it is parked through** — pinned as part of the fiber slice
+  (PROCESS.md §4).
+- **Registry/attach: personality-level, not substrate.** Rendezvous with an
+  existing domain is someone who holds its `export.handle` granting it —
+  registry semantics (names, discovery) are jacl's to define.
+- **Stages: sequential first, concurrency promptly** — an svm-owned todo
+  (STAGE1.md item 6), not waiting on a further request.
+- **Trust ladder** (with §1a/PROCESS.md §6 honesty): trusted → in-process
+  domains; limited trust → domains + `attest` + attenuated grants; hostile →
+  a separate OS process. A domain distrusting its *spawner* needs
+  `window_exposed = false`, which requires **detached windows** (PROCESS.md
+  §5) — promoted to the consumer critical path; attest itself is built.
+
+Remaining before the slice: build revocation-unparks, build detached
+windows, and the exec-interface contract (EXEC.md) whose guest-served
+backend is the first Endpoint consumer.
 
 ---
 

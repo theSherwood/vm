@@ -1,0 +1,16 @@
+# The deterministic `exec` capability backend + the shared exec-cap wire protocol (op codes, argv
+# parsing, errno values). Pure — depends only on `svm-interp` for the `HostFn`/`GuestMem`
+# interface — so it builds for **wasm** (the browser cdylib grants a `scripted_exec` with no host
+# processes), unlike `svm-run` which pulls in the unix-only JIT. `svm-run` keeps the real
+# subprocess `host_exec` backend and wraps these handlers in its `HostCap`. See EXEC.md and
+# `crates/svm-run/src/exec.rs`.
+[package]
+name = "svm-exec"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+svm-interp.workspace = true

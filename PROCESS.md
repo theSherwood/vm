@@ -197,6 +197,20 @@ reply(serve_end, caller, result)  -> 0 | -errno            (resume that caller)
   `reply` is inert (generation-checked, like every stale handle). Kill of a *servicer* →
   parked clients fail with an errno (see §3 teardown). No reply forwarding, no call
   timeouts, no priority — deferred until a personality demonstrably needs them.
+- **Revocation-unparks — the guest-side cancel, pinned (2026-07-22, jacl).** The
+  holder-side counterpart of kill-safe cancel: a domain **closing/rebinding a client
+  handle completes any of its own fibers parked in a call through that handle** with a
+  probeable `CapFault`-style errno. The fiber is never destroyed — it wakes at its call
+  site on its own error path and releases what it holds, so the `pthread_cancel`
+  killed-while-holding-locks tar pit never enters the design (there is deliberately no
+  `fiber.cancel`). It is D37 death-is-revocation turned inward: same wake-with-fault
+  path as a provider dying, triggered by the holder hanging up; the servicer's late
+  `reply` lands inert via the existing generation check, so the callee side needs
+  nothing. Granularity is per-connection (all fibers parked through the handle wake);
+  per-call granularity is per-call attenuated handles. This is what makes the
+  **racing-fibers liveness pattern** work (a supervisor fiber parks on a
+  `memory.wait` timeout and revokes the connection on expiry — O1's resolution) and it
+  is the one cancellation primitive the §3.6 fiber slice must build.
 - **Wire discipline — scalars only; the data plane is explicit.** D42's borrow-only
   `(ptr,len)` args assume the handler is the *host* (validated trampoline into any guest
   window); a **guest** servicer cannot dereference a detached caller's window at all.
@@ -368,7 +382,10 @@ object, and *who holds authority over its backing* is the whole visibility story
 - **Detached**: a window minted by a **platform window-minter capability** — an ordinary
   granted authority (the D46 `Resolver`-shaped acquisition pattern: you can mint detached
   windows only if someone granted you that). No ancestor below the minter holds read
-  authority. Numeric quota, host-enforced at mint.
+  authority. Numeric quota, host-enforced at mint. **[Consumer-pinned 2026-07-22]:**
+  jacl's trust model (a domain that distrusts its spawner and attests
+  `window_exposed = false`) requires this built — promoted onto the §3.6 consumer
+  critical path (IMPORTS.md §3.6 consumer pinning); `attest` itself is landed.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.
@@ -717,7 +734,7 @@ Unchanged in substance from v1, restated against the substrate:
 
 | # | Risk / question | Where | Status |
 |---|---|---|---|
-| O1 | Endpoint servicer DoS (never replies): callers park forever. v1 answer: your servicer is in your grant chain — you trusted it; a personality may add timeouts. Is that acceptable for cross-*sibling* endpoints? | §4 | open |
+| O1 | Endpoint servicer DoS (never replies): callers park forever. v1 answer: your servicer is in your grant chain — you trusted it; a personality may add timeouts. Is that acceptable for cross-*sibling* endpoints? **Resolved (2026-07-22, jacl):** cross-trust callers use the racing-fibers pattern — a supervisor fiber parks on a `memory.wait` timeout and, on expiry, revokes the connection (**revocation-unparks**, §4): the parked caller wakes with a probeable errno, the late `reply` is generation-inert. Timeouts stay personality policy; the substrate adds only revocation-unparks | §4 | resolved — racing fibers + revocation-unparks |
 | O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable). **Spike done (§4 S0 results):** nested futex rendezvous works today (pinned by `futex_cross_domain.rs`); sibling aliases are value-coherent but need region-canonical futex keys for wakeup (Linux shared-futex analogue) — no confinement-hinge contact. Integration (O15) promoted this to **S1b** (it also gates JIT concurrent parent↔child) | §9 | resolved — nested confirmed; sibling/JIT fix is S1b |
 | O3 | JIT compile-cache: **built** with key `(funcs ptr, n_funcs, entry, size_log2)` — carve base is *absent* (position-independent reuse), so it hits across offsets, not just repeated same-slot spawns. Residual: a robust separate-module identity (a digest would beat the funcs pointer, though the run-lifetime grant contract makes a stale-pointer collision impossible within a run); cache eviction if a long shell session accumulates many distinct applets | §4, §5 | mostly resolved |
 | O15 | **In-place shared-window children are unsafe** (§4 S1 finding): D38 clamp confines the *offset*, but a width-`w` access at a carve's top reaches `w−1` bytes past it — caught by the per-window trailing guard page, which densely-packed carves lack. So a concurrent JIT child must keep its **own guarded window**; the live parent↔child channel is a `SharedRegion` + canonical-key futex (S1b), never implicit carve addresses. No D38 change. Decided; the alternative (per-carve guard pages) is rejected as wasteful and layout-invasive | §4 | resolved (own-window + SharedRegion) |
