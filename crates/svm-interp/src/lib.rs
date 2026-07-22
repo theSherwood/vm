@@ -7081,6 +7081,84 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     jit_invoke_body!(h, args, sig)
                 }
+                // §3.6 slice 2 — `svc.poll` (`cap.call CAP_SELF_TYPE_ID 9`): the service point.
+                // Drain this domain's inbound dispatch queue, running each dispatch as a
+                // handler over the domain's **one world** — same functions, same live window,
+                // same powerbox, same fuel — and post its result under the ticket; return the
+                // count served. Run-to-completion this slice (exactly the passive instance's
+                // serialized observable behavior — the oracle); handler parking rides the
+                // fiber-admission slice. Serviced here because only the eval loop can run
+                // guest code — a backend tier without this arm answers `-EINVAL` from the
+                // generic dispatch, probeable. A handler trap is terminal for the domain
+                // (one world: there is no second state to shield).
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_SVC_POLL,
+                    sig,
+                    ..
+                } => {
+                    let mut served: i64 = 0;
+                    loop {
+                        let d = {
+                            let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            hg.svc_queue.pop_front()
+                        };
+                        let Some(d) = d else { break };
+                        // The queue only holds servable dispatches (checked at enqueue), so a
+                        // missing handler here is host-state corruption: fail closed.
+                        let fidx = {
+                            let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            hg.svc_handler_func(d.export, d.op).ok_or(Trap::CapFault)?
+                        };
+                        let params = funcs[fidx as usize].params.clone();
+                        if d.args.len() != params.len() {
+                            // Arity mismatch is the *dispatch's* fault, not the domain's:
+                            // probeable errno in the completion cell, domain keeps serving.
+                            let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            hg.svc_results.insert(d.ticket, EINVAL);
+                            continue;
+                        }
+                        let child_args: Vec<Value> = d
+                            .args
+                            .iter()
+                            .zip(params)
+                            .map(|(s, ty)| slot_to_val(ty, *s))
+                            .collect();
+                        // The handler's nested run over the SAME world (the jit_invoke pattern):
+                        // window/fuel move into the child and back whatever the outcome.
+                        let child_mem = mem.take();
+                        let mut child = VCpu::new(
+                            Arc::clone(&funcs),
+                            fidx,
+                            &child_args,
+                            child_mem,
+                            Arc::clone(host),
+                            *fuel,
+                            depth + frames.len() as u32 + 1,
+                            0, // transient: never scheduler-posted (driven inline to completion)
+                            sched.clone(),
+                            spawn_quota,
+                            Arc::clone(dt),
+                        );
+                        child.memop = memop;
+                        let out = run_inner(&mut child, u64::MAX);
+                        *mem = child.mem.take();
+                        *fuel = child.fuel;
+                        match out {
+                            Ok(Inner::Done(results)) => {
+                                let r = results.first().copied().map_or(0, val_to_slot);
+                                let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                hg.svc_results.insert(d.ticket, r);
+                                served += 1;
+                            }
+                            Ok(_) => return Err(Trap::CapFault), // no handler parking this slice
+                            Err(t) => return Err(t),
+                        }
+                    }
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(served));
+                    }
+                }
                 Inst::CapCall {
                     type_id,
                     op,
@@ -10293,6 +10371,30 @@ pub struct GuestImplEntry {
     pub state: Option<Arc<Mutex<ProviderState>>>,
 }
 
+/// §3.6 slice 2 — one queued inbound dispatch (the serve-loop core): a call targeting this
+/// domain's impl-export `export`, op `op`, args in the i64-slot ABI, completion posted under
+/// `ticket`. Admitted as a handler over the domain's **one world** at a `svc.poll` service
+/// point — run-to-completion this slice (handler parking rides the fiber-admission slice),
+/// which is exactly the passive instance's serialized observable behavior (the oracle).
+pub struct SvcDispatch {
+    pub export: u32,
+    pub op: u32,
+    pub args: Vec<i64>,
+    pub ticket: u64,
+}
+
+/// §3.6 bounded dispatch-queue depth. Small and fixed: a full queue refuses the enqueue
+/// fail-closed (probeable at the enqueuer) — backpressure, not buffering (the pinned design).
+pub const SVC_QUEUE_CAP: usize = 64;
+
+/// The reserved self-namespace op number for `svc.poll` (§3.6 slice 2): drain-and-serve all
+/// queued dispatches, return the count. Rides `cap.call CAP_SELF_TYPE_ID` like
+/// `cap.self.provenance` — no wire change, no new opcode; serviced by the eval loop (it runs
+/// guest code, which host-side dispatch cannot), so a backend tier without the eval-loop arm
+/// answers `-EINVAL`, probeable. `svc.wait` (park-until-dispatch) takes the next number when
+/// the caller-parking slice gives it a real waker.
+pub const CAP_SELF_SVC_POLL: u32 = 9;
+
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
 /// once from the provider module's memory declaration + data segments at wiring) and powerbox
 /// its ops execute over. The powerbox starts empty; the wirer may re-grant its own capabilities
@@ -10462,6 +10564,16 @@ pub struct Host {
     /// Memoized reified-offer handles by impl-export index (re-reifying returns the same
     /// backing).
     self_reified: BTreeMap<u32, i32>,
+    /// §3.6 slice 2 — the domain's **bounded inbound dispatch queue** (the serve-loop core):
+    /// dispatches targeting this domain's offers queue here and are admitted as handlers over
+    /// the domain's **one world** (live window + powerbox) at the guest's `svc.poll` service
+    /// points. Bounded, fail-closed: a full queue refuses the enqueue (probeable at the
+    /// enqueuer), per the pinned §3.6 design. Enqueued embedder-side this slice
+    /// ([`Host::svc_enqueue`]); the cross-domain caller side is the §3.6 caller-parking slice.
+    svc_queue: VecDeque<SvcDispatch>,
+    /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
+    svc_results: BTreeMap<u64, i64>,
+    svc_next_ticket: u64,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -10734,6 +10846,9 @@ impl Host {
             self_module: None,
             self_instance: None,
             self_reified: BTreeMap::new(),
+            svc_queue: VecDeque::new(),
+            svc_results: BTreeMap::new(),
+            svc_next_ticket: 0,
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -11268,6 +11383,11 @@ impl Host {
             // §6 `cap.self.attest`: the domain's platform-vouched provenance, packed as
             // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
             4 => Ok(vec![self.attestation.packed() as i64]),
+            // §3.6 `svc.poll` reaching host-side dispatch means this backend tier has no
+            // eval-loop servicing arm (only the eval loop can run guest handler code): answer
+            // a probeable `-EINVAL` rather than trap — the guest's serve loop can fall back.
+            // The tree-walk eval loop intercepts the op before dispatch and serves it.
+            CAP_SELF_SVC_POLL => Ok(vec![EINVAL]),
             // §3.1 `cap.self.provenance(handle) -> i32` (IMPORTS.md): the binding's provenance
             // class — `0` = **platform-terminated** (host-native vtable), `d ≥ 1` =
             // **ancestor-terminated** (a wired guest impl terminating `d` domain boundaries up:
@@ -11707,6 +11827,42 @@ impl Host {
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
         self.self_module = Some(Arc::clone(m));
+    }
+
+    /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served
+    /// at the guest's next `svc.poll` service point. Returns the completion ticket, or `None`
+    /// **fail-closed** when the queue is full (backpressure is the enqueuer's problem, probeable)
+    /// or the target isn't a well-formed offer op of the registered self module. Embedder-side
+    /// this slice; a cross-domain caller's enqueue is the §3.6 caller-parking slice.
+    pub fn svc_enqueue(&mut self, export: u32, op: u32, args: Vec<i64>) -> Option<u64> {
+        if self.svc_queue.len() >= SVC_QUEUE_CAP || self.svc_handler_func(export, op).is_none() {
+            return None;
+        }
+        let ticket = self.svc_next_ticket;
+        self.svc_next_ticket += 1;
+        self.svc_queue.push_back(SvcDispatch {
+            export,
+            op,
+            args,
+            ticket,
+        });
+        Some(ticket)
+    }
+
+    /// Take a served dispatch's result (first result slot; `0` for a no-result handler).
+    /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
+    pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
+        self.svc_results.remove(&ticket)
+    }
+
+    /// The function a queued `(export, op)` dispatch runs: the registered self module's
+    /// impl-export op table entry, checked in-range against its function table. `None` fails
+    /// the enqueue closed — the queue only ever holds servable dispatches.
+    fn svc_handler_func(&self, export: u32, op: u32) -> Option<FuncIdx> {
+        let m = self.self_module.as_ref()?;
+        let e = m.impl_exports.get(export as usize)?;
+        let f = *e.ops.get(op as usize)?;
+        ((f as usize) < m.funcs.len()).then_some(f)
     }
 
     /// The named-op view of self interface `ty`: `(names, sigs)`, or `None` when no self module

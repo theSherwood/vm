@@ -1371,6 +1371,31 @@ slice; the exhaustive explorer fails a `CapRead` park closed (nothing can
 feed stdin inside an exploration); bytecode's interactive `Vcpu` stdin
 park is unchanged.
 
+**[BUILT 2026-07-22] §3.6 slice 2 — the serve-loop core (`svc.poll` +
+the bounded dispatch queue + one-world handlers).** A domain's offers now
+serve over its **one world**: dispatches queue on the domain's bounded
+inbound queue (`SVC_QUEUE_CAP`; a full queue refuses the enqueue
+fail-closed — backpressure at the enqueuer, never buffering, and the
+queue only ever holds servable dispatches) and are admitted at the
+guest's **`svc.poll`** service point, each running as a handler over the
+same live window, powerbox, and fuel as `main` — what `main` writes,
+handlers read, and vice versa; a handler trap is terminal for the domain
+(one world, no second state to shield). Handlers run **to completion**
+this slice — exactly the passive instance's serialized observable
+behavior, which is the oracle. Encoding rides the **reserved
+self-namespace dispatch** (`cap.call CAP_SELF_TYPE_ID 9`, the
+`cap.self.provenance` precedent): no wire bump, no new opcode, generic
+verify already covers it; the op is serviced by the eval loop (only it
+can run guest code — the `Jit.invoke` nested-drive pattern, same window
+moved in and back), and a backend tier without the servicing arm answers
+a probeable `-EINVAL`. Pinned by `svc_serve_loop.rs` (one-world
+mutation + ordered serialization + completion cells, bounded/unservable
+refusals, arity-errno-and-continue, the pinned op number). **Deferred to
+the next slices:** `svc.wait`'s park-on-empty (its only real waker — a
+guest caller's enqueue — arrives with caller-side parking), handler
+fibers that may park (fiber admission), text sugar for `svc.*`, and the
+guest-caller enqueue path itself.
+
 ---
 
 ## 4. Interactions with settled decisions
