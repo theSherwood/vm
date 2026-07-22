@@ -211,6 +211,15 @@ reply(serve_end, caller, result)  -> 0 | -errno            (resume that caller)
   **racing-fibers liveness pattern** work (a supervisor fiber parks on a
   `memory.wait` timeout and revokes the connection on expiry — O1's resolution) and it
   is the one cancellation primitive the §3.6 fiber slice must build.
+  **[BUILT 2026-07-22 — §3.6 slice 1, reference interpreter.]** `Stream.close` is real
+  (shared-dispatch, backend-uniform; use-after-close is the D37 `CapFault`); a blocking
+  stream read parks the fiber keyed by its handle (`Blocked::CapRead` + the scheduler's
+  handle→waiters index); a sibling's close wakes every parked fiber with `-EBADF` via
+  `Scheduler::cap_revoke`/`Pending::CapResult`; the park-vs-revoke race is closed by a
+  liveness re-check under the scheduler lock. Racing-fibers pinned end to end by
+  `svm-interp/tests/revocation_unparks.rs`. Slot-parked (`call.import`) calls, their
+  rebind-triggered revocation, and JIT/bytecode-scheduler parity ride the later §3.6
+  slices (see IMPORTS.md §3.6 as-built scope).
 - **Wire discipline — scalars only; the data plane is explicit.** D42's borrow-only
   `(ptr,len)` args assume the handler is the *host* (validated trampoline into any guest
   window); a **guest** servicer cannot dereference a detached caller's window at all.

@@ -1342,9 +1342,34 @@ coordination across domains of varying mutual trust. Its answers settle the
   `window_exposed = false`, which requires **detached windows** (PROCESS.md
   §5) — promoted to the consumer critical path; attest itself is built.
 
-Remaining before the slice: build revocation-unparks, build detached
-windows, and the exec-interface contract (EXEC.md) whose guest-served
-backend is the first Endpoint consumer.
+Remaining before the slice: ~~build revocation-unparks~~ **[BUILT
+2026-07-22 — §3.6 slice 1]**, build detached windows, and ~~the
+exec-interface contract~~ **[EXEC.md landed; host/scripted backends
+built]** — its guest-served backend is the first Endpoint consumer.
+
+**[BUILT 2026-07-22] §3.6 slice 1 — revocation-unparks.** The substrate
+primitive is live on the reference interpreter's M:N scheduler:
+`Stream.close` is now **real** (slot entry cleared in the one shared
+dispatch — uniform across backends; a fresh call on the closed handle is
+the D37 use-after-close `CapFault` the docs always promised), a blocking
+stream read with no data **parks the fiber keyed by the handle it is
+parked through** (`Blocked::CapRead` + the scheduler's handle→waiters
+index, the futex `wait_waiters`/`notify` pair as template), and a sibling
+fiber's close **wakes every fiber parked through the handle with `-EBADF`**
+(`Scheduler::cap_revoke` → `Pending::CapResult`) — delivered as the call's
+return value on the fiber's own error path, never a trap, never a kill.
+The park-vs-revoke race is closed by a liveness re-check under the
+scheduler lock (a revoked-while-parking fiber wakes itself with the same
+errno). Pinned by `revocation_unparks.rs`: the racing-fibers test (parked
+read + sibling close + timer via `atomic.wait` timeout) and the D37
+close-then-use faults. **Scope, honestly:** the park and wake live on the
+tree-walk scheduler this slice; import-routed (`call.import`) blocking
+reads keep their historical non-blocking 0-EOF (the flag is discarded, so
+it cannot leak into a later direct call's park decision) — slot-parked
+calls and their rebind-triggered revocation are the §3.6 caller-parking
+slice; the exhaustive explorer fails a `CapRead` park closed (nothing can
+feed stdin inside an exploration); bytecode's interactive `Vcpu` stdin
+park is unchanged.
 
 ---
 

@@ -3548,6 +3548,14 @@ enum Blocked {
         width: u32,
         timeout_ns: u64,
     },
+    /// Blocked inside a capability call **through `handle`** (§3.6 slice 1: a blocking stream
+    /// read with no data). Parked in the scheduler's handle-keyed waiter index, so a
+    /// **revocation** of that handle (another fiber's `Stream.close`, D37 turned inward) can
+    /// find and wake it with a probeable negative errno — the racing-fibers escape hatch
+    /// (IMPORTS.md §3.6 consumer pinning / PROCESS.md §4 revocation-unparks). Nothing else
+    /// wakes it today: a scheduler-run blocking read with no closer blocks forever, which is
+    /// what blocking means.
+    CapRead { handle: i32 },
 }
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
@@ -3559,6 +3567,10 @@ enum Pending {
     /// Finish a §14 co-fiber `yield`: push the value the parent's `resume` delivered (the result of
     /// the child's `Yielder` cap.call). Only ever set on a *coroutine* child the parent drives inline.
     CoResume(i64),
+    /// Finish a revoked capability call ([`Blocked::CapRead`]): push this as the call's i64
+    /// result — a negative errno the parked fiber probes on its own error path. The fiber is
+    /// never killed and never traps; cancellation is a returned value (§3.6 revocation-unparks).
+    CapResult(i64),
 }
 
 /// One run of a vCPU until it finishes or yields.
@@ -3621,6 +3633,13 @@ struct Sched {
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
     wait_waiters: BTreeMap<FutexKey, Vec<(u64, Box<VCpu>)>>,
+    /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
+    /// (§3.6 slice 1 — the handle → parked-fibers index revocation-unparks needs). Woken only by
+    /// [`Scheduler::cap_revoke`] with a negative errno; the wait_waiters/notify pair is the template.
+    /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
+    /// between this map and `runnable` as a pointer, never by value.)
+    #[allow(clippy::vec_box)]
+    cap_waiters: BTreeMap<i32, Vec<Box<VCpu>>>,
     /// Min-heap of `(deadline, waiter id, futex key)` for timing out `wait`s.
     timers: BinaryHeap<Reverse<(Instant, u64, FutexKey)>>,
     /// OS-thread handles of spawned workers (joined by `drive` at the end).
@@ -3698,6 +3717,25 @@ impl Scheduler {
         let n = woken.len() as u32;
         for mut v in woken {
             v.pending = Some(Pending::Wait(WAIT_WOKEN));
+            s.runnable.push_back(v);
+        }
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
+    /// §3.6 revocation-unparks: wake **every** fiber parked in a capability call through
+    /// `handle`, completing each one's call with the negative errno `status` (probeable on the
+    /// fiber's own error path — never a trap, never a kill). Called at the revocation act
+    /// (`Stream.close` from a sibling fiber); returns how many were woken. Granularity is
+    /// per-connection by design: all fibers parked through the handle wake together.
+    fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
+        let mut s = self.lock();
+        let woken = s.cap_waiters.remove(&handle).unwrap_or_default();
+        let n = woken.len() as u32;
+        for mut v in woken {
+            v.pending = Some(Pending::CapResult(status));
             s.runnable.push_back(v);
         }
         if n > 0 {
@@ -4044,6 +4082,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 sched.work.notify_all(); // let idle workers recompute their timer deadline
             }
         }
+        Step::Park(Blocked::CapRead { handle }) => {
+            // §3.6 slice 1: park inside a capability call, keyed by the handle. The
+            // park-vs-revoke race mirrors the futex compare-and-park: enqueue under the
+            // scheduler lock, then re-check the handle's liveness — a `cap_revoke` that ran
+            // between the empty-read decision and this insertion found no waiter, so if the
+            // handle is now dead we wake ourselves with the same errno instead of parking
+            // forever. (Lock order sched → host; the revoke path holds neither.)
+            let mut s = sched.lock();
+            let live = v
+                .host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .handle_live(handle);
+            if live {
+                s.cap_waiters.entry(handle).or_default().push(v);
+            } else {
+                v.pending = Some(Pending::CapResult(CAP_REVOKED));
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+            }
+        }
         Step::Yield => {
             // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
             let mut s = sched.lock();
@@ -4074,6 +4133,15 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.notify(key, count),
             SchedRef::Det(d) => d.notify(key, count),
+        }
+    }
+    /// §3.6 revocation-unparks: wake every fiber parked in a capability call through `handle`
+    /// with the negative errno `status` ([`Scheduler::cap_revoke`]). The explorer has no
+    /// cap-call parks (a `Blocked::CapRead` there fails closed at the park), so it is a no-op.
+    fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
+        match self {
+            SchedRef::Real(s) => s.cap_revoke(handle, status),
+            SchedRef::Det(_) => 0,
         }
     }
     /// Take a finished child's outcome (for a resuming `thread.join`).
@@ -4498,6 +4566,28 @@ impl SchedDriver {
                             vcpu: v,
                         });
                     }
+                }
+                // Blocking stream reads are not part of the explored model (the same restriction
+                // as the other non-resumable drivers: nothing external can feed stdin inside an
+                // exploration, so the park could never wake). Fail closed rather than wedge.
+                Step::Park(Blocked::CapRead { .. }) => {
+                    let id = v.id;
+                    drop(v);
+                    let mut s = det.lock();
+                    if let Some(parent) = s.join_waiters.remove(&id) {
+                        s.runnable.push(parent);
+                    }
+                    s.results.insert(
+                        id,
+                        Outcome {
+                            result: Err(Trap::CapFault),
+                            mem: None,
+                            fuel: 0,
+                            trap_bt: Vec::new(),
+                            trap_fiber: None,
+                        },
+                    );
+                    s.live -= 1;
                 }
                 Step::Yield => {
                     // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU
@@ -5866,6 +5956,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let top = v.frames.len() - 1;
             v.frames[top].vals.push(Reg::from_i64(value));
         }
+        Some(Pending::CapResult(status)) => {
+            // §3.6 revocation-unparks: the handle this fiber's capability call was parked
+            // through was revoked. The call completes with the negative errno — the fiber
+            // resumes on its own error path (no trap, no kill; cancellation is a value).
+            let top = v.frames.len() - 1;
+            v.frames[top].vals.push(Reg::from_i64(status));
+        }
         None => {}
     }
 
@@ -7005,6 +7102,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results = hg.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    // §3.6 slice 1 — the two revocation-unparks hooks, direct-call route:
+                    // (a) a blocking stream read with no data parks THIS fiber, keyed by the
+                    //     handle it is parked through (the dispatch's placeholder result is
+                    //     discarded; the wake delivers the real one via `Pending::CapResult`);
+                    if hg.take_stdin_parked() {
+                        drop(hg);
+                        return Ok(Inner::Park(Blocked::CapRead { handle: h }));
+                    }
+                    // (b) a `Stream.close` that just revoked `h` wakes every sibling fiber
+                    //     parked in a call through it, each completing with a probeable errno.
+                    let closed = *type_id == cap_id::STREAM && *op == 2;
+                    drop(hg);
+                    if closed {
+                        sched.cap_revoke(h, CAP_REVOKED);
+                    }
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7060,6 +7172,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *import | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
+                    // Import-routed blocking reads don't park this slice (slot-parked calls are
+                    // the §3.6 caller-parking slice); discard the flag so it can't leak into a
+                    // later direct call's park decision — the read keeps its historical 0-EOF.
+                    let _ = hg.take_stdin_parked();
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7077,6 +7193,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                    let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7100,6 +7217,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *ty | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
+                    let _ = hg.take_stdin_parked(); // no dyn-parking this slice (see call.import)
                     for (s, tyv) in results.iter().zip(&sig.results) {
                         frames[top]
                             .vals
@@ -9394,6 +9512,10 @@ pub fn builtin_iface_shape(id: u32) -> Option<Vec<(&'static str, FuncType)>> {
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal.
 const ENOMEM: i64 = -12; // resource quota exhausted (e.g. the Jit compile budget)
+/// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
+/// call returns when the handle it was parked through is revoked out from under it. Probeable
+/// on the fiber's own error path — never a trap (D42: errors return, traps stay for escape).
+const CAP_REVOKED: i64 = -9;
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
@@ -12247,6 +12369,18 @@ impl Host {
         self.table[slot].entry = None;
     }
 
+    /// Whether `handle` still names a live table entry (its slot has an entry and the packed
+    /// generation matches). The §3.6 revocation-unparks park-vs-revoke race check: a fiber about
+    /// to park through a handle confirms it wasn't revoked in the window since its empty read —
+    /// authority-neutral (a `bool`, no binding escapes), and deliberately type-blind (liveness,
+    /// not typing, is the question).
+    pub fn handle_live(&self, handle: i32) -> bool {
+        let slot = (handle as u32 as usize) & (CAP - 1);
+        let gen = (handle as u32) >> CAP_LOG2;
+        let s = &self.table[slot];
+        s.entry.is_some() && (s.generation & GEN_MASK) == gen
+    }
+
     /// Resolve a handle at a `cap.call` use site (§3c) — **the security hinge**: mask
     /// the index into the host-owned table (never branch), then re-check the entry's
     /// interface `type_id` and `generation`. A forged / closed / wrong-type index is
@@ -12688,6 +12822,18 @@ impl Host {
             return self.self_dispatch(op, args);
         }
         match self.resolve(handle, type_id)? {
+            // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
+            // turned inward: the holder hangs up). Null the slot entry so every later use of the
+            // handle is the clean D37 use-after-close fault the docs always promised, and so a
+            // sibling fiber parked in a read through this handle can be woken by the caller
+            // (the eval loop calls `Scheduler::cap_revoke` after this dispatch returns).
+            // Handled here rather than in `stream_op` because closing needs the *handle*,
+            // which the per-role op body deliberately never sees. Uniform across backends —
+            // every backend routes through this one dispatch.
+            Binding::Stream(_) if op == 2 => {
+                self.close(handle);
+                Ok(vec![0])
+            }
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
             Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
             // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
