@@ -620,7 +620,6 @@ fn translate_impl(
         caps.entry("vm_map".to_string()).or_insert_with(|| {
             let i = imports.len() as u32;
             imports.push(svm_ir::Import {
-                ns: String::new(),
                 name: "vm_map".to_string(),
                 // Interned into the type section at module build (`finalize_import_shapes`).
                 shape: svm_ir::ImportShape::Func(u32::MAX),
@@ -3156,7 +3155,6 @@ fn collect_cap_imports(
                     import_of.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
                         imports.push(svm_ir::Import {
-                            ns: String::new(),
                             name: import.to_string(),
                             shape: svm_ir::ImportShape::Func(u32::MAX),
                             mode: svm_ir::ImportMode::Required,
@@ -3211,7 +3209,6 @@ fn register_vm_memory_imports(
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
                         imports.push(svm_ir::Import {
-                            ns: String::new(),
                             name: import.to_string(),
                             shape: svm_ir::ImportShape::Func(u32::MAX),
                             mode: svm_ir::ImportMode::Required,
@@ -3260,7 +3257,6 @@ fn register_vm_io_imports(
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
                         imports.push(svm_ir::Import {
-                            ns: String::new(),
                             name: import.to_string(),
                             shape: svm_ir::ImportShape::Func(u32::MAX),
                             mode: svm_ir::ImportMode::Required,
@@ -3310,7 +3306,6 @@ fn register_vm_stream_imports(
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
                         imports.push(svm_ir::Import {
-                            ns: String::new(),
                             name: import.to_string(),
                             shape: svm_ir::ImportShape::Func(u32::MAX),
                             mode: svm_ir::ImportMode::Required,
@@ -3363,7 +3358,6 @@ fn register_vm_jit_imports(
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
                         imports.push(svm_ir::Import {
-                            ns: String::new(),
                             name: import.to_string(),
                             shape: svm_ir::ImportShape::Func(u32::MAX),
                             mode: svm_ir::ImportMode::Required,
@@ -3425,7 +3419,6 @@ fn register_vm_region_imports(
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
                         imports.push(svm_ir::Import {
-                            ns: String::new(),
                             name: import.to_string(),
                             shape: svm_ir::ImportShape::Func(u32::MAX),
                             mode: svm_ir::ImportMode::Required,
@@ -4058,7 +4051,7 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
             Inst::ConstI64(!(page - 1)), // v6 = ~(PAGE-1)
             i64and(5, 6),                // v7 = limit (page-aligned)
             Inst::ConstI64(0),           // v8 (spacer — keeps the block's numbering)
-            Inst::ConstI32(0),           // v9 = vestigial handle (slot is the dispatch)
+            Inst::ConstI32(0),           // v9 (spacer — keeps the block's numbering; ex-handle)
             Inst::IntBin {
                 ty: IntTy::I64,
                 op: BinOp::Sub,
@@ -4070,7 +4063,6 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
                 import: vm_map_import,
                 op: 0,
                 sig: import_sig("vm_map"),
-                handle: 9,
                 args: vec![3, 10, 11],
             }, // v12 = map result (ignored)
             Inst::ConstI64(HEAP_TOP as i64), // v13
@@ -11436,12 +11428,10 @@ fn lower_vm_builtin(
             if name != "__vm_unmap" {
                 args.push(ctx.operand_i32(vm_arg(c, 2)?)?); // prot
             }
-            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
                 sig: import_sig(import),
-                handle,
                 args,
             });
             ctx.bind_dest(&c.dest, r);
@@ -11449,12 +11439,10 @@ fn lower_vm_builtin(
         }
         "__vm_page_size" => {
             let imp = ctx.import_of("vm_page_size")?;
-            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
                 sig: import_sig("vm_page_size"),
-                handle,
                 args: vec![],
             });
             ctx.bind_dest(&c.dest, r);
@@ -11471,12 +11459,10 @@ fn lower_vm_builtin(
             if name == "__vm_io_submit_async" {
                 args.push(ctx.operand_i64(vm_arg(c, 2)?)?); // the completion counter pointer
             }
-            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
                 sig: import_sig(import),
-                handle,
                 args,
             });
             ctx.bind_dest(&c.dest, r);
@@ -11524,12 +11510,10 @@ fn lower_vm_builtin(
             for i in 0..argc {
                 args.push(ctx.operand_i64(vm_arg(c, i)?)?);
             }
-            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
                 sig: import_sig(import),
-                handle,
                 args,
             });
             ctx.bind_dest(&c.dest, r);
@@ -11542,12 +11526,10 @@ fn lower_vm_builtin(
         "__vm_region_create" => {
             let imp = ctx.import_of("vm_region_create")?;
             let len = ctx.operand_i64(vm_arg(c, 0)?)?;
-            let handle = ctx.push(Inst::ConstI32(0));
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
                 sig: import_sig("vm_region_create"),
-                handle,
                 args: vec![len],
             });
             ctx.bind_dest(&c.dest, r);
@@ -11883,8 +11865,6 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
     // The primitive capability mapping (write/read/exit): drop the dropped args, map the rest.
     if let Some(spec) = cap_spec(name) {
         let import = ctx.import_of(spec.name)?;
-        // Vestigial handle operand (the slot is the dispatch; retired at the next format bump).
-        let handle = ctx.push(Inst::ConstI32(0));
         let mut args = Vec::new();
         for (a, _attrs) in c.arguments.iter().skip(spec.drop_args) {
             args.push(ctx.operand(a)?);
@@ -11893,7 +11873,6 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             import,
             op: 0,
             sig: spec.sig,
-            handle,
             args,
         };
         // A non-void result (write/read) is a value to bind; `exit` is void (`push_effect`).
@@ -15272,12 +15251,10 @@ impl<'a> BlockCtx<'a> {
             return Ok(new_off);
         }
         let import = self.import_of("write")?;
-        let handle = self.push(Inst::ConstI32(0));
         Ok(self.push(Inst::CallImport {
             import,
             op: 0,
             sig: import_sig("write"),
-            handle,
             args: vec![buf, len],
         }))
     }

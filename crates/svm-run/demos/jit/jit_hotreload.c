@@ -78,7 +78,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 7); // format v7 (§3.5: shape-referencing imports + named interface elements)
+  eb(buf, 8); // format v8 (single-string import names; call.sym link form)
   eb(buf, 1);
   eb(buf, 16);
   eb(buf, 0);
@@ -119,7 +119,6 @@ static long emit_adder(char *buf, long k) {
 static long emit_caller(char *buf) {
   emit_header(buf);
   eb(buf, 1); // 1 import: ("", "f") -> func type 0 (v7)
-  eb(buf, 0); // ns length (unnamespaced)
   eb(buf, 1);
   eb(buf, 'f');
   eb(buf, 0);   // shape tag: func
@@ -139,9 +138,8 @@ static long emit_caller(char *buf) {
   eb(buf, 2);    // 2 instructions
   eb(buf, 0x10); // v2 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);
-  eb(buf, 0x7C); // v3 = call.import "f" (import 0) (v0, v1)
+  eb(buf, 0x0E); // v3 = call.sym "f" (import 0) (v0, v1) — v8 link-form placeholder
   uleb(buf, 0);
-  uleb(buf, 0); // consumer-local op 0 (v7)
   emit_i64_pair_sig(buf);
   uleb(buf, 2); // handle = v2
   eb(buf, 2);   // 2 args

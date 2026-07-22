@@ -470,16 +470,71 @@ fn verify_func(
                 types.extend_from_slice(&sig.results);
                 continue;
             }
+            // §7/§22 symbolic call (v8): `call.sym` verifies exactly like a *flat* manifest
+            // import call (op 0), plus its legacy handle operand (i32, ignored by manifest
+            // dispatch — it is live only to the linker: the Cap symbol's runtime handle and
+            // the `Slot` patch target). Executable when the instance binds the name; the
+            // linker's rewrite target when resolved first. One rule, both consumers.
+            if let Inst::CallSym {
+                import,
+                sig,
+                handle,
+                args,
+            } = inst
+            {
+                if imports.get(*import as usize).is_none() {
+                    return Err(VerifyError::UnresolvedImport {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                let Some(want) = import_op_sig(imports, type_section, *import, 0) else {
+                    return Err(VerifyError::ImportOpOutOfRange {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                        op: 0,
+                    });
+                };
+                if want != sig {
+                    return Err(VerifyError::ImportSigMismatch {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                {
+                    let cx = Cx {
+                        fi,
+                        bi,
+                        types: &types,
+                    };
+                    cx.expect(*handle, ValType::I32)?;
+                    if args.len() != sig.params.len() {
+                        return Err(VerifyError::CallArgCountMismatch {
+                            func: fi,
+                            block: bi,
+                            expected: sig.params.len(),
+                            found: args.len(),
+                        });
+                    }
+                    for (a, want) in args.iter().zip(&sig.params) {
+                        cx.expect(*a, *want)?;
+                    }
+                }
+                types.extend_from_slice(&sig.results);
+                continue;
+            }
             // §7 executable named import (IMPORTS.md phase 1): the index must name a declared
             // import and the call's self-describing `sig` must equal the manifest's — the
-            // canonical-interface check `cap.call` cannot have (its sig is self-asserted). The
-            // handle operand is typed like `cap.call`'s (vestigial in static dispatch, but still
-            // a value reference that must be well-formed). Arg/result typing mirrors `cap.call`.
+            // canonical-interface check `cap.call` cannot have (its sig is self-asserted).
+            // No handle operand (v8): the slot binding identifies the capability. Arg/result
+            // typing mirrors `cap.call`.
             if let Inst::CallImport {
                 import,
                 op,
                 sig,
-                handle,
                 args,
             } = inst
             {
@@ -513,7 +568,6 @@ fn verify_func(
                         bi,
                         types: &types,
                     };
-                    cx.expect(*handle, ValType::I32)?;
                     if args.len() != sig.params.len() {
                         return Err(VerifyError::CallArgCountMismatch {
                             func: fi,
@@ -813,6 +867,8 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
             // manifest's declared signature, so the self-describing copy is authoritative here.
             Inst::CallImport { sig, .. } => types.extend_from_slice(&sig.results),
             Inst::CallImportDyn { sig, .. } => types.extend_from_slice(&sig.results),
+            // Link-form placeholder: rejected by `verify_func`, but the collector stays total.
+            Inst::CallSym { sig, .. } => types.extend_from_slice(&sig.results),
             // Phase-2 attach: one `i32` status.
             Inst::ImportAttach { .. } => types.push(ValType::I32),
             // §3.5 single-i32 appends.
@@ -971,9 +1027,12 @@ fn check_inst(
         Inst::ConstI64(_) => ValType::I64,
         // §7 executable named imports + phase-2 attach append their results in the
         // multi-result/call section of `verify_func` (manifest-checked there); unreachable here.
-        Inst::CallImport { .. } | Inst::CallImportDyn { .. } | Inst::ImportAttach { .. } => {
+        Inst::CallImport { .. }
+        | Inst::CallImportDyn { .. }
+        | Inst::CallSym { .. }
+        | Inst::ImportAttach { .. } => {
             unreachable!(
-                "CallImport/CallImportDyn/ImportAttach handled before check_inst's value match"
+                "CallImport/CallImportDyn/CallSym/ImportAttach handled before check_inst's value match"
             )
         }
         // §7 reflection + §3.5 ops append their results in the multi-result section above;

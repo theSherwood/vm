@@ -1730,6 +1730,7 @@ pub fn coverage(inst: &Inst) -> Class {
         Inst::CapCall { .. }
         | Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
+        | Inst::CallSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount

@@ -1331,19 +1331,30 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         // with the reserved [`svm_ir::CAP_IMPORT_TYPE_ID`] and the import index as the op — the
         // host's dispatch translates it through the instantiation-time binding table, exactly as
         // the tree-walker and the JIT thunk do (one shared implementation, three backends in
-        // lockstep). The handle operand is vestigial (the binding carries the granted handle) but
-        // still a live register; pass it like `cap.call`'s — the dispatch ignores it.
+        // lockstep). No handle operand since v8 (the binding carries the granted handle); the
+        // dispatch never read one, so the register is simply absent.
         Inst::CallImport {
             import,
             op,
             sig,
-            handle,
             args,
         } => Op::CapCall {
             type_id: svm_ir::CAP_IMPORT_TYPE_ID,
             // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
             op: *import | (*op << 16),
-            handle: g(*handle),
+            handle: u32::MAX, // no operand (v8); the exec passes 0, the dispatch ignores it
+            args: args.iter().map(|a| g(*a)).collect(),
+            dst,
+            results: sig.results.clone().into(),
+        },
+        // §7/§22 symbolic call: when bound at instantiation it is a flat import dispatch
+        // (op 0); the legacy handle operand is a live register the dispatch ignores.
+        Inst::CallSym {
+            import, sig, args, ..
+        } => Op::CapCall {
+            type_id: svm_ir::CAP_IMPORT_TYPE_ID,
+            op: *import,
+            handle: u32::MAX,
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
             results: sig.results.clone().into(),
@@ -7937,7 +7948,13 @@ impl Vm {
                     // as i64 slots, results re-typed by the call's `sig.results`. Via [`HostCell`] so a
                     // parallel vCPU takes the shared-host lock only for this one call (4c-host); the
                     // cooperative path is exclusive (uncontended), so order is unchanged.
-                    let h = r!(*handle).i32();
+                    // `u32::MAX` = no handle operand (a v8 `call.import` — the slot binding
+                    // identifies the capability; the dispatch ignores the value).
+                    let h = if *handle == u32::MAX {
+                        0
+                    } else {
+                        r!(*handle).i32()
+                    };
                     let mut argv: Vec<i64> = Vec::with_capacity(args.len());
                     for a in args.iter() {
                         argv.push(r!(*a).i64());

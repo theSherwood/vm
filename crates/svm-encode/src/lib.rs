@@ -106,13 +106,14 @@ mod op {
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
-    pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, op (v7), sig, handle, arg idx-list
+    pub const CALL_IMPORT: u8 = 0x7C; // manifest capability call (v8): import idx, op, sig, arg idx-list
                                       // v7 §3.5 opcodes live in the low band (0x0A..=0x0D): every 0x1X..0xFX slot above is
                                       // either assigned or inside a computed range (CAST/FTOI/ITOF/LOAD families, SIMD prefix).
     pub const CALL_IMPORT_DYN: u8 = 0x0A; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
     pub const EXPORT_HANDLE: u8 = 0x0B; // v7 §3.5: impl-export idx -> i32 handle
     pub const CAP_SELF_TYPE_ID: u8 = 0x0C; // v7 §3.5: type idx -> i32 runtime type_id
     pub const CAP_SELF_COVERS: u8 = 0x0D; // v7 §3.5: handle operand, type idx -> i32 covers
+    pub const CALL_SYM: u8 = 0x0E; // v8 §7/§22 link-form symbolic call: import idx, sig, handle, arg idx-list
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
     pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
     pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
@@ -249,7 +250,7 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -354,10 +355,9 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     // symbols, for a loader to bind by name (DESIGN.md §22 host-assisted resolve).
     write_uleb(&mut out, m.imports.len() as u64);
     for imp in &m.imports {
-        // v7: two-level name (`ns` may be empty), then the shape reference — tag byte
-        // (0 = func, 1 = interface) + uleb type-section index. Signatures live in the type
-        // section; the wire never duplicates them.
-        write_str(&mut out, &imp.ns);
+        // v8: one name string (dotted namespacing by convention), then the shape reference —
+        // tag byte (0 = func, 1 = interface) + uleb type-section index. Signatures live in the
+        // type section; the wire never duplicates them.
         write_str(&mut out, &imp.name);
         match imp.shape {
             svm_ir::ImportShape::Func(t) => {
@@ -581,20 +581,34 @@ fn encode_func(out: &mut Vec<u8>, f: &Func) {
 
 fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
     match inst {
-        // §7 named import (v2 wire form), mirroring `cap.call` but carrying an import *index*
-        // (into the module's import section) instead of a bound `(type_id, op)`: the import stays
-        // unresolved on the wire so a loader can bind it by name (DESIGN.md §22 host-assisted resolve).
+        // Manifest capability call, mirroring `cap.call` but carrying an import *index* (into
+        // the module's import section) instead of a bound `(type_id, op)`: dispatch goes through
+        // the instance's slot binding — the bytes are never rewritten.
         Inst::CallImport {
             import,
             op,
             sig,
-            handle,
             args,
         } => {
             out.push(self::op::CALL_IMPORT);
             write_uleb(out, *import as u64);
-            // v7: the consumer-local op immediate (0 for flat imports).
+            // The consumer-local op immediate (0 for flat imports). No handle operand (v8):
+            // the slot binding identifies the capability.
             write_uleb(out, *op as u64);
+            write_types(out, &sig.params);
+            write_types(out, &sig.results);
+            write_idxs(out, args);
+        }
+        // v8 §7/§22 link-form symbolic call: the loader-ABI placeholder (never verifies;
+        // `resolve_imports_with` rewrites it before the gate).
+        Inst::CallSym {
+            import,
+            sig,
+            handle,
+            args,
+        } => {
+            out.push(self::op::CALL_SYM);
+            write_uleb(out, *import as u64);
             write_types(out, &sig.params);
             write_types(out, &sig.results);
             write_uleb(out, *handle as u64);
@@ -1682,9 +1696,8 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     let nimports = c.count()?;
     let mut imports = Vec::new();
     for _ in 0..nimports {
-        // v7: two-level name, then the shape tag + type-section index (range-checked by the
+        // v8: one name string, then the shape tag + type-section index (range-checked by the
         // verifier, not here — the decoder stays a pure fail-closed byte reader).
-        let ns = c.str()?;
         let name = c.str()?;
         let shape = match c.byte()? {
             0 => svm_ir::ImportShape::Func(c.uleb()? as u32),
@@ -1697,12 +1710,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
             1 => svm_ir::ImportMode::Rebindable,
             b => return Err(DecodeError::BadImportMode(b)),
         };
-        imports.push(Import {
-            ns,
-            name,
-            shape,
-            mode,
-        });
+        imports.push(Import { name, shape, mode });
     }
     // Export section (v3): mirrors the encoder. Grows on demand (the count is attacker-influenced).
     // Funcidx range + name uniqueness are the verifier's job, not the decoder's (it stays a pure,
@@ -2072,6 +2080,14 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::CALL_IMPORT => Inst::CallImport {
             import: c.idx()?,
             op: c.idx()?,
+            sig: FuncType {
+                params: decode_types(c)?,
+                results: decode_types(c)?,
+            },
+            args: decode_idxs(c)?,
+        },
+        op::CALL_SYM => Inst::CallSym {
+            import: c.idx()?,
             sig: FuncType {
                 params: decode_types(c)?,
                 results: decode_types(c)?,

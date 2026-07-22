@@ -103,7 +103,7 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 'V');
   eb(&e, 'M');
   eb(&e, 0);
-  eb(&e, 7); // format v7 (§3.5: shape-referencing imports + named interface elements)
+  eb(&e, 8); // format v8 (single-string import names; call.sym link form)
   // Memory descriptor: present, size_log2 16 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(&e, 1);

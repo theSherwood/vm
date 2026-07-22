@@ -493,9 +493,10 @@ is checked, not asserted. *Status: **landed**, notes:*
   shims with `Resolved::Cap` (handle-free, link-time symbol resolution) and
   the guests discover their own handles via `cap.self` reflection — §2.3's
   dynamic mode for the `Instantiator` ops, exercised end to end.*
-- *The vestigial `CallImport` handle operand is **kept** until the next
-  wire-format bump, exactly as §2.5 schedules it (frontends emit a dummy,
-  backends ignore it).*
+- *The vestigial `CallImport` handle operand was **kept** until the next
+  wire-format bump, exactly as §2.5 scheduled it — and retired there: at v8
+  `call.import` has no operand, and the symbolic spelling that still carries
+  one is its own instruction, `call.sym` (see the §3.5 as-built notes).*
 
 **The deletion phase is tracked work, not eventual cleanup.** The failure
 mode of this migration is not a wrong design; it is stalling at phase 1 and
@@ -665,8 +666,8 @@ type 0 func (i64, i64) -> (i64)
 type 1 func (i64) -> (i64)
 type 2 interface { read: 0, len: 1 }   ; op names required
 
-import 0 interface "env" "fs" 2 required   ; grouped: one slot, the whole requirement
-import 1 func "env" "log" 1 rebindable     ; flat: a singleton requirement
+import 0 interface "posix.fs" 2 required   ; grouped: one slot, the whole requirement
+import 1 func "app.log" 1 rebindable       ; flat: a singleton requirement
 
 func 0 () -> (i64) {
   block 0 {
@@ -674,8 +675,8 @@ func 0 () -> (i64) {
     v2 = i64.const 64
     v3 = call.import 0.read (v1, v2)   ; by name — resolved to the op index at parse
     v4 = call.import 0.1 (v1)          ; or positional — identical wire form
-    v5 = call.import [v6] interface 2 . read (v1, v2)  ; dynamic: handle from a
-    return v5                          ; value, requirement by type-section ref
+    v5 = call.import.dyn 2.read v6 (v1, v2)  ; dynamic: handle from a value,
+    return v5                          ; requirement by type-section ref
   }
 }
 ```
@@ -697,9 +698,21 @@ func 0 () -> (i64) {
   `export … interface` they are func indices — the kind keyword up front says
   which). One signature syntax, `(params) -> (results)`, appearing only in
   `type … func` entries; everything else references a type index.
-- **Import names are two-level**: `("env", "fs")` — the first level names the
-  provider binding point, the second the bundle (grouped) or op (flat).
-  Resolver vocabulary.
+- **An import name is one string; the core only compares it for equality**
+  (settled 2026-07-22, replacing the earlier two-level `("env", "fs")` form).
+  Namespacing is a *convention inside the string*, never a wire field: dotted
+  segments, most-significant first — `posix.fs`, `app.log` — with the `svm.`
+  prefix reserved for platform-defined interfaces. Wirer policy (forward
+  everything under `posix.`, grant by prefix) is prefix matching in binder
+  code, exactly where policy belongs; the mechanism stays name-blind. This is
+  the same discipline as D59 (names never enter type identity): structure in
+  names is for wirers, humans, and tooling — the core sees an atom. Precedent:
+  the component model's own IDs (`wasi:filesystem/types@0.2.0`) pack
+  namespace, package, and version into one structured string; wasm's separate
+  module level is an accident of the JS `importObject` embedding, not a
+  design principle. The v7 wire's vestigial `ns` field (nothing ever resolved
+  on it) is deleted at v8. The name pairs naturally with the op level:
+  `("posix.fs", "read")` — level 1 picks the object, level 2 the op.
 - **Index spaces stay per-section** (types / imports / funcs / exports).
   Import index = handle-table slot is ABI (plus the reserved child prefix);
   folding types into the import numbering would put a "subtract the
@@ -1024,30 +1037,58 @@ live run is over but its provider instance keeps serving both C's `log`
 calls and P's `count` calls — the counter they share lives in the instance,
 not in the finished run.
 
-**As built (2026-07-21, wire v7).** Everything above is landed — coverage binding with
-bind-time remaps (child manifests + host wiring; name-less legacy wires fall back to
-first-signature-position matching), the settled declaration surface (indices, kinds,
-required op names, `{ name: idx }` maps, legacy sugar kept where free), the `op`
-immediate, `call.import.dyn`, `export.handle` (memoized; one shared service state per
-domain), `cap.self.type_id`/`covers`, and `ValType::Cap` as an i32-width reservation —
-verified by both verifiers, executed by all three backends through the one generic
-dispatch (the import dispatch packs `slot | op << 16`; dyn packs `ty | op << 16` under
-a reserved id; the self extensions pack `selfop | idx << 8`). Deliberate deferrals,
-each with its reason recorded:
+**As built (2026-07-21, wire v7; polish pass + v8 bump 2026-07-22).** Everything above is
+landed — coverage binding with bind-time remaps (child manifests + host wiring;
+name-less legacy wires fall back to first-signature-position matching), the settled
+declaration surface (indices, kinds, required op names, `{ name: idx }` maps, legacy
+sugar kept where free), the `op` immediate, `call.import.dyn`, `export.handle`
+(memoized; one shared service state per domain), `cap.self.type_id`/`covers`, and
+`ValType::Cap` as an i32-width reservation — verified by both verifiers, executed by
+all three backends through the one generic dispatch (the import dispatch packs
+`slot | op << 16`; dyn packs `ty | op << 16` under a reserved id; the self extensions
+pack `selfop | idx << 8`). The polish pass closed two of the original deferrals: the
+printer emits the full settled body surface (`func N` checked labels, braced
+`block N (params) { … }` bodies, numeric branch targets), and `import.attach` on a
+grouped slot runs the coverage walk against the slot's retained requirement set,
+refreshing the op remap (non-covering or dead handles are a probeable `-EINVAL`;
+requirement-less slots keep the exact-`type_id` check). Remaining deferrals, each
+with its reason recorded:
 
-- **The vestigial `call.import` handle operand is retained**, not retired: it is *live*
-  in link-form modules (the §7 loader ABI reads it as the cap-symbol handle and the
-  `Slot` patch target), so its retirement rides the future migration of that ABI to
-  manifest/attach — not this bump.
+- **[BUILT 2026-07-22, wire v8] The handle operand is retired from `call.import`; the
+  `ns` field is deleted.** A manifest call site is now `call.import 0.read (args)` —
+  no operand; the slot binding identifies the capability — and an import name is one
+  string (dotted namespacing by convention; the two-string text form still parses,
+  joined with `.`). The as-built shape differs from the plan sketched here before the
+  build, in one instructive way. The plan said link-form cap symbols would "become
+  manifest imports"; that is impossible — a link-form cap call passes its *handle per
+  call site* (a C program's `write(fd, …)`: the symbol resolves the `(type_id, op)`,
+  the fd flows at runtime), which is dynamic dispatch and can never be a slot bound
+  once at instantiation. What was built instead is a **split**: `call.import` is the
+  clean manifest call, and the symbolic spelling is its own instruction, **`call.sym
+  <import> v<handle> (args)`** (wire 0x0E) — flat name, self-describing sig, and the
+  handle operand only *it* still carries. `call.sym` has one rule serving both of its
+  historical consumers: it verifies exactly like a flat `call.import` (op 0, plus the
+  i32 handle operand) and **executes as ordinary slot dispatch when the instance binds
+  the name** (operand ignored) — the chibicc emission stream instantiates unchanged —
+  while remaining the **linker's rewrite target** when `resolve_imports_with` runs
+  first (Cap → `cap.call` on the live operand; Slot → `call_indirect` via the
+  operand's patched `ConstI32`; Func → direct call). One spelling, two binding times:
+  a symbolic call binds by name at whichever binding act comes first. Emitters that
+  never link (svm-llvm, svm-wasm, the printer's canonical output) produce the clean
+  form only.
 - **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
   the type is reserved and lowers as `i32` everywhere.
-- **Text cosmetics** — braced numbered blocks, `func N` labels — are a follow-up print
-  pass; the parser accepts todays's bodies unchanged.
 - **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
   built-in shapes await their consumers; grouped binding works today through child
   manifests and host-side wiring.
-- **`import.attach` on grouped rebindable slots** currently takes the exact-id path
-  (attach-time coverage walk + remap refresh is a small follow-up).
+- **Legacy text forms still parse and should be retired.** The parser accepts the
+  pre-§3.5 spellings — `blockN(…):` indentation labels, unindexed `func` headers,
+  `export "name" N`, the `impl` offer spelling, inline-signature imports, name-inline
+  `call.import "name" (sig)`, bare-index interface/offer elements — as input sugar
+  only; the printer emits none of them. Retirement is a mechanical slice: migrate the
+  hand-written corpora (~2.5k legacy block labels across tests/examples, plus the
+  embedded text-IR generator strings in `svm-posix`) via parse-old → print-new, then
+  delete the legacy parse paths. No wire change; no functionality change.
 
 ### 3.6 The unified execution model — one world per domain  [DESIGNED 2026-07-21; subsumes the two-world split when the fiber slice lands]
 

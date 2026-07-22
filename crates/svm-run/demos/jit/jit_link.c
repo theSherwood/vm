@@ -85,7 +85,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 7);  // format v7 (§3.5: shape-referencing imports + named interface elements)
+  eb(buf, 8);  // format v8 (single-string import names; call.sym link form)
   eb(buf, 1);  // memory present
   eb(buf, 16); // size_log2 = 16 (must match this module's 64 KiB window)
   eb(buf, 0);  // no data segments
@@ -127,15 +127,14 @@ static long emit_service(char *buf) {
   return n_out;
 }
 
-// `client(a, b) = F(a, b) + 100`, where `F` is an **unresolved import** the loader binds by name.
-// Opcodes: 0x10 = i32.const (the import's handle placeholder — patched to the resolved slot and
-// reused as the call_indirect index), 0x7C = call.import, 0x11 = i64.const, 0x40 = i64.add.
-// Values: v0,v1 = params; v2 = handle const; v3 = F(a,b); v4 = 100; v5 = v3+v4.
+// `client(a, b) = F(a, b) + 100`, where `F` is an **unresolved symbol** the loader binds by name.
+// Opcodes: 0x10 = i32.const (the symbol's handle placeholder — patched to the resolved slot and
+// reused as the call_indirect index), 0x0E = call.sym (v8 link form), 0x11 = i64.const,
+// 0x40 = i64.add. Values: v0,v1 = params; v2 = handle const; v3 = F(a,b); v4 = 100; v5 = v3+v4.
 static long emit_client(char *buf) {
   emit_header(buf);
-  // Import section (v7): one import, ("", "F") : func -> type entry 0.
+  // Import section (v8): one import, "F" : func -> type entry 0.
   eb(buf, 1); // 1 import
-  eb(buf, 0); // ns length (unnamespaced)
   eb(buf, 1); // name length
   eb(buf, 'F');
   eb(buf, 0);             // shape tag: func
@@ -155,9 +154,8 @@ static long emit_client(char *buf) {
   eb(buf, 4);    // 4 instructions
   eb(buf, 0x10); // v2 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);
-  eb(buf, 0x7C);          // v3 = call.import "F" ...
+  eb(buf, 0x0E);          // v3 = call.sym "F" ... (v8 link-form placeholder)
   uleb(buf, 0);           //   import index 0
-  uleb(buf, 0);           //   consumer-local op 0 (v7)
   emit_i64_pair_sig(buf); //   self-describing sig (i64, i64) -> (i64)
   uleb(buf, 2);           //   handle operand = v2
   eb(buf, 2);             //   2 args

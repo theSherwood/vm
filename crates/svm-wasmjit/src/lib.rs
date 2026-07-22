@@ -1192,14 +1192,47 @@ pub fn outline_cap_calls(m: &mut Module) {
                     import,
                     op,
                     sig,
+                    args,
+                } = inst
+                {
+                    let g = base + wrappers.len() as u32;
+                    // Wrapper shape (v8): (...sig.params) -> sig.results — no handle operand;
+                    // the import index is an immediate, so it stays baked into the wrapper body.
+                    let params = sig.params.clone();
+                    let nparams = params.len() as u32;
+                    let wrapper_args: Vec<u32> = (0..nparams).collect();
+                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let block = Block {
+                        params: params.clone(),
+                        insts: vec![Inst::CallImport {
+                            import: *import,
+                            op: *op,
+                            sig: sig.clone(),
+                            args: wrapper_args,
+                        }],
+                        term: Terminator::Return(ret),
+                    };
+                    wrappers.push(Func {
+                        params,
+                        results: sig.results.clone(),
+                        blocks: vec![block],
+                    });
+                    let call_args = args.clone();
+                    *inst = Inst::Call {
+                        func: g,
+                        args: call_args,
+                    };
+                } else if let Inst::CallSym {
+                    import,
+                    sig,
                     handle,
                     args,
                 } = inst
                 {
                     let g = base + wrappers.len() as u32;
-                    // Same wrapper shape as `cap.call`: (handle: i32, ...sig.params) -> sig.results.
-                    // The import index is an immediate, so it stays baked into the wrapper body; the
-                    // (vestigial) handle operand is threaded through like `cap.call`'s live one.
+                    // §7/§22 symbolic call: same shape as the old handle-carrying form —
+                    // (handle: i32, ...sig.params) -> sig.results; the dispatch ignores the
+                    // handle, but it is a live call-site register to thread through.
                     let mut params = Vec::with_capacity(1 + sig.params.len());
                     params.push(ValType::I32);
                     params.extend(sig.params.iter().copied());
@@ -1208,9 +1241,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
                     let block = Block {
                         params: params.clone(),
-                        insts: vec![Inst::CallImport {
+                        insts: vec![Inst::CallSym {
                             import: *import,
-                            op: *op,
                             sig: sig.clone(),
                             handle: 0,
                             args: wrapper_args,

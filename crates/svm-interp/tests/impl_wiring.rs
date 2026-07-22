@@ -308,7 +308,7 @@ fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
     let manifest = |specs: &[(&str, Vec<ValType>, ImportMode)]| {
         let mut m = svm_ir::Module::default();
         for (name, params, mode) in specs {
-            m.add_func_import("", *name, sig(params.clone(), vec![ValType::I64]), *mode);
+            m.add_func_import(*name, sig(params.clone(), vec![ValType::I64]), *mode);
         }
         (m.imports, m.types)
     };
@@ -693,4 +693,67 @@ fn reflection_and_dyn_dispatch_run_over_the_registered_self_module() {
     // An unregistered domain fails closed (probeable, never a hang).
     let mut bare = Host::new();
     assert!(bare.reify_export(0).is_err(), "no self module ⇒ CapFault");
+}
+
+#[test]
+fn grouped_attach_runs_the_coverage_walk_and_refreshes_the_remap() {
+    // A grouped **rebindable** slot starts empty; the guest later discovers a capability and
+    // attaches it. §3.5: attach is the coverage walk against the slot's retained manifest
+    // requirement — a covering offer binds (remap refreshed), a non-covering one is -EINVAL.
+    let pm = Arc::new(provider_module());
+    let mut parent = Host::new();
+    parent.set_self_module(&pm);
+    let h = parent.reify_export(0).expect("reify");
+    let (mut child, _ci, _ca) = parent
+        .spawn_named_child(&[("later".into(), h)], 1 << 16)
+        .expect("spawn");
+
+    // The consumer requires only `dbl`, rebindable, under a name nothing matches at spawn.
+    let cm = svm_text::parse_module(
+        "type 0 func (i64) -> (i64)\n\
+         type 1 interface { dbl: 0 }\n\
+         import 0 interface \"nothing\" 1 rebindable\n\n\
+         func (i64) -> (i64) {\n\
+         block0(va: i64):\n\
+           vh = i32.const 0\n\
+           vr = call.import 0.dbl vh (va)\n\
+           return vr\n\
+         }\n",
+    )
+    .expect("consumer parses");
+    child
+        .bind_child_manifest(&cm.imports, &cm.types)
+        .expect("rebindable withhold = empty slot");
+    assert!(child.import_binding(0).is_none(), "starts empty");
+
+    // A non-covering attach (a plain module grant is no guest impl) fails closed, probeable.
+    let bogus = child.grant_module(&cm);
+    let r = child
+        .cap_dispatch_slots(
+            svm_ir::CAP_IMPORT_ATTACH_TYPE_ID,
+            0,
+            0,
+            &[bogus as i64],
+            None,
+        )
+        .expect("attach dispatch itself succeeds");
+    assert!(r[0] < 0, "non-covering handle refuses with -errno");
+    assert!(child.import_binding(0).is_none(), "slot still empty");
+
+    // The discovered offer covers the subset requirement: attach binds + remaps [0 -> 1].
+    let disc = child.resolve_cap_name("later").expect("discovered");
+    let r = child
+        .cap_dispatch_slots(
+            svm_ir::CAP_IMPORT_ATTACH_TYPE_ID,
+            0,
+            0,
+            &[disc as i64],
+            None,
+        )
+        .expect("attach dispatch");
+    assert_eq!(r, vec![0], "covering attach succeeds");
+    let args = [Value::I64(21)];
+    let mut fuel = 1_000_000u64;
+    let tree = svm_interp::run_with_host(&cm, 0, &args, &mut fuel, &mut child);
+    assert_eq!(tree, Ok(vec![Value::I64(42)]), "attached remap dispatch");
 }

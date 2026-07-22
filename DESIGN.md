@@ -2571,9 +2571,10 @@ missing symbol) is caught by re-verification, never trusted. Two flavors, both b
   reaches a function it does not share an index space with through the **shared `call_indirect` table**
   at a runtime-assigned slot. Both directions work: plugin→host and old/loaded→newly-installed.
 
-**The lowering primitive** is `svm_ir::resolve_imports_with`: each `CallImport` rewrites **1:1** (no
+**The lowering primitive** is `svm_ir::resolve_imports_with`: each `CallSym` (the v8 symbolic-call
+spelling; a bound `call.sym` also executes directly as flat import dispatch) rewrites **1:1** (no
 value renumbering) to `Cap(ResolvedCap)`→`cap.call` (the §7 case), `Func(FuncIdx)`→a direct `call`
-(static), or `Slot(u32)`→`call_indirect <slot>` (dynamic; the import's handle operand must be a
+(static), or `Slot(u32)`→`call_indirect <slot>` (dynamic; the symbol's handle operand must be a
 `ConstI32` placeholder, patched to the slot and reused as the index). Unresolved/ill-typed → fail-closed.
 
 **Serializable imports (codec v2).** So a unit can be shipped as a `.so` with *undefined references*,

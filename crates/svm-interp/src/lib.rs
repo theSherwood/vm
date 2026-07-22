@@ -423,10 +423,12 @@ impl DebugShared {
             // An executable `call.import` (IMPORTS.md phase 1) is a capability boundary too;
             // reported under the reserved import-dispatch type_id with the import index as the op
             // (the concrete binding is instantiation state, not visible at this layer).
-            Inst::CallImport { import, .. } if self.cap_stops => Some(StopReason::CapCall {
-                type_id: svm_ir::CAP_IMPORT_TYPE_ID,
-                op: *import,
-            }),
+            Inst::CallImport { import, .. } | Inst::CallSym { import, .. } if self.cap_stops => {
+                Some(StopReason::CapCall {
+                    type_id: svm_ir::CAP_IMPORT_TYPE_ID,
+                    op: *import,
+                })
+            }
             _ => None,
         }
     }
@@ -7021,6 +7023,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // operand is ignored (the binding carries the real handle).
                 Inst::CallImport {
                     import, sig, args, ..
+                }
+                | Inst::CallSym {
+                    import, sig, args, ..
                 } if matches!(
                     host.lock().unwrap_or_else(|e| e.into_inner()).import_binding(*import),
                     Some(b) if b.type_id == iface::JIT && matches!(b.op, 1 | 3 | 4)
@@ -7055,6 +7060,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *import | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
+                    for (s, ty) in results.iter().zip(&sig.results) {
+                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                    }
+                }
+                // §7/§22 symbolic call: when the instance bound the name, dispatch exactly like
+                // a flat `call.import` (op 0); the legacy handle operand is ignored.
+                Inst::CallSym {
+                    import, sig, args, ..
+                } => {
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args {
+                        argv.push(get(&frames[top].vals, *a)?.i64());
+                    }
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results =
+                        hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7982,8 +8004,10 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::ConstI64(c) => Reg::from_i64(*c),
         // §7 executable named imports (+ phase-2 attach) need the host's import-binding table,
         // so they're serviced in the eval loop (like `cap.call`), never in this pure-op helper.
+        // `CallSym` (the v8 link-form placeholder) never verifies, so it can never execute.
         Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
+        | Inst::CallSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
@@ -10031,6 +10055,10 @@ pub type HostFnRegion = Box<
 /// ([`Host::wire_impl`]) — declaring an offer confers nothing; this entry existing in a domain's
 /// table is what moves authority. Op `i` runs `funcs[ops[i]]` as a **v1 pure dispatch** (see
 /// [`Binding::GuestImpl`]): windowless, empty powerbox, fixed fuel — arguments in, results out.
+/// A slot's retained §3.5 requirement set: the manifest's `(names, sigs)`, shared with the
+/// attach-time coverage walk.
+type ImportReq = Arc<(Vec<String>, Vec<FuncType>)>;
+
 /// §3.5 coverage walk: for every required `(name, sig)`, find the same-named,
 /// signature-equal provider op; extra provider ops are ignored. Name-less providers (legacy
 /// wires) fall back to exact positional matching. Returns the consumer→provider op remap, or
@@ -10214,6 +10242,11 @@ pub struct Host {
     /// present, maps consumer-local op indices to provider op indices (frozen at the binding
     /// act by the coverage walk). `None` = flat binding (consumer op must be 0).
     import_remaps: Vec<Option<Arc<[u32]>>>,
+    /// §3.5 per-slot **requirement sets** `(names, sigs)`, parallel to `import_bindings`,
+    /// retained from the manifest at the binding act so a later `import.attach` can run the
+    /// coverage walk against the attached capability (and refresh the slot's remap). `None` =
+    /// no requirement recorded — attach falls back to the legacy exact-`type_id` check.
+    import_reqs: Vec<Option<ImportReq>>,
     /// §3.5 **self-module registration**: the running module's type-section interfaces, offers,
     /// and function table, registered at run setup so `call.import.dyn`, `cap.self.type_id`,
     /// `cap.self.covers`, and `export.handle` resolve through one host-side entry on all three
@@ -10493,6 +10526,7 @@ impl Host {
             guest_impls: Vec::new(),
             iface_intern: Vec::new(),
             import_remaps: Vec::new(),
+            import_reqs: Vec::new(),
             self_module: None,
             self_instance: None,
             self_reified: BTreeMap::new(),
@@ -10599,11 +10633,13 @@ impl Host {
         };
         let mut bindings = Vec::with_capacity(imports.len());
         let mut remaps: Vec<Option<Arc<[u32]>>> = Vec::with_capacity(imports.len());
+        let mut reqs: Vec<(Vec<String>, Vec<FuncType>)> = Vec::with_capacity(imports.len());
         for (i, im) in imports.iter().enumerate() {
             let rebindable = im.mode == svm_ir::ImportMode::Rebindable;
             let Some((req_names, req_sigs)) = requirement(im) else {
                 return Err(i as u32);
             };
+            reqs.push((req_names.clone(), req_sigs.clone()));
             // §3.3: a named offer grant binds directly — the parent's wrap/override. §3.5: the
             // match is the coverage walk (name-keyed against a named provider; exact positional
             // against a name-less legacy wire), producing the slot's frozen op remap.
@@ -10649,6 +10685,11 @@ impl Host {
                 self.set_import_remap(i, r);
             }
         }
+        // Retain every slot's requirement so a later `import.attach` coverage-checks against
+        // the manifest's declared shape (§3.5), not just the current binding's type_id.
+        for (i, (names, sigs)) in reqs.into_iter().enumerate() {
+            self.set_import_req(i, names, sigs);
+        }
         Ok(())
     }
 
@@ -10682,6 +10723,7 @@ impl Host {
             "an import binding can never target the import-dispatch pseudo-type_id"
         );
         self.import_remaps = vec![None; bindings.len()];
+        self.import_reqs = vec![None; bindings.len()];
         self.import_bindings = bindings;
     }
 
@@ -11545,6 +11587,14 @@ impl Host {
     pub fn set_import_remap(&mut self, slot: usize, remap: Arc<[u32]>) {
         if let Some(r) = self.import_remaps.get_mut(slot) {
             *r = Some(remap);
+        }
+    }
+
+    /// §3.5: retain slot `slot`'s manifest requirement set so `import.attach` can coverage-check
+    /// an attached capability against it. No-op for an out-of-range slot.
+    pub fn set_import_req(&mut self, slot: usize, names: Vec<String>, sigs: Vec<FuncType>) {
+        if let Some(r) = self.import_reqs.get_mut(slot) {
+            *r = Some(Arc::new((names, sigs)));
         }
     }
 
@@ -12460,6 +12510,35 @@ impl Host {
                 return Err(Trap::CapFault);
             }
             let new_handle = *args.first().ok_or(Trap::Malformed)? as i32;
+            // §3.5: when the slot's manifest requirement was retained, attach is the coverage
+            // walk — the attached capability must cover the declared `(name, sig)` set (exact
+            // shape, or a covering wired guest impl), and the slot's remap refreshes with the
+            // binding. Without a recorded requirement, the legacy exact-`type_id` check stands.
+            if let Some(req) = self.import_reqs.get(slot).cloned().flatten() {
+                let (req_names, req_sigs) = &*req;
+                let Some(tid) = self.type_id_of(new_handle) else {
+                    return Ok(vec![EINVAL]); // dead/forged — probeable, never a trap
+                };
+                let exact = tid == self.intern_interface(req_sigs);
+                let cover = if exact {
+                    Some((0..req_sigs.len() as u32).collect::<Arc<[u32]>>())
+                } else {
+                    self.resolve_guest_impl(new_handle).ok().and_then(|e| {
+                        let (en, es) = (Arc::clone(&e.names), Arc::clone(&e.sigs));
+                        coverage_remap(req_names, req_sigs, &en, &es)
+                    })
+                };
+                let Some(remap) = cover else {
+                    return Ok(vec![EINVAL]); // does not cover — fail closed, probeable
+                };
+                let b = &mut self.import_bindings[slot];
+                b.type_id = tid;
+                b.op = remap[0];
+                b.handle = new_handle;
+                b.bound = true;
+                self.import_remaps[slot] = Some(remap);
+                return Ok(vec![0]);
+            }
             if self.resolve(new_handle, b.type_id).is_err() {
                 return Ok(vec![EINVAL]);
             }

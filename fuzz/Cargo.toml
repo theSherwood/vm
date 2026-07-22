@@ -148,5 +148,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "coverage_walk"
+path = "fuzz_targets/coverage_walk.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

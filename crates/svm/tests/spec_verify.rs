@@ -407,7 +407,6 @@ fn directed_rule_rejects() {
                 params: vec![],
                 results: vec![],
             },
-            handle: 0,
             args: vec![],
         }],
         T::Return(vec![]),
@@ -423,16 +422,12 @@ fn directed_rule_rejects() {
         func(
             vec![],
             vec![],
-            vec![
-                Inst::ConstI32(0), // vestigial handle operand (IMPORTS.md §2.5)
-                Inst::CallImport {
-                    import: 0,
-                    op: 0,
-                    sig,
-                    handle: 0,
-                    args: vec![],
-                },
-            ],
+            vec![Inst::CallImport {
+                import: 0,
+                op: 0,
+                sig,
+                args: vec![],
+            }],
             T::Return(vec![]),
         )
     };
@@ -441,21 +436,21 @@ fn directed_rule_rejects() {
         results: vec![],
     };
     let mut m = module(vec![import_call(unit_sig.clone())]);
-    m.add_func_import("", "ping", unit_sig.clone(), svm_ir::ImportMode::Required);
+    m.add_func_import("ping", unit_sig.clone(), svm_ir::ImportMode::Required);
     accept(&m, "manifest-bearing call.import");
     // Same module, call-site sig disagrees with the manifest's declaration.
     let mut m = module(vec![import_call(FuncType {
         params: vec![],
         results: vec![V::I32],
     })]);
-    m.add_func_import("", "ping", unit_sig.clone(), svm_ir::ImportMode::Required);
+    m.add_func_import("ping", unit_sig.clone(), svm_ir::ImportMode::Required);
     reject(&m, "import sig mismatch", |e| {
         matches!(e, VerifyError::ImportSigMismatch { .. })
     });
     // Two manifest entries sharing a name.
     let mut m = module(vec![import_call(unit_sig.clone())]);
-    m.add_func_import("", "ping", unit_sig.clone(), svm_ir::ImportMode::Required);
-    m.add_func_import("", "ping", unit_sig, svm_ir::ImportMode::Required);
+    m.add_func_import("ping", unit_sig.clone(), svm_ir::ImportMode::Required);
+    m.add_func_import("ping", unit_sig, svm_ir::ImportMode::Required);
     reject(&m, "duplicate import name", |e| {
         matches!(e, VerifyError::DuplicateImport { .. })
     });
@@ -479,15 +474,10 @@ fn directed_rule_rejects() {
         results: vec![V::I64],
     };
     let mut m = module(vec![attach_fn.clone()]);
-    m.add_func_import(
-        "",
-        "out",
-        stream_sig.clone(),
-        svm_ir::ImportMode::Rebindable,
-    );
+    m.add_func_import("out", stream_sig.clone(), svm_ir::ImportMode::Rebindable);
     accept(&m, "attach to a rebindable import");
     let mut m = module(vec![attach_fn.clone()]);
-    m.add_func_import("", "out", stream_sig, svm_ir::ImportMode::Required);
+    m.add_func_import("out", stream_sig, svm_ir::ImportMode::Required);
     reject(&m, "attach to a required import", |e| {
         matches!(e, VerifyError::AttachNotRebindable { .. })
     });
@@ -764,7 +754,6 @@ fn spec_agreement_on_v7_grouped_surface() {
                     import: 0,
                     op,
                     sig: i64_sig.clone(),
-                    handle: 0,
                     args: vec![1],
                 },
             ],
@@ -781,8 +770,7 @@ fn spec_agreement_on_v7_grouped_surface() {
             }]),
         ];
         m.imports = vec![svm_ir::Import {
-            ns: "env".into(),
-            name: "svc".into(),
+            name: "env.svc".into(),
             shape: svm_ir::ImportShape::Interface(1),
             mode: svm_ir::ImportMode::Required,
         }];

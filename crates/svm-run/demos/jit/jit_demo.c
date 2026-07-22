@@ -128,7 +128,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 7); // format v7 (§3.5: shape-referencing imports + named interface elements)
+  eb(buf, 8); // format v8 (single-string import names; call.sym link form)
   // Memory descriptor: present, size_log2 16. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
   // program like this one at the 64 KiB default (a mismatch is a clean -22, not an escape).
