@@ -19,7 +19,7 @@ use svm_text::parse_module;
 // cross-thread non-atomic access through the confined sub-windows.
 const SRC: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vo0 = i64.const 65536
   ve = i64.const 1
   vsl = i64.const 12
@@ -39,14 +39,16 @@ block0(v0: i32):
   vs2 = i64.add vs1 vm0e
   vs3 = i64.add vs2 vm1e
   return vs3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vaddr = i64.const 0
   v21 = i32.const 21
   i32.store8 vaddr v21
   v5 = i64.const 5
   return v5
+  }
 }
 "#;
 
@@ -91,7 +93,7 @@ fn parallel_instantiate_race_free_under_miri() {
 const MODULE_CHILD: &str = r#"memory 12
 data 0 "K"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   vm = i64.const 1
@@ -99,12 +101,13 @@ block0(v0: i64):
   i32.store8 vm v30
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 "#;
 
 const MODULE_ROOT: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(vinst: i32, vmod: i32):
+block 0 (vinst: i32, vmod: i32) {
   vmod64 = i64.extend_i32_s vmod
   ve = i64.const 0
   vsl = i64.const 12
@@ -125,6 +128,7 @@ block0(vinst: i32, vmod: i32):
   vs2 = i64.add vs1 vm0e
   vs3 = i64.add vs2 vm1e
   return vs3
+  }
 }
 "#;
 

@@ -24,11 +24,12 @@ use svm_ir::Module;
 // Serial dependency (unvectorizable, unfoldable), pure registers — a clean CPU-bound scaling probe.
 const SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const -7046029254386353131
   v2 = i32.const 0
-  br block1(v2, v1, v0)
-block1(v3: i32, v4: i64, v5: i32):
+  br 1(v2, v1, v0)
+}
+block 1 (v3: i32, v4: i64, v5: i32) {
   v6 = i64.const 13
   v7 = i64.shl v4 v6
   v8 = i64.xor v4 v7
@@ -41,9 +42,11 @@ block1(v3: i32, v4: i64, v5: i32):
   v15 = i32.const 1
   v16 = i32.add v3 v15
   v17 = i32.lt_s v16 v5
-  br_if v17 block1(v16, v14, v5) block2(v14)
-block2(v18: i64):
+  br_if v17 1(v16, v14, v5) 2(v14)
+}
+block 2 (v18: i64) {
   return v18
+  }
 }
 "#;
 

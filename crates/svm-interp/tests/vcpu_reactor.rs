@@ -17,14 +17,15 @@ use svm_text::parse_module;
 const SRC: &str = r#"
 memory 16
 func (i32) -> () {
-block0(vout: i32):
+block 0 (vout: i32) {
   v0 = i64.const 64
   v1 = i64.const 0
   i64.store v1 v0
   return
+  }
 }
 func (i32) -> () {
-block0(vout: i32):
+block 0 (vout: i32) {
   vaddr = i64.const 0
   vc = i64.load vaddr
   vc2 = call 2 (vc)
@@ -33,12 +34,14 @@ block0(vout: i32):
   vlen = i64.const 1
   vw = cap.call 0 1 (i64, i64) -> (i64) vout(vptr, vlen)
   return
+  }
 }
 func (i64) -> (i64) {
-block0(vx: i64):
+block 0 (vx: i64) {
   v1 = i64.const 1
   vr = i64.add vx v1
   return vr
+  }
 }
 "#;
 

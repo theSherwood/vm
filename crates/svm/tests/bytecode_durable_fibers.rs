@@ -30,7 +30,7 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
     // routing (vs. the legacy single swapped `SHADOW_SP_OFF` word, now retired).
     let src = "memory 17\n\
         func (i32) -> (i64) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
         \x20 v1 = durable.shadow_base\n\
         \x20 v2 = cap.call 13 0 (i64) -> (i64) v0 (v1)\n\
         \x20 v3 = ref.func 1\n\
@@ -44,14 +44,16 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
         \x20 v13 = durable.shadow_base\n\
         \x20 v14 = cap.call 13 0 (i64) -> (i64) v0 (v13)\n\
         \x20 return v2\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i32.wrap_i64 v1\n\
         \x20 v3 = durable.shadow_base\n\
         \x20 v4 = cap.call 13 0 (i64) -> (i64) v2 (v3)\n\
         \x20 v5 = suspend v4\n\
         \x20 return v5\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -111,18 +113,20 @@ fn bytecode_non_durable_fiber_run_leaves_the_reserve_untouched() {
     // work, and a non-durable guest's reserve word stays whatever it was (here, a sentinel).
     let src = "memory 17\n\
         func (i32) -> (i64) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
         \x20 v2 = ref.func 1\n\
         \x20 v3 = i64.const 4096\n\
         \x20 v4 = cont.new v2 v3\n\
         \x20 v5 = i64.extend_i32_u v0\n\
         \x20 v6, v7 = cont.resume v4 v5\n\
         \x20 return v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 42\n\
         \x20 return v2\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");

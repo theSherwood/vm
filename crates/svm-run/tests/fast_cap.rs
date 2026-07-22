@@ -12,11 +12,12 @@ use svm_run::{cap_thunk, fast_cap_resolver};
 // and return the delta. The mock clock starts at 0 and increments once per read, so this is 1.
 const SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 2 0 () -> (i64) v0 ()
   v2 = cap.call 2 0 () -> (i64) v0 ()
   v3 = i64.sub v2 v1
   return v3
+  }
 }
 "#;
 

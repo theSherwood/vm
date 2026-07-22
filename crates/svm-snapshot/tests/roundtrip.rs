@@ -17,24 +17,26 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 // (clock now 0) instead of reloading the saved 42 would be observable (100 vs 142).
 const SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
 // A *different* instrumented module (adds 200), for the identity-gate test.
 const SRC_OTHER: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 200
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -43,7 +45,7 @@ block0(v0: i32):
 // must carry the fiber's continuation (window shadow region) + its residue (Section 2).
 const SRC_FIBER: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -52,14 +54,16 @@ block0():
   v6 = i64.const 7
   v7, v8 = cont.resume v2 v6
   return v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 42
   v3 = suspend v2
   v4 = i64.const 100
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -284,7 +288,7 @@ fn freeze_succeeds_after_draining_a_non_durable_handle() {
 // root's extent). The handle stash uses linear memory, so transform on the confined path.
 const SRC_MULTIVCPU: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65536
   i32.store v1 v0
   v2 = i64.const 0
@@ -295,9 +299,10 @@ block0(v0: i32):
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
@@ -305,6 +310,7 @@ block0(v0: i64, v1: i64):
   v6 = i64.const 10
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "#;
 
@@ -418,7 +424,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
 // spawned-vCPU residue (+ root extent), and the thaw must reconstruct both into non-colliding regions.
 const SRC_FIBER_AND_VCPU: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65536
   i32.store v1 v0
   v2 = i64.const 0
@@ -432,9 +438,10 @@ block0(v0: i32):
   v13 = thread.join v4
   v14 = i64.add v10 v13
   return v14
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
@@ -442,14 +449,16 @@ block0(v0: i64, v1: i64):
   v6 = i64.const 10
   v7 = i64.add v5 v6
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 5
   v3 = suspend v2
   v4 = i64.const 1000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -603,7 +612,7 @@ fn fiber_residue_generation_round_trips_through_the_codec() {
 // freeze has to land *mid-run* — which `arm_freeze_after` makes deterministic.
 const SRC_RECYCLE: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 2
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -617,19 +626,22 @@ block0():
   v12 = i64.const 7
   v13, v14 = cont.resume v8 v12
   return v14
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 42
   v3 = suspend v2
   v4 = i64.const 100
   v5 = i64.add v3 v4
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   return v2
+  }
 }
 "#;
 
@@ -712,7 +724,7 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
 // per-parent join table rebuilds on thaw.
 const SRC_NESTED: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65536
   i32.store v1 v0
   v2 = i64.const 0
@@ -723,9 +735,10 @@ block0(v0: i32):
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i64.const 0
@@ -736,14 +749,16 @@ block0(v0: i64, v1: i64):
   v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
   v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
   return v5
+  }
 }
 "#;
 

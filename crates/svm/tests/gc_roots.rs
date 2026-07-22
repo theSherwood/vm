@@ -22,7 +22,7 @@ use svm_verify::verify_module;
 fn gc_roots_round_trips() {
     let src = "memory 16\n\
         func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 4096\n\
         \x20 vmask = i64.const -1\n\
@@ -30,6 +30,7 @@ fn gc_roots_round_trips() {
         \x20 v3 = i64.const 8\n\
         \x20 v4 = gc.roots v0 v1 vmask v2 v3\n\
         \x20 return v4\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -67,7 +68,7 @@ fn gc_roots_finds_caller_frame_root() {
     // range [0x5000, 0x6000); sentinel 0x5050; buf at offset 0, cap 8 slots.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 20560\n\
         \x20 v1 = i64.const 20480\n\
         \x20 v2 = i64.const 24576\n\
@@ -79,6 +80,7 @@ fn gc_roots_finds_caller_frame_root() {
         \x20 v7 = i64.const 8\n\
         \x20 v8 = i64.load v7\n\
         \x20 return v5 v6 v8\n\
+          }\n\
         }\n";
     // candidates in [0x5000,0x6000): heap_lo 0x5000 and the sentinel 0x5050 ⇒ count 2, ascending.
     assert_eq!(run_i64s(src), vec![2, 0x5000, 0x5050]);
@@ -90,7 +92,7 @@ fn gc_roots_finds_caller_frame_root() {
 fn gc_roots_excludes_out_of_range() {
     let src = "memory 16\n\
         func () -> (i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 20560\n\
         \x20 v1 = i64.const 32768\n\
         \x20 v2 = i64.const 36864\n\
@@ -100,6 +102,7 @@ fn gc_roots_excludes_out_of_range() {
         \x20 v5 = gc.roots v1 v2 vmask v3 v4\n\
         \x20 v6 = i64.load v3\n\
         \x20 return v5 v6\n\
+          }\n\
         }\n";
     // Only heap_lo (0x8000) is in range; the 0x5050 sentinel is excluded ⇒ count 1.
     assert_eq!(run_i64s(src), vec![1, 0x8000]);
@@ -112,7 +115,7 @@ fn gc_roots_excludes_out_of_range() {
 fn gc_roots_scans_suspended_fiber_stack() {
     let src = "memory 16\n\
         func () -> (i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -127,13 +130,15 @@ fn gc_roots_scans_suspended_fiber_stack() {
         \x20 v11 = i64.const 8\n\
         \x20 v12 = i64.load v11\n\
         \x20 return v10 v12\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 28752\n\
         \x20 v3 = i64.const 0\n\
         \x20 v4 = suspend v3\n\
         \x20 return v2\n\
+          }\n\
         }\n";
     // candidates in [0x7000,0x7100): heap_lo 0x7000 (root frame) and 0x7050 (fiber's live stack) ⇒
     // count 2, with the fiber word as the second (ascending) slot.
@@ -152,7 +157,7 @@ fn gc_roots_is_unsupported_on_the_jit_without_fibers() {
     use svm_jit::{compile_and_run, JitError};
     let src = "memory 16\n\
         func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v1 = i64.const 0\n\
         \x20 v2 = i64.const 4096\n\
         \x20 v3 = i64.const 0\n\
@@ -160,6 +165,7 @@ fn gc_roots_is_unsupported_on_the_jit_without_fibers() {
         \x20 vmask = i64.const -1\n\
         \x20 v5 = gc.roots v1 v2 vmask v3 v4\n\
         \x20 return v5\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -198,7 +204,7 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
     // returns it; buf at offset 0, cap 8 slots.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -215,12 +221,14 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
         \x20 v13 = i64.const 8\n\
         \x20 v14 = i64.load v13\n\
         \x20 return v10 v12 v14\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 0\n\
         \x20 v3 = suspend v2\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
     verify_module(&m).expect("verify");
@@ -263,7 +271,7 @@ fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
     // fiber can load them (a load's result can't be rematerialized across the call). Root window
     // [0x6000, 0x6100) covers heap_lo + all N pointers. gc.roots buffer at 0x200, cap 32. The fold sum
     // is stored at 0x1000 (out of window) purely to keep the loads live past the call.
-    let mut root = String::from("memory 16\nfunc () -> (i64) {\nblock0():\n");
+    let mut root = String::from("memory 16\nfunc () -> (i64) {\nblock 0 () {\n");
     let mut k = 0usize;
     for i in 0..N {
         let (val, off) = (0x6008 + i * 8, 0x100 + i * 8);
@@ -289,9 +297,9 @@ fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
     k += 1;
     root.push_str(&format!("  v{k}, v{} = cont.resume v{vc} v{va}\n", k + 1));
     let vres = k + 1;
-    root.push_str(&format!("  return v{vres}\n}}\n"));
+    root.push_str(&format!("  return v{vres}\n  }}\n}}\n"));
 
-    let mut f = String::from("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+    let mut f = String::from("func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n");
     let mut fk = 2usize;
     let mut loaded = Vec::new();
     for i in 0..N {
@@ -326,7 +334,7 @@ fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
     f.push_str(&format!("  v{fk} = i64.const 4096\n"));
     let vsaddr = fk;
     f.push_str(&format!("  i64.store v{vsaddr} v{acc}\n"));
-    f.push_str(&format!("  return v{vcount}\n}}\n"));
+    f.push_str(&format!("  return v{vcount}\n  }}\n}}\n"));
 
     let src = format!("{root}{f}");
     let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
@@ -365,7 +373,7 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
     // 0x1000 — outside both the buffer and the heap window — purely to keep it live past the resume.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -376,9 +384,10 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
         \x20 v8 = i64.const 8\n\
         \x20 v9 = i64.load v8\n\
         \x20 return v5 v7 v9\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = ref.func 2\n\
         \x20 v3 = i64.const 4096\n\
         \x20 v4 = cont.new v2 v3\n\
@@ -387,9 +396,10 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
         \x20 v8 = i64.const 4096\n\
         \x20 i64.store v8 v1\n\
         \x20 return v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 31408\n\
         \x20 v3 = i64.const 31424\n\
         \x20 v4 = i64.const 0\n\
@@ -397,6 +407,7 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
         \x20 vmask = i64.const -1\n\
         \x20 v6 = gc.roots v2 v3 vmask v4 v5\n\
         \x20 return v6\n\
+          }\n\
         }\n";
     let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
     verify_module(&m).expect("verify");
@@ -452,24 +463,27 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
     // holds 0x7050 (28752). `sp` args are unused parameters.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 0\n\
         \x20 v2 = thread.spawn 1 v0 v1\n\
-        \x20 br block1(v2)\n\
-        block1(v3: i32):\n\
+        \x20 br 1(v2)\n\
+        }\n\
+        block 1 (v3: i32) {\n\
         \x20 v4 = i64.const 128\n\
         \x20 v5 = i32.atomic.load.acquire v4\n\
         \x20 v6 = i32.const 0\n\
         \x20 v7 = i32.ne v5 v6\n\
-        \x20 br_if v7 block3(v3) block2(v3)\n\
-        block2(v8: i32):\n\
+        \x20 br_if v7 3(v3) 2(v3)\n\
+        }\n\
+        block 2 (v8: i32) {\n\
         \x20 v9 = i64.const 128\n\
         \x20 v10 = i32.const 0\n\
         \x20 v11 = i64.const 1000000000\n\
         \x20 v12 = i32.atomic.wait v9 v10 v11\n\
-        \x20 br block1(v8)\n\
-        block3(v13: i32):\n\
+        \x20 br 1(v8)\n\
+        }\n\
+        block 3 (v13: i32) {\n\
         \x20 v14 = i64.const 28752\n\
         \x20 v15 = i64.const 28753\n\
         \x20 v16 = i64.const 0\n\
@@ -488,9 +502,10 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v27 = i64.const 8\n\
         \x20 v28 = i64.load v27\n\
         \x20 return v18 v26 v28\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = ref.func 2\n\
         \x20 v3 = i64.const 0\n\
         \x20 v4 = cont.new v2 v3\n\
@@ -502,28 +517,33 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v10 = i64.const 128\n\
         \x20 v11 = i32.const 1\n\
         \x20 v12 = atomic.notify v10 v11\n\
-        \x20 br block1()\n\
-        block1():\n\
+        \x20 br 1()\n\
+        }\n\
+        block 1 () {\n\
         \x20 v13 = i64.const 136\n\
         \x20 v14 = i32.atomic.load.acquire v13\n\
         \x20 v15 = i32.const 0\n\
         \x20 v16 = i32.ne v14 v15\n\
-        \x20 br_if v16 block3() block2()\n\
-        block2():\n\
+        \x20 br_if v16 3() 2()\n\
+        }\n\
+        block 2 () {\n\
         \x20 v17 = i64.const 136\n\
         \x20 v18 = i32.const 0\n\
         \x20 v19 = i64.const 1000000000\n\
         \x20 v20 = i32.atomic.wait v17 v18 v19\n\
-        \x20 br block1()\n\
-        block3():\n\
+        \x20 br 1()\n\
+        }\n\
+        block 3 () {\n\
         \x20 v21 = i64.const 0\n\
         \x20 return v21\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 0\n\
         \x20 v3 = suspend v2\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
     verify_module(&m).expect("verify");
@@ -589,7 +609,7 @@ const BUF_WORDS: usize = 16;
 ))]
 fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
     use std::fmt::Write as _;
-    let mut src = String::from("memory 16\nfunc () -> (i64) {\nblock0():\n");
+    let mut src = String::from("memory 16\nfunc () -> (i64) {\nblock 0 () {\n");
     let mut v: u32 = 0;
     for &r in roots {
         // ref.func 1; sp (unused param); cont.new; arg = the root; resume → fiber parks holding arg.
@@ -624,10 +644,10 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
     )
     .unwrap();
     writeln!(src, "  return v{}", v + 5).unwrap();
-    src.push_str("}\n");
+    src.push_str("  }\n}\n");
     // Shared fiber body: keep `arg` (v1) live across the suspend, then return it.
-    src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
-    src.push_str("  v2 = i64.const 0\n  v3 = suspend v2\n  return v1\n}\n");
+    src.push_str("func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n");
+    src.push_str("  v2 = i64.const 0\n  v3 = suspend v2\n  return v1\n  }\n}\n");
 
     let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
@@ -788,7 +808,7 @@ fn gc_roots_strips_pointer_tag_via_mask() {
     let src = format!(
         "memory 16\n\
         func () -> (i64, i64, i64) {{\n\
-        block0():\n\
+        block 0 () {{\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -805,12 +825,14 @@ fn gc_roots_strips_pointer_tag_via_mask() {
         \x20 v13 = i64.const 8\n\
         \x20 v14 = i64.load v13\n\
         \x20 return v10 v12 v14\n\
+          }}\n\
         }}\n\
         func (i64, i64) -> (i64) {{\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {{\n\
         \x20 v2 = i64.const 0\n\
         \x20 v3 = suspend v2\n\
         \x20 return v1\n\
+          }}\n\
         }}\n"
     );
     // {heap_lo 0x7000, masked tagged root 0x7050} ⇒ count 2, ascending; the raw tagged word (huge)
@@ -835,7 +857,7 @@ fn gc_roots_strips_pointer_tag_on_the_jit() {
     let src = format!(
         "memory 16\n\
         func () -> (i64, i64) {{\n\
-        block0():\n\
+        block 0 () {{\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -850,12 +872,14 @@ fn gc_roots_strips_pointer_tag_on_the_jit() {
         \x20 v11 = i64.const 0\n\
         \x20 v12 = i64.load v11\n\
         \x20 return v10 v12\n\
+          }}\n\
         }}\n\
         func (i64, i64) -> (i64) {{\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {{\n\
         \x20 v2 = i64.const 0\n\
         \x20 v3 = suspend v2\n\
         \x20 return v1\n\
+          }}\n\
         }}\n"
     );
     let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}"));
@@ -884,7 +908,7 @@ fn gc_roots_rejects_fold_down_mask_in_verifier() {
     let src = format!(
         "memory 16\n\
         func () -> (i64) {{\n\
-        block0():\n\
+        block 0 () {{\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 4096\n\
         \x20 vmask = i64.const {FOLD_DOWN_MASK}\n\
@@ -892,6 +916,7 @@ fn gc_roots_rejects_fold_down_mask_in_verifier() {
         \x20 v3 = i64.const 8\n\
         \x20 v4 = gc.roots v0 v1 vmask v2 v3\n\
         \x20 return v4\n\
+          }}\n\
         }}\n"
     );
     let m = parse_module(&src).expect("parse");
@@ -913,7 +938,7 @@ fn gc_roots_runtime_rejects_fold_down_mask() {
     let src = format!(
         "memory 16\n\
         func () -> (i64) {{\n\
-        block0():\n\
+        block 0 () {{\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 4096\n\
         \x20 vmask = i64.const {FOLD_DOWN_MASK}\n\
@@ -921,6 +946,7 @@ fn gc_roots_runtime_rejects_fold_down_mask() {
         \x20 v3 = i64.const 8\n\
         \x20 v4 = gc.roots v0 v1 vmask v2 v3\n\
         \x20 return v4\n\
+          }}\n\
         }}\n"
     );
     let m = parse_module(&src).expect("parse");

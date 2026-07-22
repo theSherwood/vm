@@ -43,15 +43,16 @@ extern "C" fn triple(
 
 const NAMED: &str = "\
 memory 15
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 5
-  v2 = call.import \"add_seven\" (i64) -> (i64) v0 (v1)
+  v2 = call.sym \"add_seven\" (i64) -> (i64) v0 (v1)
   v3 = i32.const 0
-  v4 = call.import \"triple\" (i64) -> (i64) v3 (v2)
+  v4 = call.sym \"triple\" (i64) -> (i64) v3 (v2)
   return v4
+  }
 }
 ";
 
@@ -98,15 +99,16 @@ fn name_bound_host_fn_callbacks_run_through_the_c_abi() {
 const HELLO: &str = "\
 memory 15
 data ro 16384 \"hi from C\\n\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 16384
   v2 = i64.const 10
-  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.const 0
   return v4
+  }
 }
 ";
 
@@ -205,23 +207,25 @@ fn errors_are_fail_closed_not_panics() {
 
 const COUNTER: &str = "\
 memory 15
-export \"_start\" 0
-export \"add\" 1
+export 0 func \"_start\" 0
+export 1 func \"add\" 1
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 1024
   v1 = i64.const 0
   i64.store v0 v1
   v2 = i32.const 0
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1024
   v3 = i64.load v2
   v4 = i64.add v3 v1
   i64.store v2 v4
   return v4
+  }
 }
 ";
 
@@ -298,12 +302,13 @@ extern "C" fn record_hook(ctx: *mut c_void, ev: *const SvmMemEvent) -> i32 {
 const MEM_KERNEL: &str = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 64
   v1 = i64.const 7
   i64.store v0 v1 offset=8
   v2 = i64.load v0 offset=8
   return v2
+  }
 }
 ";
 
@@ -414,9 +419,9 @@ extern "C" fn upcase(
 // handle operands are dummies).
 const UPCASE_IR: &str = "\
 memory 15
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 2048
   v1 = i32.const 97
   i32.store8 v0 v1
@@ -429,13 +434,14 @@ block0():
   v6 = i32.const 0
   v7 = i64.const 2048
   v8 = i64.const 3
-  v9 = call.import \"upcase\" (i64, i64) -> (i64) v6 (v7, v8)
+  v9 = call.sym \"upcase\" (i64, i64) -> (i64) v6 (v7, v8)
   v10 = i32.const 0
   v11 = i64.const 2048
   v12 = i64.const 3
-  v13 = call.import \"write\" (i64, i64) -> (i64) v10 (v11, v12)
+  v13 = call.sym \"write\" (i64, i64) -> (i64) v10 (v11, v12)
   v14 = i32.const 0
   return v14
+  }
 }
 ";
 

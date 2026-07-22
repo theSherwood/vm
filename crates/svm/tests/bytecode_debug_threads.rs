@@ -16,7 +16,7 @@ use svm_text::parse_module;
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -26,15 +26,17 @@ block0():
   vaddr = i64.const 0
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -44,7 +46,7 @@ block0(vsp: i64, varg: i64):
 const ATOMIC_TWO: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -54,13 +56,15 @@ block0():
   vaddr = i64.const 0
   vr = i64.atomic.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vrmw = i64.atomic.rmw.add vaddr varg
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -230,7 +234,8 @@ fn module_spawns_threads_detects_the_multithreaded_case() {
     let racy = parse_module(RACY_COUNTER).unwrap();
     assert!(bytecode::module_spawns_threads(&racy));
     let seq =
-        parse_module("func () -> (i64) {\nblock0():\n  a = i64.const 7\n  return a\n}").unwrap();
+        parse_module("func () -> (i64) {\nblock 0 () {\n  a = i64.const 7\n  return a\n  }\n}")
+            .unwrap();
     assert!(!bytecode::module_spawns_threads(&seq));
 }
 
@@ -286,7 +291,7 @@ fn bytecode_cross_thread_write_watchpoint_fires_per_worker() {
 const WORKER_CALLS: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   sp = i64.const 0
   one = i64.const 1
   h0 = thread.spawn 1 sp one
@@ -294,20 +299,23 @@ block0():
   addr = i64.const 0
   r = i64.load addr
   return r
+  }
 }
 func (i64, i64) -> (i64) {
-block0(sp: i64, inc: i64):
+block 0 (sp: i64, inc: i64) {
   addr = i64.const 0
   cur = i64.load addr
   nxt = call 2(cur, inc)
   i64.store addr nxt
   z = i64.const 0
   return z
+  }
 }
 func (i64, i64) -> (i64) {
-block0(a: i64, b: i64):
+block 0 (a: i64, b: i64) {
   s = i64.add a b
   return s
+  }
 }
 "#;
 
@@ -447,7 +455,7 @@ fn bytecode_scheduled_tick_replays_deterministically() {
 const FUTEX_HANDOFF: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 8
   v1 = i64.const 987654
   i64.atomic.store.release v0 v1
@@ -461,9 +469,10 @@ block0():
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   v2 = i32.const 0
   v3 = i64.const 1000000000
@@ -471,6 +480,7 @@ block0(vsp: i64, v0: i64):
   v5 = i64.const 8
   v6 = i64.atomic.load.acquire v5
   return v6
+  }
 }
 "#;
 
@@ -537,7 +547,7 @@ fn bytecode_breakpoint_after_a_wait_fires_once_woken() {
 const FIBER_WORKERS: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 0
   vh0 = thread.spawn 1 vsp va
@@ -547,9 +557,10 @@ block0():
   vaddr = i64.const 0
   vr = i64.atomic.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vf = ref.func 2
   vz0 = i64.const 0
   vk = cont.new vf vz0
@@ -561,15 +572,17 @@ block0(vsp: i64, varg: i64):
   vrmw = i64.atomic.rmw.add vaddr vr2
   vz = i64.const 0
   return vz
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp2: i64, varg2: i64):
+block 0 (vsp2: i64, varg2: i64) {
   v0 = i64.const 1
   v1 = i64.add varg2 v0
   v2 = suspend v1
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 

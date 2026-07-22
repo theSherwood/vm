@@ -36,17 +36,19 @@ fn run_q(src: &str, quota: Option<Quota>) -> Result<i64, Trap> {
 const FIBER_BOMB: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 1024
   v2 = cont.new v0 v1
   v3 = cont.new v0 v1
   v4 = i64.const 0
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   return varg
+  }
 }
 "#;
 
@@ -87,15 +89,17 @@ fn fiber_quota_default_runs() {
 const THREAD_PROG: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 5
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   return varg
+  }
 }
 "#;
 
@@ -141,27 +145,32 @@ fn vcpu_quota_spawn_join_loop_is_concurrent() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 7
   v6 = thread.spawn 1 v5 v5
   v7 = thread.join v6
   v8 = i64.const 1
   v9 = i64.add v4 v8
-  br block1(v9)
-block3():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 42
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   return varg
+  }
 }
 "#;
     assert_eq!(

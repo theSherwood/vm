@@ -71,8 +71,8 @@ fn i32s(xs: &[i32]) -> Vec<Value> {
 fn data_readonly_segment_write_faults_load_reads() {
     // memory 13 = 8 KiB (2 pages); a RO segment starts at page 1 (offset 4096).
     let store = "data ro 4096 \"\\xab\\xcd\"\nmemory 13\n\
-        func () -> (i32) {\nblock0():\n  v0 = i64.const 4096\n  v1 = i32.const 1\n  \
-        i32.store8 v0 v1\n  v2 = i32.const 0\n  return v2\n}\n";
+        func () -> (i32) {\nblock 0 () {\n  v0 = i64.const 4096\n  v1 = i32.const 1\n  \
+        i32.store8 v0 v1\n  v2 = i32.const 0\n  return v2\n  }\n}\n";
     let m = parse_module(store).expect("parse");
     verify_module(&m).expect("verify");
     let mut fuel = 100_000u64;
@@ -91,7 +91,7 @@ fn data_readonly_segment_write_faults_load_reads() {
 
     // A load of the same RO byte succeeds and reads the initialized value (0xab) on both.
     let load = "data ro 4096 \"\\xab\\xcd\"\nmemory 13\n\
-        func () -> (i32) {\nblock0():\n  v0 = i64.const 4096\n  v1 = i32.load8_u v0\n  return v1\n}\n";
+        func () -> (i32) {\nblock 0 () {\n  v0 = i64.const 4096\n  v1 = i32.load8_u v0\n  return v1\n  }\n}\n";
     let m = parse_module(load).expect("parse");
     verify_module(&m).expect("verify");
     let mut fuel = 100_000u64;
@@ -106,9 +106,10 @@ fn data_readonly_segment_write_faults_load_reads() {
 fn jit_matches_interp_add() {
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -127,13 +128,14 @@ fn jit_matches_interp_arith_with_select() {
     // (v0 < v1) ? 100 : (v0 - v1)^2 — sub, mul, lt_s, select, const.
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.sub v0 v1
   v3 = i32.mul v2 v2
   v4 = i32.lt_s v0 v1
   v5 = i32.const 100
   v6 = select v4 v5 v3
   return v6
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -152,7 +154,7 @@ fn jit_matches_interp_bitwise_and_shifts() {
     // Exercise and/or/xor/shl/shr_u/shr_s/rotl, incl. shift-count masking semantics.
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.and v0 v1
   v3 = i32.or v0 v1
   v4 = i32.xor v2 v3
@@ -161,6 +163,7 @@ block0(v0: i32, v1: i32):
   v7 = i32.shr_s v6 v1
   v8 = i32.rotl v7 v1
   return v8
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -178,12 +181,13 @@ block0(v0: i32, v1: i32):
 fn jit_matches_interp_comparisons_and_eqz() {
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.lt_u v0 v1
   v3 = i32.ge_s v0 v1
   v4 = i32.eqz v2
   v5 = i32.add v3 v4
   return v5
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -196,10 +200,11 @@ block0(v0: i32, v1: i32):
 fn jit_matches_interp_i64_ops() {
     let src = r#"
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.mul v0 v1
   v3 = i64.sub v2 v1
   return v3
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -219,13 +224,14 @@ fn jit_matches_interp_sign_extend_ops() {
     // with extend32_s on i32 the identity) against it. i32 first.
     let src32 = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.extend8_s v0
   v2 = i32.extend16_s v0
   v3 = i32.extend32_s v0
   v4 = i32.add v1 v2
   v5 = i32.add v4 v3
   return v5
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -243,13 +249,14 @@ block0(v0: i32):
     // i64 — extend32_s is a genuine narrowing here (low 32 bits, sign-extended to 64).
     let src64 = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.extend8_s v0
   v2 = i64.extend16_s v0
   v3 = i64.extend32_s v0
   v4 = i64.add v1 v2
   v5 = i64.add v4 v3
   return v5
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -271,16 +278,19 @@ fn jit_matches_interp_loop_with_back_edge() {
     // br / br_if and multi-block SSA lowering.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 "#;
     let inputs: Vec<Vec<Value>> = [1, 2, 5, 10, 100, 1000]
@@ -298,10 +308,11 @@ fn jit_matches_interp_mem_store_load_roundtrip() {
 memory 16
 
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   i64.store v0 v1
   v2 = i64.load v0
   return v2
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -327,13 +338,14 @@ fn jit_matches_interp_atomic_rmw() {
             let src = format!(
                 "memory 16\n\
                  func ({ty}, {ty}) -> ({ty}) {{\n\
-                 block0(v0: {ty}, v1: {ty}):\n\
+                 block 0 (v0: {ty}, v1: {ty}) {{\n\
                  \x20 v2 = i64.const 8\n\
                  \x20 {ty}.atomic.store v2 v0\n\
                  \x20 v3 = {ty}.atomic.rmw.{op} v2 v1\n\
                  \x20 v4 = {ty}.atomic.load v2\n\
                  \x20 v5 = {ty}.add v3 v4\n\
                  \x20 return v5\n\
+                   }}\n\
                  }}\n"
             );
             assert_jit_matches_interp(
@@ -354,13 +366,14 @@ fn jit_matches_interp_atomic_cmpxchg() {
     // either way the *old* value is returned. Return old + new to pin both.
     let src = "memory 16\n\
         func (i64, i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64, v2: i64):\n\
+        block 0 (v0: i64, v1: i64, v2: i64) {\n\
         \x20 v3 = i64.const 16\n\
         \x20 i64.atomic.store v3 v0\n\
         \x20 v4 = i64.atomic.cmpxchg v3 v1 v2\n\
         \x20 v5 = i64.atomic.load v3\n\
         \x20 v6 = i64.add v4 v5\n\
         \x20 return v6\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(
         src,
@@ -378,13 +391,14 @@ fn jit_matches_interp_atomic_aliases_plain_memory() {
     // plain load, and an atomic load sees a plain store.
     let src = "memory 16\n\
         func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
+        block 0 (v0: i64) {\n\
         \x20 v1 = i64.const 24\n\
         \x20 i64.atomic.store v1 v0\n\
         \x20 v2 = i64.load v1\n\
         \x20 i64.store v1 v2\n\
         \x20 v3 = i64.atomic.load v1\n\
         \x20 return v3\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src, &[vec![Value::I64(0xDEAD_BEEF)], vec![Value::I64(-5)]]);
 }
@@ -396,11 +410,12 @@ fn jit_atomic_unaligned_traps_both() {
     // The JIT trap is the software alignment guard (not the hardware guard page), so it is portable.
     let src = "memory 16\n\
         func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 4\n\
         \x20 v1 = i64.const 1\n\
         \x20 v2 = i64.atomic.rmw.add v0 v1\n\
         \x20 return v2\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -427,7 +442,7 @@ fn jit_matches_interp_orderings_and_fence() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 5
   i64.atomic.store.release v0 v1
@@ -439,6 +454,7 @@ block0():
   v5 = i64.atomic.load v0
   v6 = i64.add v2 v5
   return v6
+  }
 }
 "#;
     assert_jit_matches_interp(src, &[vec![]]);
@@ -451,12 +467,13 @@ fn jit_matches_interp_mem_narrow_store_load() {
 memory 16
 
 func (i64, i32) -> (i32) {
-block0(v0: i64, v1: i32):
+block 0 (v0: i64, v1: i32) {
   i32.store8 v0 v1
   v2 = i32.load8_u v0
   v3 = i32.load8_s v0
   v4 = i32.add v2 v3
   return v4
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -477,12 +494,13 @@ fn jit_matches_interp_mem_masking_aliases_out_of_window() {
 memory 16
 
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 8
   i64.store v1 v0
   v2 = i64.const 65544
   v3 = i64.load v2
   return v3
+  }
 }
 "#;
     assert_jit_matches_interp(src, &[vec![Value::I64(0xDEAD_BEEF)], vec![Value::I64(-99)]]);
@@ -494,20 +512,25 @@ block0(v0: i64):
 fn jit_matches_interp_br_table() {
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
-  br_table v0 [block1(), block2(), block3()] block4()
-block1():
+block 0 (v0: i32) {
+  br_table v0 [1(), 2(), 3()] 4()
+}
+block 1 () {
   v1 = i32.const 10
   return v1
-block2():
+}
+block 2 () {
   v2 = i32.const 20
   return v2
-block3():
+}
+block 3 () {
   v3 = i32.const 30
   return v3
-block4():
+}
+block 4 () {
   v4 = i32.const 99
   return v4
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -526,18 +549,22 @@ block4():
 fn jit_matches_interp_br_table_with_args() {
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
-  br_table v0 [block1(v1), block2(v1)] block3(v1)
-block1(v2: i32):
+block 0 (v0: i32, v1: i32) {
+  br_table v0 [1(v1), 2(v1)] 3(v1)
+}
+block 1 (v2: i32) {
   v3 = i32.const 1
   v4 = i32.add v2 v3
   return v4
-block2(v5: i32):
+}
+block 2 (v5: i32) {
   v6 = i32.const 2
   v7 = i32.add v5 v6
   return v7
-block3(v8: i32):
+}
+block 3 (v8: i32) {
   return v8
+  }
 }
 "#;
     assert_jit_matches_interp(src, &[i32s(&[0, 100]), i32s(&[1, 100]), i32s(&[9, 100])]);
@@ -547,11 +574,12 @@ block3(v8: i32):
 fn jit_matches_interp_div_rem_signed() {
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.div_s v0 v1
   v3 = i32.rem_s v0 v1
   v4 = i32.add v2 v3
   return v4
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -573,9 +601,10 @@ fn jit_matches_interp_rem_s_int_min_neg_one() {
     // skipped, so the JIT must lower srem to give 0 (not a hardware overflow trap).
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.rem_s v0 v1
   return v2
+  }
 }
 "#;
     assert_jit_matches_interp(src, &[i32s(&[i32::MIN, -1]), i32s(&[7, 3]), i32s(&[-7, 3])]);
@@ -585,11 +614,12 @@ block0(v0: i32, v1: i32):
 fn jit_matches_interp_div_rem_unsigned() {
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.div_u v0 v1
   v3 = i32.rem_u v0 v1
   v4 = i32.add v2 v3
   return v4
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -602,9 +632,10 @@ block0(v0: i32, v1: i32):
 fn jit_matches_interp_trapping_trunc() {
     let src = r#"
 func (f64) -> (i32) {
-block0(v0: f64):
+block 0 (v0: f64) {
   v1 = i32.trunc_f64_s v0
   return v1
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -625,13 +656,16 @@ fn jit_matches_interp_unreachable_in_untaken_branch() {
     // the branch is not taken. v0 != 0 -> returns 5; v0 == 0 -> interp traps -> skipped.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
-  br_if v0 block1() block2()
-block1():
+block 0 (v0: i32) {
+  br_if v0 1() 2()
+}
+block 1 () {
   v1 = i32.const 5
   return v1
-block2():
+}
+block 2 () {
   unreachable
+  }
 }
 "#;
     assert_jit_matches_interp(src, &[i32s(&[1]), i32s(&[42]), i32s(&[0])]);
@@ -641,9 +675,10 @@ block2():
 fn jit_matches_interp_no_args_const() {
     let src = r#"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 42
   return v0
+  }
 }
 "#;
     assert_jit_matches_interp(src, &[vec![]]);
@@ -659,12 +694,13 @@ fn f64s(xs: &[f64]) -> Vec<Value> {
 fn jit_matches_interp_f64_arith() {
     let src = r#"
 func (f64, f64) -> (f64) {
-block0(v0: f64, v1: f64):
+block 0 (v0: f64, v1: f64) {
   v2 = f64.add v0 v1
   v3 = f64.mul v2 v0
   v4 = f64.sub v3 v1
   v5 = f64.div v4 v0
   return v5
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -683,7 +719,7 @@ block0(v0: f64, v1: f64):
 fn jit_matches_interp_f32_unary_and_minmax() {
     let src = r#"
 func (f32, f32) -> (f32) {
-block0(v0: f32, v1: f32):
+block 0 (v0: f32, v1: f32) {
   v2 = f32.abs v0
   v3 = f32.neg v1
   v4 = f32.min v2 v3
@@ -692,6 +728,7 @@ block0(v0: f32, v1: f32):
   v7 = f32.ceil v6
   v8 = f32.copysign v7 v1
   return v8
+  }
 }
 "#;
     let f32s = |a: f32, b: f32| vec![Value::F32(a), Value::F32(b)];
@@ -711,13 +748,14 @@ block0(v0: f32, v1: f32):
 fn jit_matches_interp_float_compares() {
     let src = r#"
 func (f64, f64) -> (i32) {
-block0(v0: f64, v1: f64):
+block 0 (v0: f64, v1: f64) {
   v2 = f64.lt v0 v1
   v3 = f64.ge v0 v1
   v4 = f64.ne v0 v1
   v5 = i32.add v2 v3
   v6 = i32.add v5 v4
   return v6
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -735,7 +773,7 @@ block0(v0: f64, v1: f64):
 fn jit_matches_interp_int_extend_wrap() {
     let src = r#"
 func (i32, i64) -> (i64) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = i64.extend_i32_s v0
   v3 = i64.extend_i32_u v0
   v4 = i32.wrap_i64 v1
@@ -743,6 +781,7 @@ block0(v0: i32, v1: i64):
   v6 = i64.add v2 v3
   v7 = i64.add v6 v5
   return v7
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -760,7 +799,7 @@ fn jit_matches_interp_int_float_conversions() {
     // i32 -> f64 (signed/unsigned), back via saturating trunc; reinterpret too.
     let src = r#"
 func (i32, f64) -> (i64) {
-block0(v0: i32, v1: f64):
+block 0 (v0: i32, v1: f64) {
   v2 = f64.convert_i32_s v0
   v3 = f64.convert_i32_u v0
   v4 = f64.add v2 v3
@@ -769,6 +808,7 @@ block0(v0: i32, v1: f64):
   v7 = i64.reinterpret_f64 v5
   v8 = i64.add v6 v7
   return v8
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -832,20 +872,22 @@ fn jit_fiber_support_is_platform_gated() {
     let srcs = [
         // cont.new + cont.resume
         "func () -> (i64) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = ref.func 1\n\
          \x20 v1 = i64.const 4096\n\
          \x20 v2 = cont.new v0 v1\n\
          \x20 v3 = i64.const 0\n\
          \x20 v4, v5 = cont.resume v2 v3\n\
          \x20 return v5\n\
+           }\n\
          }\n\
-         func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n  return v1\n}\n",
+         func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  return v1\n  }\n}\n",
         // suspend
         "func (i64, i64) -> (i64) {\n\
-         block0(v0: i64, v1: i64):\n\
+         block 0 (v0: i64, v1: i64) {\n\
          \x20 v2 = suspend v1\n\
          \x20 return v2\n\
+           }\n\
          }\n",
     ];
     for src in srcs {
@@ -915,17 +957,19 @@ fn jit_matches_interp_direct_call() {
     // threading (no memory here, but the ABI still passes it).
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = call 1 (v0)
   v3 = call 1 (v1)
   v4 = i32.add v2 v3
   return v4
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.mul v0 v0
   return v1
+  }
 }
 "#;
     assert_jit_matches_interp_at(src, 0, &[i32s(&[3, 4]), i32s(&[-2, 5]), i32s(&[0, 0])]);
@@ -939,17 +983,19 @@ fn jit_matches_interp_call_through_memory() {
 memory 16
 
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = call 1 (v0, v1)
   v3 = i64.load v0
   return v3
+  }
 }
 
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   i64.store v0 v1
   v2 = i64.const 0
   return v2
+  }
 }
 "#;
     assert_jit_matches_interp_at(
@@ -966,23 +1012,26 @@ block0(v0: i64, v1: i64):
 // power-of-two-padded table: 1->f1, 2->f2, 0->f0 (type mismatch -> trap), 3->padding.
 const INDIRECT: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = call_indirect (i32) -> (i32) v0 (v1)
   return v2
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 2
   v2 = i32.mul v0 v1
   return v2
+  }
 }
 "#;
 
@@ -1006,24 +1055,27 @@ fn jit_matches_interp_ref_func_indirect() {
     // `ref.func 2` materializes the index of f2 (*2); dispatch through it.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = ref.func 2
   v2 = call_indirect (i32) -> (i32) v1 (v0)
   return v2
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 2
   v2 = i32.mul v0 v1
   return v2
+  }
 }
 "#;
     assert_jit_matches_interp_at(src, 0, &[i32s(&[5]), i32s(&[-4]), i32s(&[0])]);
@@ -1033,22 +1085,25 @@ block0(v0: i32):
 fn jit_matches_interp_return_call_indirect() {
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   return_call_indirect (i32) -> (i32) v0 (v1)
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 2
   v2 = i32.mul v0 v1
   return v2
+  }
 }
 "#;
     assert_jit_matches_interp_at(src, 0, &[i32s(&[1, 5]), i32s(&[2, 5]), i32s(&[0, 5])]);
@@ -1061,16 +1116,19 @@ fn jit_matches_interp_return_call_tail_recursion() {
     // Values flow between blocks only through block parameters (block-local SSA).
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.eqz v0
-  br_if v2 block1(v1) block2(v0, v1)
-block1(v3: i32):
+  br_if v2 1(v1) 2(v0, v1)
+}
+block 1 (v3: i32) {
   return v3
-block2(v4: i32, v5: i32):
+}
+block 2 (v4: i32, v5: i32) {
   v6 = i32.mul v5 v4
   v7 = i32.const -1
   v8 = i32.add v4 v7
   return_call 0(v8, v6)
+  }
 }
 "#;
     assert_jit_matches_interp_at(
@@ -1090,10 +1148,11 @@ fn jit_matches_interp_float_mem_roundtrip() {
 memory 16
 
 func (i64, f64) -> (f64) {
-block0(v0: i64, v1: f64):
+block 0 (v0: i64, v1: f64) {
   f64.store v0 v1
   v2 = f64.load v0
   return v2
+  }
 }
 "#;
     assert_jit_matches_interp(
@@ -1127,7 +1186,7 @@ fn jit_cap_memory_escape_oracle_grown_tail() {
     let src = format!(
         "memory 16\n\
          func (i32) -> (i64) {{\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {{\n\
          \x20 v1 = i64.const {OFF}\n\
          \x20 v2 = i64.const 4096\n\
          \x20 v3 = i32.const 3\n\
@@ -1137,6 +1196,7 @@ fn jit_cap_memory_escape_oracle_grown_tail() {
          \x20 i64.store v5 v6\n\
          \x20 v7 = i64.load v5\n\
          \x20 return v7\n\
+           }}\n\
          }}\n"
     );
     let m = parse_module(&src).expect("parse");
@@ -1212,7 +1272,7 @@ fn jit_cap_shared_region_aliases_differential() {
     let src = format!(
         "memory 17\n\
          func (i32) -> (i64) {{\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {{\n\
          \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
@@ -1222,6 +1282,7 @@ fn jit_cap_shared_region_aliases_differential() {
          \x20 i64.store v2 v6\n\
          \x20 v7 = i64.load v1\n\
          \x20 return v7\n\
+           }}\n\
          }}\n"
     );
     let m = parse_module(&src).expect("parse");
@@ -1366,10 +1427,11 @@ mod cap {
     fn jit_cap_clock_now() {
         let src = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   return v2
+  }
 }
 "#;
         let mut hi = Host::new();
@@ -1388,7 +1450,7 @@ block0(v0: i32):
 memory 16
 
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i32.const 72
   i32.store8 v1 v2
@@ -1399,6 +1461,7 @@ block0(v0: i32):
   v6 = i64.const 2
   v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
+  }
 }
 "#;
         let mut hi = Host::new();
@@ -1414,10 +1477,11 @@ block0(v0: i32):
     fn jit_cap_exit_propagates_code() {
         let src = r#"
 func (i32) -> () {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 7
   cap.call 1 0 (i32) -> () v0 (v1)
   unreachable
+  }
 }
 "#;
         let mut hi = Host::new();
@@ -1438,7 +1502,7 @@ block0(v0: i32):
 memory 16
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 4096
   v3 = i32.const 1
@@ -1448,6 +1512,7 @@ block0(v0: i32):
   i32.store8 v5 v6
   v7 = i32.const 0
   return v7
+  }
 }
 "#;
         // Non-vacuous: the interpreter (the spec) must actually fault on the post-`protect` store.
@@ -1486,17 +1551,19 @@ block0(v0: i32):
 memory 16
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1(v0)
   v2 = cap.call 3 3 () -> (i64) v0 ()
   return v1
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 99 0 () -> (i64) v0 ()
   v2 = i32.wrap_i64 v1
   return v2
+  }
 }
 "#;
         // Non-vacuous: the interpreter (the spec) stays trapped *through* the caller.
@@ -1604,7 +1671,7 @@ block0(v0: i32):
                 }
             }
         }
-        format!("memory 16\nfunc (i32) -> (i64) {{\nblock0(v0: i32):\n{body}  return v{acc}\n}}\n")
+        format!("memory 16\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n{body}  return v{acc}\n  }}\n}}\n")
     }
 
     /// Generative differential coverage of the `Memory` capability **including growth**: random
@@ -1643,7 +1710,7 @@ block0(v0: i32):
         let grow_and_read = r#"
 memory 16
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1048576
   v2 = i64.const 4096
   v3 = i32.const 3
@@ -1653,6 +1720,7 @@ block0(v0: i32):
   i64.store v5 v6
   v7 = i64.load v5
   return v7
+  }
 }
 "#;
         // Non-vacuous: the interpreter (the spec) returns the grown-page value, not a fault.
@@ -1677,7 +1745,7 @@ block0(v0: i32):
         let grow_then_unmap = r#"
 memory 16
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1048576
   v2 = i64.const 4096
   v3 = i32.const 3
@@ -1685,6 +1753,7 @@ block0(v0: i32):
   v5 = cap.call 3 1 (i64, i64) -> (i64) v0 (v1, v2)
   v6 = i64.load v1
   return v6
+  }
 }
 "#;
         let mut hi2 = Host::new();
@@ -1755,10 +1824,11 @@ block0(v0: i32):
         // A forged handle index must be inert in the JIT too (CapFault), matching interp.
         let src = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   return v2
+  }
 }
 "#;
         let mut hi = Host::new();
@@ -1872,9 +1942,10 @@ mod fast_cap {
         let ir = "\
 memory 16
 func (i32, i64) -> (i64) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = cap.call 42 0 (i64) -> (i64) v0(v1)
   return v2
+  }
 }
 ";
         let (g, f) = run_both(ir, 41);
@@ -1889,9 +1960,10 @@ block0(v0: i32, v1: i64):
         let ir = "\
 memory 16
 func (i32, i64) -> (i64) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = cap.call 42 1 (i64) -> (i64) v0(v1)
   return v2
+  }
 }
 ";
         let (g, f) = run_both(ir, 21);
@@ -1973,22 +2045,26 @@ mod fast_cap_prod {
     fn clock_now_fast_matches_generic_and_interp() {
         let ir = "\
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i32, v4: i64, v5: i64) {
   v6 = i64.const 8
   v7 = i64.lt_s v5 v6
-  br_if v7 block2(v3, v4, v5) block3(v4)
-block2(v8: i32, v9: i64, v10: i64):
+  br_if v7 2(v3, v4, v5) 3(v4)
+}
+block 2 (v8: i32, v9: i64, v10: i64) {
   v11 = cap.call 2 0 () -> (i64) v8()
   v12 = i64.add v9 v11
   v13 = i64.const 1
   v14 = i64.add v10 v13
-  br block1(v8, v12, v14)
-block3(v15: i64):
+  br 1(v8, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }
 ";
         let got = assert_all_agree(ir, |h| h.grant_clock());
@@ -2001,22 +2077,26 @@ block3(v15: i64):
     fn blocking_work_fast_matches_generic_and_interp() {
         let ir = "\
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i32, v4: i64, v5: i64) {
   v6 = i64.const 8
   v7 = i64.lt_s v5 v6
-  br_if v7 block2(v3, v4, v5) block3(v4)
-block2(v8: i32, v9: i64, v10: i64):
+  br_if v7 2(v3, v4, v5) 3(v4)
+}
+block 2 (v8: i32, v9: i64, v10: i64) {
   v11 = cap.call 10 0 (i64) -> (i64) v8(v10)
   v12 = i64.add v9 v11
   v13 = i64.const 1
   v14 = i64.add v10 v13
-  br block1(v8, v12, v14)
-block3(v15: i64):
+  br 1(v8, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }
 ";
         // mix(arg) = arg*6364136223846793005 + 1442695040888963407 (wrapping) — the Blocking transform.
@@ -2038,9 +2118,10 @@ block3(v15: i64):
         // A Clock cap.call through a handle the host never granted (empty powerbox).
         let ir = "\
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 2 0 () -> (i64) v0()
   return v1
+  }
 }
 ";
         let m = parse_module(ir).expect("parse");
@@ -2110,7 +2191,7 @@ fn min_max_canonicalize_nan_bit_exactly() {
     for op in ["min", "max"] {
         // ---- scalar f32 ----
         let src = format!(
-            "func (f32, f32) -> (f32) {{\nblock0(v0: f32, v1: f32):\n  v2 = f32.{op} v0 v1\n  return v2\n}}\n"
+            "func (f32, f32) -> (f32) {{\nblock 0 (v0: f32, v1: f32) {{\n  v2 = f32.{op} v0 v1\n  return v2\n  }}\n}}\n"
         );
         let m = parse_module(&src).unwrap();
         verify_module(&m).unwrap();
@@ -2144,7 +2225,7 @@ fn min_max_canonicalize_nan_bit_exactly() {
         }
         // ---- scalar f64 ----
         let src = format!(
-            "func (f64, f64) -> (f64) {{\nblock0(v0: f64, v1: f64):\n  v2 = f64.{op} v0 v1\n  return v2\n}}\n"
+            "func (f64, f64) -> (f64) {{\nblock 0 (v0: f64, v1: f64) {{\n  v2 = f64.{op} v0 v1\n  return v2\n  }}\n}}\n"
         );
         let m = parse_module(&src).unwrap();
         verify_module(&m).unwrap();
@@ -2183,13 +2264,13 @@ fn min_max_canonicalize_nan_bit_exactly() {
     // 1.0 splat must canonicalize that lane on both backends. Observe lane 0 as f32.
     for op in ["min", "max"] {
         let src = format!(
-            "func () -> (f32) {{\nblock0():\n  \
+            "func () -> (f32) {{\nblock 0 () {{\n  \
              v0 = v128.const 69 35 193 127 0 0 128 63 0 0 128 63 0 0 128 63\n  \
              v1 = f32.const 1.0\n  \
              v2 = f32x4.splat v1\n  \
              v3 = f32x4.{op} v0 v2\n  \
              v4 = f32x4.extract_lane 0 v3\n  \
-             return v4\n}}\n"
+             return v4\n  }}\n}}\n"
         );
         let m = parse_module(&src).unwrap();
         verify_module(&m).unwrap();

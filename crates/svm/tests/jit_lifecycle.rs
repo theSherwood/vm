@@ -59,7 +59,7 @@ fn run_jit(src: &str) -> JitOutcome {
 /// and `0` on the JIT (the child already ran synchronously).
 const KILL_DETACH: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   ventry = i64.const 1\n\
   voff = i64.const 0\n\
   vsl = i64.const 12\n\
@@ -72,11 +72,13 @@ block0(v0: i32):\n\
   vsum = i32.add vkm vd\n\
   vr = i64.extend_i32_u vsum\n\
   return vr\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(vci: i64):\n\
+block 0 (vci: i64) {\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 /// `instantiate` a child (returns 7), then **spin `poll` until it finishes** and return the terminal
@@ -85,26 +87,30 @@ block0(vci: i64):\n\
 /// finishes) and exercises the running→done transition of an OS-thread child.
 const POLL_DONE: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   ventry = i64.const 1\n\
   voff = i64.const 0\n\
   vsl = i64.const 12\n\
   vq = i64.const 0\n\
   vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vsl, vq)\n\
-  br block1(v0, vch)\n\
-block1(bv0: i32, bvch: i32):\n\
+  br 1(v0, vch)\n\
+}\n\
+block 1 (bv0: i32, bvch: i32) {\n\
   vp = cap.call 6 9 (i32) -> (i32) bv0 (bvch)\n\
   vzero = i32.const 0\n\
   vrun = i32.eq vp vzero\n\
-  br_if vrun block1(bv0, bvch) block2(vp)\n\
-block2(vpf: i32):\n\
+  br_if vrun 1(bv0, bvch) 2(vp)\n\
+}\n\
+block 2 (vpf: i32) {\n\
   vr = i64.extend_i32_u vpf\n\
   return vr\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(vci: i64):\n\
+block 0 (vci: i64) {\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 #[test]
@@ -138,39 +144,45 @@ fn jit_poll_reports_child_done() {
 /// concurrently with the parent — the whole point of async children (the substrate for a pipeline).
 const POLL_RUNNING: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   ventry = i64.const 1\n\
   voff = i64.const 0\n\
   vsl = i64.const 12\n\
   vq = i64.const 0\n\
   vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vsl, vq)\n\
   vfirst = cap.call 6 9 (i32) -> (i32) v0 (vch)\n\
-  br block1(v0, vch, vfirst)\n\
-block1(bv0: i32, bvch: i32, bfirst: i32):\n\
+  br 1(v0, vch, vfirst)\n\
+}\n\
+block 1 (bv0: i32, bvch: i32, bfirst: i32) {\n\
   vp = cap.call 6 9 (i32) -> (i32) bv0 (bvch)\n\
   vzero = i32.const 0\n\
   vrun = i32.eq vp vzero\n\
-  br_if vrun block1(bv0, bvch, bfirst) block2(bfirst, vp)\n\
-block2(bf: i32, vfin: i32):\n\
+  br_if vrun 1(bv0, bvch, bfirst) 2(bfirst, vp)\n\
+}\n\
+block 2 (bf: i32, vfin: i32) {\n\
   vten = i32.const 10\n\
   vfm = i32.mul bf vten\n\
   vsum = i32.add vfm vfin\n\
   vr = i64.extend_i32_u vsum\n\
   return vr\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(vci: i64):\n\
+block 0 (vci: i64) {\n\
   vz = i64.const 0\n\
-  br block1(vz)\n\
-block1(i: i64):\n\
+  br 1(vz)\n\
+}\n\
+block 1 (i: i64) {\n\
   vlim = i64.const 20000000\n\
   vlt = i64.lt_u i vlim\n\
   vinc = i64.const 1\n\
   vnext = i64.add i vinc\n\
-  br_if vlt block1(vnext) block2()\n\
-block2():\n\
+  br_if vlt 1(vnext) 2()\n\
+}\n\
+block 2 () {\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 #[test]

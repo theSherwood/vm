@@ -65,12 +65,13 @@ fn check_fuel(src: &str, arg: Value, fuel: u64) {
 const STORE_OOB: &str = "\
 memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65532
   v2 = i64.const 0
   i64.store v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 debug.file 0 \"fault.c\"
 debug.fname 0 \"store_oob\"
@@ -86,17 +87,19 @@ fn single_frame_memory_fault() {
 /// later add, so func0's window stays live). The backtrace must walk callee then caller.
 const CALL_THEN_DIV: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i32.const 1
   v3 = i32.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = i32.div_s v0 v1
   return v2
+  }
 }
 debug.file 0 \"div.c\"
 debug.fname 0 \"outer\"
@@ -114,22 +117,25 @@ fn two_frame_caller_chain() {
 /// window on the reified `stack` (not just the top one) lands at its own call site.
 const DEEP_CHAIN: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   return v1
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 5
   v2 = i32.add v0 v1
   v3 = call 2 (v2)
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = i32.rem_s v0 v1
   return v2
+  }
 }
 debug.file 0 \"chain.c\"
 debug.fname 0 \"top\"
@@ -149,17 +155,19 @@ fn three_frame_caller_chain() {
 /// is the call site, not the post-call op — a `inst + 1` boundary check against the tree-walker.
 const CALL_MIDBLOCK: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 100
   v2 = call 1 (v0)
   v3 = i32.add v2 v1
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = i32.div_s v0 v1
   return v2
+  }
 }
 debug.file 0 \"mid.c\"
 debug.fname 0 \"caller\"
@@ -179,10 +187,11 @@ fn caller_location_is_the_call_site() {
 /// instructions before the terminator, pinning that count.
 const UNREACHABLE: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 7
   v2 = i32.add v0 v1
   unreachable
+  }
 }
 debug.file 0 \"halt.c\"
 debug.fname 0 \"halt\"
@@ -199,13 +208,16 @@ fn terminator_trap_unreachable() {
 /// scan-back heuristic would get wrong.
 const UNREACHABLE_EMPTY_BLOCK: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.eqz v0
-  br_if v1 block1(v0) block2(v0)
-block1(v2: i32):
+  br_if v1 1(v0) 2(v0)
+}
+block 1 (v2: i32) {
   unreachable
-block2(v3: i32):
+}
+block 2 (v3: i32) {
   return v3
+  }
 }
 debug.file 0 \"br.c\"
 debug.fname 0 \"maybe_halt\"
@@ -221,10 +233,11 @@ fn terminator_trap_in_empty_block() {
 /// A clean run leaves an empty backtrace on both backends (and the same result).
 const CLEAN: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   return v2
+  }
 }
 debug.file 0 \"ok.c\"
 debug.fname 0 \"ok\"
@@ -236,13 +249,14 @@ debug.loc 0 0 0 0 1 3
 /// the case that pins the `bump = 0` (no innermost advance) branch of the backtrace.
 const FUEL_BURN: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   v3 = i32.add v2 v1
   v4 = i32.add v3 v1
   v5 = i32.add v4 v1
   return v5
+  }
 }
 debug.file 0 \"burn.c\"
 debug.fname 0 \"burn\"

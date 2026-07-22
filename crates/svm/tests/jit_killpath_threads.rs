@@ -56,21 +56,25 @@ fn run_killed(src: &str, delay_ms: u64) -> JitOutcome {
 fn killpath_stops_spinning_sibling() {
     let src = "memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = thread.spawn 1 v0 v0
-  br block1(v0)
-block1(v2: i64):
+  br 1(v0)
+}
+block 1 (v2: i64) {
   v3 = i64.const 1
   v4 = i64.add v2 v3
-  br block1(v4)
+  br 1(v4)
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
-  br block1(v0)
-block1(v2: i64):
+block 0 (v0: i64, v1: i64) {
+  br 1(v0)
+}
+block 1 (v2: i64) {
   v3 = i64.const 1
   v4 = i64.add v2 v3
-  br block1(v4)
+  br 1(v4)
+  }
 }
 ";
     assert_eq!(
@@ -89,25 +93,29 @@ block1(v2: i64):
 fn killpath_wakes_parked_futex_waiter() {
     let src = "memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = thread.spawn 1 v0 v0
-  br block1(v0)
-block1(v2: i64):
+  br 1(v0)
+}
+block 1 (v2: i64) {
   v3 = i64.const 1
   v4 = i64.add v2 v3
-  br block1(v4)
+  br 1(v4)
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   v3 = i32.const 0
   v4 = i64.const -1
   v5 = i32.atomic.wait v2 v3 v4
-  br block1(v0)
-block1(v6: i64):
+  br 1(v0)
+}
+block 1 (v6: i64) {
   v7 = i64.const 1
   v8 = i64.add v6 v7
-  br block1(v8)
+  br 1(v8)
+  }
 }
 ";
     assert_eq!(

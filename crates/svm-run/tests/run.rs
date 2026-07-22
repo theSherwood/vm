@@ -28,10 +28,11 @@ fn entry_points_reject_unverified_modules_fail_closed() {
     // skips `verify_module` cannot bypass the §2a escape gate — both must fail closed, not run it.
     let m = parse_module(
         "func () -> (i64) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i64.const 0\n\
          \x20 v1 = i64.load v0\n\
          \x20 return v1\n\
+           }\n\
          }\n",
     )
     .expect("parse");
@@ -54,15 +55,16 @@ fn writes_to_stdout_and_returns() {
     let m = load(
         "memory 16\n\
          data 16 \"hi\\n\"\n\
-         export \"_start\" 0\n\
+         export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i32.const 0\n\
          \x20 v1 = i64.const 16\n\
          \x20 v2 = i64.const 3\n\
-         \x20 v3 = call.import \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v3 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = i32.const 7\n\
          \x20 return v4\n\
+           }\n\
          }\n",
     );
     assert!(is_named_powerbox_entry(&m));
@@ -76,13 +78,14 @@ fn writes_to_stdout_and_returns() {
 fn exit_capability_sets_code() {
     // The guest invokes Exit(5) through its `exit` manifest import — terminal.
     let m = load(
-        "export \"_start\" 0\n\
+        "export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i32.const 0\n\
          \x20 v1 = i32.const 5\n\
-         \x20 call.import \"exit\" (i32) -> () v0(v1)\n\
+         \x20 call.sym \"exit\" (i32) -> () v0(v1)\n\
          \x20 unreachable\n\
+           }\n\
          }\n",
     );
     let run = run_powerbox(&m, b"").expect("run");
@@ -96,16 +99,17 @@ fn echoes_stdin_to_stdout() {
     // endpoint: read→stdin, write→stdout).
     let m = load(
         "memory 16\n\
-         export \"_start\" 0\n\
+         export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i32.const 0\n\
          \x20 v1 = i64.const 0\n\
          \x20 v2 = i64.const 64\n\
-         \x20 v3 = call.import \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
-         \x20 v4 = call.import \"write\" (i64, i64) -> (i64) v0(v1, v3)\n\
+         \x20 v3 = call.sym \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v4 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v3)\n\
          \x20 v5 = i32.const 0\n\
          \x20 return v5\n\
+           }\n\
          }\n",
     );
     let run = run_powerbox(&m, b"ping").expect("run");
@@ -117,10 +121,11 @@ fn bare_kernel_returns_value() {
     // A non-powerbox entry — a pure function (i64 x) -> (i64) returning x + 1.
     let m = load(
         "func (i64) -> (i64) {\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.add v0 v1\n\
          \x20 return v2\n\
+           }\n\
          }\n",
     );
     assert!(!is_named_powerbox_entry(&m));
@@ -443,15 +448,17 @@ fn cli_compiles_and_runs_c() {
 #[test]
 fn deadline_kills_runaway_powerbox_guest() {
     let m = load(
-        "export \"_start\" 0\n\
+        "export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i32.const 0\n\
-         \x20 br block1(v0)\n\
-         block1(v1: i32):\n\
+         \x20 br 1(v0)\n\
+         }\n\
+         block 1 (v1: i32) {\n\
          \x20 v2 = i32.const 1\n\
          \x20 v3 = i32.add v1 v2\n\
-         \x20 br block1(v3)\n\
+         \x20 br 1(v3)\n\
+           }\n\
          }\n",
     );
     let err = run_powerbox_with_deadline(&m, b"", Some(Duration::from_millis(100)))
@@ -470,13 +477,14 @@ fn deadline_kills_runaway_powerbox_guest() {
 #[test]
 fn trap_kill_message_carries_a_source_backtrace() {
     let m = load(
-        "export \"_start\" 0\n\
+        "export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i32.const 1\n\
          \x20 v1 = i32.const 0\n\
          \x20 v2 = i32.div_s v0 v1\n\
          \x20 return v2\n\
+           }\n\
          }\n\
          debug.file 0 \"guest.c\"\n\
          debug.fname 0 \"divide\"\n\
@@ -499,14 +507,15 @@ fn trap_kill_message_carries_a_source_backtrace() {
 fn memfault_kill_message_carries_a_source_backtrace() {
     let m = load(
         "memory 16\n\
-         export \"_start\" 0\n\
+         export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i64.const 65532\n\
          \x20 v1 = i64.const 0\n\
          \x20 i64.store v0 v1\n\
          \x20 v2 = i32.const 0\n\
          \x20 return v2\n\
+           }\n\
          }\n\
          debug.file 0 \"mem.c\"\n\
          debug.fname 0 \"store_oob\"\n\
@@ -529,15 +538,16 @@ fn deadline_does_not_delay_fast_guest() {
     let m = load(
         "memory 16\n\
          data 16 \"hi\\n\"\n\
-         export \"_start\" 0\n\
+         export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i32.const 0\n\
          \x20 v1 = i64.const 16\n\
          \x20 v2 = i64.const 3\n\
-         \x20 v3 = call.import \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v3 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = i32.const 7\n\
          \x20 return v4\n\
+           }\n\
          }\n",
     );
     let t0 = Instant::now();
@@ -564,12 +574,12 @@ fn deadline_does_not_delay_fast_guest() {
 fn powerbox_region_minting_round_trips() {
     let m = load(
         "memory 17\n\
-         export \"_start\" 0\n\
+         export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i32.const 0\n\
          \x20 v1 = i64.const 65536\n\
-         \x20 v2 = call.import \"vm_region_create\" (i64) -> (i64) v0(v1)\n\
+         \x20 v2 = call.sym \"vm_region_create\" (i64) -> (i64) v0(v1)\n\
          \x20 v3 = i32.wrap_i64 v2\n\
          \x20 v4 = cap.call 4 3 () -> (i64) v3()\n\
          \x20 v5 = i64.const 0\n\
@@ -580,6 +590,7 @@ fn powerbox_region_minting_round_trips() {
          \x20 i32.store8 v5 v9\n\
          \x20 v10 = i32.load8_u v4\n\
          \x20 return v10\n\
+           }\n\
          }\n",
     );
     let run = run_powerbox(&m, b"").expect("run");
@@ -740,17 +751,19 @@ fn demo_jit_threads_runs() {
 fn quota_contains_a_powerbox_thread_bomb() {
     // A powerbox entry (paramless exported `_start`) that just spawns a vCPU and returns.
     let src = "memory 16\n\
-        export \"_start\" 0\n\
+        export 0 func \"_start\" 0\n\
         func () -> () {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 5\n\
         \x20 v1 = thread.spawn 1 v0 v0\n\
         \x20 v2 = thread.join v1\n\
         \x20 return\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 return varg\n\
+          }\n\
         }\n";
     let m = load(src);
 
@@ -790,16 +803,17 @@ fn manifest_imports_run_like_inline_capcalls() {
         import 0 \"write\" (i64, i64) -> (i64)\n\
         import 1 \"exit\" (i32) -> ()\n\
         data 16 \"hi\\n\"\n\
-        export \"_start\" 0\n\
+        export 0 func \"_start\" 0\n\
         func () -> (i32) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i32.const 0\n\
         \x20 v1 = i64.const 16\n\
         \x20 v2 = i64.const 3\n\
-        \x20 v3 = call.import 0 v0 (v1, v2)\n\
+        \x20 v3 = call.import 0 (v1, v2)\n\
         \x20 v4 = i32.const 0\n\
-        \x20 call.import 1 v0 (v4)\n\
+        \x20 call.import 1 (v4)\n\
         \x20 unreachable\n\
+          }\n\
         }\n";
     let m = load(named);
     assert_eq!(m.imports.len(), 2, "two named imports declared");
@@ -816,9 +830,9 @@ fn manifest_imports_run_like_inline_capcalls() {
         data 16 \"hi\\n\"\n\
         data 32 \"stdout\"\n\
         data 40 \"exit\"\n\
-        export \"_start\" 0\n\
+        export 0 func \"_start\" 0\n\
         func () -> (i32) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 32\n\
         \x20 v1 = i64.const 6\n\
         \x20 v2 = cap.self.resolve v0 v1\n\
@@ -831,6 +845,7 @@ fn manifest_imports_run_like_inline_capcalls() {
         \x20 v9 = i32.const 0\n\
         \x20 cap.call 1 0 (i32) -> () v8(v9)\n\
         \x20 unreachable\n\
+          }\n\
         }\n",
     );
 
@@ -853,14 +868,15 @@ fn unknown_named_import_fails_closed() {
     // A capability name the host policy doesn't know is a clean instantiation error
     // (`validate_powerbox_manifest`) — never a silent no-op or a wrong call.
     let src = "import 0 \"frobnicate\" (i64) -> (i64)\n\
-        export \"_start\" 0\n\
+        export 0 func \"_start\" 0\n\
         func () -> (i32) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i32.const 0\n\
         \x20 v1 = i64.const 0\n\
-        \x20 v2 = call.import 0 v0 (v1)\n\
+        \x20 v2 = call.import 0 (v1)\n\
         \x20 v3 = i32.const 0\n\
         \x20 return v3\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     let err = match svm_run::instantiate(m) {

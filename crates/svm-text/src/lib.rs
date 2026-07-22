@@ -4,16 +4,21 @@
 //!
 //! It is a *dev tool*, not escape-TCB: the binary decoder (`svm-encode`) is the
 //! untrusted-input path. The parser still returns `Result` and never panics, but it
-//! need not be exhaustively hardened. The printer normalizes value/block names to
-//! `vN`/`blockN`, so a parse→print→parse round-trip is identity at the IR level.
+//! need not be exhaustively hardened. The printer normalizes value names to `vN` and
+//! block labels to their indices, so a parse→print→parse round-trip is identity at
+//! the IR level. One grammar (the pre-§3.5 dual spellings are retired): braced
+//! numbered blocks, indexed exports, numeric branch targets. The streaming sugars
+//! (inline-signature imports, name-inline `call.sym`) and optional `func`/`type`
+//! labels are deliberate parts of that one grammar, not legacy.
 //!
 //! Example:
 //! ```text
 //! func (i32) -> (i32) {
-//! block0(v0: i32):
-//!   v1 = i32.const 10
-//!   v2 = i32.add v0 v1
-//!   return v2
+//!   block 0 (v0: i32) {
+//!     v1 = i32.const 10
+//!     v2 = i32.add v0 v1
+//!     return v2
+//!   }
 //! }
 //! ```
 #![forbid(unsafe_code)]
@@ -1366,61 +1371,42 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 let elems = p.parse_iface_elems()?;
                 p.types.push(svm_ir::TypeEntry::Interface(elems));
             }
-            // Exports. v7 forms (§3.5): `export <idx> func "name" <funcidx>` and
+            // Exports (settled §3.5 forms only; the unindexed `export "name" N` and the
+            // `impl` offer spellings are retired): `export <idx> func "name" <funcidx>` and
             // `export <idx> interface "name" <t> { op: funcidx, ... }` (offer; map keys must
             // match the interface's declared op names, or bare funcidxs positionally).
-            // Legacy: `export "name" <funcidx>` / `export "name" impl <iface> : <funcidx>...`.
             Some(Tok::Ident(s)) if s == "export" => {
                 p.next()?;
-                if matches!(p.peek(), Some(Tok::Int(_))) {
-                    let idx = p.parse_int()?;
-                    let kind = p.parse_ident()?;
-                    let name = String::from_utf8(p.parse_str()?)
-                        .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
-                    match kind.as_str() {
-                        "func" => {
-                            if idx < 0 || idx as usize != exports.len() {
-                                return err(
-                                    "export indices must be dense and in declaration order",
-                                );
-                            }
-                            let func = p.parse_u32()?;
-                            exports.push(Export { name, func });
+                if !matches!(p.peek(), Some(Tok::Int(_))) {
+                    return err(
+                        "export takes a dense index (the legacy `export \"name\" N` and `impl` spellings are retired)",
+                    );
+                }
+                let idx = p.parse_int()?;
+                let kind = p.parse_ident()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
+                match kind.as_str() {
+                    "func" => {
+                        if idx < 0 || idx as usize != exports.len() {
+                            return err("export indices must be dense and in declaration order");
                         }
-                        "interface" => {
-                            if idx < 0 || idx as usize != impl_exports.len() {
-                                return err("offer indices must be dense and in declaration order");
-                            }
-                            let interface = p.parse_u32()?;
-                            let ops = p.parse_offer_ops(interface)?;
-                            impl_exports.push(ImplExport {
-                                name,
-                                interface,
-                                ops,
-                            });
-                        }
-                        k => return err(format!("export kind must be func or interface: {k}")),
+                        let func = p.parse_u32()?;
+                        exports.push(Export { name, func });
                     }
-                } else {
-                    let name = String::from_utf8(p.parse_str()?)
-                        .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
-                    if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
-                        p.next()?;
-                        let interface = p.parse_u32()?;
-                        p.expect(&Tok::Colon)?;
-                        let mut ops = Vec::new();
-                        while matches!(p.peek(), Some(Tok::Int(_))) {
-                            ops.push(p.parse_u32()?);
+                    "interface" => {
+                        if idx < 0 || idx as usize != impl_exports.len() {
+                            return err("offer indices must be dense and in declaration order");
                         }
+                        let interface = p.parse_u32()?;
+                        let ops = p.parse_offer_ops(interface)?;
                         impl_exports.push(ImplExport {
                             name,
                             interface,
                             ops,
                         });
-                    } else {
-                        let func = p.parse_u32()?;
-                        exports.push(Export { name, func });
                     }
+                    k => return err(format!("export kind must be func or interface: {k}")),
                 }
             }
             _ => funcs.push(p.parse_func(funcs.len() as u32)?),
@@ -1551,35 +1537,21 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 }
                 p.expect(&Tok::RBrace)?;
             }
-            // Exports — skip past them in the header prescan. v7 forms: `export <idx> func
-            // "name" <funcidx>` / `export <idx> interface "name" <t> { ... }`; legacy:
-            // `export "name" <funcidx>` / `export "name" impl <iface> : <funcidx>...`.
+            // Exports — skip past them in the header prescan (settled forms only: `export
+            // <idx> func "name" <funcidx>` / `export <idx> interface "name" <t> { ... }`;
+            // the unindexed and `impl` spellings are retired).
             Some(Tok::Ident(s)) if s == "export" => {
                 p.next()?;
-                if matches!(p.peek(), Some(Tok::Int(_))) {
-                    p.parse_int()?;
-                    let kind = p.parse_ident()?;
-                    p.parse_str()?;
-                    p.parse_int()?;
-                    if kind == "interface" {
-                        p.expect(&Tok::LBrace)?;
-                        while !matches!(p.peek(), Some(Tok::RBrace)) {
-                            p.next()?;
-                        }
-                        p.expect(&Tok::RBrace)?;
-                    }
-                } else {
-                    p.parse_str()?;
-                    if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
+                p.parse_int()?;
+                let kind = p.parse_ident()?;
+                p.parse_str()?;
+                p.parse_int()?;
+                if kind == "interface" {
+                    p.expect(&Tok::LBrace)?;
+                    while !matches!(p.peek(), Some(Tok::RBrace)) {
                         p.next()?;
-                        p.parse_int()?;
-                        p.expect(&Tok::Colon)?;
-                        while matches!(p.peek(), Some(Tok::Int(_))) {
-                            p.parse_int()?;
-                        }
-                    } else {
-                        p.parse_int()?;
                     }
+                    p.expect(&Tok::RBrace)?;
                 }
             }
             Some(Tok::Ident(s)) if s == "func" => {
@@ -2097,24 +2069,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_block(&mut self, block_idx: u32) -> Result<PBlock, ParseError> {
-        // §3.5 surface: `block N (name: type, ...) { insts… term }` — the index is a checked
-        // positional label and the body is braced (labels are the index's decimal string, so
-        // numeric branch targets resolve). Legacy: `label(name: type, ...):` then instruction
-        // lines up to a terminator.
+        // The one block form (settled §3.5, legacy labels retired): `block N (name: type, ...)
+        // { insts… term }` — the index is a checked positional label and the body is braced
+        // (labels are the index's decimal string, so numeric branch targets resolve).
         let header_line = self.cur_line();
         let label = self.ident()?;
-        let braced = label == "block" && matches!(self.peek(), Some(Tok::Int(_)));
-        let label = if braced {
-            let n = self.parse_int()?;
-            if n < 0 || n as u32 != block_idx {
-                return err(format!(
-                    "block label {n} out of order (this is block {block_idx})"
-                ));
-            }
-            n.to_string()
-        } else {
-            label
-        };
+        if label != "block" {
+            return err(format!(
+                "expected `block {block_idx} (…) {{`, found `{label}` (the legacy `blockN(…):` label form is retired)"
+            ));
+        }
+        let n = self.parse_int()?;
+        if n < 0 || n as u32 != block_idx {
+            return err(format!(
+                "block label {n} out of order (this is block {block_idx})"
+            ));
+        }
+        let label = n.to_string();
         // Per-block value-name table; parameters take indices 0..k.
         let mut names: HashMap<String, u32> = HashMap::new();
         let mut params = Vec::new();
@@ -2140,11 +2111,7 @@ impl<'a> Parser<'a> {
             params.push(t);
         }
         self.expect(&Tok::RParen)?;
-        if braced {
-            self.expect(&Tok::LBrace)?;
-        } else {
-            self.expect(&Tok::Colon)?;
-        }
+        self.expect(&Tok::LBrace)?;
 
         let mut insts = Vec::new();
         let mut next_idx = params.len() as u32;
@@ -2167,9 +2134,7 @@ impl<'a> Parser<'a> {
             ) {
                 let term = self.parse_term(&names)?;
                 dbg.term_line = cur;
-                if braced {
-                    self.expect(&Tok::RBrace)?;
-                }
+                self.expect(&Tok::RBrace)?;
                 return Ok(PBlock {
                     label,
                     params,
@@ -2346,13 +2311,13 @@ impl<'a> Parser<'a> {
         //   manifest:    `call.import <idx>[.<opname> | op <n>] (args)` — sig from the decl;
         //                a legacy `v<handle>` operand before the args parses and is discarded
         //                (the slot binding identifies the capability since v8)
-        //   link-form:   `call.sym <idx> v<handle> (args)` — the §7/§22 placeholder
-        //   name-inline: `call.import "name" (params)->(results) v<h> (args)` — legacy link-form
-        //                sugar; interns the name as a flat func import and yields a `CallSym`
+        //   symbolic:    `call.sym <idx> v<handle> (args)` — the §7/§22 symbolic call
+        //   name-inline: `call.sym "name" (params)->(results) v<h> (args)` — the *streaming*
+        //                form: interns the name as a flat func import and yields a `CallSym`
         // The name-inline form lets a streaming frontend (chibicc) emit a symbolic call per site
         // with no pre-collected import table; the parser interns the name into `imports`.
         if op == "call.import" || op == "call.sym" {
-            if op == "call.import" && matches!(self.peek(), Some(Tok::Str(_))) {
+            if op == "call.sym" && matches!(self.peek(), Some(Tok::Str(_))) {
                 // Name-inline sugar: interns the signature as a type entry and the name as a
                 // flat func import; the call is a link-form `CallSym` (the handle operand is
                 // the cap symbol's runtime handle / `Slot` patch target).
@@ -2411,10 +2376,6 @@ impl<'a> Parser<'a> {
                 0
             };
             let sig = self.import_op_sig(import, opidx)?;
-            // Legacy sugar: a pre-v8 handle operand before the arg list parses and is dropped.
-            if !matches!(self.peek(), Some(Tok::LParen)) {
-                self.value(names)?;
-            }
             let args = self.parse_value_list(names)?;
             return Ok(Inst::CallImport {
                 import,
@@ -3261,6 +3222,44 @@ impl<'a> Parser<'a> {
 }
 
 #[cfg(test)]
+mod retired_forms {
+    use super::*;
+
+    // The pre-§3.5 dual grammars are retired: each spelling is a parse error, pinned
+    // here so a legacy path cannot quietly grow back.
+    #[test]
+    fn legacy_spellings_are_rejected() {
+        // `blockN(...):` indentation labels.
+        assert!(parse_module("func () -> () {\nblock0():\n  return\n}\n").is_err());
+        // Unindexed `export "name" N`.
+        assert!(parse_module(
+            "export \"main\" 0\nfunc () -> () {\nblock 0 () {\n  return\n  }\n}\n"
+        )
+        .is_err());
+        // The `impl` offer spelling.
+        assert!(parse_module(concat!(
+            "type 0 func () -> ()\ntype 1 interface { f: 0 }\n",
+            "export \"x\" impl 1 : 0\n",
+            "func () -> () {\nblock 0 () {\n  return\n  }\n}\n"
+        ))
+        .is_err());
+        // Name-inline under `call.import` (the streaming spelling is `call.sym`).
+        assert!(parse_module(concat!(
+            "func (i32) -> () {\nblock 0 (v0: i32) {\n",
+            "  call.import \"exit\" (i32) -> () v0 (v0)\n  unreachable\n  }\n}\n"
+        ))
+        .is_err());
+        // The retired pre-v8 handle operand on an indexed `call.import`.
+        assert!(parse_module(concat!(
+            "import 0 \"exit\" (i32) -> ()\n",
+            "func (i32) -> () {\nblock 0 (v0: i32) {\n",
+            "  call.import 0 v0 (v0)\n  unreachable\n  }\n}\n"
+        ))
+        .is_err());
+    }
+}
+
+#[cfg(test)]
 mod import_text_tests {
     use super::*;
     use svm_ir::{Inst, ResolvedCap};
@@ -3271,13 +3270,14 @@ import 0 \"write\" (i64, i64) -> (i64)
 import 1 \"exit\" (i32) -> ()
 
 func (i32) -> () {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 3
-  v3 = call.import 0 v0 (v1, v2)
+  v3 = call.import 0 (v1, v2)
   v4 = i32.const 0
-  call.import 1 v0 (v4)
+  call.import 1 (v4)
   return
+  }
 }
 ";
 
@@ -3287,8 +3287,7 @@ block0(v0: i32):
         assert_eq!(m.imports.len(), 2);
         assert_eq!(m.imports[0].name, "write");
         assert_eq!(m.imports[1].name, "exit");
-        // The body carries two CallImports, sigs recovered from the import table (the legacy
-        // handle operands parse and are discarded — v8).
+        // The body carries two CallImports, sigs recovered from the import table.
         let insts = &m.funcs[0].blocks[0].insts;
         let imports: Vec<_> = insts
             .iter()
@@ -3307,17 +3306,19 @@ block0(v0: i32):
     #[test]
     fn exports_round_trip() {
         let src = "\
-export \"main\" 1
-export \"helper\" 0
+export 0 func \"main\" 1
+export 1 func \"helper\" 0
 
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 ";
         let m = parse_module(src).expect("parse");
@@ -3340,13 +3341,15 @@ export 0 func \"main\" 0
 export 0 interface \"logger\" 1 { put: 1, get: 0 }
 
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 ";
         let m = parse_module(src).expect("parse");
@@ -3363,17 +3366,20 @@ block0(v0: i64):
     fn auto_debug_synthesizes_a_line_table_and_named_ssa_values() {
         let src = "\
 func () -> (i64) {
-block0():
+block 0 () {
   vn = i64.const 5
   vacc0 = i64.const 0
-  br block1(vn, vacc0)
-block1(vi: i64, vacc: i64):
+  br 1(vn, vacc0)
+}
+block 1 (vi: i64, vacc: i64) {
   vsum = i64.add vacc vi
   vone = i64.const 1
   vnext = i64.sub vi vone
-  br_if vnext block1(vnext, vsum) block2(vsum)
-block2(vr: i64):
+  br_if vnext 1(vnext, vsum) 2(vsum)
+}
+block 2 (vr: i64) {
   return vr
+  }
 }
 ";
         // Plain parse leaves a program with no `debug` section as `None` (unchanged behavior).
@@ -3386,34 +3392,49 @@ block2(vr: i64):
             .expect("auto debug info");
         assert_eq!(di.files, vec![AUTO_DEBUG_FILE.to_string()]);
 
-        // block1 inst0 (`vsum = i64.add`) is on source line 7; inst2 (`vnext = i64.sub`) on line 9.
+        // block1 inst0 (`vsum = i64.add`) is on source line 8; inst2 (`vnext = i64.sub`) on line 10.
         let loc = |b, i| {
             di.locs
                 .iter()
                 .find(|l| l.func == 0 && l.block == b && l.inst == i)
                 .unwrap()
         };
-        assert_eq!(loc(1, 0).line, 7);
-        assert_eq!(loc(1, 2).line, 9);
+        assert_eq!(loc(1, 0).line, 8);
+        assert_eq!(loc(1, 2).line, 10);
 
-        // Loop params i/acc are ssa 0/1, live from the block header (line 6); the result `vsum`
-        // (block-local index 2) is scoped from just after its defining line (7 → 8).
+        // Loop params i/acc are ssa 0/1, live from the block header (line 7); the result `vsum`
+        // (block-local index 2) is scoped from just after its defining line (8 → 9).
         let var = |n: &str| di.vars.iter().find(|v| v.name == n).unwrap();
         assert!(matches!(var("vi").loc, VarLoc::Ssa { value: 0 }));
-        assert_eq!(var("vi").scope.unwrap().0, 6);
+        assert_eq!(var("vi").scope.unwrap().0, 7);
         assert!(matches!(var("vacc").loc, VarLoc::Ssa { value: 1 }));
         assert!(matches!(var("vsum").loc, VarLoc::Ssa { value: 2 }));
-        assert_eq!(var("vsum").scope.unwrap().0, 8);
+        assert_eq!(var("vsum").scope.unwrap().0, 9);
     }
 
     // The linker's Cap lowering (IMPORTS.md §2.5: `resolve_imports_with` survives in the linker
     // only) over parsed text IR — the parse → link integration, not an instantiation path.
-    // Since v8 the link-form spelling is `call.sym` (indexed `call.import` is the manifest
-    // call, which the linker never touches).
+    // The link-form spelling is `call.sym` (indexed `call.import` is the manifest call, which
+    // the linker never touches); the symbolic call carries the live handle operand.
     #[test]
     fn linker_lowers_parsed_imports_to_capcalls() {
-        let src = SRC.replace("call.import", "call.sym");
-        let m = parse_module(&src).expect("parse");
+        let src = "\
+memory 16
+import 0 \"write\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func (i32) -> () {
+block 0 (v0: i32) {
+  v1 = i64.const 0
+  v2 = i64.const 3
+  v3 = call.sym 0 v0 (v1, v2)
+  v4 = i32.const 0
+  call.sym 1 v0 (v4)
+  return
+  }
+}
+";
+        let m = parse_module(src).expect("parse");
         let r = svm_ir::resolve_imports_with(&m, |n| match n {
             "write" => Some(svm_ir::Resolved::Cap(ResolvedCap { type_id: 0, op: 1 })),
             "exit" => Some(svm_ir::Resolved::Cap(ResolvedCap { type_id: 1, op: 0 })),
@@ -3440,21 +3461,22 @@ mod import_inline_tests {
     use super::*;
     use svm_ir::Inst;
 
-    // Name-inline `call.import "name" (sig) v<h> (args)` needs no `import` declaration: the
-    // parser interns the name and yields the link-form `CallSym` (v8). Two sites with the same
-    // name+sig share one import index.
+    // Name-inline `call.sym "name" (sig) v<h> (args)` — the streaming form — needs no
+    // `import` declaration: the parser interns the name and yields a `CallSym`. Two sites
+    // with the same name+sig share one import index.
     #[test]
     fn name_inline_interns_imports() {
         let src = "\
 func (i32) -> () {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 3
-  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
-  v4 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
   v5 = i32.const 0
-  call.import \"exit\" (i32) -> () v0 (v5)
+  call.sym \"exit\" (i32) -> () v0 (v5)
   return
+  }
 }
 ";
         let m = parse_module(src).expect("parse name-inline imports");
@@ -3481,12 +3503,14 @@ block0(v0: i32):
         // print → re-parse round trip (the `debug.fname <func> "<name>"` directive).
         let src = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 debug.file 0 \"a.c\"
 debug.fname 0 \"compute\"

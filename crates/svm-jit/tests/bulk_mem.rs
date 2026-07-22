@@ -56,7 +56,7 @@ fn fill_then_copy() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 171
   v2 = i64.const 16
@@ -68,6 +68,7 @@ block0():
   v6 = i64.const 100
   v7 = i64.load v6
   return v7
+  }
 }
 ";
     // 0xABABABABABABABAB reinterpreted as i64.
@@ -81,7 +82,7 @@ fn overlapping_move() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 1
   v2 = i64.const 24
@@ -93,6 +94,7 @@ block0():
   v6 = i64.const 16
   v7 = i64.load v6
   return v7
+  }
 }
 ";
     // Every byte in [0,24) was 0x01, so after the move [16,24) is still 0x0101010101010101.
@@ -106,13 +108,14 @@ fn zero_length_wild_pointer_is_noop() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 999999999
   v1 = i64.const 888888888
   v2 = i64.const 0
   mem.copy v0 v1 v2
   v3 = i64.const 42
   return v3
+  }
 }
 ";
     assert_eq!(run_all(src), Ok(42));
@@ -125,13 +128,14 @@ fn copy_past_window_faults() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 65528
   v1 = i64.const 0
   v2 = i64.const 32
   mem.copy v0 v1 v2
   v3 = i64.const 0
   return v3
+  }
 }
 ";
     assert_eq!(run_all(src), Err(()));
@@ -144,13 +148,14 @@ fn fill_oversized_length_faults() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 0
   v2 = i64.const 4294967296
   mem.fill v0 v1 v2
   v3 = i64.const 0
   return v3
+  }
 }
 ";
     assert_eq!(run_all(src), Err(()));
@@ -171,12 +176,13 @@ fn self_copy_overrunning_mapped_faults() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 65537
   mem.copy v0 v0 v1
   v2 = i64.const 0
   return v2
+  }
 }
 ";
     assert_eq!(run_all(src), Err(()));
@@ -188,12 +194,13 @@ fn self_move_overrunning_mapped_faults() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 65537
   mem.move v0 v0 v1
   v2 = i64.const 0
   return v2
+  }
 }
 ";
     assert_eq!(run_all(src), Err(()));
@@ -206,13 +213,14 @@ fn copy_src_overrunning_mapped_faults() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 63000
   v2 = i64.const 4096
   mem.copy v0 v1 v2
   v3 = i64.const 0
   return v3
+  }
 }
 ";
     assert_eq!(run_all(src), Err(()));
@@ -225,13 +233,14 @@ fn fill_overrunning_mapped_faults() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 63000
   v1 = i32.const 65
   v2 = i64.const 4096
   mem.fill v0 v1 v2
   v3 = i64.const 0
   return v3
+  }
 }
 ";
     assert_eq!(run_all(src), Err(()));

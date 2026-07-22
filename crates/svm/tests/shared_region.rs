@@ -22,7 +22,7 @@ fn alias_probe_src() -> String {
         // that granule is the 64 KiB allocation granularity, so the second alias lands at 64 KiB.
         "memory 17\n\
          func (i32) -> (i64) {{\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {{\n\
          \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
@@ -32,6 +32,7 @@ fn alias_probe_src() -> String {
          \x20 i64.store v2 v6\n\
          \x20 v7 = i64.load v1\n\
          \x20 return v7\n\
+           }}\n\
          }}\n"
     )
 }
@@ -63,7 +64,7 @@ fn shared_region_without_second_mapping_is_not_aliased() {
     let src = format!(
         "memory 17\n\
          func (i32) -> (i64) {{\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {{\n\
          \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
@@ -72,6 +73,7 @@ fn shared_region_without_second_mapping_is_not_aliased() {
          \x20 i64.store v2 v6\n\
          \x20 v7 = i64.load v1\n\
          \x20 return v7\n\
+           }}\n\
          }}\n"
     );
     let m = parse_module(&src).expect("parse");
@@ -109,7 +111,7 @@ fn ring_buffer_straddling_access_wraps_differential() {
     let src = format!(
         "memory 17\n\
          func (i32) -> (i64) {{\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {{\n\
          \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
@@ -133,6 +135,7 @@ fn ring_buffer_straddling_access_wraps_differential() {
          \x20 v20 = i64.sub v9 v8\n\
          \x20 v21 = i64.add v19 v20\n\
          \x20 return v21\n\
+           }}\n\
          }}\n"
     );
     let m = parse_module(&src).expect("parse");

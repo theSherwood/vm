@@ -25,14 +25,16 @@ use svm_interp::{bytecode, Value};
 // and engine-supported), plus a divide-by-zero trap kernel.
 const ALU: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 6364136223846793005
   v11 = i64.mul v8 v10
   v12 = i64.const 1442695040888963407
@@ -40,65 +42,77 @@ block2(v7: i64, v8: i64, v9: i64):
   v14 = i64.add v13 v9
   v15 = i64.const 1
   v16 = i64.add v9 v15
-  br block1(v7, v14, v16)
-block3(v17: i64):
+  br 1(v7, v14, v16)
+}
+block 3 (v17: i64) {
   return v17
+  }
 }
 "#;
 
 const CALL: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = call 1 (v8, v9)
   v11 = i64.const 1
   v12 = i64.add v9 v11
-  br block1(v7, v10, v12)
-block3(v13: i64):
+  br 1(v7, v10, v12)
+}
+block 3 (v13: i64) {
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.add v0 v1
   return v2
+  }
 }
 "#;
 
 const MEM: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 8
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9
   v13 = i64.const 1
   v14 = i64.add v9 v13
-  br block1(v7, v12, v14)
-block3(v15: i64):
+  br 1(v7, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }
 "#;
 
 const DIVTRAP: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.div_s v0 v1
   return v2
+  }
 }
 "#;
 
@@ -108,14 +122,16 @@ block0(v0: i64):
 const THREADS: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 500
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -125,15 +141,18 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
+  br 1(v12)
+}
+block 3 () {
   v13 = i64.const 0
-  br block4(v13)
-block4(v14: i64):
+  br 4(v13)
+}
+block 4 (v14: i64) {
   v15 = i64.const 8
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14) block6()
-block5(v17: i64):
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -142,29 +161,35 @@ block5(v17: i64):
   v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
-  br block4(v25)
-block6():
+  br 4(v25)
+}
+block 6 () {
   v26 = i64.const 0
   v27 = i64.atomic.load v26
   return v27
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 0
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 "#;
 
@@ -178,14 +203,16 @@ block2():
 const THREADS_TIERUP: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 500
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -195,15 +222,18 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
+  br 1(v12)
+}
+block 3 () {
   v13 = i64.const 0
-  br block4(v13)
-block4(v14: i64):
+  br 4(v13)
+}
+block 4 (v14: i64) {
   v15 = i64.const 8
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14) block6()
-block5(v17: i64):
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -212,33 +242,40 @@ block5(v17: i64):
   v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
-  br block4(v25)
-block6():
+  br 4(v25)
+}
+block 6 () {
   v26 = i64.const 0
   v27 = i64.atomic.load v26
   return v27
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = call 2 (v0)
   v2 = i64.const 0
   v3 = i64.atomic.rmw.add v2 v1
   v4 = i64.const 0
   return v4
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i64, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
   v4 = i64.lt_s v3 v2
-  br_if v4 block2(v2, v3) block3(v3)
-block2(v5: i64, v6: i64):
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
   v7 = i64.const 1
   v8 = i64.add v6 v7
-  br block1(v5, v8)
-block3(v9: i64):
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
   return v9
+  }
 }
 "#;
 
@@ -249,7 +286,7 @@ block3(v9: i64):
 const FUTEX: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
   v0 = i64.const 0
@@ -260,9 +297,10 @@ block0():
   v7 = i64.atomic.load.acquire v6
   v8 = thread.join v4
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 8
   v2 = i64.const 987654
   i64.atomic.store.release v1 v2
@@ -274,6 +312,7 @@ block0(vsp: i64, v0: i64):
   v7 = atomic.notify v5 v6
   v8 = i64.const 0
   return v8
+  }
 }
 "#;
 
@@ -287,12 +326,13 @@ const PB_HELLO: &str = r#"
 memory 16
 data 0 "hello, powerbox!\n"
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 17
   v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)
   v6 = i32.const 0
   return v6
+  }
 }
 "#;
 
@@ -301,13 +341,14 @@ block0(v0: i32, v1: i32, v2: i32):
 const PB_ECHO: &str = r#"
 memory 16
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 256
   v5 = cap.call 0 0 (i64, i64) -> (i64) v1(v3, v4)
   v6 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v5)
   v7 = i32.const 0
   return v7
+  }
 }
 "#;
 
@@ -315,12 +356,13 @@ block0(v0: i32, v1: i32, v2: i32):
 // — exactly 1, proving the deterministic strictly-increasing counter works under wasm.
 const PB_CLOCK: &str = r#"
 func (i32, i32, i32, i32, i32) -> (i64) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   v5 = i32.const 0
   v6 = cap.call 2 0 (i32) -> (i64) v4(v5)
   v7 = cap.call 2 0 (i32) -> (i64) v4(v5)
   v8 = i64.sub v7 v6
   return v8
+  }
 }
 "#;
 
@@ -328,11 +370,12 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):
 // with exit code 42; the trailing return is unreachable.
 const PB_EXIT: &str = r#"
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i32.const 42
   cap.call 1 0 (i32) -> () v2(v3)
   v4 = i32.const 0
   return v4
+  }
 }
 "#;
 
@@ -342,12 +385,13 @@ const PB_STDERR: &str = r#"
 memory 16
 data 0 "warning!\n"
 func (i32, i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.const 0
   v5 = i64.const 9
   v6 = cap.call 0 1 (i64, i64) -> (i64) v3(v4, v5)
   v7 = i32.const 0
   return v7
+  }
 }
 "#;
 
@@ -360,7 +404,7 @@ memory 16
 data 0 "via resolve\n"
 data 4096 "stdout"
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 4096
   v4 = i64.const 6
   v5 = cap.self.resolve v3 v4
@@ -369,6 +413,7 @@ block0(v0: i32, v1: i32, v2: i32):
   v8 = cap.call 0 1 (i64, i64) -> (i64) v5(v6, v7)
   v9 = i32.const 0
   return v9
+  }
 }
 "#;
 
@@ -380,13 +425,14 @@ const LIVE_GUEST: &str = r#"
 memory 16
 data 0 "live from wasm!\n"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = i64.const 0
   v4 = i64.const 16
   v5 = cap.call 13 1 (i64, i64, i64) -> (i64) v0(v2, v3, v4)
   v6 = cap.call 13 0 () -> (i64) v1()
   return v6
+  }
 }
 "#;
 
@@ -396,13 +442,14 @@ block0(v0: i32, v1: i32):
 const BIG_ECHO: &str = r#"
 memory 22
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 4194304
   v5 = cap.call 0 0 (i64, i64) -> (i64) v1(v3, v4)
   v6 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v5)
   v7 = i32.const 0
   return v7
+  }
 }
 "#;
 
@@ -412,24 +459,28 @@ block0(v0: i32, v1: i32, v2: i32):
 const CAP_ADDK: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i64, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
   v4 = i64.const 128
   v5 = i64.lt_u v3 v4
-  br_if v5 block2(v2, v3) block3()
-block2(v6: i64, v7: i64):
+  br_if v5 2(v2, v3) 3()
+}
+block 2 (v6: i64, v7: i64) {
   v8 = i64.load v7
   v9 = i64.add v8 v6
   i64.store v7 v9
   v10 = i64.const 8
   v11 = i64.add v7 v10
-  br block1(v6, v11)
-block3():
+  br 1(v6, v11)
+}
+block 3 () {
   v12 = i64.const 0
   v13 = i64.load v12
   return v13
+  }
 }
 "#;
 
@@ -443,7 +494,7 @@ block3():
 // 42*1000 + 123 = 42123 — confined child execution over the shared data plane.
 const CHILD_SHARED: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 12
@@ -457,14 +508,16 @@ block0(v0: i32):
   v11 = i64.mul v6 v10
   v12 = i64.add v11 v9
   return v12
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 7
   v2 = i32.const 123
   i32.store8 v1 v2
   v3 = i64.const 42
   return v3
+  }
 }
 "#;
 
@@ -472,7 +525,7 @@ block0(v0: i64):
 // — confinement composes. The grandchild returns 77, propagated up through two joins.
 const CHILD_DEPTH2: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 12
@@ -480,9 +533,10 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = i32.const 171
@@ -494,14 +548,16 @@ block0(v0: i64):
   v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
   v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
   return v9
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.const 200
   i32.store8 v1 v2
   v3 = i64.const 77
   return v3
+  }
 }
 "#;
 
@@ -510,7 +566,7 @@ block0(v0: i64):
 // page op — returning 0. Proves the §14 memory-management capability is attenuated to the child.
 const CHILD_ADDRSPACE: &str = r#"memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -518,14 +574,16 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i32.wrap_i64 v1
   v3 = i64.const 0
   v4 = i64.const 16384
   v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)
   return v5
+  }
 }
 "#;
 
@@ -533,7 +591,7 @@ block0(v0: i64, v1: i64):
 // `instantiate` returns -EINVAL (-22); the parent returns it without joining.
 const CHILD_BADCARVE: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 12
@@ -541,18 +599,20 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.extend_i32_s v5
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   return v1
+  }
 }
 "#;
 
 // A child trap (`unreachable`) must propagate through `join` as the parent's trap (STATUS_TRAP).
 const CHILD_TRAP: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 0
   v3 = i64.const 12
@@ -560,10 +620,12 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   unreachable
+  }
 }
 "#;
 
@@ -574,19 +636,21 @@ block0(v0: i64):
 // Resume delivers arg=7; the fiber returns arg+100 → resumer sees value 107.
 const FIB_RUN: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = i64.const 7
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 100
   v1 = i64.add varg v0
   return v1
+  }
 }
 "#;
 
@@ -594,7 +658,7 @@ block0(vsp: i64, varg: i64):
 // Result 11 + 25 = 36 — repeated park/resume of the same fiber with suspend-result delivery.
 const FIB_SUSPEND: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -604,22 +668,24 @@ block0():
   v7, v8 = cont.resume v2 v6
   v9 = i64.add v5 v8
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 1
   v1 = i64.add varg v0
   v2 = suspend v1
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
 // Two suspends in a fiber, resumed with 3, 4, 5 — exercises multiple switches across one fiber.
 const FIB_LOOP: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -632,35 +698,39 @@ block0():
   v12 = i64.add v5 v8
   v13 = i64.add v12 v11
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = suspend varg
   v1 = suspend v0
   v2 = i64.add varg v0
   v3 = i64.add v2 v1
   return v3
+  }
 }
 "#;
 
 // Resuming a never-created fiber handle is an inert FiberFault (a trap) on both engines.
 const FIB_FORGED: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i32.const 99
   v1 = i64.const 5
   v2, v3 = cont.resume v0 v1
   return v3
+  }
 }
 "#;
 
 // The root activation cannot `suspend` (no resumer) — FiberFault on both engines.
 const FIB_ROOTSUSPEND: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 5
   v1 = suspend v0
   return v1
+  }
 }
 "#;
 
@@ -672,7 +742,7 @@ block0():
 // 200+r1, then returns 999+r2 (r1=10, r2=20). Result 100 + 210 + 1019 + RETURNED*1_000_000.
 const CORO: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -691,9 +761,10 @@ block0(v0: i32):
   v19 = i64.mul v17 v18
   v20 = i64.add v16 v19
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = i32.const 7
@@ -706,17 +777,19 @@ block0(v0: i64):
   v9 = i64.const 999
   v10 = i64.add v9 v8
   return v10
+  }
 }
 "#;
 
 // Resuming a coroutine handle that was never spawned is an inert CapFault (a trap) on both engines.
 const CORO_FORGED: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 9
   v2 = i64.const 0
   v3, v4 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v1, v2)
   return v4
+  }
 }
 "#;
 
@@ -727,25 +800,27 @@ block0(v0: i32):
 // Install the unit (→ table slot), then call_indirect it: 6*7 + 100 = 142.
 const JIT_INSTALL: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
   v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
   v6 = i32.wrap_i64 v5
   v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
   return v7
+  }
 }
 "#;
 
 // Install, then uninstall the slot, then call_indirect it → IndirectCall trap (the freed slot).
 const JIT_UNINSTALL: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
   v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
   v6 = cap.call 11 4 (i64) -> (i64) v0 (v5)
   v7 = i32.wrap_i64 v5
   v8 = call_indirect (i32, i32) -> (i32) v7 (v2, v3)
   return v8
+  }
 }
 "#;
 
@@ -760,19 +835,21 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32):
 // Worker `invoke`s the unit: `cap.call 11 1` (op 1) runs `service(6,7)` over the shared window → 142.
 const THREADS_JIT_INVOKE: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   vje = i64.extend_i32_u v0
   vce = i64.extend_i32_u v1
   vc32 = i64.const 32
   vchi = i64.shl vce vc32
   vpacked = i64.or vchi vje
   vi0 = i64.const 0
-  br block1(vi0, vpacked)
-block1(vi: i64, vp: i64):
+  br 1(vi0, vpacked)
+}
+block 1 (vi: i64, vp: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vp) block3()
-block2(vi2: i64, vp2: i64):
+  br_if vlt 2(vi, vp) 3()
+}
+block 2 (vi2: i64, vp2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
@@ -782,15 +859,18 @@ block2(vi2: i64, vp2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vp2)
-block3():
+  br 1(v9, vp2)
+}
+block 3 () {
   vj0 = i64.const 0
-  br block4(vj0)
-block4(vj: i64):
+  br 4(vj0)
+}
+block 4 (vj: i64) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj) block6()
-block5(vj2: i64):
+  br_if vlt2 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -799,14 +879,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vp: i64):
+block 0 (vsp: i64, vp: i64) {
   vmask = i64.const 4294967295
   vjit64 = i64.and vp vmask
   vjit = i32.wrap_i64 vjit64
@@ -820,6 +902,7 @@ block0(vsp: i64, vp: i64):
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
+  }
 }
 "#;
 
@@ -830,19 +913,21 @@ block0(vsp: i64, vp: i64):
 // (`svm_par_jit_codegen_service(1)`). Root func 0 is identical; only the worker's invoke sig differs.
 const THREADS_JIT_INVOKE_F64: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   vje = i64.extend_i32_u v0
   vce = i64.extend_i32_u v1
   vc32 = i64.const 32
   vchi = i64.shl vce vc32
   vpacked = i64.or vchi vje
   vi0 = i64.const 0
-  br block1(vi0, vpacked)
-block1(vi: i64, vp: i64):
+  br 1(vi0, vpacked)
+}
+block 1 (vi: i64, vp: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vp) block3()
-block2(vi2: i64, vp2: i64):
+  br_if vlt 2(vi, vp) 3()
+}
+block 2 (vi2: i64, vp2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
@@ -852,15 +937,18 @@ block2(vi2: i64, vp2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vp2)
-block3():
+  br 1(v9, vp2)
+}
+block 3 () {
   vj0 = i64.const 0
-  br block4(vj0)
-block4(vj: i64):
+  br 4(vj0)
+}
+block 4 (vj: i64) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj) block6()
-block5(vj2: i64):
+  br_if vlt2 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -869,14 +957,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vp: i64):
+block 0 (vsp: i64, vp: i64) {
   vmask = i64.const 4294967295
   vjit64 = i64.and vp vmask
   vjit = i32.wrap_i64 vjit64
@@ -890,6 +980,7 @@ block0(vsp: i64, vp: i64):
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
+  }
 }
 "#;
 
@@ -898,19 +989,21 @@ block0(vsp: i64, vp: i64):
 // `Domain`; `service(6,7) = 142`.
 const THREADS_JIT_INSTALL: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   vje = i64.extend_i32_u v0
   vce = i64.extend_i32_u v1
   vc32 = i64.const 32
   vchi = i64.shl vce vc32
   vpacked = i64.or vchi vje
   vi0 = i64.const 0
-  br block1(vi0, vpacked)
-block1(vi: i64, vp: i64):
+  br 1(vi0, vpacked)
+}
+block 1 (vi: i64, vp: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vp) block3()
-block2(vi2: i64, vp2: i64):
+  br_if vlt 2(vi, vp) 3()
+}
+block 2 (vi2: i64, vp2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
@@ -920,15 +1013,18 @@ block2(vi2: i64, vp2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vp2)
-block3():
+  br 1(v9, vp2)
+}
+block 3 () {
   vj0 = i64.const 0
-  br block4(vj0)
-block4(vj: i64):
+  br 4(vj0)
+}
+block 4 (vj: i64) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj) block6()
-block5(vj2: i64):
+  br_if vlt2 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -937,14 +1033,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vp: i64):
+block 0 (vsp: i64, vp: i64) {
   vmask = i64.const 4294967295
   vjit64 = i64.and vp vmask
   vjit = i32.wrap_i64 vjit64
@@ -960,6 +1058,7 @@ block0(vsp: i64, vp: i64):
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
+  }
 }
 "#;
 
@@ -971,14 +1070,16 @@ block0(vsp: i64, vp: i64):
 // Root `(instantiator) -> sum`: instantiate 8 same-module children (func 1), join, sum. 8 × 5 = 40.
 const THREADS_INST: &str = r#"memory 20
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vi0 = i64.const 0
-  br block1(vi0, v0)
-block1(vi: i64, vinst: i32):
+  br 1(vi0, v0)
+}
+block 1 (vi: i64, vinst: i32) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vinst) block3(vinst)
-block2(vi2: i64, vinst2: i32):
+  br_if vlt 2(vi, vinst) 3(vinst)
+}
+block 2 (vi2: i64, vinst2: i32) {
   vone = i64.const 1
   viplus = i64.add vi2 vone
   v64k = i64.const 65536
@@ -993,16 +1094,19 @@ block2(vi2: i64, vinst2: i32):
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
-  br block1(vinext, vinst2)
-block3(vinst3: i32):
+  br 1(vinext, vinst2)
+}
+block 3 (vinst3: i32) {
   vj0 = i64.const 0
   vs0 = i64.const 0
-  br block4(vj0, vs0, vinst3)
-block4(vj: i64, vs: i64, vinst4: i32):
+  br 4(vj0, vs0, vinst3)
+}
+block 4 (vj: i64, vs: i64, vinst4: i32) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
-block5(vj2: i64, vs2: i64, vinst5: i32):
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16
@@ -1012,14 +1116,17 @@ block5(vj2: i64, vs2: i64, vinst5: i32):
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br block4(vjn, vsn, vinst5)
-block6(vs3: i64):
+  br 4(vjn, vsn, vinst5)
+}
+block 6 (vs3: i64) {
   return vs3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 5
   return v1
+  }
 }
 "#;
 
@@ -1028,14 +1135,16 @@ block0(v0: i64):
 // and returns its value — VM-in-VM-in-VM across three Worker generations. 8 × 9 = 72.
 const THREADS_INST_NESTED: &str = r#"memory 20
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vi0 = i64.const 0
-  br block1(vi0, v0)
-block1(vi: i64, vinst: i32):
+  br 1(vi0, v0)
+}
+block 1 (vi: i64, vinst: i32) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vinst) block3(vinst)
-block2(vi2: i64, vinst2: i32):
+  br_if vlt 2(vi, vinst) 3(vinst)
+}
+block 2 (vi2: i64, vinst2: i32) {
   vone = i64.const 1
   viplus = i64.add vi2 vone
   v64k = i64.const 65536
@@ -1050,16 +1159,19 @@ block2(vi2: i64, vinst2: i32):
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
-  br block1(vinext, vinst2)
-block3(vinst3: i32):
+  br 1(vinext, vinst2)
+}
+block 3 (vinst3: i32) {
   vj0 = i64.const 0
   vs0 = i64.const 0
-  br block4(vj0, vs0, vinst3)
-block4(vj: i64, vs: i64, vinst4: i32):
+  br 4(vj0, vs0, vinst3)
+}
+block 4 (vj: i64, vs: i64, vinst4: i32) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
-block5(vj2: i64, vs2: i64, vinst5: i32):
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16
@@ -1069,12 +1181,14 @@ block5(vj2: i64, vs2: i64, vinst5: i32):
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br block4(vjn, vsn, vinst5)
-block6(vs3: i64):
+  br 4(vjn, vsn, vinst5)
+}
+block 6 (vs3: i64) {
   return vs3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
   ventry = i64.const 2
   voff = i64.const 0
@@ -1083,11 +1197,13 @@ block0(v0: i64):
   vgh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
   vgr = cap.call 6 1 (i32) -> (i64) vinst (vgh)
   return vgr
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 9
   return v1
+  }
 }
 "#;
 
@@ -1096,11 +1212,12 @@ block0(v0: i64):
 const THREADS_INST_UNIT: &str = r#"memory 16
 data 0 "K"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 "#;
 
@@ -1108,15 +1225,17 @@ block0(v0: i64):
 // compile + push-to-shared-source + data materialization crossing Workers. 8 × 75 = 600.
 const THREADS_INST_MOD: &str = r#"memory 20
 func (i32, i32) -> (i64) {
-block0(vinst0: i32, vmod0: i32):
+block 0 (vinst0: i32, vmod0: i32) {
   vmod64 = i64.extend_i32_s vmod0
   vi0 = i64.const 0
-  br block1(vi0, vinst0, vmod64)
-block1(vi: i64, vinst: i32, vmod: i64):
+  br 1(vi0, vinst0, vmod64)
+}
+block 1 (vi: i64, vinst: i32, vmod: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vinst, vmod) block3(vinst)
-block2(vi2: i64, vinst2: i32, vmod2: i64):
+  br_if vlt 2(vi, vinst, vmod) 3(vinst)
+}
+block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
   vone = i64.const 1
   viplus = i64.add vi2 vone
   v64k = i64.const 65536
@@ -1131,16 +1250,19 @@ block2(vi2: i64, vinst2: i32, vmod2: i64):
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
-  br block1(vinext, vinst2, vmod2)
-block3(vinst3: i32):
+  br 1(vinext, vinst2, vmod2)
+}
+block 3 (vinst3: i32) {
   vj0 = i64.const 0
   vs0 = i64.const 0
-  br block4(vj0, vs0, vinst3)
-block4(vj: i64, vs: i64, vinst4: i32):
+  br 4(vj0, vs0, vinst3)
+}
+block 4 (vj: i64, vs: i64, vinst4: i32) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
-block5(vj2: i64, vs2: i64, vinst5: i32):
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16
@@ -1150,9 +1272,11 @@ block5(vj2: i64, vs2: i64, vinst5: i32):
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br block4(vjn, vsn, vinst5)
-block6(vs3: i64):
+  br 4(vjn, vsn, vinst5)
+}
+block 6 (vs3: i64) {
   return vs3
+  }
 }
 "#;
 
@@ -1163,15 +1287,17 @@ block6(vs3: i64):
 const THREADS_IO: &str = r#"memory 16
 data 0 "tick\n"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
   v1 = i64.const 0
-  br block1(v1, vh0)
-block1(vi: i64, vhh: i64):
+  br 1(v1, vh0)
+}
+block 1 (vi: i64, vhh: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u vi v2
-  br_if v3 block2(vi, vhh) block3()
-block2(vi2: i64, vhh2: i64):
+  br_if v3 2(vi, vhh) 3()
+}
+block 2 (vi2: i64, vhh2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
@@ -1181,15 +1307,18 @@ block2(vi2: i64, vhh2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vhh2)
-block3():
+  br 1(v9, vhh2)
+}
+block 3 () {
   v10 = i64.const 0
-  br block4(v10)
-block4(vj: i64):
+  br 4(v10)
+}
+block 4 (vj: i64) {
   v11 = i64.const 8
   v12 = i64.lt_u vj v11
-  br_if v12 block5(vj) block6()
-block5(vj2: i64):
+  br_if v12 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -1198,14 +1327,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vh: i64):
+block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 5
@@ -1215,6 +1346,7 @@ block0(vsp: i64, vh: i64):
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
   return v4
+  }
 }
 "#;
 
@@ -1225,11 +1357,12 @@ block0(vsp: i64, vh: i64):
 // instruments it; gencorpus bakes the *instrumented* module into the corpus.
 const DURABLE_SRC: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 2 0 () -> (i64) v0 ()
   v2 = cap.call 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
 
@@ -1239,12 +1372,13 @@ block0(v0: i32):
 // cap by the symbol table → returns clock.now + 777 = 777 (or fail-closed when unlinked).
 const DL_GUEST: &str = r#"memory 16
 func (i32, i32, i32) -> (i64) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.extend_i32_u v1
   v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)
   v5 = i32.wrap_i64 v4
   v6 = call_indirect (i32) -> (i64) v5 (v2)
   return v6
+  }
 }
 "#;
 
@@ -1256,7 +1390,7 @@ block0(v0: i32, v1: i32, v2: i32):
 // second mapping → reads back the marker *iff* both mappings alias the same backing (the §13 promise).
 const REGION_ALIAS: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 4 3 () -> (i64) v0 ()
   v2 = i64.const 0
   v3 = i32.const 3
@@ -1266,15 +1400,17 @@ block0(v0: i32):
   i64.store v2 v6
   v7 = i64.load v1
   return v7
+  }
 }
 "#;
 
 // Query the region's length (op 2) → the granted 64 KiB = 65536.
 const REGION_LEN: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 4 2 () -> (i64) v0 ()
   return v1
+  }
 }
 "#;
 
@@ -1284,19 +1420,21 @@ block0(v0: i32):
 // Number of caps the domain holds → 3.
 const SELF_COUNT: &str = r#"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = cap.self.count
   return v0
+  }
 }
 "#;
 
 // cap.self.get(idx) → (handle, type_id); sum them so the result depends on both.
 const SELF_GET: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1, v2 = cap.self.get v0
   v3 = i32.add v1 v2
   return v3
+  }
 }
 "#;
 
@@ -1308,22 +1446,26 @@ block0(v0: i32):
 // is safe to sweep negatives; large n wraps i64 identically on both engines.
 const TAIL_FACT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 1
   return_call 1(v0, v1)
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1
   v3 = i64.lt_s v0 v2
-  br_if v3 block1(v1) block2(v0, v1)
-block1(v4: i64):
+  br_if v3 1(v1) 2(v0, v1)
+}
+block 1 (v4: i64) {
   return v4
-block2(v5: i64, v6: i64):
+}
+block 2 (v5: i64, v6: i64) {
   v7 = i64.mul v6 v5
   v8 = i64.const -1
   v9 = i64.add v5 v8
   return_call 1(v9, v7)
+  }
 }
 "#;
 
@@ -1332,21 +1474,24 @@ block2(v5: i64, v6: i64):
 // identical on both engines.
 const TAIL_INDIRECT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 5
   return_call_indirect (i64) -> (i64) v0 (v1)
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 10
   v2 = i64.add v0 v1
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 2
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 "#;
 
@@ -1356,37 +1501,40 @@ block0(v0: i64):
 // i64x2: splat arg into both lanes, add → [2·arg, 2·arg], extract lane 0 → 2·arg (wraps identically).
 const SIMD_I64X2: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i64x2.add v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }
 "#;
 
 // i32x4: splat the low 32 bits, add lanewise, extract lane 0, sign-extend back to i64.
 const SIMD_I32X4: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i32x4.splat v1
   v3 = i32x4.add v2 v2
   v4 = i32x4.extract_lane 0 v3
   v5 = i64.extend_i32_s v4
   return v5
+  }
 }
 "#;
 
 // v128 memory round-trip: splat arg, `v128.store` it, `v128.load` it back, extract lane 1 → arg.
 const SIMD_MEM: &str = r#"memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i64.const 0
   v128.store v2 v1
   v3 = v128.load v2
   v4 = i64x2.extract_lane 1 v3
   return v4
+  }
 }
 "#;
 
@@ -1399,7 +1547,7 @@ block0(v0: i64):
 // In-range constants (one duplicated, one out of range) → roots {4096, 5000}, total 2.
 const GC_BASELINE: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   va = i64.const 4096
   vb = i64.const 5000
   vc = i64.const 5000
@@ -1411,13 +1559,14 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
 
 // Tagged pointer: a tag in the top byte; `vmask` strips it so the bare offset 5000 is in range.
 const GC_TAGGED: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   va = i64.const 9151314442816852872
   vlo = i64.const 4096
   vhi = i64.const 8192
@@ -1426,6 +1575,7 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
 
@@ -1446,7 +1596,7 @@ fn hex(bytes: &[u8]) -> String {
 // add/sub/mul/div + i64→f64 convert: ((a + 3) * 2 - 1) / 2, all in f64.
 const FLOAT_ARITH: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.reinterpret_i64 v0
   v2 = i64.const 3
   v3 = f64.convert_i64_s v2
@@ -1460,25 +1610,27 @@ block0(v0: i64):
   v11 = f64.div v10 v6
   v12 = i64.reinterpret_f64 v11
   return v12
+  }
 }
 "#;
 
 // sqrt(|a|) — sqrt rounding + abs; sqrt(NaN)/sqrt(-x) exercise NaN canonicalization.
 const FLOAT_SQRT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.reinterpret_i64 v0
   v2 = f64.abs v1
   v3 = f64.sqrt v2
   v4 = i64.reinterpret_f64 v3
   return v4
+  }
 }
 "#;
 
 // min/max/copysign vs 1.0 — the signed-zero and NaN-propagation edges of min/max + sign transfer.
 const FLOAT_MINMAX: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.reinterpret_i64 v0
   v2 = i64.const 1
   v3 = f64.convert_i64_s v2
@@ -1487,25 +1639,27 @@ block0(v0: i64):
   v6 = f64.copysign v5 v1
   v7 = i64.reinterpret_f64 v6
   return v7
+  }
 }
 "#;
 
 // f64→f32→f64 round-trip (precision loss, inf/NaN), then saturating f64→i64 (inf→MAX, NaN→0).
 const FLOAT_CONVERT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.reinterpret_i64 v0
   v2 = f32.demote_f64 v1
   v3 = f64.promote_f32 v2
   v4 = i64.trunc_sat_f64_s v3
   return v4
+  }
 }
 "#;
 
 // comparisons: (a < 1.0) + (a == a) — the second is 0 only for NaN (the classic NaN ≠ NaN test).
 const FLOAT_CMP: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.reinterpret_i64 v0
   v2 = i64.const 1
   v3 = f64.convert_i64_s v2
@@ -1514,6 +1668,7 @@ block0(v0: i64):
   v6 = i32.add v4 v5
   v7 = i64.extend_i32_u v6
   return v7
+  }
 }
 "#;
 
@@ -1539,7 +1694,7 @@ const FLOAT_ARGS: &[i64] = &[
 // so `svm_run` must return STATUS_UNSUPPORTED, matching native. (Forged handle never runs.)
 const UNSUP: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -1551,11 +1706,13 @@ block0():
   v8 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v3 (v4, v5, v6, v7)
   v9 = i64.const 0
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 0
   return v0
+  }
 }
 "#;
 

@@ -15,14 +15,16 @@ use svm_text::parse_module;
 // not a single-thread interleaving. (Same kernel the cooperative oracle and the wasm Workers run.)
 const THREADS: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 500
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -32,15 +34,18 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
+  br 1(v12)
+}
+block 3 () {
   v13 = i64.const 0
-  br block4(v13)
-block4(v14: i64):
+  br 4(v13)
+}
+block 4 (v14: i64) {
   v15 = i64.const 8
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14) block6()
-block5(v17: i64):
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -49,29 +54,35 @@ block5(v17: i64):
   v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
-  br block4(v25)
-block6():
+  br 4(v25)
+}
+block 6 () {
   v26 = i64.const 0
   v27 = i64.atomic.load v26
   return v27
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 0
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 "#;
 
@@ -79,14 +90,16 @@ block2():
 // `thread.join` delivers each child's **return value** to the joiner across threads, not just a count.
 const JOIN_VALUES: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0, v0)
-block1(v1: i64, vacc: i64):
+  br 1(v0, v0)
+}
+block 1 (v1: i64, vacc: i64) {
   v2 = i64.const 4
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1, vacc) block3(vacc)
-block2(v4: i64, vacc2: i64):
+  br_if v3 2(v1, vacc) 3(vacc)
+}
+block 2 (v4: i64, vacc2: i64) {
   v5 = i64.const 10
   v5b = i64.add v4 v5
   v6 = thread.spawn 1 v5b v5b
@@ -97,15 +110,18 @@ block2(v4: i64, vacc2: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12, vacc2)
-block3(vacc3: i64):
+  br 1(v12, vacc2)
+}
+block 3 (vacc3: i64) {
   v13 = i64.const 0
-  br block4(v13, vacc3)
-block4(v14: i64, vacc4: i64):
+  br 4(v13, vacc3)
+}
+block 4 (v14: i64, vacc4: i64) {
   v15 = i64.const 4
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14, vacc4) block6(vacc4)
-block5(v17: i64, vacc5: i64):
+  br_if v16 5(v14, vacc4) 6(vacc4)
+}
+block 5 (v17: i64, vacc5: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -115,13 +131,16 @@ block5(v17: i64, vacc5: i64):
   v24 = i64.add vacc5 v23
   v25 = i64.const 1
   v26 = i64.add v17 v25
-  br block4(v26, v24)
-block6(vacc6: i64):
+  br 4(v26, v24)
+}
+block 6 (vacc6: i64) {
   return vacc6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   return v0
+  }
 }
 "#;
 
@@ -132,7 +151,7 @@ block0(vsp: i64, v0: i64):
 // interleaving, so the result is interleaving-invariant and differential-tests the futex cleanly.
 const FUTEX_HANDOFF: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 8
   v1 = i64.const 987654
   i64.atomic.store.release v0 v1
@@ -146,9 +165,10 @@ block0():
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   v2 = i32.const 0
   v3 = i64.const 1000000000
@@ -156,6 +176,7 @@ block0(vsp: i64, v0: i64):
   v5 = i64.const 8
   v6 = i64.atomic.load.acquire v5
   return v6
+  }
 }
 "#;
 
@@ -165,14 +186,16 @@ block0(vsp: i64, v0: i64):
 // threads, with an interleaving-invariant result.
 const BARRIER: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 0
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -182,10 +205,12 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
-  br block4()
-block4():
+  br 1(v12)
+}
+block 3 () {
+  br 4()
+}
+block 4 () {
   v13 = i64.const 8
   v14 = i32.const 0
   v15 = i64.const 1000000000
@@ -194,17 +219,21 @@ block4():
   v18 = i64.atomic.load v17
   v19 = i64.const 8
   v20 = i64.lt_u v18 v19
-  br_if v20 block4() block5(v18)
-block5(v21: i64):
-  br block6(v21)
-block6(v22: i64):
+  br_if v20 4() 5(v18)
+}
+block 5 (v21: i64) {
+  br 6(v21)
+}
+block 6 (v22: i64) {
   v23 = i64.const 0
-  br block7(v22, v23)
-block7(v24: i64, v25: i64):
+  br 7(v22, v23)
+}
+block 7 (v24: i64, v25: i64) {
   v26 = i64.const 8
   v27 = i64.lt_u v25 v26
-  br_if v27 block8(v24, v25) block9(v24)
-block8(v28: i64, v29: i64):
+  br_if v27 8(v24, v25) 9(v24)
+}
+block 8 (v28: i64, v29: i64) {
   v30 = i64.const 4
   v31 = i64.mul v29 v30
   v32 = i64.const 16
@@ -213,29 +242,34 @@ block8(v28: i64, v29: i64):
   v35 = thread.join v34
   v36 = i64.const 1
   v37 = i64.add v29 v36
-  br block7(v28, v37)
-block9(v38: i64):
+  br 7(v28, v37)
+}
+block 9 (v38: i64) {
   return v38
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 7
   v5 = i64.eq v3 v4
-  br_if v5 block1() block2()
-block1():
+  br_if v5 1() 2()
+}
+block 1 () {
   v6 = i64.const 8
   v7 = i32.const 1
   i32.atomic.store v6 v7
   v8 = i64.const 8
   v9 = i32.const 100
   v10 = atomic.notify v8 v9
-  br block2()
-block2():
+  br 2()
+}
+block 2 () {
   v11 = i64.const 0
   return v11
+  }
 }
 "#;
 

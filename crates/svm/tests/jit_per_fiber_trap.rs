@@ -69,19 +69,21 @@ fn differential_trap_fiber(src: &str) -> Option<i64> {
 /// it; the fiber divides by zero. The run traps `DivByZero`, the backtrace names the fiber's div line,
 /// and the trap is attributed to **fiber 0** — not the root.
 const FIBER_DIV0: &str = "func () -> (i32, i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = ref.func 1\n\
     \x20 v1 = i64.const 4096\n\
     \x20 v2 = cont.new v0 v1\n\
     \x20 v3 = i64.const 7\n\
     \x20 v4, v5 = cont.resume v2 v3\n\
     \x20 return v4 v5\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 0\n\
     \x20 v3 = i64.div_s v1 v2\n\
     \x20 return v3\n\
+      }\n\
     }\n\
     debug.file 0 \"fib.c\"\n\
     debug.fname 1 \"divz\"\n\
@@ -115,28 +117,31 @@ fn trap_in_a_resumed_fiber_is_attributed_to_that_fiber() {
 /// fiber (B) is attributed — pinning the stack discipline that a single-fiber test can't reach. Both
 /// engines must name **fiber 1**.
 const NESTED_DIV0: &str = "func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = ref.func 1\n\
     \x20 v1 = i64.const 4096\n\
     \x20 v2 = cont.new v0 v1\n\
     \x20 v3 = i64.const 1\n\
     \x20 v4, v5 = cont.resume v2 v3\n\
     \x20 return v5\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = ref.func 2\n\
     \x20 v3 = i64.const 8192\n\
     \x20 v4 = cont.new v2 v3\n\
     \x20 v5 = i64.const 1\n\
     \x20 v6, v7 = cont.resume v4 v5\n\
     \x20 return v7\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 0\n\
     \x20 v3 = i64.div_s v1 v2\n\
     \x20 return v3\n\
+      }\n\
     }\n\
     debug.file 0 \"nest.c\"\n\
     debug.fname 2 \"inner\"\n\
@@ -153,11 +158,12 @@ fn nested_resume_attributes_the_innermost_fiber() {
 
 /// A trap in the **root** computation (no fiber running) is attributed to the root sentinel `-1`.
 const ROOT_DIV0: &str = "func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = i64.const 5\n\
     \x20 v1 = i64.const 0\n\
     \x20 v2 = i64.div_s v0 v1\n\
     \x20 return v2\n\
+      }\n\
     }\n\
     debug.file 0 \"root.c\"\n\
     debug.fname 0 \"root\"\n\
@@ -179,9 +185,10 @@ fn trap_in_the_root_is_attributed_to_no_fiber() {
 /// After the fiber traps and is attributed, a subsequent **clean** run clears the attribution — the
 /// fiber handle is per-run, never stale.
 const CLEAN: &str = "func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = i64.const 42\n\
     \x20 return v0\n\
+      }\n\
     }\n";
 
 #[test]

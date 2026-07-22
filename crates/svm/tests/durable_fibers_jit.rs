@@ -37,7 +37,7 @@ use svm_verify::verify_module;
 /// twice (the fiber suspends once, yielding 42, then returns 7 + 100 = 107). No caps ⇒ deterministic.
 const FIBER_SRC: &str = "memory 17\n\
     func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = ref.func 1\n\
     \x20 v1 = i64.const 4096\n\
     \x20 v2 = cont.new v0 v1\n\
@@ -46,14 +46,16 @@ const FIBER_SRC: &str = "memory 17\n\
     \x20 v6 = i64.const 7\n\
     \x20 v7, v8 = cont.resume v2 v6\n\
     \x20 return v8\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 42\n\
     \x20 v3 = suspend v2\n\
     \x20 v4 = i64.const 100\n\
     \x20 v5 = i64.add v3 v4\n\
     \x20 return v5\n\
+      }\n\
     }\n";
 
 fn jit_seed(interp: &[InterpFrozen]) -> Vec<JitFrozen> {
@@ -82,7 +84,7 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     // routing (vs. the legacy single swapped `SHADOW_SP_OFF` word, now retired).
     let src = "memory 17\n\
         func (i32) -> (i64) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
         \x20 v1 = durable.shadow_base\n\
         \x20 v2 = cap.call 13 0 (i64) -> (i64) v0 (v1)\n\
         \x20 v3 = ref.func 1\n\
@@ -96,14 +98,16 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
         \x20 v13 = durable.shadow_base\n\
         \x20 v14 = cap.call 13 0 (i64) -> (i64) v0 (v13)\n\
         \x20 return v2\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i32.wrap_i64 v1\n\
         \x20 v3 = durable.shadow_base\n\
         \x20 v4 = cap.call 13 0 (i64) -> (i64) v2 (v3)\n\
         \x20 v5 = suspend v4\n\
         \x20 return v5\n\
+          }\n\
         }\n";
     // The fibers `suspend` (rather than return) so both stay concurrently live in their own slots —
     // otherwise §12.8 recycling step 3 would reclaim fiber A's finished slot for fiber B, routing B
@@ -174,7 +178,7 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
     // would return 7 + 100. Freezing from the start parks the fiber after its suspend.
     let src = "memory 17\n\
         func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -183,14 +187,16 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
         \x20 v6 = i64.const 7\n\
         \x20 v7, v8 = cont.resume v2 v6\n\
         \x20 return v8\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 42\n\
         \x20 v3 = suspend v2\n\
         \x20 v4 = i64.const 100\n\
         \x20 v5 = i64.add v3 v4\n\
         \x20 return v5\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     let inst = transform_module(&m).expect("transform");
@@ -382,7 +388,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
 fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
     let src = "memory 17\n\
         func (i32) -> (i64) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
         \x20 v1 = i64.const 65536\n\
         \x20 i32.store v1 v0\n\
         \x20 v2 = ref.func 1\n\
@@ -391,9 +397,10 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
         \x20 v5 = i64.const 0\n\
         \x20 v6, v7 = cont.resume v4 v5\n\
         \x20 return v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 65536\n\
         \x20 v3 = i32.load v2\n\
         \x20 v4 = i32.const 0\n\
@@ -401,6 +408,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
         \x20 v6 = i64.const 5\n\
         \x20 v7 = i64.add v5 v6\n\
         \x20 return v7\n\
+          }\n\
         }\n";
     let mut m = parse_module(src).expect("parse");
     m.memory = Some(svm_ir::Memory {
@@ -469,7 +477,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
 /// (resume A; resume B; B's suspend) lands it with B parked at generation 1.
 const RECYCLE_SRC: &str = "memory 17\n\
     func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = ref.func 2\n\
     \x20 v1 = i64.const 4096\n\
     \x20 v2 = cont.new v0 v1\n\
@@ -483,19 +491,22 @@ const RECYCLE_SRC: &str = "memory 17\n\
     \x20 v12 = i64.const 7\n\
     \x20 v13, v14 = cont.resume v8 v12\n\
     \x20 return v14\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 42\n\
     \x20 v3 = suspend v2\n\
     \x20 v4 = i64.const 100\n\
     \x20 v5 = i64.add v3 v4\n\
     \x20 return v5\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 0\n\
     \x20 return v2\n\
+      }\n\
     }\n";
 
 /// Recycling step 4 (cross-backend): with the **mid-run freeze trigger** (`arm_freeze_after`) the JIT

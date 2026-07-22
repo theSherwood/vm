@@ -156,11 +156,12 @@ fn check(src: &str) {
 /// into the shadow stack and a thaw reloads it. `base = clock_v + (clock_v + 1)`.
 const TWO_CLOCK_READS: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 2 0 () -> (i64) v0 ()
   v2 = cap.call 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
 
@@ -174,7 +175,7 @@ fn single_fiber_clock_freeze_thaw_round_trip() {
 /// params, and the thaw must restore them. `base = 5*clock_v + 8`.
 const MULTI_LIVE: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 2 0 () -> (i64) v0 ()
   v2 = i64.const 7
   v3 = i64.add v1 v2
@@ -184,6 +185,7 @@ block0(v0: i32):
   v6 = i64.add v3 v5
   v9 = i64.add v6 v8
   return v9
+  }
 }
 "#;
 

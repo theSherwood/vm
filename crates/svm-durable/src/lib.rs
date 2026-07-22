@@ -1380,7 +1380,7 @@ mod tests {
     #[test]
     fn no_cap_call_is_left_unchanged() {
         let m = parse_with_mem(
-            "func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n",
+            "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
             12,
         );
         let out = transform_module(&m).expect("transform");
@@ -1390,7 +1390,7 @@ mod tests {
     #[test]
     fn instrumented_function_verifies() {
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
             18,
         );
         let out = transform_module(&m).expect("transform");
@@ -1406,7 +1406,7 @@ mod tests {
     fn two_cap_calls_become_two_resume_points() {
         // Two suspend points in one block ⇒ two br_table arms ⇒ 3·2 + 4 = 10 blocks.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
             18,
         );
         let out = transform_module(&m).expect("two resume points are in scope");
@@ -1423,7 +1423,7 @@ mod tests {
         // A two-level chain: the caller suspends on its `call` to the leaf, the leaf on
         // its `cap.call`. Both are may-suspend, so both get the 7-block instrumentation.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = call 1 (v0)\n  return v1\n}\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = call 1 (v0)\n  return v1\n  }\n}\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
             18,
         );
         let out = transform_module(&m).expect("transform");
@@ -1442,7 +1442,7 @@ mod tests {
         // never suspends, so it is not instrumented and func 0's only suspend point is its
         // own cap.call; the helper's result is spilled/reloaded, never re-issued.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = call 1 (v0)\n  v2 = i32.const 0\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v2)\n  v4 = i64.add v1 v3\n  return v4\n}\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 5\n  return v1\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = call 1 (v0)\n  v2 = i32.const 0\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v2)\n  v4 = i64.add v1 v3\n  return v4\n  }\n}\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 5\n  return v1\n  }\n}\n",
             18,
         );
         let helper_before = m.funcs[1].clone();
@@ -1459,7 +1459,7 @@ mod tests {
     fn instrumented_module_with_guest_memory_op_is_rejected() {
         // A guest store could alias the durable region at `[0, SHADOW_BASE)` → R9 fails closed.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 7\n  i64.store v1 v3\n  return v2\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 7\n  i64.store v1 v3\n  return v2\n  }\n}\n",
             18,
         );
         assert_eq!(transform_module(&m), Err(TransformError::GuestUsesMemory));
@@ -1470,7 +1470,7 @@ mod tests {
         // No `cap.call` anywhere ⇒ nothing is instrumented ⇒ no durable region ⇒ the
         // guest's own memory use is left untouched.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 7\n  i64.store v0 v1\n  v2 = i64.load v0\n  return v2\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 7\n  i64.store v0 v1\n  v2 = i64.load v0\n  return v2\n  }\n}\n",
             18,
         );
         let out = transform_module(&m).expect("no instrumentation, memory use is fine");
@@ -1480,7 +1480,7 @@ mod tests {
     #[test]
     fn cap_call_without_memory_is_rejected() {
         let mut m = svm_text::parse_module(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
         )
         .unwrap();
         m.memory = None;

@@ -59,7 +59,7 @@ fn both(src: &str) -> (Result<Vec<Value>, svm_interp::Trap>, JitOutcome) {
 /// `2*65536 + 104*256 + 105` = `157801` — proving the bytes flowed through the FIFO in order.
 const WRITE_THEN_READ: &str = "memory 17\n\
 func (i32, i32) -> (i64) {\n\
-block0(vw: i32, vr: i32):\n\
+block 0 (vw: i32, vr: i32) {\n\
   a0 = i64.const 0\n\
   ch = i32.const 104\n\
   i32.store8 a0 ch\n\
@@ -82,6 +82,7 @@ block0(vw: i32, vr: i32):\n\
   t3 = i32.add t2 vb1\n\
   vresult = i64.extend_i32_u t3\n\
   return vresult\n\
+  }\n\
 }\n";
 
 /// func 0 `(write_end, read_end)`: read from the pipe **before** anything is written (non-blocking →
@@ -89,7 +90,7 @@ block0(vw: i32, vr: i32):\n\
 /// `empty_read * 1000 + (0 - bad_write)` = `0*1000 + 22` = `22`.
 const EMPTY_AND_WRONG_DIRECTION: &str = "memory 17\n\
 func (i32, i32) -> (i64) {\n\
-block0(vw: i32, vr: i32):\n\
+block 0 (vw: i32, vr: i32) {\n\
   a0 = i64.const 0\n\
   vlen = i64.const 4\n\
   vempty = cap.call 0 0 (i64, i64) -> (i64) vr (a0, vlen)\n\
@@ -100,6 +101,7 @@ block0(vw: i32, vr: i32):\n\
   vt = i64.mul vempty k1000\n\
   vsum = i64.add vt vd\n\
   return vsum\n\
+  }\n\
 }\n";
 
 #[test]

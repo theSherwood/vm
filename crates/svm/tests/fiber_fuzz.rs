@@ -509,7 +509,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
         let mut src = String::from("memory 16\n");
         // Root: create the fibers (handle of fiber f stored at mem[16+8f]), then run its phases,
         // spawning + joining each worker in between (strictly sequential).
-        src.push_str("func () -> (i64) {\nblock0():\n");
+        src.push_str("func () -> (i64) {\nblock 0 () {\n");
         let mut v: u32 = 0;
         for f in 0..nf {
             writeln!(src, "  v{v} = ref.func {}", 1 + nw + f).unwrap();
@@ -539,10 +539,10 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
             }
         }
         writeln!(src, "  return v{acc}").unwrap();
-        src.push_str("}\n");
+        src.push_str("  }\n}\n");
         // Workers: each runs its phase's steps and returns its accumulator.
         for w in 1..=nw {
-            src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+            src.push_str("func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n");
             let mut v: u32 = 2;
             writeln!(src, "  v{v} = i64.const 0").unwrap();
             let mut acc = v;
@@ -551,11 +551,11 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
                 acc = emit_step(&mut src, &mut v, s, acc);
             }
             writeln!(src, "  return v{acc}").unwrap();
-            src.push_str("}\n");
+            src.push_str("  }\n}\n");
         }
         // Fiber bodies: fiber f does `suspends[f]` suspends, mixing each delivered value in.
         for s in &suspends {
-            src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+            src.push_str("func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n");
             let mut v: u32 = 2;
             let mut acc = 1; // start from the first-resume arg
             for _ in 0..*s {
@@ -569,7 +569,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
                 v += 6;
             }
             writeln!(src, "  return v{acc}").unwrap();
-            src.push_str("}\n");
+            src.push_str("  }\n}\n");
         }
 
         let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));

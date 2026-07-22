@@ -8,16 +8,19 @@ use svm_dap::{DapServer, Json};
 // and the two loop variables mapped to their block-relative SSA value indices.
 const LOOP_SUM_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 
 debug.file 0 "sum.c"
@@ -353,7 +356,7 @@ fn dap_reverse_debugging_walks_back_through_breakpoint_hits() {
 const WORKERS_DBG: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -363,15 +366,17 @@ block0():
   vaddr = i64.const 0
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
   vz = i64.const 0
   return vz
+  }
 }
 
 debug.file 0 "worker.c"
@@ -642,17 +647,19 @@ fn dap_multithreaded_reverse_continue_walks_back_through_hits() {
 // Caller (func 0) calls helper (func 1) then continues; the call is m.c:5 and the next line m.c:6.
 const CALL_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i32.const 1
   v3 = i32.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 debug.file 0 "m.c"
@@ -733,12 +740,13 @@ fn dap_next_steps_over_a_call() {
 // Two source lines, the first spanning two ops (so op-stepping would stutter on it).
 const TWO_LINES_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   v3 = i32.const 1
   v4 = i32.add v2 v3
   return v4
+  }
 }
 
 debug.file 0 "f.c"
@@ -973,7 +981,7 @@ fn dap_evaluate_computes_an_expression() {
 const AGGREGATES_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 11
   i32.store v0 v1
   v2 = i64.const 4
@@ -994,6 +1002,7 @@ block0(v0: i64):
   i32.store v12 v13
   v14 = i32.const 0
   return v14
+  }
 }
 
 debug.file 0 "s.c"
@@ -1141,7 +1150,7 @@ fn dap_expands_struct_and_array_in_the_variables_pane() {
 const NON_C_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 1000
   i32.store v0 v1
   v2 = i64.const 4
@@ -1150,6 +1159,7 @@ block0(v0: i64):
   i32.store v3 v4
   v5 = i32.const 0
   return v5
+  }
 }
 
 debug.file 0 "x.rs"
@@ -1350,7 +1360,7 @@ fn dap_evaluate_member_and_index_access() {
 const POINTER_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 16
   v2 = i64.add v0 v1
   v3 = i32.const 7
@@ -1362,6 +1372,7 @@ block0(v0: i64):
   i64.store v0 v2
   v7 = i32.const 0
   return v7
+  }
 }
 
 debug.file 0 "p.c"
@@ -1462,11 +1473,12 @@ fn dap_expands_a_pointer_to_its_pointee() {
 const FLOAT_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.const 2.5
   f64.store v0 v1
   v2 = i32.const 0
   return v2
+  }
 }
 
 debug.file 0 "f.c"
@@ -1510,7 +1522,7 @@ fn dap_evaluate_floats_and_short_circuit() {
 const WINVIA_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 16
   v2 = i64.add v0 v1
   v3 = i32.const 10
@@ -1521,6 +1533,7 @@ block0(v0: i64):
   i32.store v5 v6
   v7 = i32.const 0
   return v7
+  }
 }
 
 debug.file 0 "s.c"
@@ -1734,7 +1747,7 @@ fn dap_data_breakpoint_info_null_for_unaddressable_local() {
 const WATCH_MT_DBG: &str = r#"
 memory 17
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -1744,15 +1757,17 @@ block0():
   vaddr = i64.const 0
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
   vz = i64.const 0
   return vz
+  }
 }
 
 debug.file 0 "worker.c"

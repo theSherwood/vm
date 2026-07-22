@@ -39,7 +39,7 @@ fn run(src: &str) -> Result<Vec<Value>, Trap> {
 /// if `detach` blocked or the run waited wrong, this would hang.
 const POLL_RUNNING_THEN_DETACH: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   ventry = i64.const 1\n\
   voff = i64.const 0\n\
   vsl = i64.const 12\n\
@@ -52,19 +52,23 @@ block0(v0: i32):\n\
   i32.store8 vz vone\n\
   vp64 = i64.extend_i32_u vp\n\
   return vp64\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(vci: i64):\n\
-  br block1()\n\
-block1():\n\
+block 0 (vci: i64) {\n\
+  br 1()\n\
+}\n\
+block 1 () {\n\
   vz = i64.const 0\n\
   vb = i32.load8_u vz\n\
   v1 = i32.const 1\n\
   veq = i32.eq vb v1\n\
-  br_if veq block2() block1()\n\
-block2():\n\
+  br_if veq 2() 1()\n\
+}\n\
+block 2 () {\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 /// `poll` reaches `1` (returned) for a child that finishes. The parent polls in a loop, **yielding**
@@ -73,33 +77,38 @@ block2():\n\
 /// status, which must be `1`.
 const POLL_RETURNED: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   ventry = i64.const 1\n\
   voff = i64.const 0\n\
   vsl = i64.const 12\n\
   vq = i64.const 0\n\
   vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vsl, vq)\n\
-  br block1(v0, vch)\n\
-block1(v0a: i32, vcha: i32):\n\
+  br 1(v0, vch)\n\
+}\n\
+block 1 (v0a: i32, vcha: i32) {\n\
   vp = cap.call 6 9 (i32) -> (i32) v0a (vcha)\n\
   vz32 = i32.const 0\n\
   vne = i32.ne vp vz32\n\
-  br_if vne block2(v0a, vcha, vp) block3(v0a, vcha)\n\
-block3(v0b: i32, vchb: i32):\n\
+  br_if vne 3(v0a, vcha, vp) 2(v0a, vcha)\n\
+}\n\
+block 2 (v0b: i32, vchb: i32) {\n\
   v8192 = i64.const 8192\n\
   vexp = i32.const 0\n\
   vto = i64.const 100000\n\
   vy = i32.atomic.wait v8192 vexp vto\n\
-  br block1(v0b, vchb)\n\
-block2(v0c: i32, vchc: i32, vpf: i32):\n\
+  br 1(v0b, vchb)\n\
+}\n\
+block 3 (v0c: i32, vchc: i32, vpf: i32) {\n\
   vjr = cap.call 6 1 (i32) -> (i64) v0c (vchc)\n\
   vpf64 = i64.extend_i32_u vpf\n\
   return vpf64\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(vci: i64):\n\
+block 0 (vci: i64) {\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 #[test]

@@ -18,7 +18,7 @@ use svm_text::parse_module;
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -28,15 +28,17 @@ block0():
   vaddr = i64.const 0
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 

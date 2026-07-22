@@ -35,12 +35,13 @@ fn traced(src: &str, arg: Value) -> TracedRun {
 const STORE_OOB: &str = "\
 memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65532
   v2 = i64.const 0
   i64.store v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 debug.file 0 \"fault.c\"
 debug.fname 0 \"store_oob\"
@@ -51,17 +52,19 @@ debug.loc 0 0 2 0 10 3
 /// feeds a later add, so func0's frame is live (not a tail call). call @ line 40; div @ line 30.
 const CALL_THEN_DIV: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i32.const 1
   v3 = i32.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = i32.div_s v0 v1
   return v2
+  }
 }
 debug.file 0 \"div.c\"
 debug.fname 0 \"outer\"
@@ -99,8 +102,9 @@ fn interp_trap_backtrace_walks_the_caller_chain() {
 fn a_clean_run_has_no_trap_backtrace() {
     let src = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 ";
     let (res, bt) = traced(src, Value::I32(42));

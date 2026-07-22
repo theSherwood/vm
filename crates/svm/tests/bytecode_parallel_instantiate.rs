@@ -23,14 +23,16 @@ use svm_text::parse_module;
 /// Each child returns 5 ⇒ 8 × 5 = 40, regardless of how the child threads interleave.
 const FANOUT: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vi0 = i64.const 0
-  br block1(vi0, v0)
-block1(vi: i64, vinst: i32):
+  br 1(vi0, v0)
+}
+block 1 (vi: i64, vinst: i32) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vinst) block3(vinst)
-block2(vi2: i64, vinst2: i32):
+  br_if vlt 2(vi, vinst) 3(vinst)
+}
+block 2 (vi2: i64, vinst2: i32) {
   v4096 = i64.const 4096
   vofflo = i64.mul vi2 v4096
   v64k = i64.const 65536
@@ -46,16 +48,19 @@ block2(vi2: i64, vinst2: i32):
   i32.store vhoff vh
   v1 = i64.const 1
   vinext = i64.add vi2 v1
-  br block1(vinext, vinst2)
-block3(vinst3: i32):
+  br 1(vinext, vinst2)
+}
+block 3 (vinst3: i32) {
   vj0 = i64.const 0
   vs0 = i64.const 0
-  br block4(vj0, vs0, vinst3)
-block4(vj: i64, vs: i64, vinst4: i32):
+  br 4(vj0, vs0, vinst3)
+}
+block 4 (vj: i64, vs: i64, vinst4: i32) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
-block5(vj2: i64, vs2: i64, vinst5: i32):
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16
@@ -65,14 +70,17 @@ block5(vj2: i64, vs2: i64, vinst5: i32):
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br block4(vjn, vsn, vinst5)
-block6(vs3: i64):
+  br 4(vjn, vsn, vinst5)
+}
+block 6 (vs3: i64) {
   return vs3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 5
   return v1
+  }
 }
 "#;
 
@@ -81,14 +89,16 @@ block0(v0: i64):
 /// confinement composing to depth 2 under parallelism. Each grandchild returns 9 ⇒ 8 × 9 = 72.
 const NESTED: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vi0 = i64.const 0
-  br block1(vi0, v0)
-block1(vi: i64, vinst: i32):
+  br 1(vi0, v0)
+}
+block 1 (vi: i64, vinst: i32) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vinst) block3(vinst)
-block2(vi2: i64, vinst2: i32):
+  br_if vlt 2(vi, vinst) 3(vinst)
+}
+block 2 (vi2: i64, vinst2: i32) {
   v4096 = i64.const 4096
   vofflo = i64.mul vi2 v4096
   v64k = i64.const 65536
@@ -104,16 +114,19 @@ block2(vi2: i64, vinst2: i32):
   i32.store vhoff vh
   v1 = i64.const 1
   vinext = i64.add vi2 v1
-  br block1(vinext, vinst2)
-block3(vinst3: i32):
+  br 1(vinext, vinst2)
+}
+block 3 (vinst3: i32) {
   vj0 = i64.const 0
   vs0 = i64.const 0
-  br block4(vj0, vs0, vinst3)
-block4(vj: i64, vs: i64, vinst4: i32):
+  br 4(vj0, vs0, vinst3)
+}
+block 4 (vj: i64, vs: i64, vinst4: i32) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
-block5(vj2: i64, vs2: i64, vinst5: i32):
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16
@@ -123,12 +136,14 @@ block5(vj2: i64, vs2: i64, vinst5: i32):
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br block4(vjn, vsn, vinst5)
-block6(vs3: i64):
+  br 4(vjn, vsn, vinst5)
+}
+block 6 (vs3: i64) {
   return vs3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
   ventry = i64.const 2
   voff = i64.const 0
@@ -137,11 +152,13 @@ block0(v0: i64):
   vgh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
   vgr = cap.call 6 1 (i32) -> (i64) vinst (vgh)
   return vgr
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 9
   return v1
+  }
 }
 "#;
 
@@ -232,11 +249,12 @@ fn parallel_instantiate_nested_matches_oracle() {
 const MODULE_CHILD: &str = r#"memory 12
 data 0 "K"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 "#;
 
@@ -245,15 +263,17 @@ block0(v0: i64):
 /// child returns 75 ⇒ 8 × 75 = 600, regardless of how the children's threads interleave.
 const MODULE_FANOUT: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(vinst0: i32, vmod0: i32):
+block 0 (vinst0: i32, vmod0: i32) {
   vmod64 = i64.extend_i32_s vmod0
   vi0 = i64.const 0
-  br block1(vi0, vinst0, vmod64)
-block1(vi: i64, vinst: i32, vmod: i64):
+  br 1(vi0, vinst0, vmod64)
+}
+block 1 (vi: i64, vinst: i32, vmod: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vinst, vmod) block3(vinst)
-block2(vi2: i64, vinst2: i32, vmod2: i64):
+  br_if vlt 2(vi, vinst, vmod) 3(vinst)
+}
+block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
   v4096 = i64.const 4096
   vofflo = i64.mul vi2 v4096
   v64k = i64.const 65536
@@ -269,16 +289,19 @@ block2(vi2: i64, vinst2: i32, vmod2: i64):
   i32.store vhoff vh
   v1 = i64.const 1
   vinext = i64.add vi2 v1
-  br block1(vinext, vinst2, vmod2)
-block3(vinst3: i32):
+  br 1(vinext, vinst2, vmod2)
+}
+block 3 (vinst3: i32) {
   vj0 = i64.const 0
   vs0 = i64.const 0
-  br block4(vj0, vs0, vinst3)
-block4(vj: i64, vs: i64, vinst4: i32):
+  br 4(vj0, vs0, vinst3)
+}
+block 4 (vj: i64, vs: i64, vinst4: i32) {
   vn2 = i64.const 8
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
-block5(vj2: i64, vs2: i64, vinst5: i32):
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16
@@ -288,9 +311,11 @@ block5(vj2: i64, vs2: i64, vinst5: i32):
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br block4(vjn, vsn, vinst5)
-block6(vs3: i64):
+  br 4(vjn, vsn, vinst5)
+}
+block 6 (vs3: i64) {
   return vs3
+  }
 }
 "#;
 
@@ -374,16 +399,18 @@ fn parallel_instantiate_module_fanout_matches_oracle() {
 /// values. Each module coroutine returns 75 (its data byte) ⇒ 8 × 75 = 600.
 const COROUTINE_MODULE: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(vinst0: i32, vmod0: i32):
+block 0 (vinst0: i32, vmod0: i32) {
   vmod64 = i64.extend_i32_s vmod0
   vi0 = i64.const 0
   vs0 = i64.const 0
-  br block1(vi0, vs0, vinst0, vmod64)
-block1(vi: i64, vs: i64, vinst: i32, vmod: i64):
+  br 1(vi0, vs0, vinst0, vmod64)
+}
+block 1 (vi: i64, vs: i64, vinst: i32, vmod: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vs, vinst, vmod) block3(vs)
-block2(vi2: i64, vs2: i64, vinst2: i32, vmod2: i64):
+  br_if vlt 2(vi, vs, vinst, vmod) 3(vs)
+}
+block 2 (vi2: i64, vs2: i64, vinst2: i32, vmod2: i64) {
   v4096 = i64.const 4096
   vofflo = i64.mul vi2 v4096
   v64k = i64.const 65536
@@ -396,9 +423,11 @@ block2(vi2: i64, vs2: i64, vinst2: i32, vmod2: i64):
   vsnew = i64.add vs2 vval
   v1 = i64.const 1
   vinext = i64.add vi2 v1
-  br block1(vinext, vsnew, vinst2, vmod2)
-block3(vs3: i64):
+  br 1(vinext, vsnew, vinst2, vmod2)
+}
+block 3 (vs3: i64) {
   return vs3
+  }
 }
 "#;
 

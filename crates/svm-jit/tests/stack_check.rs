@@ -20,41 +20,46 @@ use svm_text::parse_module;
 // recurses into itself forever via a non-tail `call` (frames accumulate on the fiber's control stack).
 const RECURSE: &str = "\
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
   v3 = i64.const 0
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = call 2 (v0)
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 2 (v0)
   return v1
+  }
 }
 ";
 
 // Root creates a fiber that immediately returns 7 — no deep stack use, must run fine under the guard.
 const SHALLOW: &str = "\
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
   v3 = i64.const 0
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 7
   return v2
+  }
 }
 ";
 
@@ -72,30 +77,34 @@ fn unbounded_fiber_recursion_traps_stack_overflow() {
 // ABI param, no shared cell), so the spawned vCPU's fiber must trap StackOverflow on *its* stack.
 const SPAWNED_RECURSE: &str = "\
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = ref.func 2
   v3 = i64.const 4096
   v4 = cont.new v2 v3
   v5 = i64.const 0
   v6, v7 = cont.resume v4 v5
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = call 3 (v0)
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 3 (v0)
   return v1
+  }
 }
 ";
 

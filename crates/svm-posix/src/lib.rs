@@ -938,7 +938,7 @@ mod tests {
     /// heap base (`4096`), `write` returns `2`, so the result is `2_004096` — and stdout is `"hi"`.
     const MALLOC_WRITE: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   vsz = i64.const 2\n\
   vptr = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
   vh = i32.const 104\n\
@@ -953,6 +953,7 @@ block0(vph: i32):\n\
   vt = i64.mul vn vk\n\
   vr = i64.add vt vptr\n\
   return vr\n\
+  }\n\
 }\n";
 
     fn run_interp(src: &str, stdin: &[u8]) -> (Result<Vec<Value>, svm_interp::Trap>, Vec<u8>) {
@@ -997,7 +998,7 @@ block0(vph: i32):\n\
     /// a cat-style echo. Returns `n` (bytes read); stdout is whatever stdin held.
     const READ_ECHO: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   veight = i64.const 8\n\
   vbuf = cap.call 13 2 (i64) -> (i64) vph (veight)\n\
   vfd0 = i64.const 0\n\
@@ -1005,16 +1006,18 @@ block0(vph: i32):\n\
   vfd1 = i64.const 1\n\
   vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vn)\n\
   return vn\n\
+  }\n\
 }\n";
 
     /// func 0 `(handle) -> i64`: `exit(42)` — never returns.
     const EXIT_42: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   vc = i64.const 42\n\
   vx = cap.call 13 4 (i64) -> (i64) vph (vc)\n\
   vz = i64.const 0\n\
   return vz\n\
+  }\n\
 }\n";
 
     #[test]
@@ -1036,7 +1039,7 @@ block0(vph: i32):\n\
     /// `c` would bump fresh to `a + 64`, giving `64_000032` — so the value is non-vacuous.)
     const MALLOC_FREE_REUSE: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   vsz = i64.const 32\n\
   va = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
   vb = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
@@ -1048,6 +1051,7 @@ block0(vph: i32):\n\
   vt = i64.mul vcva vk\n\
   vr = i64.add vt vbva\n\
   return vr\n\
+  }\n\
 }\n";
 
     #[test]
@@ -1104,7 +1108,7 @@ block0(vph: i32):\n\
     /// and 3 bytes round-trip → `3_000003`; stdout and the memfs file `"f"` are both `"Hi!"`.
     const FILE_ROUNDTRIP: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   vpath = i64.const 0\n\
   vfch = i32.const 102\n\
   i32.store8 vpath vfch\n\
@@ -1133,6 +1137,7 @@ block0(vph: i32):\n\
   vt = i64.mul vfd vk\n\
   vres = i64.add vt vr\n\
   return vres\n\
+  }\n\
 }\n";
 
     #[test]
@@ -1200,7 +1205,7 @@ block0(vph: i32):\n\
     /// gone → `-ENOENT`). Returns `unlink_result * 1000 + (-open_result)` = `0*1000 + 2` = `2`.
     const UNLINK_THEN_OPEN: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   vpath = i64.const 0\n\
   vg = i32.const 103\n\
   i32.store8 vpath vg\n\
@@ -1214,6 +1219,7 @@ block0(vph: i32):\n\
   vt = i64.mul vu vk\n\
   vr = i64.add vt vneg\n\
   return vr\n\
+  }\n\
 }\n";
 
     #[test]
@@ -1267,7 +1273,7 @@ block0(vph: i32):\n\
     /// heap base (`4096`) and returns it; stdout is `"/bin"`.
     const GETENV_ECHO: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   vp = i64.const 0\n\
   vP = i32.const 80\n\
   i32.store8 vp vP\n\
@@ -1286,6 +1292,7 @@ block0(vph: i32):\n\
   vfour = i64.const 4\n\
   vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vptr, vfour)\n\
   return vptr\n\
+  }\n\
 }\n";
 
     #[test]
@@ -1346,7 +1353,7 @@ block0(vph: i32):\n\
     /// `"/tmp\0"` and returns the buffer offset (32) → `0*1_000_000 + 32 = 32`; stdout is `"/tmp"`.
     const CHDIR_GETCWD: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vph: i32):\n\
+block 0 (vph: i32) {\n\
   vp = i64.const 0\n\
   vsl = i32.const 47\n\
   i32.store8 vp vsl\n\
@@ -1371,6 +1378,7 @@ block0(vph: i32):\n\
   vtt = i64.mul vcd vk\n\
   vr = i64.add vtt vgc\n\
   return vr\n\
+  }\n\
 }\n";
 
     #[test]
@@ -1525,10 +1533,10 @@ block0(vph: i32):\n\
     /// (→ `2_004096`, `"hi"`).
     const IMPORT_BOUND_MALLOC_WRITE: &str = "memory 17\n\
 func () -> (i64) {\n\
-block0():\n\
+block 0 () {\n\
   vph = i32.const 0\n\
   vsz = i64.const 2\n\
-  vptr = call.import \"malloc\" (i64) -> (i64) vph (vsz)\n\
+  vptr = call.sym \"malloc\" (i64) -> (i64) vph (vsz)\n\
   vh = i32.const 104\n\
   i32.store8 vptr vh\n\
   vone = i64.const 1\n\
@@ -1537,11 +1545,12 @@ block0():\n\
   i32.store8 vp1 vi\n\
   vph2 = i32.const 0\n\
   vfd = i64.const 1\n\
-  vn = call.import \"write\" (i64, i64, i64) -> (i64) vph2 (vfd, vptr, vsz)\n\
+  vn = call.sym \"write\" (i64, i64, i64) -> (i64) vph2 (vfd, vptr, vsz)\n\
   vk = i64.const 1000000\n\
   vt = i64.mul vn vk\n\
   vr = i64.add vt vptr\n\
   return vr\n\
+  }\n\
 }\n";
 
     #[test]

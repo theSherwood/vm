@@ -96,13 +96,13 @@ const SYMTAB_OFF: usize = 8192;
 
 /// `service(a, b) = a*a + b` — a self-contained unit the guest installs into the table.
 const SERVICE: &str = "memory 16\nfunc (i32, i32) -> (i32) {\n\
-    block0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v0\n  v3 = i32.add v2 v1\n  return v3\n}\n";
+    block 0 (v0: i32, v1: i32) {\n  v2 = i32.mul v0 v0\n  v3 = i32.add v2 v1\n  return v3\n  }\n}\n";
 
 /// `unit(a, b) = F(a, b) + 100`, where `F` is an **unresolved import** the loader binds by name.
 const UNIT: &str = "memory 16\nfunc (i32, i32) -> (i32) {\n\
-    block0(v0: i32, v1: i32):\n  v2 = i32.const 0\n\
-    \x20 v3 = call.import \"F\" (i32, i32) -> (i32) v2 (v0, v1)\n\
-    \x20 v4 = i32.const 100\n  v5 = i32.add v3 v4\n  return v5\n}\n";
+    block 0 (v0: i32, v1: i32) {\n  v2 = i32.const 0\n\
+    \x20 v3 = call.sym \"F\" (i32, i32) -> (i32) v2 (v0, v1)\n\
+    \x20 v4 = i32.const 100\n  v5 = i32.add v3 v4\n  return v5\n  }\n}\n";
 
 /// Seed an init image with the service at [`SVC_OFF`] and the unit at [`UNIT_OFF`].
 fn seed_service_and_unit(svc: &[u8], unit: &[u8]) -> Vec<u8> {
@@ -119,7 +119,7 @@ fn seed_service_and_unit(svc: &[u8], unit: &[u8]) -> Vec<u8> {
 /// `unit(a, b)`. The slot is read back from install (the loader's real pattern — never hard-coded).
 fn install_link_invoke_guest(svc_len: usize, unit_len: usize) -> String {
     format!(
-        "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32, v2: i32):\n\
+        "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32, v2: i32) {{\n\
          \x20 v3 = i64.const {svc_off}\n  v4 = i64.const {svc_len}\n\
          \x20 v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n\
          \x20 v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)\n\
@@ -132,7 +132,7 @@ fn install_link_invoke_guest(svc_len: usize, unit_len: usize) -> String {
          \x20 v18 = i64.const {st}\n  v19 = i64.const 5\n\
          \x20 v20 = cap.call 11 5 (i64, i64, i64, i64) -> (i64) v0 (v16, v17, v18, v19)\n\
          \x20 v21 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v20, v1, v2)\n\
-         \x20 return v21\n}}\n",
+         \x20 return v21\n  }}\n}}\n",
         svc_off = SVC_OFF,
         unit_off = UNIT_OFF,
         st = SYMTAB_OFF,
@@ -174,7 +174,7 @@ fn guest_compiles_links_and_invokes_by_name_across_backends() {
 #[test]
 fn linking_to_a_wrong_typed_slot_traps_not_confuses() {
     // A service of the WRONG arity for the import: (i32) -> (i32).
-    let svc = blob("memory 16\nfunc (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let svc = blob("memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     let unit = unresolved_blob(UNIT); // imports F as (i32, i32) -> (i32)
     let init = seed_service_and_unit(&svc, &unit);
     let guest = install_link_invoke_guest(svc.len(), unit.len());
@@ -190,11 +190,11 @@ fn linking_to_a_wrong_typed_slot_traps_not_confuses() {
 /// [`SYMTAB_OFF`] and returns the raw result (handle or `-errno`) — for the fail-closed cases.
 fn compile_linked_only(unit_len: usize, symtab_len: usize) -> String {
     format!(
-        "memory 16\nfunc (i32) -> (i64) {{\nblock0(v0: i32):\n\
+        "memory 16\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n\
          \x20 v1 = i64.const {unit_off}\n  v2 = i64.const {unit_len}\n\
          \x20 v3 = i64.const {st}\n  v4 = i64.const {symtab_len}\n\
          \x20 v5 = cap.call 11 5 (i64, i64, i64, i64) -> (i64) v0 (v1, v2, v3, v4)\n\
-         \x20 return v5\n}}\n",
+         \x20 return v5\n  }}\n}}\n",
         unit_off = UNIT_OFF,
         st = SYMTAB_OFF,
     )

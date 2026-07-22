@@ -15,7 +15,7 @@ use svm_text::parse_module;
 /// map). `compute(a)`: line 2 `t = a + 1`, line 3 `u = t * 3`, line 4 `return u - 2`.
 const COMPUTE_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   v3 = i32.const 3
@@ -23,6 +23,7 @@ block0(v0: i32):
   v5 = i32.const 2
   v6 = i32.sub v4 v5
   return v6
+  }
 }
 
 debug.file 0 "compute.c"
@@ -93,7 +94,7 @@ fn jit_threads_source_locs_into_a_machine_address_map() {
 fn jit_without_debug_info_has_no_source_map() {
     // No `debug.*` section ⇒ no source locs stamped (codegen byte-identical to before) and an empty
     // map, so `symbolize` always returns `None`.
-    let cm = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let cm = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     assert!(cm.src_ranges().is_empty(), "no -g ⇒ no source map");
     assert!(cm
         .symbolize(cm.src_ranges().first().map_or(0x1000, |r| r.lo as usize))
@@ -136,7 +137,7 @@ fn jit_emits_debug_line_that_round_trips_through_the_reader() {
     }
 
     // A non-`-g` module emits no section.
-    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let bare = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     assert!(bare.debug_line_section().is_empty());
 }
 
@@ -168,7 +169,7 @@ fn jit_emits_debug_info_subprograms_that_round_trip() {
     );
 
     // A non-`-g` module emits nothing.
-    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let bare = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     let (bi, ba) = bare.debug_info_sections();
     assert!(bi.is_empty() && ba.is_empty());
 }
@@ -229,7 +230,7 @@ fn jit_wraps_dwarf_in_an_elf_whose_sections_round_trip() {
     assert!(lo > 0x1000, "low_pc is a live mapped address, not a stub");
 
     // A non-`-g` module produces no ELF (nothing to register).
-    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let bare = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     assert!(bare.elf_object().is_empty());
     let _ = hi;
 }
@@ -265,13 +266,13 @@ fn jit_registers_and_unregisters_with_the_gdb_jit_interface() {
     );
 
     // A non-`-g` module has nothing to register.
-    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let bare = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     assert!(bare.register_with_gdb().is_none());
 }
 
 const VAR_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   v3 = i32.const 3
@@ -279,6 +280,7 @@ block0(v0: i32):
   v5 = i32.const 2
   v6 = i32.sub v4 v5
   return v6
+  }
 }
 
 debug.file 0 "compute.c"
@@ -343,7 +345,7 @@ fn jit_without_debug_vars_tracks_no_variables() {
         compile(COMPUTE_DBG).var_locations().is_empty(),
         "lines without debug.var ⇒ no tracked vars"
     );
-    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let bare = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     assert!(bare.var_locations().is_empty());
 }
 
@@ -352,10 +354,11 @@ fn jit_without_debug_vars_tracks_no_variables() {
 /// references type 0 (`int`), exercising the inter-type `DW_FORM_ref4` fixups.
 const TYPES_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 debug.file 0 "types.c"
@@ -449,7 +452,7 @@ fn jit_emits_type_dies_that_round_trip() {
     assert_eq!(parsed.subs.len(), 1, "the function subprogram survives");
 
     // A non-`-g` module emits nothing.
-    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let bare = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     let (bi, ba) = bare.debug_info_sections();
     assert!(bi.is_empty() && ba.is_empty());
 }
@@ -572,7 +575,7 @@ fn jit_emits_debug_frame_cfi_for_unwinding() {
     assert_eq!(cie_end + 4 + fde_len, f.len(), "exactly one CIE + one FDE");
 
     // A non-`-g` module emits no frame info.
-    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let bare = compile("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n");
     assert!(bare.debug_frame_section().is_empty());
 }
 
@@ -585,7 +588,7 @@ fn jit_emits_debug_frame_cfi_for_unwinding() {
 /// because the optimizer rematerializes/folds plain computed values, dropping their value labels.
 const SPILL_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1(v0)
   v2 = call 1(v0)
   v3 = call 1(v0)
@@ -614,13 +617,15 @@ block0(v0: i32):
   v26 = i32.add v25 v13
   v27 = i32.add v26 v14
   return v27
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 3
   v2 = i32.mul v0 v1
   return v2
+  }
 }
 
 debug.file 0 "spill.c"

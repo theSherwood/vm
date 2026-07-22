@@ -1,6 +1,6 @@
 //! In-window dynamic linking, milestone 0: **compile-time (static) linking of a function symbol.**
 //!
-//! A unit `caller` references another unit `add` by *name* (`call.import "add"`). The loader resolves
+//! A unit `caller` references another unit `add` by *name* (`call.sym "add"`). The loader resolves
 //! the name to `add`'s function index and `svm_ir::resolve_imports_with` rewrites the `CallImport`
 //! into a **direct `call`** — exactly what a static linker does (symbol → concrete call). By the time
 //! the verifier and both backends see the module, it's an ordinary closed module; "linking" was a
@@ -15,16 +15,18 @@ use svm_ir::{Resolved, ResolvedCap};
 /// resolving to a `Func` drops it.
 const TWO_UNITS: &str = "\
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.const 0
-  v3 = call.import \"add\" (i32, i32) -> (i32) v2 (v0, v1)
+  v3 = call.sym \"add\" (i32, i32) -> (i32) v2 (v0, v1)
   return v3
+  }
 }
 ";
 
@@ -33,7 +35,7 @@ block0(v0: i32, v1: i32):
 fn link_and_run(resolver: impl FnMut(&str) -> Option<Resolved>, args: &[i32]) -> i64 {
     let m = svm_text::parse_module(TWO_UNITS).expect("parse");
     assert_eq!(m.imports.len(), 1, "one named import: \"add\"");
-    // The compile-time link step: rewrite call.import "add" → a direct call to add's index.
+    // The compile-time link step: rewrite call.sym "add" → a direct call to add's index.
     let linked = svm_ir::resolve_imports_with(&m, resolver).expect("resolve");
     assert!(linked.imports.is_empty(), "imports lowered away");
     // No CallImport survives; it became a direct Call.
@@ -91,15 +93,17 @@ fn unresolved_symbol_fails_closed() {
 fn signature_mismatch_is_caught_by_reverify() {
     let src = "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.const 0
-  v3 = call.import \"sym\" (i32, i32) -> (i32) v2 (v0, v1)
+  v3 = call.sym \"sym\" (i32, i32) -> (i32) v2 (v0, v1)
   return v3
+  }
 }
 ";
     let m = svm_text::parse_module(src).expect("parse");
@@ -116,10 +120,11 @@ block0(v0: i32, v1: i32):
 fn capability_resolution_still_works() {
     let src = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = call.import \"write\" (i32) -> (i32) v0 (v1)
+  v2 = call.sym \"write\" (i32) -> (i32) v0 (v1)
   return v2
+  }
 }
 ";
     let m = svm_text::parse_module(src).expect("parse");
@@ -172,9 +177,10 @@ fn unit(src: &str, exports: &[(&str, u32)]) -> LinkUnit {
 
 const MATH_UNIT: &str = "\
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.add v0 v1
   return v2
+  }
 }
 ";
 
@@ -182,10 +188,11 @@ block0(v0: i32, v1: i32):
 /// (app's functions reindexed after math's) and resolves the import to a direct call.
 const APP_UNIT: &str = "\
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.const 0
-  v3 = call.import \"add\" (i32, i32) -> (i32) v2 (v0, v1)
+  v3 = call.sym \"add\" (i32, i32) -> (i32) v2 (v0, v1)
   return v3
+  }
 }
 ";
 
@@ -207,8 +214,9 @@ fn links_two_separate_units_into_one_program() {
 fn links_across_a_reindexing_offset() {
     let pad = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 "; // an unrelated unit so `math` lands at a non-zero base
     let linked = link(&[
@@ -255,8 +263,9 @@ const PAD16: &str = "\
 memory 16
 data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 ";
 
@@ -268,7 +277,7 @@ block0(v0: i32):
 fn cross_unit_data_symbol_is_relocated() {
     let store = LinkUnit {
         module: svm_text::parse_module(
-            "memory 16\ndata 0 \"\\x2a\"\nfunc (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n",
+            "memory 16\ndata 0 \"\\x2a\"\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
         )
         .unwrap(),
         data_exports: vec![("answer".into(), 0)],
@@ -278,10 +287,11 @@ fn cross_unit_data_symbol_is_relocated() {
         module: svm_text::parse_module(
             "memory 16\n\
              func (i32) -> (i32) {\n\
-             block0(v0: i32):\n\
+             block 0 (v0: i32) {\n\
              \x20 v1 = i64.const 0\n\
              \x20 v2 = i32.load8_u v1\n\
              \x20 return v2\n\
+               }\n\
              }\n",
         )
         .unwrap(),
@@ -315,10 +325,11 @@ fn self_data_is_relocated() {
             "memory 16\n\
              data 0 \"\\x07\"\n\
              func (i32) -> (i32) {\n\
-             block0(v0: i32):\n\
+             block 0 (v0: i32) {\n\
              \x20 v1 = i64.const 0\n\
              \x20 v2 = i32.load8_u v1\n\
              \x20 return v2\n\
+               }\n\
              }\n",
         )
         .unwrap(),
@@ -343,8 +354,10 @@ fn self_data_is_relocated() {
 #[test]
 fn bad_relocation_fails_closed() {
     let u = LinkUnit {
-        module: svm_text::parse_module("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n")
-            .unwrap(),
+        module: svm_text::parse_module(
+            "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+        )
+        .unwrap(),
         // inst 0 of an empty block body doesn't exist → BadReloc.
         relocations: vec![DataReloc {
             func: 0,
@@ -370,24 +383,27 @@ fn bad_relocation_fails_closed() {
 fn import_resolves_to_a_call_indirect_slot() {
     let src = "\
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.sub v0 v1
   return v2
+  }
 }
 
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.const 2
   v3 = i32.mul v0 v2
   v4 = i32.add v3 v1
   return v4
+  }
 }
 
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.const 0
-  v3 = call.import \"F\" (i32, i32) -> (i32) v2 (v0, v1)
+  v3 = call.sym \"F\" (i32, i32) -> (i32) v2 (v0, v1)
   return v3
+  }
 }
 ";
     let m = svm_text::parse_module(src).expect("parse");
@@ -420,9 +436,10 @@ fn slot_import_requires_a_const_handle() {
     // The handle here is a block *parameter* (v0), not a const → SlotHandleNotConst.
     let src = "\
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
-  v2 = call.import \"F\" (i32) -> (i32) v0 (v1)
+block 0 (v0: i32, v1: i32) {
+  v2 = call.sym \"F\" (i32) -> (i32) v0 (v1)
   return v2
+  }
 }
 ";
     let m = svm_text::parse_module(src).expect("parse");
@@ -438,13 +455,14 @@ block0(v0: i32, v1: i32):
 #[test]
 fn link_merges_impl_surfaces_across_units() {
     let provider = unit(
-        "type (i32, i32) -> (i32)\n\
-         interface { add: 0 }\n\
-         export \"adder\" impl 1 : 0\n\n\
+        "type 0 func (i32, i32) -> (i32)\n\
+         type 1 interface { add: 0 }\n\
+         export 0 interface \"adder\" 1 { add: 0 }\n\n\
          func (i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32):\n\
+         block 0 (v0: i32, v1: i32) {\n\
            v2 = i32.add v0 v1\n\
            return v2\n\
+           }\n\
          }\n",
         &[],
     );
@@ -469,13 +487,14 @@ fn link_merges_impl_surfaces_across_units() {
 
     // An offer name colliding with a function export symbol fails closed.
     let clash = unit(
-        "type (i32, i32) -> (i32)\n\
-         interface { add: 0 }\n\
-         export \"add\" impl 1 : 0\n\n\
+        "type 0 func (i32, i32) -> (i32)\n\
+         type 1 interface { add: 0 }\n\
+         export 0 interface \"add\" 1 { add: 0 }\n\n\
          func (i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32):\n\
+         block 0 (v0: i32, v1: i32) {\n\
            v2 = i32.add v0 v1\n\
            return v2\n\
+           }\n\
          }\n",
         &[],
     );

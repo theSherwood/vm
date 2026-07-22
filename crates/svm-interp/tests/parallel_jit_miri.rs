@@ -20,9 +20,10 @@ use svm_text::parse_module;
 /// The unit every worker drives: `service() -> 7` — pure compute, no host/memory use.
 const SERVICE: &str = r#"memory 16
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 7
   return v0
+  }
 }
 "#;
 
@@ -43,19 +44,21 @@ fn jit_validator(
 /// return the shared counter at `mem[8]`. Worker: unpack, `Jit.invoke` the unit, atomically add its 7.
 const INVOKE: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   vje = i64.extend_i32_u v0
   vce = i64.extend_i32_u v1
   vc32 = i64.const 32
   vchi = i64.shl vce vc32
   vpacked = i64.or vchi vje
   vi0 = i64.const 0
-  br block1(vi0, vpacked)
-block1(vi: i64, vp: i64):
+  br 1(vi0, vpacked)
+}
+block 1 (vi: i64, vp: i64) {
   vn = i64.const 2
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vp) block3()
-block2(vi2: i64, vp2: i64):
+  br_if vlt 2(vi, vp) 3()
+}
+block 2 (vi2: i64, vp2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
@@ -65,15 +68,18 @@ block2(vi2: i64, vp2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vp2)
-block3():
+  br 1(v9, vp2)
+}
+block 3 () {
   vj0 = i64.const 0
-  br block4(vj0)
-block4(vj: i64):
+  br 4(vj0)
+}
+block 4 (vj: i64) {
   vn2 = i64.const 2
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj) block6()
-block5(vj2: i64):
+  br_if vlt2 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -82,14 +88,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vp: i64):
+block 0 (vsp: i64, vp: i64) {
   vmask = i64.const 4294967295
   vjit64 = i64.and vp vmask
   vjit = i32.wrap_i64 vjit64
@@ -101,6 +109,7 @@ block0(vsp: i64, vp: i64):
   vold = i64.atomic.rmw.add vc8 vw64
   vret = i64.const 0
   return vret
+  }
 }
 "#;
 
@@ -108,19 +117,21 @@ block0(vsp: i64, vp: i64):
 /// concurrent installs into the shared dispatch table (the machinery Miri scrutinizes here).
 const INSTALL: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   vje = i64.extend_i32_u v0
   vce = i64.extend_i32_u v1
   vc32 = i64.const 32
   vchi = i64.shl vce vc32
   vpacked = i64.or vchi vje
   vi0 = i64.const 0
-  br block1(vi0, vpacked)
-block1(vi: i64, vp: i64):
+  br 1(vi0, vpacked)
+}
+block 1 (vi: i64, vp: i64) {
   vn = i64.const 2
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vp) block3()
-block2(vi2: i64, vp2: i64):
+  br_if vlt 2(vi, vp) 3()
+}
+block 2 (vi2: i64, vp2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
@@ -130,15 +141,18 @@ block2(vi2: i64, vp2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vp2)
-block3():
+  br 1(v9, vp2)
+}
+block 3 () {
   vj0 = i64.const 0
-  br block4(vj0)
-block4(vj: i64):
+  br 4(vj0)
+}
+block 4 (vj: i64) {
   vn2 = i64.const 2
   vlt2 = i64.lt_u vj vn2
-  br_if vlt2 block5(vj) block6()
-block5(vj2: i64):
+  br_if vlt2 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -147,14 +161,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vp: i64):
+block 0 (vsp: i64, vp: i64) {
   vmask = i64.const 4294967295
   vjit64 = i64.and vp vmask
   vjit = i32.wrap_i64 vjit64
@@ -168,6 +184,7 @@ block0(vsp: i64, vp: i64):
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
+  }
 }
 "#;
 

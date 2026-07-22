@@ -97,12 +97,13 @@ fn assert_resume_at_point(oracle: &str, freezable: &str, expected: i64) {
 // Two leaf cap.calls. Oracle: v2 = clock(42), v3 = clock(43), v4 = v2 + v3 = 85.
 const ORACLE_2: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -110,7 +111,7 @@ block0(v0: i32):
 // state-word address and the UNWINDING constant.)
 const FREEZE_AT_0: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v_a = i64.const 0
   v_u = i32.const 1
@@ -119,13 +120,14 @@ block0(v0: i32):
   v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
 // Freeze at point 1: the first cap.call runs NORMAL, then flip UNWINDING before the second.
 const FREEZE_AT_1: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v_a = i64.const 0
@@ -134,6 +136,7 @@ block0(v0: i32):
   v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -154,7 +157,7 @@ fn resume_at_second_of_two_points() {
 // Oracle: clock 42,43,44 → 42 + 43*10 + 44*100 = 4872.
 const ORACLE_3: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
@@ -166,13 +169,14 @@ block0(v0: i32):
   v9 = i64.add v2 v7
   v10 = i64.add v9 v8
   return v10
+  }
 }
 "#;
 
 // Freeze at point 2 (the third cap.call): resume id 3, ARM_2.
 const FREEZE_AT_2: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
@@ -187,6 +191,7 @@ block0(v0: i32):
   v9 = i64.add v2 v7
   v10 = i64.add v9 v8
   return v10
+  }
 }
 "#;
 
@@ -201,34 +206,37 @@ fn resume_at_third_of_three_points() {
 // Oracle: B = clock(42)+1000 = 1042; C = clock(43)+1 = 44; A = 1086.
 const ORACLE_PROP: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = call 2 (v0)
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1000
   v4 = i64.add v2 v3
   return v4
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
 // Same, but flip UNWINDING after the first call returns, so A freezes at the call to C.
 const FREEZE_PROP_AT_1: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v_a = i64.const 0
   v_u = i32.const 1
@@ -236,22 +244,25 @@ block0(v0: i32):
   v2 = call 2 (v0)
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1000
   v4 = i64.add v2 v3
   return v4
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 

@@ -20,7 +20,7 @@ use svm_verify::verify_module;
 /// `42` at each carve base and the parent returns `14`.
 const PARENT: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   v1 = i64.const 1\n\
   v2 = i64.const 65536\n\
   v3 = i64.const 12\n\
@@ -32,14 +32,16 @@ block0(v0: i32):\n\
   v9 = cap.call 6 1 (i32) -> (i64) v0 (v8)\n\
   v10 = i64.add v6 v9\n\
   return v10\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(v0: i64):\n\
+block 0 (v0: i64) {\n\
   v1 = i64.const 0\n\
   v2 = i32.const 42\n\
   i32.store8 v1 v2\n\
   v3 = i64.const 7\n\
   return v3\n\
+  }\n\
 }\n";
 
 #[test]

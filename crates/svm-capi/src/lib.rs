@@ -347,7 +347,7 @@ pub unsafe extern "C" fn svm_imports_provide_clock(i: *mut SvmImports, name: *co
 }
 
 /// Bind `name` to a **host-defined** capability implemented by the C callback `f` (operation `op`,
-/// opaque `ctx`). The guest reaches it as `call.import "<name>"`.
+/// opaque `ctx`). The guest reaches it as `call.sym "<name>"`.
 ///
 /// # Safety
 /// `i` is a live registry; `name` a valid C string; `f` a valid function pointer for the lifetime of

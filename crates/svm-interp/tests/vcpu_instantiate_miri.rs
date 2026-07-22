@@ -20,7 +20,7 @@ use svm_text::parse_module;
 // non-atomic access through two aliasing region views of one allocation.
 const SRC: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vo0 = i64.const 65536
   ve = i64.const 1
   vsl = i64.const 12
@@ -40,14 +40,16 @@ block0(v0: i32):
   vs2 = i64.add vs1 vm0e
   vs3 = i64.add vs2 vm1e
   return vs3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vaddr = i64.const 0
   v21 = i32.const 21
   i32.store8 vaddr v21
   v5 = i64.const 5
   return v5
+  }
 }
 "#;
 

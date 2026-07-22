@@ -62,7 +62,7 @@ fn interp(src: &str, args: &[Value]) -> Vec<i64> {
 }
 
 const ADD: &str =
-    "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n";
+    "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
 
 /// The split is behavior-preserving and the module survives a run: `compile().run()`
 /// matches the interpreter, twice, on the same `CompiledModule`.
@@ -94,7 +94,7 @@ fn run_rejects_short_args() {
 #[test]
 fn define_extra_pure_function_matches_interp() {
     let mut cm = compile(ADD);
-    let extra_src = "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  return v2\n}\n";
+    let extra_src = "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.mul v0 v1\n  return v2\n  }\n}\n";
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
@@ -109,7 +109,7 @@ fn define_extra_pure_function_matches_interp() {
 #[test]
 fn define_extra_unit_local_direct_calls() {
     let mut cm = compile(ADD);
-    let extra_src = "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = call 1 (v0)\n  v2 = i32.add v1 v1\n  return v2\n}\nfunc (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 10\n  v2 = i32.add v0 v1\n  return v2\n}\n";
+    let extra_src = "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = call 1 (v0)\n  v2 = i32.add v1 v1\n  return v2\n  }\n}\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 10\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
@@ -127,9 +127,9 @@ fn define_extra_unit_local_direct_calls() {
 fn incremental_finalize_keeps_earlier_code_runnable() {
     let mut cm = compile(ADD);
     let unit1_src =
-        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 1\n  v2 = i32.add v0 v1\n  return v2\n}\n";
+        "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 1\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
     let unit2_src =
-        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 2\n  v2 = i32.mul v0 v1\n  return v2\n}\n";
+        "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 2\n  v2 = i32.mul v0 v1\n  return v2\n  }\n}\n";
     let unit1 = parse_module(unit1_src).expect("parse");
     let unit2 = parse_module(unit2_src).expect("parse");
     verify_module(&unit1).expect("verify");
@@ -161,13 +161,13 @@ fn define_extra_call_indirect_uses_parent_table_and_mask() {
     let mut cm = compile(ADD);
     let extra_src = concat!(
         // f0: call_indirect slot 0 with the parent's signature.
-        "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 0\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n}\n",
+        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 0\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n",
         // f1: call_indirect slot 3 — masked by the parent's mask 0, wraps to slot 0.
-        "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 3\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n}\n",
+        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 3\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n",
         // f2, f3: padding so the unit pushes the cumulative function count past a
         // power-of-two boundary (1 parent + 4 extra = 5 > 4).
-        "func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n",
-        "func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n",
+        "func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 0\n  return v0\n  }\n}\n",
+        "func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 0\n  return v0\n  }\n}\n",
     );
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
@@ -201,9 +201,9 @@ fn parent_call_indirect_cannot_reach_extra_code() {
     // Parent: f0 = the dispatching entry, f1 = +10, f2 = *2 (both (i32) -> (i32)).
     // Table is padded to 4 slots; slot 3 is padding (traps), idx ≥ 4 wraps (mask 3).
     let parent_src = concat!(
-        "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = call_indirect (i32) -> (i32) v0 (v1)\n  return v2\n}\n",
-        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 10\n  v2 = i32.add v0 v1\n  return v2\n}\n",
-        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 2\n  v2 = i32.mul v0 v1\n  return v2\n}\n",
+        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = call_indirect (i32) -> (i32) v0 (v1)\n  return v2\n  }\n}\n",
+        "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 10\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n",
+        "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 2\n  v2 = i32.mul v0 v1\n  return v2\n  }\n}\n",
     );
     let mut cm = compile(parent_src);
     let sweep = |cm: &mut CompiledModule| -> Vec<JitOutcome> {
@@ -223,7 +223,7 @@ fn parent_call_indirect_cannot_reach_extra_code() {
 
     // An extra function with the SAME signature as f1/f2 — if it leaked into the table
     // anywhere, some index would now return x + 1000.
-    let extra_src = "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 1000\n  v2 = i32.add v0 v1\n  return v2\n}\n";
+    let extra_src = "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 1000\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
@@ -246,7 +246,7 @@ fn parent_call_indirect_cannot_reach_extra_code() {
 #[test]
 fn define_extra_unknown_signature_traps_fail_closed() {
     let mut cm = compile(ADD); // parent declares only (i32, i32) -> (i32)
-    let extra_src = "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i32.const 0\n  v2 = call_indirect (i64) -> (i64) v1 (v0)\n  return v2\n}\n";
+    let extra_src = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i32.const 0\n  v2 = call_indirect (i64) -> (i64) v1 (v0)\n  return v2\n  }\n}\n";
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
@@ -257,7 +257,7 @@ fn define_extra_unknown_signature_traps_fail_closed() {
     );
 }
 
-const MEM_PARENT: &str = "memory 16\nfunc () -> (i32) {\nblock0():\n  v0 = i64.const 8\n  v1 = i32.load v0\n  return v1\n}\n";
+const MEM_PARENT: &str = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i64.const 8\n  v1 = i32.load v0\n  return v1\n  }\n}\n";
 
 /// Extra code shares the parent's window environment (DESIGN.md §22 "vmctx sharing"): it is
 /// compiled against the same confinement mask + backed extent, so its memory effects match
@@ -268,7 +268,7 @@ const MEM_PARENT: &str = "memory 16\nfunc () -> (i32) {\nblock0():\n  v0 = i64.c
 fn define_extra_masking_matches_interp_memory_effects() {
     let mut cm = compile(MEM_PARENT);
     // In-window: store 0xAB at offset 8, read it back.
-    let store_src = "memory 16\nfunc () -> (i32) {\nblock0():\n  v0 = i64.const 8\n  v1 = i32.const 171\n  i32.store8 v0 v1\n  v2 = i64.const 8\n  v3 = i32.load8_u v2\n  return v3\n}\n";
+    let store_src = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i64.const 8\n  v1 = i32.const 171\n  i32.store8 v0 v1\n  v2 = i64.const 8\n  v3 = i32.load8_u v2\n  return v3\n  }\n}\n";
     let extra = parse_module(store_src).expect("parse");
     verify_module(&extra).expect("verify");
     let mut fuel = 1_000_000u64;
@@ -288,7 +288,7 @@ fn define_extra_masking_matches_interp_memory_effects() {
 
     // Beyond `mapped` (64 KiB) but inside the reserved mask domain: a guard fault —
     // detect-and-kill — on the JIT, agreeing with the interpreter.
-    let fault_src = "memory 16\nfunc () -> (i32) {\nblock0():\n  v0 = i64.const 1048584\n  v1 = i32.const 171\n  i32.store8 v0 v1\n  v2 = i32.const 0\n  return v2\n}\n";
+    let fault_src = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i64.const 1048584\n  v1 = i32.const 171\n  i32.store8 v0 v1\n  v2 = i32.const 0\n  return v2\n  }\n}\n";
     let extra = parse_module(fault_src).expect("parse");
     verify_module(&extra).expect("verify");
     let mut fuel = 1_000_000u64;
@@ -327,14 +327,14 @@ fn type_ids_are_interned_append_only_across_units() {
 
     // Unit A introduces (i64) -> (i64) as a *function* signature.
     let unit_a_src =
-        "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64.const 1\n  v2 = i64.add v0 v1\n  return v2\n}\n";
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 1\n  v2 = i64.add v0 v1\n  return v2\n  }\n}\n";
     let unit_a = parse_module(unit_a_src).expect("parse");
     verify_module(&unit_a).expect("verify");
     cm.define_extra(&unit_a.funcs).expect("unit A");
     let id = cm.interned_type_id(&novel).expect("interned by unit A");
 
     // Unit B mentions the same signature only at a call site — same id, nothing remapped.
-    let unit_b_src = "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i32.const 0\n  v2 = call_indirect (i64) -> (i64) v1 (v0)\n  return v2\n}\n";
+    let unit_b_src = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i32.const 0\n  v2 = call_indirect (i64) -> (i64) v1 (v0)\n  return v2\n  }\n}\n";
     let unit_b = parse_module(unit_b_src).expect("parse");
     verify_module(&unit_b).expect("verify");
     let ptrs = cm.define_extra(&unit_b.funcs).expect("unit B");
@@ -367,7 +367,7 @@ fn define_extra_empty_unit() {
 /// un-installed slot still traps `IndirectCallType` fail-closed.
 #[test]
 fn install_makes_unit_call_indirectable() {
-    let parent_src = "func (i32, i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32, v2: i32):\n  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)\n  return v3\n}\n";
+    let parent_src = "func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)\n  return v3\n  }\n}\n";
     let m = parse_module(parent_src).expect("parse");
     verify_module(&m).expect("verify");
     // Reserve a 16-slot table (log2 = 4) so there is padding for install (parent has 1 func).
@@ -386,7 +386,7 @@ fn install_makes_unit_call_indirectable() {
     )
     .expect("compile");
 
-    let unit_src = "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 100\n  v4 = i32.add v2 v3\n  return v4\n}\n";
+    let unit_src = "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.mul v0 v1\n  v3 = i32.const 100\n  v4 = i32.add v2 v3\n  return v4\n  }\n}\n";
     let unit = parse_module(unit_src).expect("parse");
     verify_module(&unit).expect("verify");
     let defs = cm.define_extra(&unit.funcs).expect("define_extra");
@@ -447,7 +447,7 @@ fn concurrent_finalize_does_not_disturb_running_code() {
 
     let mut cm = compile(ADD);
     // Leaf `() -> (i64)` returning 42 — no memory, no calls.
-    let leaf_src = "func () -> (i64) {\nblock0():\n  v0 = i64.const 42\n  return v0\n}\n";
+    let leaf_src = "func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n";
     let leaf = parse_module(leaf_src).expect("parse");
     verify_module(&leaf).expect("verify");
     let defs = cm.define_extra(&leaf.funcs).expect("define leaf");
@@ -485,8 +485,9 @@ fn concurrent_finalize_does_not_disturb_running_code() {
 
     // Hammer `finalize_definitions` from the main thread while the worker executes the leaf.
     for k in 0..400i64 {
-        let src =
-            format!("func () -> (i64) {{\nblock0():\n  v0 = i64.const {k}\n  return v0\n}}\n");
+        let src = format!(
+            "func () -> (i64) {{\nblock 0 () {{\n  v0 = i64.const {k}\n  return v0\n  }}\n}}\n"
+        );
         let m = parse_module(&src).expect("parse");
         verify_module(&m).expect("verify");
         cm.define_extra(&m.funcs)

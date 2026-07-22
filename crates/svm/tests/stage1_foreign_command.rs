@@ -27,7 +27,7 @@ const OUT_OFF: u64 = 8; // child copies argv here; parent forwards from CARVE + 
 fn child_src() -> &'static str {
     "memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   s0 = i64.const 0
   b0 = i32.load8_u s0
   d0 = i64.const 8
@@ -42,6 +42,7 @@ block0(v0: i64):
   i32.store8 d2 b2
   n = i64.const 3
   return n
+  }
 }
 "
 }
@@ -62,7 +63,7 @@ fn parent_src(token: &[u8; 3]) -> String {
     format!(
         "memory 17
 func (i32, i32, i32) -> (i64) {{
-block0(vinst: i32, vmod: i32, vout: i32):
+block 0 (vinst: i32, vmod: i32, vout: i32) {{
 {seed}  me = i64.extend_i32_s vmod
   ent = i64.const 0
   off = i64.const {CARVE}
@@ -73,6 +74,7 @@ block0(vinst: i32, vmod: i32, vout: i32):
   fp = i64.const {fwd}
   w = cap.call 0 1 (i64, i64) -> (i64) vout (fp, n)
   return w
+  }}
 }}
 "
     )

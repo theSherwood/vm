@@ -56,7 +56,7 @@ fn nest_src(off: u64) -> String {
     format!(
         "memory 17\n\
          func (i32) -> (i64) {{\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {{\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.const {off}\n\
          \x20 v3 = i64.const 12\n\
@@ -64,9 +64,10 @@ fn nest_src(off: u64) -> String {
          \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
          \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
+           }}\n\
          }}\n\
          func (i64) -> (i64) {{\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {{\n\
          \x20 v1 = i64.const 0\n\
          \x20 v2 = i32.const 171\n\
          \x20 i32.store8 v1 v2\n\
@@ -75,6 +76,7 @@ fn nest_src(off: u64) -> String {
          \x20 i32.store8 v3 v4\n\
          \x20 v5 = i64.const 42\n\
          \x20 return v5\n\
+           }}\n\
          }}\n"
     )
 }
@@ -133,7 +135,7 @@ fn jit_instantiator_rejects_out_of_range_carve() {
     }
     let src = "memory 17\n\
          func (i32) -> (i64) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.const 131072\n\
          \x20 v3 = i64.const 12\n\
@@ -141,11 +143,13 @@ fn jit_instantiator_rejects_out_of_range_carve() {
          \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
          \x20 v6 = i64.extend_i32_s v5\n\
          \x20 return v6\n\
+           }\n\
          }\n\
          func (i64) -> (i64) {\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {\n\
          \x20 v1 = i64.const 0\n\
          \x20 return v1\n\
+           }\n\
          }\n";
     let (ir, _imem, jo, _jmem) = both(src, 17);
     let ival = ir.expect("interp ran ok").pop().expect("one result");
@@ -173,7 +177,7 @@ fn jit_instantiator_child_trap_propagates() {
         format!(
             "memory 18\n\
              func (i32) -> (i64) {{\n\
-             block0(v0: i32):\n\
+             block 0 (v0: i32) {{\n\
              \x20 v1 = i64.const 1\n\
              \x20 v2 = i64.const 65536\n\
              \x20 v3 = i64.const 16\n\
@@ -181,10 +185,12 @@ fn jit_instantiator_child_trap_propagates() {
              \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
              \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
              \x20 return v6\n\
+               }}\n\
              }}\n\
              func (i64) -> (i64) {{\n\
-             block0(v0: i64):\n\
+             block 0 (v0: i64) {{\n\
              {body}\n\
+               }}\n\
              }}\n"
         )
     };

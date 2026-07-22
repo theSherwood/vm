@@ -15,10 +15,11 @@ use svm_verify::verify_module;
 /// func 0 `(i32) -> (i64)` (arg ignored): return `cap.self.attest` zero-extended to `i64`.
 const ATTEST_SELF: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   va = cap.self.attest\n\
   vr = i64.extend_i32_u va\n\
   return vr\n\
+  }\n\
 }\n";
 
 fn run_interp(src: &str, host: &mut Host) -> Result<Vec<Value>, svm_interp::Trap> {
@@ -108,7 +109,7 @@ fn root_attest_packs_tier_and_exposure_bits() {
 /// report is `1 | (1 << 8)` = `257`. Result `257 * 1000 + 1` = `257001`.
 const NESTED_ATTEST: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vinst: i32):\n\
+block 0 (vinst: i32) {\n\
   ventry = i64.const 1\n\
   voff = i64.const 0\n\
   vsl = i64.const 12\n\
@@ -121,12 +122,14 @@ block0(vinst: i32):\n\
   vt = i64.mul vcr vk\n\
   vsum = i64.add vt vpa64\n\
   return vsum\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(vci: i64):\n\
+block 0 (vci: i64) {\n\
   va = cap.self.attest\n\
   vr = i64.extend_i32_u va\n\
   return vr\n\
+  }\n\
 }\n";
 
 #[test]

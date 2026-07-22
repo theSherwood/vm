@@ -21,9 +21,10 @@ const RO_OFF: usize = 5 * PAGE; // a read-only data segment lands on page 5
 const SRC: &str = r#"
 data ro 20480 "ABCD"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 7
   return v1
+  }
 }
 "#;
 
@@ -114,12 +115,13 @@ fn to_captured(prots: &[PageProt]) -> Vec<CapturedProt> {
 // with it `Rw` the store succeeds.
 const STORE_SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 20480
   v2 = i64.const 99
   i64.store v1 v2
   v3 = i64.const 0
   return v3
+  }
 }
 "#;
 

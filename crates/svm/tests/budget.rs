@@ -52,7 +52,7 @@ fn run_jit(src: &str, host: &mut Host, bh: i32) -> JitOutcome {
 /// child_mem)*1000 + child_spawn` = `((700*1000 + 300)*1000 + 200)*1000 + 3` = `700300200003`.
 const SPLIT_AND_READ: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vb: i32):\n\
+block 0 (vb: i32) {\n\
   f300 = i64.const 300\n\
   m200 = i64.const 200\n\
   s3 = i64.const 3\n\
@@ -72,18 +72,20 @@ block0(vb: i32):\n\
   t4 = i64.mul t3 k1000\n\
   t5 = i64.add t4 vcs\n\
   return t5\n\
+  }\n\
 }\n";
 
 /// `split(2000, 0, 0)` out of a `(1000, …)` budget over-asks the bounded fuel field, so the whole
 /// split fails closed with `-EINVAL` (`-22`); nothing is deducted.
 const OVER_SPLIT: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vb: i32):\n\
+block 0 (vb: i32) {\n\
   big = i64.const 2000\n\
   z = i64.const 0\n\
   vsub = cap.call 14 0 (i64, i64, i64) -> (i32) vb (big, z, z)\n\
   vr = i64.extend_i32_s vsub\n\
   return vr\n\
+  }\n\
 }\n";
 
 /// `split(-1, -1, -1)` takes **all remaining** of every field; the parent is left at `(0, 0, 0)`.
@@ -91,7 +93,7 @@ block0(vb: i32):\n\
 /// `1000000000`.
 const SPLIT_ALL: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(vb: i32):\n\
+block 0 (vb: i32) {\n\
   all = i64.const -1\n\
   vsub = cap.call 14 0 (i64, i64, i64) -> (i32) vb (all, all, all)\n\
   fld0 = i64.const 0\n\
@@ -105,6 +107,7 @@ block0(vb: i32):\n\
   t2 = i64.mul t1 k1000\n\
   t3 = i64.add t2 vps\n\
   return t3\n\
+  }\n\
 }\n";
 
 fn both(src: &str, budget: (i64, i64, i64)) -> (Result<Vec<Value>, svm_interp::Trap>, JitOutcome) {

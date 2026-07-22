@@ -24,7 +24,7 @@ fn child_src() -> &'static str {
     "memory 16
 data 100 \"VM\"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.const 0
@@ -34,6 +34,7 @@ block0(v0: i64):
   v6 = i64.const 1000
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "
 }
@@ -88,25 +89,27 @@ fn both(parent_src: &str) -> BothOut {
 fn named_child_src() -> &'static str {
     "memory 16
 data 100 \"VM\"
-export \"alpha\" 0
-export \"beta\" 1
+export 0 func \"alpha\" 0
+export 1 func \"beta\" 1
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 1000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 2000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "
 }
@@ -165,7 +168,7 @@ fn jit_module_child_by_export_name_matches_interp() {
     let parent = "memory 17
 data 200 \"beta\"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 200
   v3 = i64.const 4
   v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
@@ -176,6 +179,7 @@ block0(v0: i32, v1: i32):
   v9 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
   v10 = cap.call 6 1 (i32) -> (i64) v0 (v9)
   return v10
+  }
 }
 ";
     let (ir, imem, jo, jmem) = both_named(parent);
@@ -196,7 +200,7 @@ fn jit_module_child_matches_interp() {
     // instantiate_module(module, entry 0, off 64 KiB, size 2^16, fuel 0) → join → child's result.
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -204,6 +208,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = cap.call 6 1 (i32) -> (i64) v0 (v6)
   return v7
+  }
 }
 ";
     let (ir, imem, jo, jmem) = both(parent);
@@ -241,7 +246,7 @@ fn jit_demand_module_child_matches_interp() {
     }
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -261,6 +266,7 @@ block0(v0: i32, v1: i32):
   v20 = i64.add v19 v16
   v21 = i64.add v20 v18
   return v21
+  }
 }
 ";
     let (ir, imem, jo, jmem) = both(parent);
@@ -287,7 +293,7 @@ fn jit_module_child_validation_matches_interp() {
     // (a) wrong carve size → -EINVAL.
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -295,6 +301,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
+  }
 }
 ";
     let (ir, _i, jo, _j) = both(parent);
@@ -308,7 +315,7 @@ block0(v0: i32, v1: i32):
     // (b) forged module handle → CapFault.
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v0
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -316,6 +323,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
+  }
 }
 ";
     let (ir, _i, jo, _j) = both(parent);

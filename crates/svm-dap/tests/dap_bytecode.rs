@@ -12,16 +12,19 @@ use svm_dap::{DapServer, Json};
 // variables mapped to their block-relative SSA value indices. Same fixture as the tree-walker suite.
 const LOOP_SUM_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 
 debug.file 0 "sum.c"
@@ -251,17 +254,20 @@ fn dap_over_bytecode_matches_the_tree_walker() {
 // hand-written SVM text is debuggable. Same sum loop, sans the `debug.*` directives.
 const PLAIN_SUM: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   vn = i64.const 5
   vacc0 = i64.const 0
-  br block1(vn, vacc0)
-block1(vi: i64, vacc: i64):
+  br 1(vn, vacc0)
+}
+block 1 (vi: i64, vacc: i64) {
   vsum = i64.add vacc vi
   vone = i64.const 1
   vnext = i64.sub vi vone
-  br_if vnext block1(vnext, vsum) block2(vsum)
-block2(vr: i64):
+  br_if vnext 1(vnext, vsum) 2(vsum)
+}
+block 2 (vr: i64) {
   return vr
+  }
 }
 "#;
 
@@ -284,7 +290,7 @@ fn dap_over_bytecode_debugs_plain_svm_via_synthesized_debug_info() {
         "launch ok"
     );
 
-    // A breakpoint on the loop body (line 8, `vsum = i64.add`) binds against the synthesized table.
+    // A breakpoint on the loop body (line 9, `vsum = i64.add`) binds against the synthesized table.
     let out = s.handle(&req(
         3,
         "setBreakpoints",
@@ -292,7 +298,7 @@ fn dap_over_bytecode_debugs_plain_svm_via_synthesized_debug_info() {
             ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
             (
                 "breakpoints",
-                Json::Arr(vec![Json::obj(vec![("line", Json::i(8))])]),
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(9))])]),
             ),
         ]),
     ));
@@ -308,7 +314,7 @@ fn dap_over_bytecode_debugs_plain_svm_via_synthesized_debug_info() {
         Some(&Json::Bool(true)),
         "breakpoint binds on plain SVM"
     );
-    assert_eq!(bp0.get("line"), Some(&Json::i(8)));
+    assert_eq!(bp0.get("line"), Some(&Json::i(9)));
 
     // Run to it; the loop variables read back by their **text names** (i / acc), not v-indices.
     let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
@@ -452,12 +458,13 @@ fn dap_over_bytecode_reverse_matches_the_tree_walker() {
 const MEM_STORE: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   a = i64.const 0
   v = i64.const 42
   i64.store a v
   r = i64.load a
   return r
+  }
 }
 "#;
 
@@ -561,23 +568,26 @@ const WATCH_COUNTER_DBG: &str = r#"; A counter lives at a fixed window address. 
 ; instant a store changes it — stop reason "data breakpoint".
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   a0 = i64.const 0
   z = i64.const 0
   i64.store a0 z
-  br block1(z)
-block1(i: i64):
+  br 1(z)
+}
+block 1 (i: i64) {
   a1 = i64.const 0
   one = i64.const 1
   n = i64.add i one
   i64.store a1 n
   limit = i64.const 3
   done = i64.ge_s n limit
-  br_if done block2(n) block1(n)
-block2(r: i64):
+  br_if done 2(n) 1(n)
+}
+block 2 (r: i64) {
   a2 = i64.const 0
   out = i64.load a2
   return out
+  }
 }
 
 debug.file 0 "counter.svm"
@@ -805,7 +815,7 @@ fn dap_over_bytecode_step_back_rewinds_one_op() {
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -815,15 +825,17 @@ block0():
   vaddr = i64.const 0
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -1070,7 +1082,7 @@ fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
 const FUTEX_HANDOFF: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 8
   v1 = i64.const 987654
   i64.atomic.store.release v0 v1
@@ -1084,9 +1096,10 @@ block0():
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   v2 = i32.const 0
   v3 = i64.const 1000000000
@@ -1094,6 +1107,7 @@ block0(vsp: i64, v0: i64):
   v5 = i64.const 8
   v6 = i64.atomic.load.acquire v5
   return v6
+  }
 }
 "#;
 
@@ -1154,7 +1168,7 @@ fn dap_over_bytecode_multithreaded_wait_notify() {
 // it routes to the single-vCPU `DebugRun`).
 const SUSPEND_ROUNDTRIP: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -1164,15 +1178,17 @@ block0():
   v7, v8 = cont.resume v2 v6
   v9 = i64.add v5 v8
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 1
   v1 = i64.add varg v0
   v2 = suspend v1
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -1246,7 +1262,7 @@ fn dap_over_bytecode_breakpoint_inside_a_fiber() {
 const FIBER_WORKERS: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 0
   vh0 = thread.spawn 1 vsp va
@@ -1256,9 +1272,10 @@ block0():
   vaddr = i64.const 0
   vr = i64.atomic.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vf = ref.func 2
   vz0 = i64.const 0
   vk = cont.new vf vz0
@@ -1270,15 +1287,17 @@ block0(vsp: i64, varg: i64):
   vrmw = i64.atomic.rmw.add vaddr vr2
   vz = i64.const 0
   return vz
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp2: i64, varg2: i64):
+block 0 (vsp2: i64, varg2: i64) {
   v0 = i64.const 1
   v1 = i64.add varg2 v0
   v2 = suspend v1
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -1310,7 +1329,7 @@ fn dap_over_bytecode_fiber_on_a_spawned_thread() {
             ("source", Json::obj(vec![("path", Json::s("source.svm"))])),
             (
                 "breakpoints",
-                Json::Arr(vec![Json::obj(vec![("line", Json::i(32))])]),
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(33))])]),
             ),
         ]),
     ));
@@ -1346,7 +1365,7 @@ fn dap_over_bytecode_fiber_on_a_spawned_thread() {
         .unwrap()
         .as_i64()
         .unwrap();
-    assert_eq!(line, 32, "stopped at the fiber's add on the worker");
+    assert_eq!(line, 33, "stopped at the fiber's add on the worker");
     // Continue → the other worker's fiber hits it too, then the guest terminates.
     let cont = s.handle(&req(6, "continue", Json::obj(vec![])));
     let stop2 = event(&cont, "stopped").expect("the second worker stops inside its fiber");

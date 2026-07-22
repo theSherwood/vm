@@ -44,7 +44,7 @@ fn check(src: &str, want: Result<Vec<Value>, ()>) {
 /// `42 * 1000 + 123 = 42123`.
 const SHARED_MEM: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 12
@@ -58,14 +58,16 @@ block0(v0: i32):
   v11 = i64.mul v6 v10
   v12 = i64.add v11 v9
   return v12
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 7
   v2 = i32.const 123
   i32.store8 v1 v2
   v3 = i64.const 42
   return v3
+  }
 }
 "#;
 
@@ -79,7 +81,7 @@ fn instantiate_join_shares_backing() {
 /// through two joins.
 const DEPTH_TWO: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 12
@@ -87,9 +89,10 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = i32.const 171
@@ -101,14 +104,16 @@ block0(v0: i64):
   v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
   v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
   return v9
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.const 200
   i32.store8 v1 v2
   v3 = i64.const 77
   return v3
+  }
 }
 "#;
 
@@ -122,7 +127,7 @@ fn nesting_composes_to_depth_two() {
 /// window — a confined sub-window page op — and returns the unmap result (0). The parent returns it.
 const ADDRESS_SPACE: &str = r#"memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -130,14 +135,16 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i32.wrap_i64 v1
   v3 = i64.const 0
   v4 = i64.const 16384
   v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)
   return v5
+  }
 }
 "#;
 
@@ -150,7 +157,7 @@ fn two_arg_child_manages_its_own_pages() {
 /// `-EINVAL` (-22); the parent returns it without joining.
 const BAD_CARVE: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 12
@@ -158,11 +165,13 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.extend_i32_s v5
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   return v1
+  }
 }
 "#;
 
@@ -175,7 +184,7 @@ fn out_of_range_carve_rejected() {
 /// both engines.
 const CHILD_TRAP: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 0
   v3 = i64.const 12
@@ -183,10 +192,12 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   unreachable
+  }
 }
 "#;
 

@@ -3287,7 +3287,7 @@ fn run_interp(
 }
 
 /// A host capability offered to a module's named import (wasm-style import matching, §7). It carries
-/// the `(type_id, op)` the guest's `call.import "<name>"` lowers to *and* a re-grantable action that
+/// the `(type_id, op)` the guest's `call.sym "<name>"` lowers to *and* a re-grantable action that
 /// mints the backing handle on a [`Host`]. Re-grantable (a plain `Fn`, not `FnOnce`) because the
 /// differential wrapper grants it on **two** hosts (interpreter + JIT) which must agree; grants are
 /// deterministic, so granting in the same order on both yields the same handle value.
@@ -3718,7 +3718,7 @@ pub fn instantiate(module: Module) -> Result<Instance, String> {
 }
 
 /// Instantiate `module` against a **name-keyed capability registry** (`imports`), wasm-style: each
-/// `call.import "<name>"` is matched by name to a [`HostCap`] and — at [`Instance::call`] — the
+/// `call.sym "<name>"` is matched by name to a [`HostCap`] and — at [`Instance::call`] — the
 /// slot bindings are installed in import order (slot `i` ↔ import `i`). This is decision #2's
 /// *dynamic, name-based* binding: arbitrary names, interfaces, and counts, with the fixed §3e
 /// powerbox ([`instantiate`]) just one preset over the same machinery.

@@ -14,13 +14,14 @@ use svm_text::parse_module;
 const SRC: &str = r#"
 memory 19
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 300000
   v1 = i64.load v0
   v2 = i64.const 1
   v3 = i64.add v1 v2
   i64.store v0 v3
   return v3
+  }
 }
 "#;
 

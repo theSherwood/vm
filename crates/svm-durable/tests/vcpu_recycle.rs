@@ -37,15 +37,17 @@ fn instrument(src: &str) -> Module {
 // fiber pool growing up). Result = 20.
 const LOOP_SRC: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i64, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
   v4 = i64.const 20
   v5 = i64.lt_u v2 v4
-  br_if v5 block2(v2, v3) block3(v3)
-block2(v6: i64, v7: i64):
+  br_if v5 2(v2, v3) 3(v3)
+}
+block 2 (v6: i64, v7: i64) {
   v8 = i64.const 0
   v9 = i64.const 0
   v10 = thread.spawn 1 v8 v9
@@ -53,14 +55,17 @@ block2(v6: i64, v7: i64):
   v12 = i64.add v7 v11
   v13 = i64.const 1
   v14 = i64.add v6 v13
-  br block1(v14, v12)
-block3(v15: i64):
+  br 1(v14, v12)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1
   return v2
+  }
 }
 "#;
 
@@ -94,15 +99,17 @@ fn recycling_lifts_the_lifetime_spawn_cap() {
 // 16.
 const PAIR_SRC: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i64, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
   v4 = i64.const 8
   v5 = i64.lt_u v2 v4
-  br_if v5 block2(v2, v3) block3(v3)
-block2(v6: i64, v7: i64):
+  br_if v5 2(v2, v3) 3(v3)
+}
+block 2 (v6: i64, v7: i64) {
   v8 = i64.const 0
   v9 = thread.spawn 1 v8 v8
   v10 = thread.spawn 1 v8 v8
@@ -112,14 +119,17 @@ block2(v6: i64, v7: i64):
   v14 = i64.add v13 v12
   v15 = i64.const 1
   v16 = i64.add v6 v15
-  br block1(v16, v14)
-block3(v17: i64):
+  br 1(v16, v14)
+}
+block 3 (v17: i64) {
   return v17
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1
   return v2
+  }
 }
 "#;
 

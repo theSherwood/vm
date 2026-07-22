@@ -90,7 +90,7 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
 // and drop `v2`/`v3`, yet the thaw must still reproduce the run. Baseline: 42 + 10 = 52.
 const DEAD_VALUES: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 10
   v2 = i64.const 20
   v3 = i64.const 30
@@ -98,6 +98,7 @@ block0(v0: i32):
   v5 = cap.call 2 0 (i32) -> (i64) v0 (v4)
   v6 = i64.add v5 v1
   return v6
+  }
 }
 "#;
 
@@ -114,19 +115,21 @@ fn dead_values_across_cap_call_are_dropped() {
 // A → B(leaf). A adds 1000 to B's result; B adds 100 to the clock. Baseline: 1142.
 const TWO_LEVEL: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i64.const 1000
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -144,26 +147,29 @@ fn two_level_chain_round_trips() {
 // would shift the total. Baseline: 42 + 1 + 20 + 300 = 363.
 const THREE_LEVEL: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i64.const 300
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 2 (v0)
   v2 = i64.const 20
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -182,20 +188,22 @@ fn three_level_chain_round_trips() {
 // (the re-issue path must not clobber it). Baseline: leaf=42+5=47; A = 47 + (7*2) = 61.
 const LIVE_ACROSS_CALL: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 7
   v2 = call 1 (v0)
   v3 = i64.add v1 v1
   v4 = i64.add v2 v3
   return v4
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 

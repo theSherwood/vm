@@ -28,7 +28,7 @@ use svm_verify::verify_module;
 /// child fuel-traps, which fails the test loudly instead of hanging.
 const SRC: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   vps = cap.call 4 3 () -> (i64) v0 ()\n\
   vz = i64.const 0\n\
   vprot = i32.const 3\n\
@@ -41,20 +41,24 @@ block0(v0: i32):\n\
   vjr = thread.join vchild\n\
   vst64 = i64.extend_i32_u vst\n\
   return vst64\n\
+  }\n\
 }\n\
 func (i64, i64) -> (i64) {\n\
-block0(vsp: i64, varg: i64):\n\
-  br block1()\n\
-block1():\n\
+block 0 (vsp: i64, varg: i64) {\n\
+  br 1()\n\
+}\n\
+block 1 () {\n\
   v0 = i64.const 0\n\
   v1 = i32.const 1\n\
   vw = atomic.notify v0 v1\n\
   vzero = i32.const 0\n\
   vgt = i32.lt_u vzero vw\n\
-  br_if vgt block2() block1()\n\
-block2():\n\
+  br_if vgt 2() 1()\n\
+}\n\
+block 2 () {\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 #[test]

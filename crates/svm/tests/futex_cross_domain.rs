@@ -42,7 +42,7 @@ fn run(src: &str, win_log2: u8, fuel: u64) -> Result<Vec<Value>, Trap> {
 fn parent_waits_child_notifies_across_domains() {
     const SRC: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   v1 = i64.const 1\n\
   v2 = i64.const 65536\n\
   v3 = i64.const 16\n\
@@ -58,20 +58,24 @@ block0(v0: i32):\n\
   v13 = i64.mul v11 v12\n\
   v14 = i64.add v13 v10\n\
   return v14\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(v0: i64):\n\
-  br block1()\n\
-block1():\n\
+block 0 (v0: i64) {\n\
+  br 1()\n\
+}\n\
+block 1 () {\n\
   v1 = i64.const 4096\n\
   v2 = i32.const 1\n\
   v3 = atomic.notify v1 v2\n\
   v4 = i32.const 0\n\
   v5 = i32.lt_u v4 v3\n\
-  br_if v5 block2() block1()\n\
-block2():\n\
+  br_if v5 2() 1()\n\
+}\n\
+block 2 () {\n\
   v6 = i64.const 7\n\
   return v6\n\
+  }\n\
 }\n";
     // status 0 (woken) * 100 + child result 7 — any other status means the keys diverged.
     assert_eq!(
@@ -93,7 +97,7 @@ block2():\n\
 fn child_waits_parent_notifies_across_domains() {
     const SRC: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   v1 = i64.const 1\n\
   v2 = i64.const 65536\n\
   v3 = i64.const 16\n\
@@ -109,15 +113,17 @@ block0(v0: i32):\n\
   v12 = i64.extend_i32_u v8\n\
   v13 = i64.add v11 v12\n\
   return v13\n\
+  }\n\
 }\n\
 func (i64) -> (i64) {\n\
-block0(v0: i64):\n\
+block 0 (v0: i64) {\n\
   v1 = i64.const 4096\n\
   v2 = i32.const 0\n\
   v3 = i64.const -1\n\
   v4 = i32.atomic.wait v1 v2 v3\n\
   v5 = i64.extend_i32_u v4\n\
   return v5\n\
+  }\n\
 }\n";
     let r = run(SRC, 17, 50_000_000).expect("run ok");
     assert!(

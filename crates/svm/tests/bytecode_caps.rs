@@ -51,18 +51,20 @@ fn check_cap(src: &str, extra_args: &[Value]) {
 /// One call: `f(0, [a, b]) = a + b`.
 const SUM_ARGS: &str = r#"
 func (i32, i64, i64) -> (i64) {
-block0(v0: i32, v1: i64, v2: i64):
+block 0 (v0: i32, v1: i64, v2: i64) {
   v3 = cap.call 13 0 (i64, i64) -> (i64) v0 (v1, v2)
   return v3
+  }
 }
 "#;
 
 /// Non-zero op selector: `f(5, [a]) = 500 + a`.
 const OP_SELECTOR: &str = r#"
 func (i32, i64) -> (i64) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = cap.call 13 5 (i64) -> (i64) v0 (v1)
   return v2
+  }
 }
 "#;
 
@@ -70,11 +72,12 @@ block0(v0: i32, v1: i64):
 /// through the powerbox): `r1 = f(0,[a]) = a; r2 = f(0,[r1,b]) = a + b; return r1 + r2`.
 const CHAINED: &str = r#"
 func (i32, i64, i64) -> (i64) {
-block0(v0: i32, v1: i64, v2: i64):
+block 0 (v0: i32, v1: i64, v2: i64) {
   v3 = cap.call 13 0 (i64) -> (i64) v0 (v1)
   v4 = cap.call 13 0 (i64, i64) -> (i64) v0 (v3, v2)
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -83,21 +86,25 @@ block0(v0: i32, v1: i64, v2: i64):
 /// Computes sum_{i=0}^{n-1} f(0,[i]) = sum_{i=0}^{n-1} i.
 const LOOP_CALL: &str = r#"
 func (i32, i64) -> (i64) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 0
-  br block1(v0, v1, v2, v3)
-block1(v4: i32, v5: i64, v6: i64, v7: i64):
+  br 1(v0, v1, v2, v3)
+}
+block 1 (v4: i32, v5: i64, v6: i64, v7: i64) {
   v8 = i64.lt_s v6 v5
-  br_if v8 block2(v4, v5, v6, v7) block3(v7)
-block2(v9: i32, v10: i64, v11: i64, v12: i64):
+  br_if v8 2(v4, v5, v6, v7) 3(v7)
+}
+block 2 (v9: i32, v10: i64, v11: i64, v12: i64) {
   v13 = cap.call 13 0 (i64) -> (i64) v9 (v11)
   v14 = i64.add v12 v13
   v15 = i64.const 1
   v16 = i64.add v11 v15
-  br block1(v9, v10, v16, v14)
-block3(v17: i64):
+  br 1(v9, v10, v16, v14)
+}
+block 3 (v17: i64) {
   return v17
+  }
 }
 "#;
 
@@ -152,19 +159,21 @@ fn check_self(src: &str, args: &[Value]) {
 
 const SELF_COUNT: &str = r#"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = cap.self.count
   return v0
+  }
 }
 "#;
 
 /// `cap.self.get(i)` returns `(handle, type_id)`; sum them so the result depends on both.
 const SELF_GET: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1, v2 = cap.self.get v0
   v3 = i32.add v1 v2
   return v3
+  }
 }
 "#;
 

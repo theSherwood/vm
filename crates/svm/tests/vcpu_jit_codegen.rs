@@ -21,11 +21,12 @@ use svm_verify::verify_module;
 /// use (the shape the browser emits + calls as `f0(win, env, a, b)`).
 const UNIT: &str = r#"memory 16
 func (i64, i64) -> (i64) {
-block0(va: i64, vb: i64):
+block 0 (va: i64, vb: i64) {
   v3 = i64.const 3
   vm = i64.mul va v3
   vr = i64.add vm vb
   return vr
+  }
 }
 "#;
 
@@ -33,12 +34,13 @@ block0(va: i64, vb: i64):
 /// trap surfaces exactly where the interpreter's invoke would ([`Vcpu::deliver_jit_invoke_trap`]).
 const UNIT_TRAP: &str = r#"memory 16
 func (i64) -> (i64) {
-block0(vx: i64):
+block 0 (vx: i64) {
   v7 = i64.const 7
   vd = i64.sub vx v7
   v100 = i64.const 100
   vr = i64.div_s v100 vd
   return vr
+  }
 }
 "#;
 
@@ -46,23 +48,25 @@ block0(vx: i64):
 /// no threads; the invoke is the only host event.
 const GUEST: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(vjit: i32, vcode: i32):
+block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   va = i64.const 4
   vb = i64.const 5
   vr = cap.call 11 1 (i64, i64, i64) -> (i64) vjit (vc, va, vb)
   return vr
+  }
 }
 "#;
 
 /// Guest `(jit, code) -> (i64)`: invoke the trapping unit with `x = 7`.
 const GUEST_TRAP: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(vjit: i32, vcode: i32):
+block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   vx = i64.const 7
   vr = cap.call 11 1 (i64, i64) -> (i64) vjit (vc, vx)
   return vr
+  }
 }
 "#;
 

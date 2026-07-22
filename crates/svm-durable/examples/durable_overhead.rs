@@ -38,17 +38,20 @@ const KERNELS: &[(&str, &str)] = &[
         "tight", // acc += 1 — the poll is the dominant per-iter cost
         r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
-  br block1(v1, v1, v0)
-block1(v2: i64, v3: i64, v4: i64):
+  br 1(v1, v1, v0)
+}
+block 1 (v2: i64, v3: i64, v4: i64) {
   v5 = i64.const 1
   v6 = i64.add v3 v5
   v7 = i64.add v2 v5
   v8 = i64.lt_s v7 v4
-  br_if v8 block1(v7, v6, v4) block2(v6)
-block2(v9: i64):
+  br_if v8 1(v7, v6, v4) 2(v6)
+}
+block 2 (v9: i64) {
   return v9
+  }
 }
 "#,
     ),
@@ -56,10 +59,11 @@ block2(v9: i64):
         "lcg", // acc = acc*M + c — a realistic body; the poll is a smaller fraction
         r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
-  br block1(v1, v1, v0)
-block1(v2: i64, v3: i64, v4: i64):
+  br 1(v1, v1, v0)
+}
+block 1 (v2: i64, v3: i64, v4: i64) {
   v5 = i64.const 1103515245
   v6 = i64.mul v3 v5
   v7 = i64.const 12345
@@ -67,9 +71,11 @@ block1(v2: i64, v3: i64, v4: i64):
   v9 = i64.const 1
   v10 = i64.add v2 v9
   v11 = i64.lt_s v10 v4
-  br_if v11 block1(v10, v8, v4) block2(v8)
-block2(v12: i64):
+  br_if v11 1(v10, v8, v4) 2(v8)
+}
+block 2 (v12: i64) {
   return v12
+  }
 }
 "#,
     ),

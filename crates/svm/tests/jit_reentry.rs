@@ -25,7 +25,7 @@ use svm_verify::verify_module;
 
 /// The parent guest: entry `(a, b)` forwards both args through `cap.call` (iface 100, op 0)
 /// and returns the capability's result. Declares the 64 KiB window the invoked code shares.
-const PARENT: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 0\n  v3 = cap.call 100 0 (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n}\n";
+const PARENT: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 0\n  v3 = cap.call 100 0 (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n";
 
 /// Test-side stand-in for the Phase-2 `Jit` binding: the thunk context carrying the live
 /// module pointer (set after `compile`, same provenance as the `run_raw` pointer) and the
@@ -104,7 +104,7 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
 #[test]
 fn mid_run_define_and_invoke_over_live_window() {
     // (a, b) -> a + b + 1000, plus a store of 0xAB at offset 64 of the SHARED window.
-    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i64.const 64\n  v3 = i32.const 171\n  i32.store8 v2 v3\n  v4 = i32.add v0 v1\n  v5 = i32.const 1000\n  v6 = i32.add v4 v5\n  return v6\n}\n";
+    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 64\n  v3 = i32.const 171\n  i32.store8 v2 v3\n  v4 = i32.add v0 v1\n  v5 = i32.const 1000\n  v6 = i32.add v4 v5\n  return v6\n  }\n}\n";
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr: *mut CompiledModule = ctx.cm.get();
     let (out, final_mem) =
@@ -131,7 +131,7 @@ fn mid_run_define_and_invoke_over_live_window() {
 #[test]
 fn trap_in_invoked_code_kills_the_domain() {
     let extra_src =
-        "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  unreachable\n}\n";
+        "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  unreachable\n  }\n}\n";
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr = ctx.cm.get();
     let (out, _) =
@@ -147,7 +147,7 @@ fn trap_in_invoked_code_kills_the_domain() {
 /// guest's trap cell, and the host survives — the module even runs again afterwards.
 #[test]
 fn memory_fault_in_invoked_code_is_caught_and_terminal() {
-    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i64.const 1048584\n  v3 = i32.const 1\n  i32.store8 v2 v3\n  v4 = i32.const 0\n  return v4\n}\n";
+    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 1048584\n  v3 = i32.const 1\n  i32.store8 v2 v3\n  v4 = i32.const 0\n  return v4\n  }\n}\n";
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr = ctx.cm.get();
     let (out, _) =
@@ -167,7 +167,7 @@ fn memory_fault_in_invoked_code_is_caught_and_terminal() {
 /// confine the code against).
 #[test]
 fn invoke_outside_a_run_is_rejected() {
-    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n";
+    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
     let (ctx, mut cm) = setup(extra_src);
     let code = cm.define_extra(&ctx.funcs).expect("define outside run")[0].tramp;
     let mut results = [0i64; 1];

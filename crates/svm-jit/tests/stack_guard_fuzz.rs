@@ -141,7 +141,7 @@ fn emit_h2(s: &mut String, mut k: usize, rc: usize, a: &[usize]) -> (usize, usiz
 /// case at `depth == 0` returns `seed`, else recurses on `depth - 1`. Either way the body carries an
 /// `n`-slot frame via the both-sides chain (see module docs).
 fn build_func2(n: usize, bounded: bool) -> String {
-    let mut s = String::from("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+    let mut s = String::from("func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n");
     // v0 = depth, v1 = seed. Counter starts at 2.
     let mut k = 2usize;
     if bounded {
@@ -152,12 +152,13 @@ fn build_func2(n: usize, bounded: bool) -> String {
         s.push_str(&format!("  v{iseq} = i64.eq v0 v{zero}\n"));
         k += 1;
         // base: return seed (v1); recursive: fall through to block1 carrying (depth, seed).
-        s.push_str(&format!("  br_if v{iseq} block2(v1) block1(v0, v1)\n"));
+        s.push_str(&format!("  br_if v{iseq} 2(v1) 1(v0, v1)\n"));
         let dp = k;
         k += 1;
         let sp = k;
         k += 1;
-        s.push_str(&format!("block1(v{dp}: i64, v{sp}: i64):\n"));
+        s.push_str("  }\n");
+        s.push_str(&format!("block 1 (v{dp}: i64, v{sp}: i64) {{\n"));
         let (k2, h1, a) = emit_chain_and_h1(&mut s, k, sp, n);
         k = k2;
         let one = k;
@@ -175,7 +176,8 @@ fn build_func2(n: usize, bounded: bool) -> String {
         let bp = k;
         k += 1;
         let _ = k;
-        s.push_str(&format!("block2(v{bp}: i64):\n"));
+        s.push_str("  }\n");
+        s.push_str(&format!("block 2 (v{bp}: i64) {{\n"));
         s.push_str(&format!("  return v{bp}\n"));
     } else {
         let (k2, h1, a) = emit_chain_and_h1(&mut s, k, 1 /* seed = v1 */, n);
@@ -189,6 +191,7 @@ fn build_func2(n: usize, bounded: bool) -> String {
         let _ = k;
         s.push_str(&format!("  return v{res}\n"));
     }
+    s.push_str("  }\n");
     s.push_str("}\n");
     s
 }
@@ -199,23 +202,25 @@ fn build_func2(n: usize, bounded: bool) -> String {
 fn build_module(func2: &str, initial_depth: i64) -> String {
     let root = "\
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
   v3 = i64.const 0
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 ";
     let entry = format!(
         "\
 func (i64, i64) -> (i64) {{
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {{
   v2 = i64.const {initial_depth}
   v3 = i64.const 1
   v4 = call 2 (v2, v3)
   return v4
+  }}
 }}
 "
     );

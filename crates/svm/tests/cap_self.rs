@@ -72,9 +72,10 @@ fn host_ptr(h: &mut Host) -> *mut c_void {
 #[test]
 fn count_reflects_the_granted_powerbox() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
-               block0(v0: i32, v1: i32, v2: i32):\n\
+               block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = cap.self.count\n\
                \x20 return v3\n\
+                 }\n\
                }\n";
     assert_eq!(run(src), vec![Value::I32(3)], "three handles were granted");
 }
@@ -84,10 +85,11 @@ fn count_reflects_the_granted_powerbox() {
 #[test]
 fn get_reports_the_interface_type_id() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
-               block0(v0: i32, v1: i32, v2: i32):\n\
+               block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 2\n\
                \x20 v4, v5 = cap.self.get v3\n\
                \x20 return v5\n\
+                 }\n\
                }\n";
     assert_eq!(run(src), vec![Value::I32(1)], "entry 2 is Exit (type_id 1)");
 }
@@ -98,11 +100,12 @@ fn get_reports_the_interface_type_id() {
 #[test]
 fn get_returns_the_usable_granted_handle() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
-               block0(v0: i32, v1: i32, v2: i32):\n\
+               block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 2\n\
                \x20 v4, v5 = cap.self.get v3\n\
                \x20 v6 = i32.sub v4 v2\n\
                \x20 return v6\n\
+                 }\n\
                }\n";
     assert_eq!(
         run(src),
@@ -115,10 +118,11 @@ fn get_returns_the_usable_granted_handle() {
 #[test]
 fn get_out_of_range_traps() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
-               block0(v0: i32, v1: i32, v2: i32):\n\
+               block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 99\n\
                \x20 v4, v5 = cap.self.get v3\n\
                \x20 return v5\n\
+                 }\n\
                }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -147,7 +151,7 @@ fn get_out_of_range_traps() {
 fn binary_round_trip() {
     let src = "memory 15\n\
                func (i32) -> (i32) {\n\
-               block0(v0: i32):\n\
+               block 0 (v0: i32) {\n\
                \x20 v1 = cap.self.count\n\
                \x20 v2 = i32.const 0\n\
                \x20 v3, v4 = cap.self.get v2\n\
@@ -156,6 +160,7 @@ fn binary_round_trip() {
                \x20 v7 = cap.self.resolve v5 v6\n\
                \x20 v8 = cap.self.label v3 v5 v6\n\
                \x20 return v1\n\
+                 }\n\
                }\n";
     let m = parse_module(src).expect("parse");
     // Text print → re-parse is identity (covers `cap.self.resolve`'s grammar).
@@ -201,13 +206,14 @@ fn discover_then_use_a_granted_capability() {
     let src = "memory 16\n\
                data 0 \"hi\"\n\
                func (i32, i32, i32) -> (i32) {\n\
-               block0(v0: i32, v1: i32, v2: i32):\n\
+               block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 0\n\
                \x20 v4, v5 = cap.self.get v3\n\
                \x20 v6 = i64.const 0\n\
                \x20 v7 = i64.const 2\n\
                \x20 v8 = cap.call 0 1 (i64, i64) -> (i64) v4(v6, v7)\n\
                \x20 return v5\n\
+                 }\n\
                }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");

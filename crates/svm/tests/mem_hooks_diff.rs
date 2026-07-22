@@ -20,7 +20,7 @@ const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::J
 /// there), bulk fill + copy, and all four atomics.
 const SRC: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 64
   v1 = i64.const 7
   i64.store v0 v1 offset=8
@@ -37,6 +37,7 @@ block0():
   v9 = v128.load v0
   v10 = i64.load v0 offset=8
   return v10
+  }
 }
 "#;
 
@@ -117,7 +118,7 @@ fn trace_is_identical_across_backends_and_the_result_is_unperturbed() {
 /// must end with the *attempted* access — the hook fires before the confinement check.
 const OOB: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 32
   v1 = i64.const 1
   i64.store v0 v1
@@ -125,6 +126,7 @@ block0():
   i64.store v2 v1
   v3 = i64.const 0
   return v3
+  }
 }
 "#;
 
@@ -190,19 +192,21 @@ fn a_hook_veto_aborts_the_run_identically_everywhere() {
 /// the multiset of events is fixed here.
 const THREADED: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 43981
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = i64.const 0
   v4 = i64.atomic.load v3
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   i64.atomic.store v1 v0
   return v0
+  }
 }
 "#;
 

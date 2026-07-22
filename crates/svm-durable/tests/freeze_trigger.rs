@@ -23,7 +23,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 // safepoints, in order, are: resume#1, suspend#1, resume#2, suspend#2, resume#3.
 const SRC: &str = "memory 18\n\
     func (i32) -> (i64) {\n\
-    block0(v0: i32):\n\
+    block 0 (v0: i32) {\n\
     \x20 v1 = ref.func 1\n\
     \x20 v2 = i64.const 4096\n\
     \x20 v3 = cont.new v1 v2\n\
@@ -36,15 +36,17 @@ const SRC: &str = "memory 18\n\
     \x20 v12, v13 = cont.resume v3 v5\n\
     \x20 v14 = cap.call 13 0 () -> (i64) v0 ()\n\
     \x20 return v14\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 1\n\
     \x20 v3 = suspend v2\n\
     \x20 v4 = i64.const 2\n\
     \x20 v5 = suspend v4\n\
     \x20 v6 = i64.const 0\n\
     \x20 return v6\n\
+      }\n\
     }\n";
 
 fn instrument() -> Module {

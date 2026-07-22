@@ -72,7 +72,7 @@ fn attenuated_unmap_takes_effect_and_matches() {
     let src = "\
 memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 16
   v4 = cap.call 5 4 (i64, i64) -> (i32) v0 (v2, v3)
@@ -80,6 +80,7 @@ block0(v0: i32):
   v7 = i64.const 16384
   v6 = cap.call 5 1 (i64, i64) -> (i64) v4 (v5, v7)
   return v6
+  }
 }
 ";
     let init = seed_128k();
@@ -116,7 +117,7 @@ fn attenuated_op_outside_subrange_is_rejected() {
     let src = "\
 memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v2 = i64.const 0
   v3 = i64.const 12
   v4 = cap.call 5 4 (i64, i64) -> (i32) v0 (v2, v3)
@@ -124,6 +125,7 @@ block0(v0: i32):
   v7 = i64.const 16384
   v6 = cap.call 5 1 (i64, i64) -> (i64) v4 (v5, v7)
   return v6
+  }
 }
 ";
     let init = seed_128k();
@@ -201,11 +203,12 @@ fn minting_past_table_capacity_returns_emfile_not_panic() {
     let src = "\
 memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 300
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i32, v4: i64, v5: i64) {
   v6 = i64.const 0
   v7 = i64.const 12
   v8 = cap.call 5 4 (i64, i64) -> (i32) v3 (v6, v7)
@@ -214,9 +217,11 @@ block1(v3: i32, v4: i64, v5: i64):
   v11 = i64.add v4 v10
   v12 = i64.const 0
   v13 = i64.gt_s v11 v12
-  br_if v13 block1(v3, v11, v9) block2(v9)
-block2(v14: i64):
+  br_if v13 1(v3, v11, v9) 2(v9)
+}
+block 2 (v14: i64) {
   return v14
+  }
 }
 ";
     let (ival, _imem, jo, _jmem) = both(src, 17, &seed_128k());

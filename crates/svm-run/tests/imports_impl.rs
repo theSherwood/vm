@@ -10,19 +10,21 @@ use svm_text::parse_module;
 
 /// The provider: func 1 implements `add(a, b) = a + b`; the offer's op 0 names it.
 const PROVIDER: &str = "\
-type (i64, i64) -> (i64)
-interface { add: 0 }
-export \"adder\" impl 1 : 1
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"adder\" 1 { add: 1 }
 
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 
 func (i64, i64) -> (i64) {
-block0(va: i64, vb: i64):
+block 0 (va: i64, vb: i64) {
   vs = i64.add va vb
   return vs
+  }
 }
 ";
 
@@ -32,17 +34,18 @@ import 0 \"add\" (i64, i64) -> (i64)
 import 1 \"exit\" (i32) -> ()
 
 func () -> () {
-block0():
+block 0 () {
   vh = i32.const 0
   va = i64.const 40
   vb = i64.const 2
-  vr = call.import 0 vh (va, vb)
+  vr = call.import 0 (va, vb)
   vc = i32.wrap_i64 vr
-  call.import 1 vh (vc)
+  call.import 1 (vc)
   unreachable
+  }
 }
 
-export \"_start\" 0
+export 0 func \"_start\" 0
 ";
 
 #[test]
@@ -81,13 +84,14 @@ fn offer_signature_mismatch_fails_instantiation_closed() {
         "import 0 \"add\" (i64) -> (i64)\n\
          import 1 \"exit\" (i32) -> ()\n\
          func () -> () {\n\
-         block0():\n\
+         block 0 () {\n\
            vh = i32.const 0\n\
            vc = i32.const 0\n\
-           call.import 1 vh (vc)\n\
+           call.import 1 (vc)\n\
            unreachable\n\
+           }\n\
          }\n\
-         export \"_start\" 0\n",
+         export 0 func \"_start\" 0\n",
     )
     .expect("consumer parses");
     let registry = Imports::new()
@@ -110,18 +114,19 @@ fn offer_signature_mismatch_fails_instantiation_closed() {
 /// the §3.2 v2 exporter-domain-state service, offered as `export "counter" impl 0`.
 const STATEFUL_PROVIDER: &str = "\
 memory 16
-type () -> (i64)
-interface { add: 0 }
-export \"counter\" impl 1 : 0
+type 0 func () -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"counter\" 1 { add: 0 }
 
 func () -> (i64) {
-block0():
+block 0 () {
   va = i64.const 0
   vc = i64.load va
   v1 = i64.const 1
   vn = i64.add vc v1
   i64.store va vn
   return vn
+  }
 }
 ";
 
@@ -132,17 +137,18 @@ import 0 \"bump\" () -> (i64)
 import 1 \"exit\" (i32) -> ()
 
 func () -> () {
-block0():
+block 0 () {
   vh = i32.const 0
-  v1 = call.import 0 vh ()
-  v2 = call.import 0 vh ()
-  v3 = call.import 0 vh ()
+  v1 = call.import 0 ()
+  v2 = call.import 0 ()
+  v3 = call.import 0 ()
   vc = i32.wrap_i64 v3
-  call.import 1 vh (vc)
+  call.import 1 (vc)
   unreachable
+  }
 }
 
-export \"_start\" 0
+export 0 func \"_start\" 0
 ";
 
 #[test]

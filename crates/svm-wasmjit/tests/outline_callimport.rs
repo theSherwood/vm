@@ -20,13 +20,14 @@ const SRC: &str = r#"
 memory 16
 import 0 "hostfn" (i64, i64) -> (i64)
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 10
   v2 = i64.const 20
-  vr = call.import 0 v0 (v1, v2)
+  vr = call.import 0 (v1, v2)
   v3 = i64.const 5
   vsum = i64.add vr v3
   return vsum
+  }
 }
 "#;
 

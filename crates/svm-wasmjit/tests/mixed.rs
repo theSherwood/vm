@@ -169,28 +169,33 @@ const ARGS: &[i64] = &[0, 1, 2, 5, 20, 100, -1, -5, 1000];
 /// deferred `dot` reduction — whatever it computes, the mixed run and the whole-interp oracle agree.)
 const SUM_FLOAT_LEAF: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = call 1 (v9)
   v11 = i64.add v8 v10
   v12 = i64.const 1
   v13 = i64.add v9 v12
-  br block1(v7, v11, v13)
-block3(v14: i64):
+  br 1(v7, v11, v13)
+}
+block 3 (v14: i64) {
   return v14
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }
 "#;
 
@@ -210,30 +215,35 @@ fn sum_float_leaf() {
 /// i64→i32 result narrowing in the cross-tier marshalling.
 const SUM_I32_LEAF: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.wrap_i64 v9
   v11 = call 1 (v10)
   v12 = i64.extend_i32_s v11
   v13 = i64.add v8 v12
   v14 = i64.const 1
   v15 = i64.add v9 v14
-  br block1(v7, v13, v15)
-block3(v16: i64):
+  br 1(v7, v13, v15)
+}
+block 3 (v16: i64) {
   return v16
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32x4.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i32x4.extract_lane 0 v2
   return v3
+  }
 }
 "#;
 
@@ -257,12 +267,13 @@ fn sum_i32_leaf() {
 /// top-level `f0` caller, like the browser's JS import throwing).
 const TRAPPING_LEAF: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 1 (v0)
   return v1
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v1
@@ -271,6 +282,7 @@ block0(v0: i64):
   v6 = i64x2.extract_lane 0 v2
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "#;
 

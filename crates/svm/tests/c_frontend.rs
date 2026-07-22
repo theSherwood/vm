@@ -30,7 +30,7 @@ use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§
 use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
 
-/// Parse frontend (chibicc) text IR. The frontend emits `call.import "<name>"` for capabilities
+/// Parse frontend (chibicc) text IR. The frontend emits `call.sym "<name>"` for capabilities
 /// against the module's manifest (IMPORTS.md phase 3) — nothing is rewritten; harnesses install
 /// the slot bindings at instantiation ([`bind_imports`], mirroring `svm_run`'s `grant_caps`).
 fn parse_module(ir: &str) -> Result<svm_ir::Module, svm_text::ParseError> {
@@ -2561,7 +2561,7 @@ fn c_guest_async_work_stealing() {
 #[test]
 fn generic_extern_capability_import_equals_builtin() {
     let src = r#"
-        extern long vm_page_size(int h);   /* undefined extern -> call.import "vm_page_size" */
+        extern long vm_page_size(int h);   /* undefined extern -> call.sym "vm_page_size" */
         long __vm_page_size(void);         /* recognized builtin -> inline Memory.page_size  */
         int __vm_cap(int i);
         int main(void) {

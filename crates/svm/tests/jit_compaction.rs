@@ -54,7 +54,7 @@ fn compile_reserved(m: &Module, table_log2: u8) -> CompiledModule {
 /// behavior is a function of *which* definition currently occupies it.
 fn unit_mul_add(k: i32) -> Vec<Func> {
     let src = format!(
-        "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const {k}\n  v4 = i32.add v2 v3\n  return v4\n}}\n"
+        "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n  v2 = i32.mul v0 v1\n  v3 = i32.const {k}\n  v4 = i32.add v2 v3\n  return v4\n  }}\n}}\n"
     );
     let m = parse_module(&src).expect("parse unit");
     verify_module(&m).expect("verify unit");
@@ -63,7 +63,7 @@ fn unit_mul_add(k: i32) -> Vec<Func> {
 
 /// The dispatching parent: `(slot, a, b) -> call_indirect[slot](a, b)`. Func 0, one real function,
 /// so every reserved slot ≥ 1 is installable padding.
-const DISPATCH_PARENT: &str = "func (i32, i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32, v2: i32):\n  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)\n  return v3\n}\n";
+const DISPATCH_PARENT: &str = "func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)\n  return v3\n  }\n}\n";
 
 /// Dispatch `slot` with `(a, b)` through the parent entry; expect a returned scalar.
 fn dispatch(cm: &mut CompiledModule, slot: u32, a: i32, b: i32) -> i64 {
@@ -259,7 +259,7 @@ fn install_at_rejects_invalid_targets() {
 /// the `Jit` memory-match precondition.
 fn unit_blob(k: i32) -> Vec<u8> {
     let src = format!(
-        "memory 16\nfunc (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const {k}\n  v4 = i32.add v2 v3\n  return v4\n}}\n"
+        "memory 16\nfunc (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n  v2 = i32.mul v0 v1\n  v3 = i32.const {k}\n  v4 = i32.add v2 v3\n  return v4\n  }}\n}}\n"
     );
     let m = parse_module(&src).expect("parse blob");
     verify_module(&m).expect("verify blob");
@@ -270,7 +270,7 @@ fn unit_blob(k: i32) -> Vec<u8> {
 /// result into window[0]** — so the running total persists across prompts (each prompt is a fresh
 /// `run` seeded with the prior prompt's final window), and compaction between prompts must leave
 /// both the installed slot and that window state untouched.
-const REPL_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = call_indirect (i32, i32) -> (i32) v0 (v1, v1)\n  v3 = i64.const 0\n  v4 = i32.load v3\n  v5 = i32.add v4 v2\n  i32.store v3 v5\n  return v5\n}\n";
+const REPL_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = call_indirect (i32, i32) -> (i32) v0 (v1, v1)\n  v3 = i64.const 0\n  v4 = i32.load v3\n  v5 = i32.add v4 v2\n  i32.store v3 v5\n  return v5\n  }\n}\n";
 
 /// Compile a unit into the live module exactly as the guest-driven `compile` op does: validate +
 /// store it in the `Host` (minting a `CompiledCode` handle), lower it (`define_extra`), and register
@@ -477,7 +477,7 @@ fn recompaction_carries_live_invoke_only_unit() {
 /// with `(x, x)`, **release** it (so it becomes dead code the next compaction reclaims), and
 /// accumulate the result into window[0] (persisted across prompts). `BLOBLEN` is patched to the
 /// blob's byte length before parsing.
-const REPL_INVOKE_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i64.const 4096\n  v3 = i64.const BLOBLEN\n  v4 = cap.call 11 0 (i64, i64) -> (i64) v0 (v2, v3)\n  v5 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v4, v1, v1)\n  v6 = cap.call 11 2 (i64) -> (i64) v0 (v4)\n  v7 = i64.const 0\n  v8 = i32.load v7\n  v9 = i32.add v8 v5\n  i32.store v7 v9\n  return v9\n}\n";
+const REPL_INVOKE_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 4096\n  v3 = i64.const BLOBLEN\n  v4 = cap.call 11 0 (i64, i64) -> (i64) v0 (v2, v3)\n  v5 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v4, v1, v1)\n  v6 = cap.call 11 2 (i64) -> (i64) v0 (v4)\n  v7 = i64.const 0\n  v8 = i32.load v7\n  v9 = i32.add v8 v5\n  i32.store v7 v9\n  return v9\n  }\n}\n";
 
 /// Drive a `watermark`-auto-compacting `JitSession` for `n` prompts; the blob is seeded at window
 /// offset 4096 once and reused every prompt. Returns `(per-prompt results, final window[..16],
@@ -563,7 +563,7 @@ fn jit_session_auto_compacts_transparently() {
 /// quiescent at its end), and accumulates `main+worker` into window[0]. `BLOBLEN` is patched in. Each
 /// prompt redefines (compile) + releases two units, so the arena accumulates dead code that
 /// compaction reclaims — exactly the single-threaded REPL pattern, but threaded.
-const REPL_THREADED_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i64.extend_i32_u v0\n  v3 = i64.const 2048\n  v4 = thread.spawn 1 v3 v2\n  v5 = i64.const 4096\n  v6 = i64.const BLOBLEN\n  v7 = cap.call 11 0 (i64, i64) -> (i64) v0 (v5, v6)\n  v8 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v7, v1, v1)\n  v9 = cap.call 11 2 (i64) -> (i64) v0 (v7)\n  v10 = thread.join v4\n  v11 = i32.wrap_i64 v10\n  v12 = i64.const 0\n  v13 = i32.load v12\n  v14 = i32.add v13 v8\n  v15 = i32.add v14 v11\n  i32.store v12 v15\n  return v15\n}\nfunc (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n  v2 = i32.wrap_i64 v1\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v2 (v3, v4)\n  v6 = i32.const 7\n  v7 = cap.call 11 1 (i64, i32, i32) -> (i32) v2 (v5, v6, v6)\n  v8 = cap.call 11 2 (i64) -> (i64) v2 (v5)\n  v9 = i64.extend_i32_u v7\n  return v9\n}\n";
+const REPL_THREADED_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.extend_i32_u v0\n  v3 = i64.const 2048\n  v4 = thread.spawn 1 v3 v2\n  v5 = i64.const 4096\n  v6 = i64.const BLOBLEN\n  v7 = cap.call 11 0 (i64, i64) -> (i64) v0 (v5, v6)\n  v8 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v7, v1, v1)\n  v9 = cap.call 11 2 (i64) -> (i64) v0 (v7)\n  v10 = thread.join v4\n  v11 = i32.wrap_i64 v10\n  v12 = i64.const 0\n  v13 = i32.load v12\n  v14 = i32.add v13 v8\n  v15 = i32.add v14 v11\n  i32.store v12 v15\n  return v15\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i32.wrap_i64 v1\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v2 (v3, v4)\n  v6 = i32.const 7\n  v7 = cap.call 11 1 (i64, i32, i32) -> (i32) v2 (v5, v6, v6)\n  v8 = cap.call 11 2 (i64) -> (i64) v2 (v5)\n  v9 = i64.extend_i32_u v7\n  return v9\n  }\n}\n";
 
 /// Drive a `watermark`-auto-compacting `JitSession` for a **multi-threaded** guest: each prompt
 /// spawns a worker that concurrently `Jit.compile`s (so the session's `Mutex<Host>` serialization is

@@ -122,20 +122,23 @@ impl MemModel {
 /// Sum 1024 contiguous `i64`s (offsets 0, 8, … 8184 — 8 KiB): cache-friendly.
 const SEQUENTIAL: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(off: i64, acc: i64):
+  br 1(v0, v1)
+}
+block 1 (off: i64, acc: i64) {
   v2 = i64.load off
   v3 = i64.add acc v2
   v4 = i64.const 8
   v5 = i64.add off v4
   v6 = i64.const 8192
   v7 = i64.lt_u v5 v6
-  br_if v7 block1(v5, v3) block2(v3)
-block2(v8: i64):
+  br_if v7 1(v5, v3) 2(v3)
+}
+block 2 (v8: i64) {
   return v8
+  }
 }
 "#;
 
@@ -143,12 +146,13 @@ block2(v8: i64):
 /// direct-mapped set → conflict-miss thrash, and all 16 pages fault.
 const PAGE_STRIDED: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(off: i64, acc: i64, i: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (off: i64, acc: i64, i: i64) {
   v3 = i64.load off
   v4 = i64.add acc v3
   v5 = i64.const 4096
@@ -159,9 +163,11 @@ block1(off: i64, acc: i64, i: i64):
   v10 = i64.add i v9
   v11 = i64.const 1024
   v12 = i64.lt_u v10 v11
-  br_if v12 block1(v8, v4, v10) block2(v4)
-block2(v13: i64):
+  br_if v12 1(v8, v4, v10) 2(v4)
+}
+block 2 (v13: i64) {
   return v13
+  }
 }
 "#;
 

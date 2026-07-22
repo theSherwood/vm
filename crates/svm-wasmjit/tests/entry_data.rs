@@ -106,19 +106,21 @@ fn bytecode_run(m: &svm_ir::Module, entry: u32, arg: i64, fuel: &mut u64) -> Opt
 /// which entry-rooting at func 1 correctly ignores.
 const ENTRY_ONE: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   v3 = i64.const 7
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -140,11 +142,12 @@ const DATA_READ: &str = r#"
 memory 16
 data 0 "\08\07\06\05\04\03\02\01"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.load v1
   v3 = i64.add v2 v0
   return v3
+  }
 }
 "#;
 

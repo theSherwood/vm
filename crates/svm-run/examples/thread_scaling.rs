@@ -25,11 +25,12 @@ const LARGE: i64 = 200_000_000;
 // Worker = func 1: `(i64 sp, i64 n) -> i64`, xorshift64* `n` times (serial, pure registers).
 const WORKER: &str = r#"
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vn: i64):
+block 0 (vsp: i64, vn: i64) {
   vx = i64.const -7046029254386353131
   vi = i64.const 0
-  br block1(vi, vx, vn)
-block1(va: i64, vb: i64, vc: i64):
+  br 1(vi, vx, vn)
+}
+block 1 (va: i64, vb: i64, vc: i64) {
   vs1 = i64.const 13
   vt1 = i64.shl vb vs1
   vb1 = i64.xor vb vt1
@@ -42,9 +43,11 @@ block1(va: i64, vb: i64, vc: i64):
   vone = i64.const 1
   va1 = i64.add va vone
   vlt = i64.lt_s va1 vc
-  br_if vlt block1(va1, vb3, vc) block2(vb3)
-block2(vr: i64):
+  br_if vlt 1(va1, vb3, vc) 2(vb3)
+}
+block 2 (vr: i64) {
   return vr
+  }
 }
 "#;
 
@@ -53,7 +56,7 @@ block2(vr: i64):
 /// apiece, joins all, and returns 0.
 fn guest(w: usize, n: i64) -> String {
     let mut s = String::from(
-        "memory 22\nfunc (i32, i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32, v2: i32):\n",
+        "memory 22\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n",
     );
     s.push_str(&format!("  vn = i64.const {n}\n"));
     for i in 0..w {
@@ -65,7 +68,7 @@ fn guest(w: usize, n: i64) -> String {
     for i in 0..w {
         s.push_str(&format!("  vj{i} = thread.join vh{i}\n"));
     }
-    s.push_str("  vrc = i32.const 0\n  return vrc\n}\n");
+    s.push_str("  vrc = i32.const 0\n  return vrc\n  }\n}\n");
     s.push_str(WORKER);
     s
 }

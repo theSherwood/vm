@@ -130,7 +130,7 @@ fn check(name: &str, src: &str, args: &[Value], exact_jit: bool) {
 // carry no loc). Every op runs, so all three engines map to exactly {2,3,4}.
 const COMPUTE_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   v3 = i32.const 3
@@ -138,6 +138,7 @@ block0(v0: i32):
   v5 = i32.const 2
   v6 = i32.sub v4 v5
   return v6
+  }
 }
 
 debug.file 0 "compute.c"
@@ -153,16 +154,19 @@ debug.loc 0 0 5 0 4 3
 // folded `const`, keeps the JIT's set exactly equal — see `jit_elides_const_only_source_line`.)
 const LOOP_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 
 debug.file 0 "loop.c"
@@ -175,14 +179,17 @@ debug.loc 0 1 2 0 3 1
 // and 5). So the executed line set is a strict subset of the JIT's — the `exact_jit = false` case.
 const BRANCH_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
-  br_if v0 block1() block2()
-block1():
+block 0 (v0: i32) {
+  br_if v0 1() 2()
+}
+block 1 () {
   v1 = i32.const 10
   return v1
-block2():
+}
+block 2 () {
   v2 = i32.const 20
   return v2
+  }
 }
 
 debug.file 0 "branch.c"
@@ -213,10 +220,11 @@ fn parity_branch_taken_arm_is_subset_of_jit_map() {
 // the add's immediate, emitting no machine instruction for it — so line 2 has no source range.
 const CONST_ELIDE_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 debug.file 0 "ce.c"
@@ -262,13 +270,14 @@ fn jit_elides_const_only_source_line() {
 const WINDOW_VAR_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 11
   i32.store v0 v1
   v2 = i32.const 22
   i32.store v0 v2
   v3 = i32.const 0
   return v3
+  }
 }
 
 debug.file 0 "win.c"
@@ -340,18 +349,20 @@ fn window_var_value_parity_per_step() {
 // and declines, delegating to the tree-walker / Milestone-B scheduled Inspector.)
 const THREADS_DBG: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh = thread.spawn 1 vsp va
   vj = thread.join vh
   vr = i64.const 0
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -378,12 +389,13 @@ fn bytecode_debug_trace_declines_outside_single_vcpu_scope() {
 // directly inspectable there — `regs[base + i]` — exactly the storage the tree-walker indexes.
 const SSA_VAR_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   v3 = i32.mul v2 v2
   v4 = i32.sub v3 v1
   return v4
+  }
 }
 
 debug.file 0 "ssa.c"
@@ -471,16 +483,19 @@ fn ssa_var_value_parity_per_step() {
 // us compare the inspected (i, acc) across engines hit-for-hit.
 const LOOP_VAR_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 
 debug.file 0 "loopvar.c"
@@ -560,17 +575,19 @@ fn breakpoint_runtime_parity_across_loop_iterations() {
 // type values from the IR (`func_value_types`), not from `debug.var`.
 const CALL_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = call 1(v0)
   v3 = i32.add v2 v1
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 2
   v2 = i32.mul v0 v1
   return v2
+  }
 }
 "#;
 
@@ -711,12 +728,13 @@ fn stepping_parity_over_and_out_at_a_call() {
 const READVAR_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 7
   i32.store v0 v1
   v2 = i32.const 3
   v3 = i32.add v2 v2
   return v3
+  }
 }
 
 debug.file 0 "rv.c"

@@ -24,7 +24,7 @@ fn child_src() -> &'static str {
     "memory 16
 data 100 \"VM\"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.const 0
@@ -34,6 +34,7 @@ block0(v0: i64):
   v6 = i64.const 1000
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "
 }
@@ -69,7 +70,7 @@ fn module_child_runs_with_its_data_segments() {
     // instantiate_module(module, entry 0, off 64 KiB, size_log2 16, fuel 0) → join → child's result.
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -77,6 +78,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = cap.call 6 1 (i32) -> (i64) v0 (v6)
   return v7
+  }
 }
 ";
     let (res, mem) = run_with_child(parent);
@@ -108,7 +110,7 @@ fn module_child_carve_must_match_declared_memory() {
     // with exactly its declared window, or not at all).
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -116,6 +118,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
+  }
 }
 ";
     let (res, _mem) = run_with_child(parent);
@@ -131,7 +134,7 @@ fn forged_module_handle_capfaults() {
     // Passing the *Instantiator* handle where a Module handle is expected (wrong iface) → CapFault.
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v0
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -139,6 +142,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
+  }
 }
 ";
     let (res, _mem) = run_with_child(parent);
@@ -154,25 +158,27 @@ block0(v0: i32, v1: i32):
 fn named_child_src() -> &'static str {
     "memory 16
 data 100 \"VM\"
-export \"alpha\" 0
-export \"beta\" 1
+export 0 func \"alpha\" 0
+export 1 func \"beta\" 1
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 1000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 2000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "
 }
@@ -211,7 +217,7 @@ fn module_child_addressed_by_export_name() {
     let parent = "memory 17
 data 200 \"beta\"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 200
   v3 = i64.const 4
   v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
@@ -222,6 +228,7 @@ block0(v0: i32, v1: i32):
   v9 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
   v10 = cap.call 6 1 (i32) -> (i64) v0 (v9)
   return v10
+  }
 }
 ";
     let (res, _mem) = run_with_named_child(parent);
@@ -240,11 +247,12 @@ fn module_resolve_export_is_fail_closed() {
     let parent = "memory 17
 data 200 \"nope\"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 200
   v3 = i64.const 4
   v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
   return v4
+  }
 }
 ";
     let (res, _mem) = run_with_named_child(parent);
@@ -261,11 +269,12 @@ fn module_resolve_export_out_of_bounds_name_is_efault() {
     // guest-buffer cap op (Stream/Jit.compile), never an over-read.
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 4294967296
   v3 = i64.const 4
   v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
   return v4
+  }
 }
 ";
     let (res, _mem) = run_with_named_child(parent);
@@ -283,7 +292,7 @@ fn demand_module_child_gets_data_segments_lazily() {
     // page by simply resuming (the bytes are already there). Lazy plugin loading, for free.
     let parent = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -300,6 +309,7 @@ block0(v0: i32, v1: i32):
   v17 = i64.add v10 v13
   v18 = i64.add v17 v16
   return v18
+  }
 }
 ";
     let (res, _mem) = run_with_child(parent);

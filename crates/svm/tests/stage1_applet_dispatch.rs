@@ -35,7 +35,7 @@ fn src(entry: u64, token: &[u8; 3]) -> String {
     format!(
         r#"memory 17
 func (i32, i32) -> (i64) {{
-block0(vinst: i32, vout: i32):
+block 0 (vinst: i32, vout: i32) {{
   a0 = i64.const 0
   n100 = i32.const 100
   i32.store a0 n100
@@ -73,19 +73,22 @@ block0(vinst: i32, vout: i32):
   vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
   r = cap.call 6 1 (i32) -> (i64) vinst (vch)
   return r
+  }}
 }}
 func (i64) -> (i64) {{
-block0(vt: i64):
+block 0 (vt: i64) {{
   z = i64.const 0
   return z
+  }}
 }}
 func (i64) -> (i64) {{
-block0(vf: i64):
+block 0 (vf: i64) {{
   o = i64.const 1
   return o
+  }}
 }}
 func (i64) -> (i64) {{
-block0(vci: i64):
+block 0 (vci: i64) {{
   cs = i32.const 115
   ct = i32.const 116
   cd = i32.const 100
@@ -109,6 +112,7 @@ block0(vci: i64):
   len3 = i64.const 3
   w = cap.call 0 1 (i64, i64) -> (i64) hout (a0, len3)
   return w
+  }}
 }}
 "#
     )

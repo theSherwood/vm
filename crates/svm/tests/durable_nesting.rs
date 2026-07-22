@@ -42,9 +42,10 @@ fn child() -> Module {
     instrument(
         "memory 17
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 4321
   return v1
+  }
 }
 ",
     )
@@ -56,21 +57,25 @@ fn child_loop() -> Module {
     instrument(
         "memory 17
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v1, v2)
-block1(v3: i64, v4: i64):
+  br 1(v1, v2)
+}
+block 1 (v3: i64, v4: i64) {
   v5 = i64.const 100
   v6 = i64.lt_s v3 v5
-  br_if v6 block2(v3, v4) block3(v4)
-block2(v7: i64, v8: i64):
+  br_if v6 2(v3, v4) 3(v4)
+}
+block 2 (v7: i64, v8: i64) {
   v9 = i64.add v8 v7
   v10 = i64.const 1
   v11 = i64.add v7 v10
-  br block1(v11, v9)
-block3(v12: i64):
+  br 1(v11, v9)
+}
+block 3 (v12: i64) {
   return v12
+  }
 }
 ",
     )
@@ -82,9 +87,10 @@ fn child_other() -> Module {
     instrument(
         "memory 17
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 8888
   return v1
+  }
 }
 ",
     )
@@ -96,32 +102,34 @@ block0(v0: i64):
 /// has no conversions.
 const PARENT_PROBE: &str = "memory 18
 func (i32, i64) -> (i32) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 131072
   v4 = i64.const 17
   v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v2)
   return v5
+  }
 }
 ";
 
 /// Durable parent that instantiates its granted child and `join`s it (op 1) — the happy path.
 const PARENT_JOIN: &str = "memory 18
 func (i32, i64) -> (i64) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 131072
   v4 = i64.const 17
   v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v2)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 ";
 
 /// Durable parent that instantiates a **same-module** child (op 0: its own func 1) and joins it.
 const PARENT_SELF: &str = "memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 17
@@ -129,11 +137,13 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 777
   return v1
+  }
 }
 ";
 
@@ -141,7 +151,7 @@ block0(v0: i64):
 /// mid-computation continuation for the subtree freeze). Total = 4950.
 const PARENT_SELF_LOOP: &str = "memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 17
@@ -149,23 +159,28 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 0
-  br block1(v2, v3)
-block1(v4: i64, v5: i64):
+  br 1(v2, v3)
+}
+block 1 (v4: i64, v5: i64) {
   v6 = i64.const 100
   v7 = i64.lt_s v4 v6
-  br_if v7 block2(v4, v5) block3(v5)
-block2(v8: i64, v9: i64):
+  br_if v7 2(v4, v5) 3(v5)
+}
+block 2 (v8: i64, v9: i64) {
   v10 = i64.add v9 v8
   v11 = i64.const 1
   v12 = i64.add v8 v11
-  br block1(v12, v10)
-block3(v13: i64):
+  br 1(v12, v10)
+}
+block 3 (v13: i64) {
   return v13
+  }
 }
 ";
 
@@ -270,9 +285,10 @@ fn durable_domain_refuses_guest_jit_compile() {
     ) -> Result<Arc<[Func]>, i64> {
         let m = parse_module(
             "func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 1
   return v0
+  }
 }
 ",
         )
@@ -308,7 +324,7 @@ block0():
 /// result + fiber result = 777 + 55 = 832.
 const PARENT_JOIN_THEN_FIBER: &str = "memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 17
@@ -323,18 +339,21 @@ block0(v0: i32):
   v13, v14 = cont.resume v9 v12
   v15 = i64.add v6 v14
   return v15
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 777
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 5
   v3 = suspend v2
   v4 = i64.const 55
   return v4
+  }
 }
 ";
 
@@ -342,18 +361,20 @@ block0(v0: i64, v1: i64):
 /// suspended (host-side native continuation) when the freeze lands.
 const PARENT_CORO: &str = "memory 18
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 17
   v4 = i64.const 0
   v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   return v5
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 9
   return v1
+  }
 }
 ";
 
@@ -795,7 +816,7 @@ fn nested_artifact_serializes_restores_and_thaws_through_the_codec() {
 /// 4950 (A) + 33 (B) + 5 (fiber) = 4988.
 const PARENT_TWO_CHILDREN: &str = "memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 2
   v2 = i64.const 196608
   v3 = i64.const 16
@@ -815,35 +836,42 @@ block0(v0: i32):
   v19 = i64.add v9 v18
   v20 = i64.add v19 v17
   return v20
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 0
-  br block1(v2, v3)
-block1(v4: i64, v5: i64):
+  br 1(v2, v3)
+}
+block 1 (v4: i64, v5: i64) {
   v6 = i64.const 100
   v7 = i64.lt_s v4 v6
-  br_if v7 block2(v4, v5) block3(v5)
-block2(v8: i64, v9: i64):
+  br_if v7 2(v4, v5) 3(v5)
+}
+block 2 (v8: i64, v9: i64) {
   v10 = i64.add v9 v8
   v11 = i64.const 1
   v12 = i64.add v8 v11
-  br block1(v12, v10)
-block3(v13: i64):
+  br 1(v12, v10)
+}
+block 3 (v13: i64) {
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 33
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1
   v3 = suspend v2
   v4 = i64.const 5
   return v4
+  }
 }
 ";
 
@@ -983,7 +1011,7 @@ const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
 /// the freeze and the thaw re-attach (which re-grants the `Instantiator` first, too).
 const PARENT_DEPTH2: &str = "memory 19
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 262144
   v3 = i64.const 18
@@ -991,9 +1019,10 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 256
   v2 = i64.const 2
   v3 = i64.const 131072
@@ -1002,23 +1031,28 @@ block0(v0: i64):
   v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
   v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
   return v7
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v1, v2)
-block1(v3: i64, v4: i64):
+  br 1(v1, v2)
+}
+block 1 (v3: i64, v4: i64) {
   v5 = i64.const 100
   v6 = i64.lt_s v3 v5
-  br_if v6 block2(v3, v4) block3(v4)
-block2(v7: i64, v8: i64):
+  br_if v6 2(v3, v4) 3(v4)
+}
+block 2 (v7: i64, v8: i64) {
   v9 = i64.add v8 v7
   v10 = i64.const 1
   v11 = i64.add v7 v10
-  br block1(v11, v9)
-block3(v12: i64):
+  br 1(v11, v9)
+}
+block 3 (v12: i64) {
   return v12
+  }
 }
 ";
 

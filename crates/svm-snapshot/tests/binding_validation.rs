@@ -16,9 +16,10 @@ fn module() -> Module {
     svm_text::parse_module(&format!(
         "memory {SIZE_LOG2}\n\
          func () -> (i64) {{\n\
-         block0():\n\
+         block 0 () {{\n\
          \x20 v0 = i64.const 0\n\
          \x20 return v0\n\
+           }}\n\
          }}\n"
     ))
     .expect("parse")

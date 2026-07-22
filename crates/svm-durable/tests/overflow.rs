@@ -19,12 +19,13 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 const LEAF: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 

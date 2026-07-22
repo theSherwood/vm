@@ -16,23 +16,25 @@ use svm_verify::verify_module;
 /// indirectly through the freed slot. (1 guest func + a 16-slot table ⇒ install lands at slot 1.)
 const GUEST: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
   v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
   v6 = i32.wrap_i64 v5
   v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
   return v7
+  }
 }
 "#;
 
 /// The unit: `service(a, b) = a*b + 100`.
 const SERVICE: &str = r#"memory 16
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.mul v0 v1
   v3 = i32.const 100
   v4 = i32.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -59,13 +61,14 @@ fn host_with_unit(guest: &svm_ir::Module) -> (Host, i32, i32) {
 /// (`IndirectCallType`) identically on both engines.
 const GUEST_UNINSTALL: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
   v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
   v6 = cap.call 11 4 (i64) -> (i64) v0 (v5)
   v7 = i32.wrap_i64 v5
   v8 = call_indirect (i32, i32) -> (i32) v7 (v2, v3)
   return v8
+  }
 }
 "#;
 
@@ -125,21 +128,23 @@ fn compile_unit(host: &mut Host, jit: i32, src: &str) -> i32 {
 /// Unit A: `add(a, b) = a + b` — installed at slot 1.
 const UNIT_A: &str = r#"memory 16
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 
 /// Unit B (invoked): `call_indirect[slot 1](a, b) + 1` — reaches the installed A.
 const UNIT_B: &str = r#"memory 16
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.const 1
   v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)
   v4 = i32.const 1
   v5 = i32.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -147,12 +152,13 @@ block0(v0: i32, v1: i32):
 /// install A at slot 1, then invoke B which calls A; `B(6,7) = A(6,7) + 1 = 14`.
 const GUEST_INVOKE: &str = r#"memory 16
 func (i32, i32, i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   v5 = i64.extend_i32_u v1
   v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)
   v7 = i64.extend_i32_u v2
   v8 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v7, v3, v4)
   return v8
+  }
 }
 "#;
 

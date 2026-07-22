@@ -99,20 +99,23 @@ fn jit_i64(out: &JitOutcome) -> i64 {
 // then reads the clock and adds it: oracle = 5 + clock.
 const LOOP_FIRST: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i64) {
   v4 = i64.const 1
   v5 = i64.add v3 v4
   v6 = i64.const 5
   v7 = i64.lt_s v5 v6
-  br_if v7 block1(v2, v5) block2(v2, v5)
-block2(v8: i32, v9: i64):
+  br_if v7 1(v2, v5) 2(v2, v5)
+}
+block 2 (v8: i32, v9: i64) {
   v10 = i32.const 0
   v11 = cap.call 2 0 (i32) -> (i64) v8 (v10)
   v12 = i64.add v9 v11
   return v12
+  }
 }
 "#;
 
@@ -120,20 +123,23 @@ block2(v8: i32, v9: i64):
 // oracle = clock + 5. Freezing mid-loop bakes the clock into the spilled accumulator.
 const CAP_FIRST: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 0
-  br block1(v3, v2)
-block1(v4: i64, v5: i64):
+  br 1(v3, v2)
+}
+block 1 (v4: i64, v5: i64) {
   v6 = i64.const 1
   v7 = i64.add v4 v6
   v8 = i64.add v5 v6
   v9 = i64.const 5
   v10 = i64.lt_s v7 v9
-  br_if v10 block1(v7, v8) block2(v8)
-block2(v11: i64):
+  br_if v10 1(v7, v8) 2(v8)
+}
+block 2 (v11: i64) {
   return v11
+  }
 }
 "#;
 
@@ -188,20 +194,23 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
 // from any iteration completes the remainder natively in well under a second.
 const LONG_LOOP: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i64) {
   v4 = i64.const 1
   v5 = i64.add v3 v4
   v6 = i64.const 100000000
   v7 = i64.lt_s v5 v6
-  br_if v7 block1(v2, v5) block2(v2, v5)
-block2(v8: i32, v9: i64):
+  br_if v7 1(v2, v5) 2(v2, v5)
+}
+block 2 (v8: i32, v9: i64) {
   v10 = i32.const 0
   v11 = cap.call 2 0 (i32) -> (i64) v8 (v10)
   v12 = i64.add v9 v11
   return v12
+  }
 }
 "#;
 

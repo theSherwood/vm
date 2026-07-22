@@ -15,10 +15,11 @@ fn m(src: &str) -> svm_ir::Module {
 fn pure_integer() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   return v2
+  }
 }"#));
     assert_eq!(a.in_subset, vec![true]);
     assert_eq!(a.interp_leaf, vec![false]);
@@ -34,16 +35,18 @@ block0(v0: i64):
 fn integer_caller_simd_leaf() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 1 (v0)
   return v1
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }"#));
     assert_eq!(a.in_subset, vec![true, false]);
     assert_eq!(a.interp_leaf, vec![false, true]);
@@ -60,11 +63,12 @@ block0(v0: i64):
 fn simd_entry_not_mixed() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }"#));
     assert_eq!(a.in_subset, vec![false]);
     assert!(!a.mixed_ok);
@@ -77,18 +81,20 @@ fn memory_touching_leaf_blocks_mixed() {
     let a = analyze(&m(r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 1 (v0)
   return v1
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   v4 = i64.const 0
   i64.store v4 v3
   return v3
+  }
 }"#));
     assert_eq!(a.in_subset, vec![true, false]);
     assert_eq!(
@@ -105,21 +111,24 @@ block0(v0: i64):
 fn non_leaf_simd_blocks_mixed() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 1 (v0)
   return v1
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   v4 = call 2 (v3)
   return v4
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }"#));
     assert!(
         !a.interp_leaf[1],
@@ -135,16 +144,18 @@ fn concurrency_not_mixed() {
     let a = analyze(&m(r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   return v1
+  }
 }"#));
     assert!(
         !a.mixed_ok,
@@ -159,23 +170,26 @@ block0(vsp: i64, v0: i64):
 fn indirect_all_in_subset_mixed() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 7
   v3 = call_indirect (i64) -> (i64) v1 (v2)
   return v3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 2
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i64.add v0 v1
   return v2
+  }
 }"#));
     assert_eq!(a.in_subset, vec![true, true, true]);
     assert!(a.reachable.iter().all(|&r| r), "indirect ⇒ all reachable");
@@ -190,18 +204,20 @@ block0(v0: i64):
 fn indirect_with_simd_func_not_mixed() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 7
   v3 = call_indirect (i64) -> (i64) v1 (v2)
   return v3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }"#));
     assert_eq!(a.in_subset, vec![true, false]);
     assert!(
@@ -215,15 +231,17 @@ block0(v0: i64):
 fn unreachable_out_of_subset_ok() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.convert_i64_s v0
   v2 = call 1 (v0)
   v3 = i64.trunc_sat_f64_s v1
   return v3
+  }
 }"#));
     assert_eq!(a.reachable, vec![true, false], "func 1 is never called");
     assert!(
