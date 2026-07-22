@@ -1024,16 +1024,22 @@ live run is over but its provider instance keeps serving both C's `log`
 calls and P's `count` calls — the counter they share lives in the instance,
 not in the finished run.
 
-**As built (2026-07-21, wire v7).** Everything above is landed — coverage binding with
-bind-time remaps (child manifests + host wiring; name-less legacy wires fall back to
-first-signature-position matching), the settled declaration surface (indices, kinds,
-required op names, `{ name: idx }` maps, legacy sugar kept where free), the `op`
-immediate, `call.import.dyn`, `export.handle` (memoized; one shared service state per
-domain), `cap.self.type_id`/`covers`, and `ValType::Cap` as an i32-width reservation —
-verified by both verifiers, executed by all three backends through the one generic
-dispatch (the import dispatch packs `slot | op << 16`; dyn packs `ty | op << 16` under
-a reserved id; the self extensions pack `selfop | idx << 8`). Deliberate deferrals,
-each with its reason recorded:
+**As built (2026-07-21, wire v7; polish pass 2026-07-22).** Everything above is
+landed — coverage binding with bind-time remaps (child manifests + host wiring;
+name-less legacy wires fall back to first-signature-position matching), the settled
+declaration surface (indices, kinds, required op names, `{ name: idx }` maps, legacy
+sugar kept where free), the `op` immediate, `call.import.dyn`, `export.handle`
+(memoized; one shared service state per domain), `cap.self.type_id`/`covers`, and
+`ValType::Cap` as an i32-width reservation — verified by both verifiers, executed by
+all three backends through the one generic dispatch (the import dispatch packs
+`slot | op << 16`; dyn packs `ty | op << 16` under a reserved id; the self extensions
+pack `selfop | idx << 8`). The polish pass closed two of the original deferrals: the
+printer emits the full settled body surface (`func N` checked labels, braced
+`block N (params) { … }` bodies, numeric branch targets), and `import.attach` on a
+grouped slot runs the coverage walk against the slot's retained requirement set,
+refreshing the op remap (non-covering or dead handles are a probeable `-EINVAL`;
+requirement-less slots keep the exact-`type_id` check). Remaining deferrals, each
+with its reason recorded:
 
 - **The vestigial `call.import` handle operand is retained**, not retired: it is *live*
   in link-form modules (the §7 loader ABI reads it as the cap-symbol handle and the
@@ -1041,13 +1047,17 @@ each with its reason recorded:
   manifest/attach — not this bump.
 - **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
   the type is reserved and lowers as `i32` everywhere.
-- **Text cosmetics** — braced numbered blocks, `func N` labels — are a follow-up print
-  pass; the parser accepts todays's bodies unchanged.
 - **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
   built-in shapes await their consumers; grouped binding works today through child
   manifests and host-side wiring.
-- **`import.attach` on grouped rebindable slots** currently takes the exact-id path
-  (attach-time coverage walk + remap refresh is a small follow-up).
+- **Legacy text forms still parse and should be retired.** The parser accepts the
+  pre-§3.5 spellings — `blockN(…):` indentation labels, unindexed `func` headers,
+  `export "name" N`, the `impl` offer spelling, inline-signature imports, name-inline
+  `call.import "name" (sig)`, bare-index interface/offer elements — as input sugar
+  only; the printer emits none of them. Retirement is a mechanical slice: migrate the
+  hand-written corpora (~2.5k legacy block labels across tests/examples, plus the
+  embedded text-IR generator strings in `svm-posix`) via parse-old → print-new, then
+  delete the legacy parse paths. No wire change; no functionality change.
 
 ### 3.6 The unified execution model — one world per domain  [DESIGNED 2026-07-21; subsumes the two-world split when the fiber slice lands]
 
