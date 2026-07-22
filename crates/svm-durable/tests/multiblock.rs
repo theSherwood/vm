@@ -85,18 +85,21 @@ fn assert_roundtrips(src: &str, expected: i64) {
 // spilled and reloaded — it cannot be recovered from the function entry. Baseline: 142.
 const COND: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
-  br_if v1 block1(v0) block2(v0)
-block1(v0: i32):
+  br_if v1 1(v0) 2(v0)
+}
+block 1 (v0: i32) {
   v2 = i32.const 0
   v3 = cap.call 2 0 (i32) -> (i64) v0 (v2)
   v4 = i64.const 100
   v5 = i64.add v3 v4
   return v5
-block2(v0: i32):
+}
+block 2 (v0: i32) {
   v6 = i64.const 999
   return v6
+  }
 }
 "#;
 
@@ -112,11 +115,12 @@ fn suspend_in_conditional_branch_round_trips() {
 // 1 and 2 reproduce the oracle while iteration 0's reading is reloaded.
 const LOOP: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v0: i32, v1: i64, v2: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v0: i32, v1: i64, v2: i64) {
   v3 = i32.const 0
   v4 = cap.call 2 0 (i32) -> (i64) v0 (v3)
   v5 = i64.add v1 v4
@@ -124,9 +128,11 @@ block1(v0: i32, v1: i64, v2: i64):
   v7 = i64.add v2 v6
   v8 = i64.const 3
   v9 = i64.lt_s v7 v8
-  br_if v9 block1(v0, v5, v7) block2(v5)
-block2(v10: i64):
+  br_if v9 1(v0, v5, v7) 2(v5)
+}
+block 2 (v10: i64) {
   return v10
+  }
 }
 "#;
 

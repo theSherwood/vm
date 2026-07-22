@@ -13,7 +13,7 @@ use svm_text::parse_module;
 // inst4 v4=add v2 v3, then return. Same fixture as `bytecode_fibers.rs`.
 const SUSPEND_ROUNDTRIP: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -23,15 +23,17 @@ block0():
   v7, v8 = cont.resume v2 v6
   v9 = i64.add v5 v8
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 1
   v1 = i64.add varg v0
   v2 = suspend v1
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 

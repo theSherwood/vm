@@ -14,23 +14,27 @@ use svm_text::parse_module;
 // Writes the accumulator to offset 8 each iteration, then returns the sum (touches linear memory).
 const MEM: &str = r#"memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 8
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9
   v13 = i64.const 1
   v14 = i64.add v9 v13
-  br block1(v7, v12, v14)
-block3(v15: i64):
+  br 1(v7, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }
 "#;
 
@@ -38,14 +42,16 @@ block3(v15: i64):
 // atomics + futex join, all over the one shared window).
 const THREADS: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 500
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -55,15 +61,18 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
+  br 1(v12)
+}
+block 3 () {
   v13 = i64.const 0
-  br block4(v13)
-block4(v14: i64):
+  br 4(v13)
+}
+block 4 (v14: i64) {
   v15 = i64.const 8
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14) block6()
-block5(v17: i64):
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -72,29 +81,35 @@ block5(v17: i64):
   v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
-  br block4(v25)
-block6():
+  br 4(v25)
+}
+block 6 () {
   v26 = i64.const 0
   v27 = i64.atomic.load v26
   return v27
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 0
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 "#;
 

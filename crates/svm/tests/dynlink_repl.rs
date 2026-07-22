@@ -36,7 +36,8 @@ impl Repl {
     fn new() -> Self {
         // Module 0 is a trivial host (an identity entry); all the interesting code is defined at
         // runtime. A 16-slot table (log2 = 4) gives definitions room to install.
-        let m = parse_module("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n").unwrap();
+        let m = parse_module("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n")
+            .unwrap();
         verify_module(&m).unwrap();
         let cm = CompiledModule::compile(
             &m,
@@ -116,22 +117,24 @@ fn repl_definitions_persist_and_compose_by_name() {
     repl.define(
         "sq",
         "func (i32) -> (i32) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i32.mul v0 v0\n\
          \x20 return v1\n\
+           }\n\
          }\n",
     );
 
-    // > def quad(x) = sq(sq(x))   — two `call.import \"sq\"`, each resolved to sq's slot.
+    // > def quad(x) = sq(sq(x))   — two `call.sym \"sq\"`, each resolved to sq's slot.
     repl.define(
         "quad",
         "func (i32) -> (i32) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i32.const 0\n\
-         \x20 v2 = call.import \"sq\" (i32) -> (i32) v1 (v0)\n\
+         \x20 v2 = call.sym \"sq\" (i32) -> (i32) v1 (v0)\n\
          \x20 v3 = i32.const 0\n\
-         \x20 v4 = call.import \"sq\" (i32) -> (i32) v3 (v2)\n\
+         \x20 v4 = call.sym \"sq\" (i32) -> (i32) v3 (v2)\n\
          \x20 return v4\n\
+           }\n\
          }\n",
     );
 
@@ -139,13 +142,14 @@ fn repl_definitions_persist_and_compose_by_name() {
     repl.define(
         "quad_plus",
         "func (i32) -> (i32) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i32.const 0\n\
-         \x20 v2 = call.import \"quad\" (i32) -> (i32) v1 (v0)\n\
+         \x20 v2 = call.sym \"quad\" (i32) -> (i32) v1 (v0)\n\
          \x20 v3 = i32.const 0\n\
-         \x20 v4 = call.import \"sq\" (i32) -> (i32) v3 (v0)\n\
+         \x20 v4 = call.sym \"sq\" (i32) -> (i32) v3 (v0)\n\
          \x20 v5 = i32.add v2 v4\n\
          \x20 return v5\n\
+           }\n\
          }\n",
     );
 
@@ -176,11 +180,12 @@ fn defining_against_an_unknown_name_fails_closed() {
     repl.define(
         "cube",
         "func (i32) -> (i32) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i32.const 0\n\
-         \x20 v2 = call.import \"sq\" (i32) -> (i32) v1 (v0)\n\
+         \x20 v2 = call.sym \"sq\" (i32) -> (i32) v1 (v0)\n\
          \x20 v3 = i32.mul v2 v0\n\
          \x20 return v3\n\
+           }\n\
          }\n",
     );
 }

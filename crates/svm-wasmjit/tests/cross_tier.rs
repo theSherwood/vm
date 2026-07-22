@@ -23,7 +23,7 @@ const ENV_PTR: u32 = 1024;
 const SRC: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v7 = i64.const 7
   vpre = i64.add v0 v7
   va8 = i64.const 8
@@ -32,9 +32,10 @@ block0(v0: i64):
   vaddr = i64.const 100
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   va8 = i64.const 8
   vread = i64.load va8
   vaddr = i64.const 100
@@ -43,6 +44,7 @@ block0(v0: i64):
   vd = i16x8.dot_i8x16_s vs vs
   ve = i64x2.extract_lane 0 vd
   return ve
+  }
 }
 "#;
 
@@ -211,7 +213,7 @@ fn cross_tier_shares_the_window() {
 const SRC_INDIRECT: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v7 = i64.const 7
   vpre = i64.add v0 v7
   va8 = i64.const 8
@@ -221,9 +223,10 @@ block0(v0: i64):
   vaddr = i64.const 100
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   va8 = i64.const 8
   vread = i64.load va8
   vaddr = i64.const 100
@@ -232,6 +235,7 @@ block0(v0: i64):
   vd = i16x8.dot_i8x16_s vs vs
   ve = i64x2.extract_lane 0 vd
   return ve
+  }
 }
 "#;
 
@@ -261,15 +265,16 @@ fn cross_tier_indirect_trampoline() {
 const SRC_TAILCALL: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v7 = i64.const 7
   vpre = i64.add v0 v7
   va8 = i64.const 8
   i64.store va8 vpre
   return_call 1 (v0)
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   va8 = i64.const 8
   vread = i64.load va8
   vs = i64x2.splat v0
@@ -279,6 +284,7 @@ block0(v0: i64):
   vfold = i64.mul ve vz
   vout = i64.add vread vfold
   return vout
+  }
 }
 "#;
 
@@ -310,7 +316,7 @@ fn cross_tier_tail_call() {
 const SRC_INDIRECT_DATA_PTR: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v7 = i64.const 7
   vpre = i64.add v0 v7
   va8 = i64.const 8
@@ -324,9 +330,10 @@ block0(v0: i64):
   vaddr = i64.const 100
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   va8 = i64.const 8
   vread = i64.load va8
   vaddr = i64.const 100
@@ -335,6 +342,7 @@ block0(v0: i64):
   vd = i16x8.dot_i8x16_s vs vs
   ve = i64x2.extract_lane 0 vd
   return ve
+  }
 }
 "#;
 

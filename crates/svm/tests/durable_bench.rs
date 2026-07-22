@@ -23,7 +23,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 /// then a `cap.call`, then a tail using just the last chain value + the call result. Over-
 /// capture spills all `k`+; minimal spills ~2.
 fn dead_heavy_src(k: usize) -> String {
-    let mut s = String::from("func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 1\n");
+    let mut s = String::from("func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 1\n");
     for i in 2..=k {
         s += &format!("  v{i} = i64.add v{} v{}\n", i - 1, i - 1);
     }
@@ -33,7 +33,7 @@ fn dead_heavy_src(k: usize) -> String {
     s += &format!("  v{arg} = i32.const 0\n");
     s += &format!("  v{cap} = cap.call 2 0 (i32) -> (i64) v0 (v{arg})\n");
     s += &format!("  v{res} = i64.add v{k} v{cap}\n");
-    s += &format!("  return v{res}\n}}\n");
+    s += &format!("  return v{res}\n  }}\n}}\n");
     s
 }
 

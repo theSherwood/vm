@@ -63,7 +63,7 @@ fn fresh(n: &mut usize) -> String {
 /// 3 work-body, 4 loop-check, 5 park, 6 release-wait, 7 release-wait-block, 8 done.
 const MUTATOR: &str = "\
 func (i64, i64) -> (i64) {
-block0(msp: i64, mme: i64):
+block 0 (msp: i64, mme: i64) {
   mfour = i64.const 4
   moff = i64.mul mme mfour
   mwb = i64.const 1024
@@ -71,19 +71,22 @@ block0(msp: i64, mme: i64):
   mpb = i64.const 512
   mpa = i64.add mpb moff
   mc0 = i32.const 0
-  br block1(mwa, mpa, mc0)
-block1(twa: i64, tpa: i64, tc: i32):
+  br 1(mwa, mpa, mc0)
+}
+block 1 (twa: i64, tpa: i64, tc: i32) {
   tsa = i64.const 264
   tst = i32.atomic.load.acquire tsa
   tone = i32.const 1
   tis = i32.eq tst tone
-  br_if tis block2(twa, tpa, tc) block3(twa, tpa, tc)
-block2(swa: i64, spa: i64, sc: i32):
+  br_if tis 2(twa, tpa, tc) 3(twa, tpa, tc)
+}
+block 2 (swa: i64, spa: i64, sc: i32) {
   sva = i64.const 268
   sone = i32.const 1
   i32.atomic.store.release sva sone
-  br block3(swa, spa, sc)
-block3(bwa: i64, bpa: i64, bc: i32):
+  br 3(swa, spa, sc)
+}
+block 3 (bwa: i64, bpa: i64, bc: i32) {
   bone = i32.const 1
   bcv = i32.add bc bone
   i32.atomic.store.release bwa bcv
@@ -91,31 +94,37 @@ block3(bwa: i64, bpa: i64, bc: i32):
   be = i32.atomic.load.acquire bea
   bz = i32.const 0
   bchg = i32.ne be bz
-  br_if bchg block5(bpa) block4(bwa, bpa, bcv)
-block4(kwa: i64, kpa: i64, kc: i32):
+  br_if bchg 5(bpa) 4(bwa, bpa, bcv)
+}
+block 4 (kwa: i64, kpa: i64, kc: i32) {
   kn = i32.const 64
   klt = i32.lt_s kc kn
-  br_if klt block1(kwa, kpa, kc) block5(kpa)
-block5(ppa: i64):
+  br_if klt 1(kwa, kpa, kc) 5(kpa)
+}
+block 5 (ppa: i64) {
   pone = i32.const 1
   i32.atomic.store.release ppa pone
   pcnt = i32.const 1
   pnfy = atomic.notify ppa pcnt
-  br block6()
-block6():
+  br 6()
+}
+block 6 () {
   rra = i64.const 260
   rr = i32.atomic.load.acquire rra
   rone = i32.const 1
   riseq = i32.eq rr rone
-  br_if riseq block8() block7(rr)
-block7(wr: i32):
+  br_if riseq 8() 7(rr)
+}
+block 7 (wr: i32) {
   wra = i64.const 260
   wto = i64.const 1000000000
   wres = i32.atomic.wait wra wr wto
-  br block6()
-block8():
+  br 6()
+}
+block 8 () {
   dz = i64.const 0
   return dz
+  }
 }
 ";
 
@@ -141,7 +150,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
     let next_after = |i: i64| if i < m - 1 { wp(i + 1) } else { stw };
 
     // ---- block0: spawn the mutators, request the stop, wake any early waiters. ----
-    s.push_str("block0():\n");
+    s.push_str("block 0 () {\n");
     let sp = fresh(&mut nv);
     writeln!(s, "  {sp} = i64.const 4096").unwrap();
     for i in 0..m {
@@ -164,7 +173,8 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
     writeln!(s, "  {ea2} = i64.const {EPOCH}").unwrap();
     writeln!(s, "  {wake} = i32.const {WAKE_ALL}").unwrap();
     writeln!(s, "  {nfy} = atomic.notify {ea2} {wake}").unwrap();
-    writeln!(s, "  br block{}()", wp(0)).unwrap();
+    writeln!(s, "  br {}()", wp(0)).unwrap();
+    writeln!(s, "  }}").unwrap();
 
     // ---- per-mutator: wait until parked[i] == 1, then confirm work[i] != 0. ----
     for i in 0..m {
@@ -172,7 +182,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         let wa_off = WORK_BASE + i * 4;
 
         // wp(i): spin/wait until parked[i] == 1.
-        writeln!(s, "block{}():", wp(i)).unwrap();
+        writeln!(s, "block {} () {{", wp(i)).unwrap();
         let pa = fresh(&mut nv);
         let p = fresh(&mut nv);
         let one = fresh(&mut nv);
@@ -181,10 +191,11 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         writeln!(s, "  {p} = i32.atomic.load.acquire {pa}").unwrap();
         writeln!(s, "  {one} = i32.const 1").unwrap();
         writeln!(s, "  {iseq} = i32.eq {p} {one}").unwrap();
-        writeln!(s, "  br_if {iseq} block{}() block{}()", wpc(i), wpw(i)).unwrap();
+        writeln!(s, "  br_if {iseq} {}() {}()", wpc(i), wpw(i)).unwrap();
 
         // wpw(i): block on parked[i] (futex), then re-check.
-        writeln!(s, "block{}():", wpw(i)).unwrap();
+        writeln!(s, "  }}").unwrap();
+        writeln!(s, "block {} () {{", wpw(i)).unwrap();
         let pa2 = fresh(&mut nv);
         let z = fresh(&mut nv);
         let to = fresh(&mut nv);
@@ -193,10 +204,11 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         writeln!(s, "  {z} = i32.const 0").unwrap();
         writeln!(s, "  {to} = i64.const {TIMEOUT}").unwrap();
         writeln!(s, "  {wres} = i32.atomic.wait {pa2} {z} {to}").unwrap();
-        writeln!(s, "  br block{}()", wp(i)).unwrap();
+        writeln!(s, "  br {}()", wp(i)).unwrap();
 
         // wpc(i): parked ⟹ work[i] must be non-zero (the release/acquire published it).
-        writeln!(s, "block{}():", wpc(i)).unwrap();
+        writeln!(s, "  }}").unwrap();
+        writeln!(s, "block {} () {{", wpc(i)).unwrap();
         let wa = fresh(&mut nv);
         let w = fresh(&mut nv);
         let z2 = fresh(&mut nv);
@@ -205,26 +217,22 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         writeln!(s, "  {w} = i32.atomic.load.acquire {wa}").unwrap();
         writeln!(s, "  {z2} = i32.const 0").unwrap();
         writeln!(s, "  {nz} = i32.ne {w} {z2}").unwrap();
-        writeln!(
-            s,
-            "  br_if {nz} block{}() block{}()",
-            next_after(i),
-            setwf(i)
-        )
-        .unwrap();
+        writeln!(s, "  br_if {nz} {}() {}()", next_after(i), setwf(i)).unwrap();
 
         // setwf(i): publish the work-publish failure, then continue.
-        writeln!(s, "block{}():", setwf(i)).unwrap();
+        writeln!(s, "  }}").unwrap();
+        writeln!(s, "block {} () {{", setwf(i)).unwrap();
         let wf = fresh(&mut nv);
         let one2 = fresh(&mut nv);
         writeln!(s, "  {wf} = i64.const {WORKFAIL}").unwrap();
         writeln!(s, "  {one2} = i32.const 1").unwrap();
         writeln!(s, "  i32.atomic.store.release {wf} {one2}").unwrap();
-        writeln!(s, "  br block{}()", next_after(i)).unwrap();
+        writeln!(s, "  br {}()", next_after(i)).unwrap();
+        writeln!(s, "  }}").unwrap();
     }
 
     // ---- stw: the stopped window (raise STOPPED, then release everyone). ----
-    writeln!(s, "block{stw}():").unwrap();
+    writeln!(s, "block {stw} () {{").unwrap();
     let sa = fresh(&mut nv);
     let one = fresh(&mut nv);
     writeln!(s, "  {sa} = i64.const {STOPPED}").unwrap();
@@ -247,11 +255,12 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
     writeln!(s, "  {ra2} = i64.const {RELEASE}").unwrap();
     writeln!(s, "  {wake} = i32.const {WAKE_ALL}").unwrap();
     writeln!(s, "  {nfy} = atomic.notify {ra2} {wake}").unwrap();
-    writeln!(s, "  br block{}()", join(0)).unwrap();
+    writeln!(s, "  br {}()", join(0)).unwrap();
 
     // ---- per-mutator joins. ----
     for i in 0..m {
-        writeln!(s, "block{}():", join(i)).unwrap();
+        writeln!(s, "  }}").unwrap();
+        writeln!(s, "block {} () {{", join(i)).unwrap();
         let ha = fresh(&mut nv);
         let h = fresh(&mut nv);
         let jr = fresh(&mut nv);
@@ -259,11 +268,12 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         writeln!(s, "  {h} = i32.atomic.load.acquire {ha}").unwrap();
         writeln!(s, "  {jr} = thread.join {h}").unwrap();
         let nxt = if i < m - 1 { join(i + 1) } else { final_blk };
-        writeln!(s, "  br block{nxt}()").unwrap();
+        writeln!(s, "  br {nxt}()").unwrap();
     }
 
     // ---- final: return (VIOLATION, WORKFAIL), each extended i32 → i64. ----
-    writeln!(s, "block{final_blk}():").unwrap();
+    writeln!(s, "  }}").unwrap();
+    writeln!(s, "block {final_blk} () {{").unwrap();
     let va = fresh(&mut nv);
     let vi = fresh(&mut nv);
     let viol = fresh(&mut nv);
@@ -277,6 +287,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
     writeln!(s, "  {wfi} = i32.atomic.load.acquire {wfa}").unwrap();
     writeln!(s, "  {wfl} = i64.extend_i32_u {wfi}").unwrap();
     writeln!(s, "  return {viol} {wfl}").unwrap();
+    s.push_str("  }\n");
 
     s.push_str("}\n");
     s.push_str(MUTATOR);

@@ -26,7 +26,7 @@ use svm_text::parse_module;
 // Same fixture as the CI test: three computing ops mapped to source lines 2, 3, 4 of "compute.c".
 const COMPUTE_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   v3 = i32.const 3
@@ -34,6 +34,7 @@ block0(v0: i32):
   v5 = i32.const 2
   v6 = i32.sub v4 v5
   return v6
+  }
 }
 
 debug.file 0 "compute.c"

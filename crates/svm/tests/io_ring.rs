@@ -63,10 +63,11 @@ fn both(src: &str) -> (Value, Vec<u8>, JitOutcome, Vec<u8>) {
 fn ring_runs_a_batch_of_deferred_cap_calls() {
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i32, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i32, v4: i32, v5: i64) {
   v6 = i64.const 64
   v7 = i64.mul v5 v6
   v8 = i32.const 2
@@ -88,16 +89,18 @@ block1(v3: i32, v4: i32, v5: i64):
   v19 = i64.add v5 v18
   v20 = i64.const 8
   v21 = i64.lt_u v19 v20
-  br_if v21 block1(v3, v4, v19) block2(v3)
-block2(v22: i32):
+  br_if v21 1(v3, v4, v19) 2(v3)
+}
+block 2 (v22: i32) {
   v23 = i64.const 0
   v24 = i64.const 8
   v25 = i64.const 512
   v26 = cap.call 9 0 (i64, i64, i64) -> (i64) v22 (v23, v24, v25)
   v27 = i64.const 0
   v28 = i64.const 0
-  br block3(v27, v28)
-block3(v29: i64, v30: i64):
+  br 3(v27, v28)
+}
+block 3 (v29: i64, v30: i64) {
   v31 = i64.const 32
   v32 = i64.mul v29 v31
   v33 = i64.const 512
@@ -110,9 +113,11 @@ block3(v29: i64, v30: i64):
   v40 = i64.add v29 v39
   v41 = i64.const 8
   v42 = i64.lt_u v40 v41
-  br_if v42 block3(v40, v38) block4(v38)
-block4(v43: i64):
+  br_if v42 3(v40, v38) 4(v38)
+}
+block 4 (v43: i64) {
   return v43
+  }
 }
 ";
     let (ival, imem, jo, jmem) = both(src);
@@ -137,10 +142,11 @@ block4(v43: i64):
 fn ring_reports_completed_count() {
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i32, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i32, v4: i32, v5: i64) {
   v6 = i64.const 64
   v7 = i64.mul v5 v6
   v8 = i32.const 2
@@ -152,13 +158,15 @@ block1(v3: i32, v4: i32, v5: i64):
   v12 = i64.add v5 v11
   v13 = i64.const 5
   v14 = i64.lt_u v12 v13
-  br_if v14 block1(v3, v4, v12) block2(v3)
-block2(v15: i32):
+  br_if v14 1(v3, v4, v12) 2(v3)
+}
+block 2 (v15: i32) {
   v16 = i64.const 0
   v17 = i64.const 5
   v18 = i64.const 512
   v19 = cap.call 9 0 (i64, i64, i64) -> (i64) v15 (v16, v17, v18)
   return v19
+  }
 }
 ";
     let (ival, _imem, jo, _jmem) = both(src);
@@ -193,10 +201,11 @@ fn batch_src(n: u64) -> String {
     format!(
         "memory 17
 func (i32, i32) -> (i64) {{
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {{
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i32, v5: i64):
+  br 1(v0, v1, v2)
+}}
+block 1 (v3: i32, v4: i32, v5: i64) {{
   v6 = i64.const 64
   v7 = i64.mul v5 v6
   v8 = i32.const 10
@@ -222,16 +231,18 @@ block1(v3: i32, v4: i32, v5: i64):
   v22 = i64.add v5 v21
   v23 = i64.const {n}
   v24 = i64.lt_u v22 v23
-  br_if v24 block1(v3, v4, v22) block2(v3)
-block2(v25: i32):
+  br_if v24 1(v3, v4, v22) 2(v3)
+}}
+block 2 (v25: i32) {{
   v26 = i64.const 0
   v27 = i64.const {n}
   v28 = i64.const 512
   v29 = cap.call 9 0 (i64, i64, i64) -> (i64) v25 (v26, v27, v28)
   v30 = i64.const 0
   v31 = i64.const 0
-  br block3(v30, v31)
-block3(v32: i64, v33: i64):
+  br 3(v30, v31)
+}}
+block 3 (v32: i64, v33: i64) {{
   v34 = i64.const 32
   v35 = i64.mul v32 v34
   v36 = i64.const 512
@@ -244,9 +255,11 @@ block3(v32: i64, v33: i64):
   v43 = i64.add v32 v42
   v44 = i64.const {n}
   v45 = i64.lt_u v43 v44
-  br_if v45 block3(v43, v41) block4(v41)
-block4(v46: i64):
+  br_if v45 3(v43, v41) 4(v41)
+}}
+block 4 (v46: i64) {{
   return v46
+  }}
 }}
 "
     )
@@ -354,10 +367,11 @@ fn offload_pool_overlaps_blocking_ops_on_k_threads() {
 fn blocking_direct_cap_call_runs_inline() {
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 7
   v3 = cap.call 10 0 (i64) -> (i64) v1 (v2)
   return v3
+  }
 }
 ";
     let m = parse_module(src).expect("parse");
@@ -411,7 +425,7 @@ fn offload_forged_blocking_handle_is_inert() {
     // One SQE: type_id 10, op 0, handle = 0x7FFFFFFF (never granted), n_args 1, args[0]=3, ud=99.
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.const 10
   v3 = i64.const 0
   i32.store v3 v2
@@ -437,6 +451,7 @@ block0(v0: i32, v1: i32):
   v18 = i64.const 528
   v19 = i64.load v18
   return v19
+  }
 }
 ";
     let m = parse_module(src).expect("parse");
@@ -500,10 +515,11 @@ block0(v0: i32, v1: i32):
 /// while a working notify resumes in ~ms.
 const ASYNC_RING_SRC: &str = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i32, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i32, v4: i32, v5: i64) {
   v6 = i64.const 64
   v7 = i64.mul v5 v6
   v8 = i32.const 10
@@ -529,32 +545,37 @@ block1(v3: i32, v4: i32, v5: i64):
   v22 = i64.add v5 v21
   v23 = i64.const 4
   v24 = i64.lt_u v22 v23
-  br_if v24 block1(v3, v4, v22) block2(v3, v4)
-block2(v25: i32, v26: i32):
+  br_if v24 1(v3, v4, v22) 2(v3, v4)
+}
+block 2 (v25: i32, v26: i32) {
   v27 = i64.const 0
   v28 = i64.const 4
   v29 = i64.const 1024
   v30 = cap.call 9 1 (i64, i64, i64) -> (i64) v25 (v27, v28, v29)
-  br block3(v25)
-block3(v31: i32):
+  br 3(v25)
+}
+block 3 (v31: i32) {
   v32 = i64.const 1024
   v33 = i32.atomic.load v32
   v34 = i32.const 4
   v35 = i32.lt_u v33 v34
-  br_if v35 block4(v31, v33) block5(v31)
-block4(v36: i32, v37: i32):
+  br_if v35 4(v31, v33) 5(v31)
+}
+block 4 (v36: i32, v37: i32) {
   v38 = i64.const 1024
   v39 = i64.const 10000000000
   v40 = i32.atomic.wait v38 v37 v39
-  br block3(v36)
-block5(v41: i32):
+  br 3(v36)
+}
+block 5 (v41: i32) {
   v42 = i64.const 2048
   v43 = i64.const 4
   v44 = cap.call 9 2 (i64, i64) -> (i64) v41 (v42, v43)
   v45 = i64.const 0
   v46 = i64.const 0
-  br block6(v45, v46)
-block6(v47: i64, v48: i64):
+  br 6(v45, v46)
+}
+block 6 (v47: i64, v48: i64) {
   v49 = i64.const 32
   v50 = i64.mul v47 v49
   v51 = i64.const 2048
@@ -567,9 +588,11 @@ block6(v47: i64, v48: i64):
   v58 = i64.add v47 v57
   v59 = i64.const 4
   v60 = i64.lt_u v58 v59
-  br_if v60 block6(v58, v56) block7(v56)
-block7(v61: i64):
+  br_if v60 6(v58, v56) 7(v56)
+}
+block 7 (v61: i64) {
   return v61
+  }
 }
 ";
 
@@ -704,10 +727,11 @@ fn async_submit_parks_and_reaps_on_both_backends() {
 fn async_submit_returns_submitted_count() {
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i32, v4: i32, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i32, v4: i32, v5: i64) {
   v6 = i64.const 64
   v7 = i64.mul v5 v6
   v8 = i32.const 10
@@ -730,13 +754,15 @@ block1(v3: i32, v4: i32, v5: i64):
   v20 = i64.add v5 v19
   v21 = i64.const 4
   v22 = i64.lt_u v20 v21
-  br_if v22 block1(v3, v4, v20) block2(v3)
-block2(v23: i32):
+  br_if v22 1(v3, v4, v20) 2(v3)
+}
+block 2 (v23: i32) {
   v24 = i64.const 0
   v25 = i64.const 4
   v26 = i64.const 1024
   v27 = cap.call 9 1 (i64, i64, i64) -> (i64) v23 (v24, v25, v26)
   return v27
+  }
 }
 ";
     let m = parse_module(src).expect("parse");
@@ -776,12 +802,13 @@ fn ring_submit_clamps_a_forged_entry_count() {
     // window, so each SQE read EFAULTs (a no-op completion) — pure clamp/loop-bound exercise.
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 1000000000
   v3 = i64.const 9223372036854775807
   v4 = i64.const 1000000000
   v5 = cap.call 9 0 (i64, i64, i64) -> (i64) v0 (v2, v3, v4)
   return v5
+  }
 }
 ";
     let (ival, _imem, jo, _jmem) = both(src);

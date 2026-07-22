@@ -6967,11 +6967,12 @@ int f(void) {
 #[cfg(unix)]
 const TWICE_CALLER: &str = "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  v3 = call.import \"twice\" (i64, i64) -> (i64) v1 (v2, v0)
+  v3 = call.sym \"twice\" (i64, i64) -> (i64) v1 (v2, v0)
   return v3
+  }
 }
 ";
 

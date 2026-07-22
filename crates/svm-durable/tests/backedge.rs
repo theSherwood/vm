@@ -32,20 +32,23 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 // the body. Oracle: clock(42) + 5 = 47.
 const SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 0
-  br block1(v3, v2)
-block1(v4: i64, v5: i64):
+  br 1(v3, v2)
+}
+block 1 (v4: i64, v5: i64) {
   v6 = i64.const 1
   v7 = i64.add v4 v6
   v8 = i64.add v5 v6
   v9 = i64.const 5
   v10 = i64.lt_s v7 v9
-  br_if v10 block1(v7, v8) block2(v8)
-block2(v11: i64):
+  br_if v10 1(v7, v8) 2(v8)
+}
+block 2 (v11: i64) {
   return v11
+  }
 }
 "#;
 

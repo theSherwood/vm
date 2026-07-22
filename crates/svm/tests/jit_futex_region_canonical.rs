@@ -33,7 +33,7 @@ use svm_verify::verify_module;
 /// needs to park, so a real wakeup is never missed on success.
 const SRC: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   vlen = i64.const 65536\n\
   vrh = cap.call 5 5 (i64) -> (i64) v0 (vlen)\n\
   vr = i32.wrap_i64 vrh\n\
@@ -49,16 +49,19 @@ block0(v0: i32):\n\
   vjr = thread.join vchild\n\
   vst64 = i64.extend_i32_u vst\n\
   return vst64\n\
+  }\n\
 }\n\
 func (i64, i64) -> (i64) {\n\
-block0(vsp: i64, varg: i64):\n\
+block 0 (vsp: i64, varg: i64) {\n\
   vz = i64.const 0\n\
-  br block1(vz)\n\
-block1(cnt: i64):\n\
+  br 1(vz)\n\
+}\n\
+block 1 (cnt: i64) {\n\
   vlim = i64.const 20000000\n\
   vlt = i64.lt_u cnt vlim\n\
-  br_if vlt block2(cnt) block3()\n\
-block2(cnt2: i64):\n\
+  br_if vlt 2(cnt) 3()\n\
+}\n\
+block 2 (cnt2: i64) {\n\
   va = i64.const 0\n\
   vone = i32.const 1\n\
   vw = atomic.notify va vone\n\
@@ -66,13 +69,16 @@ block2(cnt2: i64):\n\
   vgt = i32.lt_u vzero vw\n\
   vinc = i64.const 1\n\
   vnext = i64.add cnt2 vinc\n\
-  br_if vgt block4() block1(vnext)\n\
-block3():\n\
+  br_if vgt 4() 1(vnext)\n\
+}\n\
+block 3 () {\n\
   vneg = i64.const -1\n\
   return vneg\n\
-block4():\n\
+}\n\
+block 4 () {\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 #[test]

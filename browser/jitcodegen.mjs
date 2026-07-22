@@ -19,13 +19,14 @@ const STACK = 1 << 16;
 const GUEST_I32 = `
 memory 16
 func (i32, i32) -> (i64) {
-block0(vjit: i32, vcode: i32):
+block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   va = i32.const 6
   vb = i32.const 7
   vr = cap.call 11 1 (i64, i32, i32) -> (i32) vjit (vc, va, vb)
   vr64 = i64.extend_i32_u vr
   return vr64
+  }
 }
 `;
 
@@ -34,13 +35,14 @@ block0(vjit: i32, vcode: i32):
 const GUEST_F64 = `
 memory 16
 func (i32, i32) -> (i64) {
-block0(vjit: i32, vcode: i32):
+block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   va = f64.const 6.0
   vb = f64.const 7.0
   vr = cap.call 11 1 (i64, f64, f64) -> (f64) vjit (vc, va, vb)
   vi = i64.trunc_f64_s vr
   return vi
+  }
 }
 `;
 

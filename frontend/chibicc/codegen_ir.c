@@ -30,11 +30,11 @@
 // data image. A synthetic **`_start`** (function 0) takes the powerbox capability handles,
 // stashes them in a reserved region, then calls `main` with the initial
 // data-SP. **Stdio over the powerbox** (§3e): `write`/`read`/`exit` are recognized builtins
-// lowered to a §7 **named import** (`call.import "write"/"read"/"exit"`) on the stashed
+// lowered to a §7 **named import** (`call.sym "write"/"read"/"exit"`) on the stashed
 // Stream/Exit handle — the host binds each name to its (type_id, op) at load (see
 // `svm_run::default_cap_resolver`), so real C reaches stdout/stdin and terminates with an exit
 // code without the frontend hardcoding the capability's interface id. (Likewise every `__vm_*`
-// capability builtin below: the frontend emits `call.import "<name>"` + the handle; the host
+// capability builtin below: the frontend emits `call.sym "<name>"` + the handle; the host
 // resolves the operation. The non-capability `__vm_*` ops — atomics/fibers/threads — stay IR
 // primitives, not imports.)
 // **Floats** (`float`=f32, `double`/`long double`=f64) work too: arithmetic, compares,
@@ -85,6 +85,67 @@ static int cur_func_idx;    // module index of the function being emitted
 static int cur_block = -1;  // id of the block currently being emitted into (-1 = none)
 static int cur_inst;        // next instruction index within cur_block (matches the interpreter)
 
+static void cg(const char *fmt, ...);
+
+// --- Per-block output buffers (v8 text surface) -------------------------------------------
+// The braced form's labels are *checked positional*: block N must be the N-th block. The
+// generator allocates block ids as control structures are entered but emits bodies in AST
+// order, so buffer each block's text by id and flush sorted at func end. Emission outside
+// any block (module header, func header/close) goes straight to the file.
+typedef struct {
+  char *buf;
+  size_t len, cap;
+} BlkBuf;
+static BlkBuf *blk_bufs;
+static int n_blk_bufs, cap_blk_bufs;
+
+static BlkBuf *blk_of(int id) {
+  if (id >= cap_blk_bufs) {
+    int ncap = cap_blk_bufs ? cap_blk_bufs * 2 : 64;
+    while (ncap <= id)
+      ncap *= 2;
+    blk_bufs = realloc(blk_bufs, ncap * sizeof(BlkBuf));
+    memset(blk_bufs + cap_blk_bufs, 0, (ncap - cap_blk_bufs) * sizeof(BlkBuf));
+    cap_blk_bufs = ncap;
+  }
+  if (id >= n_blk_bufs)
+    n_blk_bufs = id + 1;
+  return &blk_bufs[id];
+}
+
+static void blk_append(BlkBuf *b, const char *s, size_t n) {
+  if (b->len + n + 1 > b->cap) {
+    b->cap = b->cap ? b->cap * 2 : 256;
+    while (b->len + n + 1 > b->cap)
+      b->cap *= 2;
+    b->buf = realloc(b->buf, b->cap);
+  }
+  memcpy(b->buf + b->len, s, n);
+  b->len += n;
+  b->buf[b->len] = '\0';
+}
+
+// Flush every buffered block in id order (each already ends with its own `  }` close),
+// then reset for the next function.
+static void flush_blocks(void) {
+  for (int i = 0; i < n_blk_bufs; i++) {
+    if (blk_bufs[i].buf && blk_bufs[i].len) {
+      fwrite(blk_bufs[i].buf, 1, blk_bufs[i].len, o);
+      free(blk_bufs[i].buf);
+    }
+    blk_bufs[i] = (BlkBuf){0};
+  }
+  n_blk_bufs = 0;
+}
+
+// Close the currently-open braced block body, if any (v8 text surface: `block N (...) { ... }`).
+static void close_block(void) {
+  if (cur_block != -1) {
+    cg("  }\n");
+    cur_block = -1;
+  }
+}
+
 static void cg(const char *fmt, ...) {
   if (fmt[0] == ' ' && fmt[1] == ' ') {
     const char *p = fmt + 2;
@@ -96,7 +157,15 @@ static void cg(const char *fmt, ...) {
   }
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(o, fmt, ap);
+  if (cur_block != -1) {
+    char line[8192];
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    if (n > (int)sizeof line - 1)
+      n = (int)sizeof line - 1;
+    blk_append(blk_of(cur_block), line, (size_t)n);
+  } else {
+    vfprintf(o, fmt, ap);
+  }
   va_end(ap);
 }
 
@@ -350,7 +419,9 @@ static char *cparams(void) {
 // promoted local as a parameter) and reset per-block state. Block labels resolve by name,
 // so forward references are fine. On entry each promoted slot's value is its parameter.
 static void open_block(int id) {
-  cg("block%d(" SP ": i64%s):\n", id, cparams());
+  close_block();
+  cur_block = id;
+  cg("block %d (" SP ": i64%s) {\n", id, cparams());
   nv = npromo + 1; // v0 is the data-SP; v1..vN are the promoted locals
   term = false;
   cur_block = id; // debug.loc keys (DEBUGGING.md §6): track which block we emit into
@@ -781,7 +852,9 @@ static int gen_truth(Node *node) {
 // vR follows the promoted locals at index npromo+1, and nv resumes after it.
 #define MERGE_VAL (npromo + 1)
 static void open_merge(int id, char *ty) {
-  cg("block%d(" SP ": i64%s, v%d: %s):\n", id, cparams(), MERGE_VAL, ty);
+  close_block();
+  cur_block = id;
+  cg("block %d (" SP ": i64%s, v%d: %s) {\n", id, cparams(), MERGE_VAL, ty);
   nv = npromo + 2;
   term = false;
   cur_block = id; // keep the debug keys (W4) tracking this block too
@@ -794,15 +867,15 @@ static void open_merge(int id, char *ty) {
 static int gen_logand(Node *node) {
   int ta = gen_truth(node->lhs);
   int rhs = nb++, fls = nb++, merge = nb++;
-  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, rhs, cvals(), fls,
+  cg("  br_if v%d %d(" SP "%s) %d(" SP "%s)\n", ta, rhs, cvals(), fls,
           cvals());
   open_block(rhs);
   int tb = gen_truth(node->rhs);
-  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
+  cg("  br %d(" SP "%s, v%d)\n", merge, cvals(), tb);
   open_block(fls);
   int z = nv++;
   cg("  v%d = i32.const 0\n", z);
-  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), z);
+  cg("  br %d(" SP "%s, v%d)\n", merge, cvals(), z);
   open_merge(merge, "i32");
   return MERGE_VAL;
 }
@@ -810,15 +883,15 @@ static int gen_logand(Node *node) {
 static int gen_logor(Node *node) {
   int ta = gen_truth(node->lhs);
   int tru = nb++, rhs = nb++, merge = nb++;
-  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, tru, cvals(), rhs,
+  cg("  br_if v%d %d(" SP "%s) %d(" SP "%s)\n", ta, tru, cvals(), rhs,
           cvals());
   open_block(tru);
   int one = nv++;
   cg("  v%d = i32.const 1\n", one);
-  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), one);
+  cg("  br %d(" SP "%s, v%d)\n", merge, cvals(), one);
   open_block(rhs);
   int tb = gen_truth(node->rhs);
-  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
+  cg("  br %d(" SP "%s, v%d)\n", merge, cvals(), tb);
   open_merge(merge, "i32");
   return MERGE_VAL;
 }
@@ -827,7 +900,7 @@ static int gen_logor(Node *node) {
 static int gen_cond(Node *node) {
   int c = gen_truth(node->cond);
   int th = nb++, el = nb++, merge = nb++;
-  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, th, cvals(), el,
+  cg("  br_if v%d %d(" SP "%s) %d(" SP "%s)\n", c, th, cvals(), el,
           cvals());
 
   if (node->ty->kind == TY_VOID) {
@@ -835,21 +908,21 @@ static int gen_cond(Node *node) {
     open_block(th);
     gen_expr(node->then);
     if (!term)
-      cg("  br block%d(" SP "%s)\n", merge, cvals());
+      cg("  br %d(" SP "%s)\n", merge, cvals());
     open_block(el);
     gen_expr(node->els);
     if (!term)
-      cg("  br block%d(" SP "%s)\n", merge, cvals());
+      cg("  br %d(" SP "%s)\n", merge, cvals());
     open_block(merge);
     return 0;
   }
 
   open_block(th);
   int vt = gen_expr_as(node->then, node->ty);
-  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), vt);
+  cg("  br %d(" SP "%s, v%d)\n", merge, cvals(), vt);
   open_block(el);
   int ve = gen_expr_as(node->els, node->ty);
-  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), ve);
+  cg("  br %d(" SP "%s, v%d)\n", merge, cvals(), ve);
   // An aggregate-typed `?:` carries the selected arm's *address* (by-address, §3d), so the
   // merge value is an i64 pointer; `pass_irty` maps a struct/union to i64, scalars to their type.
   open_merge(merge, pass_irty(node->ty));
@@ -891,7 +964,7 @@ static int gen_builtin_stream(Node *node, int slot, int op) {
   // §7: reach the Stream op by *name* (host-resolved to (type_id, op) at load), not an inlined
   // cap.call. The handle still selects the endpoint (stdout vs stdin).
   const char *name = (op == 1) ? "write" : "read";
-  cg("  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf,
+  cg("  v%d = call.sym \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf,
           len);
   if (node->ty->kind == TY_VOID)
     return 0;
@@ -907,7 +980,7 @@ static int gen_builtin_exit(Node *node) {
     error_tok(node->tok, "codegen_ir: exit(code) expects 1 argument");
   int code = gen_expr(node->args);
   int h = dummy_handle();
-  cg("  call.import \"exit\" (i32) -> () v%d (v%d)\n", h, code);
+  cg("  call.sym \"exit\" (i32) -> () v%d (v%d)\n", h, code);
   cg("  unreachable\n"); // Exit is noreturn (§3e)
   term = true;
   return 0;
@@ -933,10 +1006,10 @@ static int gen_builtin_memory(Node *node, int op, int want) {
   int r = nv++;
   const char *name = op == 0 ? "vm_map" : op == 1 ? "vm_unmap" : "vm_protect";
   if (want == 3)
-    cg("  v%d = call.import \"%s\" (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, name,
+    cg("  v%d = call.sym \"%s\" (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, name,
             h, off, len, prot);
   else
-    cg("  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, off,
+    cg("  v%d = call.sym \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, off,
             len);
   return r;
 }
@@ -950,7 +1023,7 @@ static int gen_builtin_page_size(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_page_size takes no arguments");
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_page_size\" () -> (i64) v%d ()\n", r, h);
+  cg("  v%d = call.sym \"vm_page_size\" () -> (i64) v%d ()\n", r, h);
   return r;
 }
 
@@ -970,7 +1043,7 @@ static int gen_builtin_io_submit_async(Node *node) {
   int ctr = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_io_submit_async\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n",
+  cg("  v%d = call.sym \"vm_io_submit_async\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n",
           r, h, sq, n, ctr);
   return r;
 }
@@ -983,7 +1056,7 @@ static int gen_builtin_io_reap(Node *node) {
   int mx = widen_i64(gen_expr(a->next), a->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_io_reap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
+  cg("  v%d = call.sym \"vm_io_reap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
   return r;
 }
 
@@ -1032,7 +1105,7 @@ static int gen_builtin_cap(Node *node) {
 
 // §7 generic capability import: a call to a function that is *declared but not defined* (an
 // `extern` with no body) and is not a recognized builtin is a **named host capability**. Lower it
-// to `call.import "<name>"`: the first C argument is the capability **handle** (an `i32`, e.g. from
+// to `call.sym "<name>"`: the first C argument is the capability **handle** (an `i32`, e.g. from
 // `__vm_cap`), the rest are the operation arguments, and the op signature is the C signature minus
 // the handle. The host binds the name to a concrete `(type_id, op)` at load (the §7 late binding,
 // `svm_run::default_cap_resolver`), so a brand-new capability needs no frontend change — just an
@@ -1065,9 +1138,9 @@ static int gen_builtin_import(Node *node) {
   const char *resty = is_void ? "" : is_flt(node->ty) ? (is64(node->ty) ? "f64" : "f32") : "i64";
   int r = is_void ? 0 : nv++;
   if (is_void)
-    cg("  call.import \"%s\" (", name);
+    cg("  call.sym \"%s\" (", name);
   else
-    cg("  v%d = call.import \"%s\" (", r, name);
+    cg("  v%d = call.sym \"%s\" (", r, name);
   for (int i = 0; i < n; i++)
     cg("%s%s", i ? ", " : "", argty[i]);
   cg(") -> (%s) v%d (", resty, handle);
@@ -1130,7 +1203,7 @@ static int gen_builtin_jit_compile(Node *node) {
   int len = widen_i64(gen_expr(a->next), a->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_jit_compile\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob,
+  cg("  v%d = call.sym \"vm_jit_compile\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob,
           len);
   return r;
 }
@@ -1150,10 +1223,9 @@ static int gen_builtin_jit_compile_linked(Node *node) {
   int st_len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  fprintf(o,
-          "  v%d = call.import \"vm_jit_compile_linked\" (i64, i64, i64, i64) -> (i64) v%d (v%d, "
-          "v%d, v%d, v%d)\n",
-          r, h, ir, ir_len, st, st_len);
+  cg("  v%d = call.sym \"vm_jit_compile_linked\" (i64, i64, i64, i64) -> (i64) v%d (v%d, "
+     "v%d, v%d, v%d)\n",
+     r, h, ir, ir_len, st, st_len);
   return r;
 }
 
@@ -1166,7 +1238,7 @@ static int gen_builtin_jit_invoke2(Node *node) {
   int y = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_jit_invoke2\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r,
+  cg("  v%d = call.sym \"vm_jit_invoke2\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r,
           h, code, x, y);
   return r;
 }
@@ -1178,7 +1250,7 @@ static int gen_builtin_jit_release(Node *node) {
   int code = widen_i64(gen_expr(a), a->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_jit_release\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  cg("  v%d = call.sym \"vm_jit_release\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
 }
 
@@ -1192,7 +1264,7 @@ static int gen_builtin_jit_install(Node *node) {
   int code = widen_i64(gen_expr(a), a->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_jit_install\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  cg("  v%d = call.sym \"vm_jit_install\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
 }
 
@@ -1205,7 +1277,7 @@ static int gen_builtin_jit_uninstall(Node *node) {
   int slot = widen_i64(gen_expr(a), a->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_jit_uninstall\" (i64) -> (i64) v%d (v%d)\n", r, h, slot);
+  cg("  v%d = call.sym \"vm_jit_uninstall\" (i64) -> (i64) v%d (v%d)\n", r, h, slot);
   return r;
 }
 
@@ -1232,7 +1304,7 @@ static int gen_builtin_region_create(Node *node) {
   int len = widen_i64(gen_expr(a), a->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.import \"vm_region_create\" (i64) -> (i64) v%d (v%d)\n", r, h, len);
+  cg("  v%d = call.sym \"vm_region_create\" (i64) -> (i64) v%d (v%d)\n", r, h, len);
   return r;
 }
 
@@ -1903,19 +1975,19 @@ static void gen_stmt(Node *node);
 static void gen_if(Node *node) {
   int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
   int t = nb++, e = nb++, end = nb++;
-  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, t, cvals(), e, cvals());
+  cg("  br_if v%d %d(" SP "%s) %d(" SP "%s)\n", c, t, cvals(), e, cvals());
   term = true;
 
   open_block(t);
   gen_stmt(node->then);
   if (!term)
-    cg("  br block%d(" SP "%s)\n", end, cvals());
+    cg("  br %d(" SP "%s)\n", end, cvals());
 
   open_block(e);
   if (node->els)
     gen_stmt(node->els);
   if (!term)
-    cg("  br block%d(" SP "%s)\n", end, cvals());
+    cg("  br %d(" SP "%s)\n", end, cvals());
 
   open_block(end);
 }
@@ -1927,7 +1999,7 @@ static void gen_for(Node *node) {
   if (node->init)
     gen_stmt(node->init);
   int cond = nb++, body = nb++, cont = nb++, end = nb++;
-  cg("  br block%d(" SP "%s)\n", cond, cvals());
+  cg("  br %d(" SP "%s)\n", cond, cvals());
   term = true;
 
   open_block(cond);
@@ -1941,9 +2013,9 @@ static void gen_for(Node *node) {
     // test-at-top form (`for`/`while`); `do/while` already tests on the back-edge, so it's untouched.
     int nc = nv++;
     cg("  v%d = i32.eqz v%d\n", nc, c);
-    cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", nc, end, cvals(), body, cvals());
+    cg("  br_if v%d %d(" SP "%s) %d(" SP "%s)\n", nc, end, cvals(), body, cvals());
   } else {
-    cg("  br block%d(" SP "%s)\n", body, cvals()); // `for(;;)` — unconditional
+    cg("  br %d(" SP "%s)\n", body, cvals()); // `for(;;)` — unconditional
   }
   term = true;
 
@@ -1952,12 +2024,12 @@ static void gen_for(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    cg("  br block%d(" SP "%s)\n", cont, cvals());
+    cg("  br %d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
   if (node->inc)
     gen_expr(node->inc);
-  cg("  br block%d(" SP "%s)\n", cond, cvals());
+  cg("  br %d(" SP "%s)\n", cond, cvals());
 
   open_block(end);
 }
@@ -1965,7 +2037,7 @@ static void gen_for(Node *node) {
 // `do body while (cond)`: body runs once, then `cont` re-tests. `break` → end.
 static void gen_do(Node *node) {
   int body = nb++, cont = nb++, end = nb++;
-  cg("  br block%d(" SP "%s)\n", body, cvals());
+  cg("  br %d(" SP "%s)\n", body, cvals());
   term = true;
 
   open_block(body);
@@ -1973,11 +2045,11 @@ static void gen_do(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    cg("  br block%d(" SP "%s)\n", cont, cvals());
+    cg("  br %d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
   int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
-  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
+  cg("  br_if v%d %d(" SP "%s) %d(" SP "%s)\n", c, body, cvals(), end,
           cvals());
 
   open_block(end);
@@ -2004,7 +2076,7 @@ static void gen_switch(Node *node) {
   // Dispatch: each compare block carries (sp, <promoted locals>, val) and forwards the
   // value (at index MERGE_VAL, after the promoted locals) to the next compare block.
   int check = nb++;
-  cg("  br block%d(" SP "%s, v%d)\n", check, cvals(), v);
+  cg("  br %d(" SP "%s, v%d)\n", check, cvals(), v);
   term = true;
   for (Node *c = node->case_next; c; c = c->case_next) {
     open_merge(check, p);
@@ -2025,13 +2097,13 @@ static void gen_switch(Node *node) {
       cg("  v%d = %s.const %ld\n", kr, p, c->end - c->begin);
       cg("  v%d = %s.le_u v%d v%d\n", hit, p, d, kr);
     }
-    cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s, v%d)\n", hit,
+    cg("  br_if v%d %d(" SP "%s) %d(" SP "%s, v%d)\n", hit,
             case_block_of(c), cvals(), next, cvals(), val);
     check = next;
   }
   // No case matched → default (or break past the switch).
   open_merge(check, p);
-  cg("  br block%d(" SP "%s)\n", defblk, cvals());
+  cg("  br %d(" SP "%s)\n", defblk, cvals());
   term = true;
 
   // The body: ND_CASE labels open their blocks; `break` (cont_label NULL so `continue`
@@ -2040,7 +2112,7 @@ static void gen_switch(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    cg("  br block%d(" SP "%s)\n", end, cvals());
+    cg("  br %d(" SP "%s)\n", end, cvals());
   open_block(end);
 }
 
@@ -2066,7 +2138,7 @@ static void gen_stmt(Node *node) {
     // A case/default label: fall-through from the previous case branches in here.
     int blk = case_block_of(node);
     if (!term)
-      cg("  br block%d(" SP "%s)\n", blk, cvals());
+      cg("  br %d(" SP "%s)\n", blk, cvals());
     open_block(blk);
     gen_stmt(node->lhs);
     return;
@@ -2088,7 +2160,7 @@ static void gen_stmt(Node *node) {
     // preceding statement (if reachable), open it, then emit the labelled statement.
     int blk = label_block_of(node->unique_label);
     if (!term)
-      cg("  br block%d(" SP "%s)\n", blk, cvals());
+      cg("  br %d(" SP "%s)\n", blk, cvals());
     open_block(blk);
     gen_stmt(node->lhs);
     return;
@@ -2098,20 +2170,20 @@ static void gen_stmt(Node *node) {
     for (int i = loopsp - 1; i >= 0; i--) {
       if (node->unique_label && loopstk[i].brk_label &&
           !strcmp(node->unique_label, loopstk[i].brk_label)) {
-        cg("  br block%d(" SP "%s)\n", loopstk[i].brk_blk, cvals());
+        cg("  br %d(" SP "%s)\n", loopstk[i].brk_blk, cvals());
         term = true;
         return;
       }
       if (node->unique_label && loopstk[i].cont_label &&
           !strcmp(node->unique_label, loopstk[i].cont_label)) {
-        cg("  br block%d(" SP "%s)\n", loopstk[i].cont_blk, cvals());
+        cg("  br %d(" SP "%s)\n", loopstk[i].cont_blk, cvals());
         term = true;
         return;
       }
     }
     // A general `goto`: branch to its target label's block (allocated on first reference,
     // so forward gotos resolve). The data-SP + promoted locals thread through as args.
-    cg("  br block%d(" SP "%s)\n", label_block_of(node->unique_label), cvals());
+    cg("  br %d(" SP "%s)\n", label_block_of(node->unique_label), cvals());
     term = true;
     return;
   }
@@ -2331,7 +2403,8 @@ static void gen_func(Obj *fn) {
     cg(") -> (%s) {\n", irty(ret));
 
   // Entry block: params are `sp` (v0), [the sret pointer], the C params, then the va ptr.
-  cg("block%d(" SP ": i64", nb++);
+  cur_block = 0;
+  cg("block %d (" SP ": i64", nb++);
   int np = 1;
   sret_param = -1;
   sret_slot = -1;
@@ -2345,7 +2418,7 @@ static void gen_func(Obj *fn) {
   int va_param = np;
   if (variadic)
     cg(", v%d: i64", np++);
-  cg("):\n");
+  cg(") {\n");
   nv = np;
   term = false;
   cur_block = 0; // the entry block (open_block isn't used for it — it has the param signature)
@@ -2410,6 +2483,8 @@ static void gen_func(Obj *fn) {
       cg("  v%d = %s.const 0\n  return v%d\n", z, irty(ret), z);
     }
   }
+  close_block();
+  flush_blocks();
   cg("}\n\n");
 }
 
@@ -2600,7 +2675,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
                                                   "addrspace", "ioring", "blocking", "jit"};
   int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,     MEMORY_SLOT,
                          ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT, JIT_SLOT};
-  cg("export \"_start\" 0\n");
+  cg("export 0 func \"_start\" 0\n");
   // A `--child-entry` module is spawned via `instantiate_module`, whose child ABI is
   // `(i64 starter) -> (i64 status)`; the top-level powerbox entry is paramless `() -> (main's ret)`.
   // The starter is ignored here (a no-capability command); `main`'s result is widened to the i64 the
@@ -2608,11 +2683,11 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   // resolve loop below is a no-op — `cap.self.resolve` would fail in a destitute child.
   if (opt_child_entry) {
     cg("func (i64) -> (i64) {\n");
-    cg("block0(v0: i64):\n");
+    cg("block 0 (v0: i64) {\n");
     nv = 1; // v0 is the (ignored) starter param
   } else {
     cg("func () -> (%s) {\n", is_void ? "" : irty(mret));
-    cg("block0():\n");
+    cg("block 0 () {\n");
     nv = 0;
   }
   // Resolve each *used* powerbox cap by name into its stash slot. Each name's bytes are written to a
@@ -2660,33 +2735,38 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v%d = i64.const %d\n", vp0, POWERBOX_ARGS_BASE + 8); // first string
     int vi0 = nv++;
     cg("  v%d = i64.const 0\n", vi0);
-    cg("  br block1(v%d, v%d, v%d)\n", vac, vi0, vp0);
+    cg("  br 1(v%d, v%d, v%d)\n", vac, vi0, vp0);
+    cg("  }\n");
     // loop_head(argc, i, p): while i <u argc, write argv[i] and scan; else finish.
-    cg("block1(v0: i64, v1: i64, v2: i64):\n");
+    cg("block 1 (v0: i64, v1: i64, v2: i64) {\n");
     cg("  v3 = i64.lt_u v1 v0\n");
-    cg("  br_if v3 block2(v0, v1, v2) block5(v0)\n");
+    cg("  br_if v3 2(v0, v1, v2) 5(v0)\n");
+    cg("  }\n");
     // body: argv[i] = p, then scan p to the byte past its NUL.
-    cg("block2(v0: i64, v1: i64, v2: i64):\n");
+    cg("block 2 (v0: i64, v1: i64, v2: i64) {\n");
     cg("  v3 = i64.const %d\n", data_end);
     cg("  v4 = i64.const 8\n");
     cg("  v5 = i64.mul v1 v4\n");
     cg("  v6 = i64.add v3 v5\n");
     cg("  i64.store v6 v2\n");
-    cg("  br block3(v0, v1, v2, v2)\n");
+    cg("  br 3(v0, v1, v2, v2)\n");
+    cg("  }\n");
     // scan(argc, i, p, q): advance q past the NUL.
-    cg("block3(v0: i64, v1: i64, v2: i64, v3: i64):\n");
+    cg("block 3 (v0: i64, v1: i64, v2: i64, v3: i64) {\n");
     cg("  v4 = i32.load8_u v3\n");
     cg("  v5 = i64.const 1\n");
     cg("  v6 = i64.add v3 v5\n");
     cg("  v7 = i32.eqz v4\n");
-    cg("  br_if v7 block4(v0, v1, v6) block3(v0, v1, v2, v6)\n");
+    cg("  br_if v7 4(v0, v1, v6) 3(v0, v1, v2, v6)\n");
+    cg("  }\n");
     // next: i++ and loop.
-    cg("block4(v0: i64, v1: i64, v2: i64):\n");
+    cg("block 4 (v0: i64, v1: i64, v2: i64) {\n");
     cg("  v3 = i64.const 1\n");
     cg("  v4 = i64.add v1 v3\n");
-    cg("  br block1(v0, v4, v2)\n");
+    cg("  br 1(v0, v4, v2)\n");
+    cg("  }\n");
     // done: argv[argc] = NULL, main_sp = page-align(entry_sp + (argc+1)*8), call main.
-    cg("block5(v0: i64):\n");
+    cg("block 5 (v0: i64) {\n");
     cg("  v1 = i64.const %d\n", data_end);
     cg("  v2 = i64.const 8\n");
     cg("  v3 = i64.mul v0 v2\n");
@@ -2712,6 +2792,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     } else {
       cg("  v15 = call %d (v13, v14, v1)\n  return v15\n", mi);
     }
+    cg("  }\n");
     cg("}\n\n");
     return;
   }
@@ -2739,6 +2820,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
       cg("  return v%d\n", r);
     }
   }
+  cg("  }\n");
   cg("}\n\n");
 }
 

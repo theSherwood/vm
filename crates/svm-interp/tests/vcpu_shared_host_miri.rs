@@ -17,15 +17,17 @@ use svm_text::parse_module;
 const CAPS: &str = r#"memory 16
 data 0 "hi\n"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
   v1 = i64.const 0
-  br block1(v1, vh0)
-block1(vi: i64, vhh: i64):
+  br 1(v1, vh0)
+}
+block 1 (vi: i64, vhh: i64) {
   v2 = i64.const 2
   v3 = i64.lt_u vi v2
-  br_if v3 block2(vi, vhh) block3()
-block2(vi2: i64, vhh2: i64):
+  br_if v3 2(vi, vhh) 3()
+}
+block 2 (vi2: i64, vhh2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
@@ -35,15 +37,18 @@ block2(vi2: i64, vhh2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vhh2)
-block3():
+  br 1(v9, vhh2)
+}
+block 3 () {
   v10 = i64.const 0
-  br block4(v10)
-block4(vj: i64):
+  br 4(v10)
+}
+block 4 (vj: i64) {
   v11 = i64.const 2
   v12 = i64.lt_u vj v11
-  br_if v12 block5(vj) block6()
-block5(vj2: i64):
+  br_if v12 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -52,14 +57,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vh: i64):
+block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 3
@@ -69,6 +76,7 @@ block0(vsp: i64, vh: i64):
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
   return v4
+  }
 }
 "#;
 

@@ -20,18 +20,20 @@ use svm_text::parse_module;
 /// the trap to the root — but the **origin** is the worker's div at line 70, not the root's join at
 /// line 30.
 const WORKER_DIV0: &str = "func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = i64.const 4096\n\
     \x20 v1 = i64.const 0\n\
     \x20 v2 = thread.spawn 1 v0 v1\n\
     \x20 v3 = thread.join v2\n\
     \x20 return v3\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 0\n\
     \x20 v3 = i64.div_s v1 v2\n\
     \x20 return v3\n\
+      }\n\
     }\n\
     debug.file 0 \"t.c\"\n\
     debug.fname 0 \"root\"\n\

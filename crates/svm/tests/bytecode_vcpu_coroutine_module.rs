@@ -21,11 +21,12 @@ use svm_text::parse_module;
 const MODULE_CHILD: &str = r#"memory 12
 data 0 "K"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 "#;
 
@@ -34,16 +35,18 @@ block0(v0: i64):
 /// values. Each module coroutine returns 75 ⇒ 8 × 75 = 600.
 const COROUTINE_MODULE: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(vinst0: i32, vmod0: i32):
+block 0 (vinst0: i32, vmod0: i32) {
   vmod64 = i64.extend_i32_s vmod0
   vi0 = i64.const 0
   vs0 = i64.const 0
-  br block1(vi0, vs0, vinst0, vmod64)
-block1(vi: i64, vs: i64, vinst: i32, vmod: i64):
+  br 1(vi0, vs0, vinst0, vmod64)
+}
+block 1 (vi: i64, vs: i64, vinst: i32, vmod: i64) {
   vn = i64.const 8
   vlt = i64.lt_u vi vn
-  br_if vlt block2(vi, vs, vinst, vmod) block3(vs)
-block2(vi2: i64, vs2: i64, vinst2: i32, vmod2: i64):
+  br_if vlt 2(vi, vs, vinst, vmod) 3(vs)
+}
+block 2 (vi2: i64, vs2: i64, vinst2: i32, vmod2: i64) {
   v4096 = i64.const 4096
   vofflo = i64.mul vi2 v4096
   v64k = i64.const 65536
@@ -56,9 +59,11 @@ block2(vi2: i64, vs2: i64, vinst2: i32, vmod2: i64):
   vsnew = i64.add vs2 vval
   v1 = i64.const 1
   vinext = i64.add vi2 v1
-  br block1(vinext, vsnew, vinst2, vmod2)
-block3(vs3: i64):
+  br 1(vinext, vsnew, vinst2, vmod2)
+}
+block 3 (vs3: i64) {
   return vs3
+  }
 }
 "#;
 

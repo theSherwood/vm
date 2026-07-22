@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* A host-defined capability: meaning(x) = x + 40. Reached by the guest as call.import "meaning".
+/* A host-defined capability: meaning(x) = x + 40. Reached by the guest as call.sym "meaning".
  * This one only computes on its scalar args, so it ignores the guest-window handle (mem). */
 static int32_t meaning(void *ctx, uint32_t op, const int64_t *args, size_t n_args,
                        int64_t *results, size_t cap, SvmGuestMem *mem) {
@@ -29,17 +29,18 @@ static int32_t meaning(void *ctx, uint32_t op, const int64_t *args, size_t n_arg
 static const char *IR =
     "memory 15\n"
     "data ro 16384 \"Hello from C!\\n\"\n"
-    "export \"_start\" 0\n"
+    "export 0 func \"_start\" 0\n"
     "func () -> (i64) {\n"
-    "block0():\n"
+    "block 0 () {\n"
     "  v0 = i32.const 0\n"            /* dummy handle operand: the slot binding dispatches */
     "  v1 = i64.const 16384\n"
     "  v2 = i64.const 14\n"
-    "  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)\n"
+    "  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)\n"
     "  v4 = i32.const 0\n"
     "  v5 = i64.const 2\n"
-    "  v6 = call.import \"meaning\" (i64) -> (i64) v4 (v5)\n"
+    "  v6 = call.sym \"meaning\" (i64) -> (i64) v4 (v5)\n"
     "  return v6\n"
+    "  }\n"
     "}\n";
 
 int main(void) {

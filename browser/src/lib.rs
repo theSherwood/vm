@@ -61,14 +61,16 @@ pub extern "C" fn run_roundtrip() -> i64 {
 /// The §ROI-spike "alu" hash recurrence: loops `n` times mixing an LCG, returns the accumulator.
 const ALU: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 6364136223846793005
   v11 = i64.mul v8 v10
   v12 = i64.const 1442695040888963407
@@ -76,9 +78,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v14 = i64.add v13 v9
   v15 = i64.const 1
   v16 = i64.add v9 v15
-  br block1(v7, v14, v16)
-block3(v17: i64):
+  br 1(v7, v14, v16)
+}
+block 3 (v17: i64) {
   return v17
+  }
 }
 "#;
 
@@ -105,14 +109,16 @@ pub extern "C" fn run_guest(n: i64) -> i64 {
 const THREADS: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 8
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 500
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -122,15 +128,18 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
+  br 1(v12)
+}
+block 3 () {
   v13 = i64.const 0
-  br block4(v13)
-block4(v14: i64):
+  br 4(v13)
+}
+block 4 (v14: i64) {
   v15 = i64.const 8
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14) block6()
-block5(v17: i64):
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -139,29 +148,35 @@ block5(v17: i64):
   v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
-  br block4(v25)
-block6():
+  br 4(v25)
+}
+block 6 () {
   v26 = i64.const 0
   v27 = i64.atomic.load v26
   return v27
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 0
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 "#;
 
@@ -807,11 +822,12 @@ fn par_jit_codegen() -> bool {
 /// (the ABI generalization to floats). `fservice(6.0, 7.0) = 142.0`.
 const JIT_SERVICE_FLOAT: &str = r#"memory 16
 func (f64, f64) -> (f64) {
-block0(v0: f64, v1: f64):
+block 0 (v0: f64, v1: f64) {
   v2 = f64.mul v0 v1
   v3 = f64.const 100.0
   v4 = f64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -1799,7 +1815,7 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrspace"];
 
 /// The reference host's §7 capability-import name policy — a browser-side twin of `svm-run`'s
-/// `default_cap_resolver`. The on-ramp emits `call.import "<name>"` for each libc→capability shim
+/// `default_cap_resolver`. The on-ramp emits `call.sym "<name>"` for each libc→capability shim
 /// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `cap.call`
 /// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
 /// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
@@ -4464,11 +4480,12 @@ fn browser_jit_validator(
 /// bytecode entry builds memory from the module, so no in-guest blob seeding is needed).
 const JIT_SERVICE: &str = r#"memory 16
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.mul v0 v1
   v3 = i32.const 100
   v4 = i32.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -4512,17 +4529,18 @@ pub fn jit_exec(m: &svm_ir::Module) -> (i32, i64) {
 /// memory-match precondition against the parent window.)
 const DL_UNIT: &str = r#"memory 16
 func (i32) -> (i64) {
-block0(v0: i32):
-  v1 = call.import "clock" () -> (i64) v0 ()
+block 0 (v0: i32) {
+  v1 = call.sym "clock" () -> (i64) v0 ()
   v2 = i64.const 777
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
 
 /// Run `m`'s function 0 with a `Jit` cap, a `Clock` cap, and a host-`compile_linked` [`DL_UNIT`]:
 /// **dynamic linking** — the unit's named import `"clock"` is bound (via the symbol table) to the
-/// `Clock` capability `(type_id 2, op 0)` before verify, lowering `call.import "clock"` to a real
+/// `Clock` capability `(type_id 2, op 0)` before verify, lowering `call.sym "clock"` to a real
 /// `cap.call 2 0`. The guest receives `(jit, code, clock)`, installs the unit and `call_indirect`s it
 /// passing the clock handle → `777`. With `link == false` the symbol table is empty, so the import is
 /// unresolved and `compile_linked` fails closed (`STATUS_TRAP`). Returns `(status, value)`.
@@ -4751,21 +4769,23 @@ pub extern "C" fn run_powerbox() -> i64 {
 memory 16
 data 0 "hello, powerbox!\n"
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 17
   v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)
   v6 = i32.const 0
   return v6
+  }
 }
 "#;
     const EXIT: &str = r#"
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i32.const 42
   cap.call 1 0 (i32) -> () v2(v3)
   v4 = i32.const 0
   return v4
+  }
 }
 "#;
     let (Ok(hm), Ok(em)) = (svm_text::parse_module(HELLO), svm_text::parse_module(EXIT)) else {
@@ -4793,24 +4813,28 @@ pub extern "C" fn run_capture() -> i64 {
     const ADDK: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i64, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
   v4 = i64.const 128
   v5 = i64.lt_u v3 v4
-  br_if v5 block2(v2, v3) block3()
-block2(v6: i64, v7: i64):
+  br_if v5 2(v2, v3) 3()
+}
+block 2 (v6: i64, v7: i64) {
   v8 = i64.load v7
   v9 = i64.add v8 v6
   i64.store v7 v9
   v10 = i64.const 8
   v11 = i64.add v7 v10
-  br block1(v6, v11)
-block3():
+  br 1(v6, v11)
+}
+block 3 () {
   v12 = i64.const 0
   v13 = i64.load v12
   return v13
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(ADDK) else {
@@ -4836,7 +4860,7 @@ block3():
 pub extern "C" fn run_instantiate() -> i64 {
     const SHARED: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 12
@@ -4850,14 +4874,16 @@ block0(v0: i32):
   v11 = i64.mul v6 v10
   v12 = i64.add v11 v9
   return v12
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 7
   v2 = i32.const 123
   i32.store8 v1 v2
   v3 = i64.const 42
   return v3
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(SHARED) else {
@@ -4875,11 +4901,12 @@ block0(v0: i64):
 pub extern "C" fn run_simd() -> i64 {
     const S: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i64x2.add v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(S) else {
@@ -4903,11 +4930,12 @@ block0(v0: i64):
 pub extern "C" fn run_durable() -> i64 {
     const SRC: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 2 0 () -> (i64) v0 ()
   v2 = cap.call 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(SRC) else {
@@ -4931,12 +4959,13 @@ block0(v0: i32):
 pub extern "C" fn run_dynlink() -> i64 {
     const G: &str = r#"memory 16
 func (i32, i32, i32) -> (i64) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.extend_i32_u v1
   v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)
   v5 = i32.wrap_i64 v4
   v6 = call_indirect (i32) -> (i64) v5 (v2)
   return v6
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(G) else {
@@ -4955,12 +4984,13 @@ block0(v0: i32, v1: i32, v2: i32):
 pub extern "C" fn run_jit() -> i64 {
     const G: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32, v3: i32):
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
   v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
   v6 = i32.wrap_i64 v5
   v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
   return v7
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(G) else {
@@ -4979,7 +5009,7 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32):
 pub extern "C" fn run_region() -> i64 {
     const R: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 4 3 () -> (i64) v0 ()
   v2 = i64.const 0
   v3 = i32.const 3
@@ -4989,6 +5019,7 @@ block0(v0: i32):
   i64.store v2 v6
   v7 = i64.load v1
   return v7
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(R) else {
@@ -5006,9 +5037,10 @@ block0(v0: i32):
 pub extern "C" fn run_reflect() -> i64 {
     const R: &str = r#"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = cap.self.count
   return v0
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(R) else {
@@ -5027,7 +5059,7 @@ block0():
 pub extern "C" fn run_gcroots() -> i64 {
     const G: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   va = i64.const 4096
   vb = i64.const 5000
   vc = i64.const 5000
@@ -5039,6 +5071,7 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(G) else {
@@ -5057,22 +5090,26 @@ block0():
 pub extern "C" fn run_tailcall() -> i64 {
     const T: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 1
   return_call 1(v0, v1)
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1
   v3 = i64.lt_s v0 v2
-  br_if v3 block1(v1) block2(v0, v1)
-block1(v4: i64):
+  br_if v3 1(v1) 2(v0, v1)
+}
+block 1 (v4: i64) {
   return v4
-block2(v5: i64, v6: i64):
+}
+block 2 (v5: i64, v6: i64) {
   v7 = i64.mul v6 v5
   v8 = i64.const -1
   v9 = i64.add v5 v8
   return_call 1(v9, v7)
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(T) else {
@@ -5095,19 +5132,21 @@ block2(v5: i64, v6: i64):
 pub extern "C" fn run_fiber() -> i64 {
     const FIB: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = i64.const 7
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 100
   v1 = i64.add varg v0
   return v1
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(FIB) else {
@@ -5131,7 +5170,7 @@ block0(vsp: i64, varg: i64):
 pub extern "C" fn run_coroutine() -> i64 {
     const CORO: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -5150,9 +5189,10 @@ block0(v0: i32):
   v19 = i64.mul v17 v18
   v20 = i64.add v16 v19
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = i32.const 7
@@ -5165,6 +5205,7 @@ block0(v0: i64):
   v9 = i64.const 999
   v10 = i64.add v9 v8
   return v10
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(CORO) else {
@@ -5183,12 +5224,13 @@ block0(v0: i64):
 pub extern "C" fn run_float() -> i64 {
     const SQRT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.reinterpret_i64 v0
   v2 = f64.abs v1
   v3 = f64.sqrt v2
   v4 = i64.reinterpret_f64 v3
   return v4
+  }
 }
 "#;
     let Ok(m) = svm_text::parse_module(SQRT) else {

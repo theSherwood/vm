@@ -60,7 +60,7 @@ fn assert_jit_matches_interp(src: &str) {
 #[test]
 fn fiber_suspend_then_resume() {
     let src = "func () -> (i32, i64, i32, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -69,13 +69,15 @@ fn fiber_suspend_then_resume() {
         \x20 v6 = i64.const 7\n\
         \x20 v7, v8 = cont.resume v2 v6\n\
         \x20 return v4 v5 v7 v8\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = suspend v1\n\
         \x20 v3 = i64.const 100\n\
         \x20 v4 = i64.add v2 v3\n\
         \x20 return v4\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -85,22 +87,25 @@ fn fiber_suspend_then_resume() {
 #[test]
 fn fiber_generator_loop() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 0\n\
-        \x20 br block1(v2, v3)\n\
-        block1(v4: i64, v5: i64):\n\
+        \x20 br 1(v2, v3)\n\
+        }\n\
+        block 1 (v4: i64, v5: i64) {\n\
         \x20 v6 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v4 v6\n\
         \x20 v9 = i64.add v5 v8\n\
-        \x20 br_if v7 block2(v9) block1(v4, v9)\n\
-        block2(v10: i64):\n\
+        \x20 br_if v7 2(v9) 1(v4, v9)\n\
+        }\n\
+        block 2 (v10: i64) {\n\
         \x20 return v10\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 1\n\
         \x20 v3 = suspend v2\n\
         \x20 v4 = i64.const 2\n\
@@ -109,6 +114,7 @@ fn fiber_generator_loop() {
         \x20 v7 = suspend v6\n\
         \x20 v8 = i64.const 4\n\
         \x20 return v8\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -119,7 +125,7 @@ fn fiber_generator_loop() {
 #[test]
 fn fiber_nested_resume_chain() {
     let src = "func () -> (i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -127,9 +133,10 @@ fn fiber_nested_resume_chain() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6, v7 = cont.resume v2 v3\n\
         \x20 return v5 v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = ref.func 2\n\
         \x20 v3 = i64.const 8192\n\
         \x20 v4 = cont.new v2 v3\n\
@@ -138,13 +145,15 @@ fn fiber_nested_resume_chain() {
         \x20 v8 = suspend v7\n\
         \x20 v9, v10 = cont.resume v4 v5\n\
         \x20 return v10\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 11\n\
         \x20 v3 = suspend v2\n\
         \x20 v4 = i64.const 22\n\
         \x20 return v4\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -153,7 +162,7 @@ fn fiber_nested_resume_chain() {
 #[test]
 fn fiber_resume_after_return_traps() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -161,10 +170,12 @@ fn fiber_resume_after_return_traps() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6, v7 = cont.resume v2 v3\n\
         \x20 return v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -173,10 +184,11 @@ fn fiber_resume_after_return_traps() {
 #[test]
 fn fiber_root_suspend_traps() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 5\n\
         \x20 v1 = suspend v0\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -190,7 +202,7 @@ fn fiber_root_suspend_traps() {
 #[test]
 fn fiber_handle_values_match_across_backends() {
     let src = "func () -> (i64, i64, i32, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -198,10 +210,12 @@ fn fiber_handle_values_match_across_backends() {
         \x20 v4 = i64.const 3\n\
         \x20 v5, v6 = cont.resume v3 v4\n\
         \x20 return v2 v3 v5 v6\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     // Cross-backend agreement (the differential)…
     assert_jit_matches_interp(src);
@@ -224,17 +238,19 @@ fn fiber_handle_values_match_across_backends() {
 #[test]
 fn fiber_wrong_type_funcref_traps() {
     let src = "func () -> (i32, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 1\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 return v4 v5\n\
+          }\n\
         }\n\
         func (i32) -> (i32) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
         \x20 return v0\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -246,7 +262,7 @@ fn fiber_wrong_type_funcref_traps() {
 fn fiber_uses_data_stack_and_memory() {
     let src = "memory 16\n\
         func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 1024\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -255,14 +271,16 @@ fn fiber_uses_data_stack_and_memory() {
         \x20 v6 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v2 v6\n\
         \x20 return v8\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 i64.store v0 v1\n\
         \x20 v2 = i64.const 0\n\
         \x20 v3 = suspend v2\n\
         \x20 v4 = i64.load v0\n\
         \x20 return v4\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -278,25 +296,28 @@ fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
     // `func 1` (entry) calls `func 2` (helper) at fib.c:5; the helper `suspend`s at fib.c:9.
     let src = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
   v3 = i64.const 5
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = call 2(v0, v1)
   return v2
+  }
 }
 
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = suspend v1
   return v2
+  }
 }
 
 debug.file 0 "fib.c"
@@ -368,24 +389,26 @@ fn fiber_forged_generation_faults_identically() {
     // Genuine handle: the fiber runs and returns 99.
     assert_jit_matches_interp(
         "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
         \x20 v4 = i64.const 0\n\
         \x20 v5, v6 = cont.resume v2 v4\n\
         \x20 return v6\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 99\n\
         \x20 return v2\n\
+          }\n\
         }\n",
     );
     // Forged handle `(1 << 24) | 0`: same slot 0, generation 1 ≠ 0 ⇒ FiberFault on both backends.
     assert_jit_matches_interp(
         "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -393,11 +416,13 @@ fn fiber_forged_generation_faults_identically() {
         \x20 v4 = i64.const 0\n\
         \x20 v5, v6 = cont.resume v3 v4\n\
         \x20 return v6\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 99\n\
         \x20 return v2\n\
+          }\n\
         }\n",
     );
 }
@@ -411,7 +436,7 @@ fn recycled_slot_generation_guard_agrees() {
     // handle makes the reuse observable (16777216). Both backends must produce the same handle.
     assert_jit_matches_interp(
         "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -419,18 +444,20 @@ fn recycled_slot_generation_guard_agrees() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6 = cont.new v0 v1\n\
         \x20 return v6\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 7\n\
         \x20 return v2\n\
+          }\n\
         }\n",
     );
     // After slot 0 is recycled (now gen 1), resuming A's stale gen-0 handle (i64 0) must fault on
     // both backends — even though slot 0 is live — because the generation no longer matches.
     assert_jit_matches_interp(
         "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -440,11 +467,13 @@ fn recycled_slot_generation_guard_agrees() {
         \x20 v9 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v9 v3\n\
         \x20 return v8\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 7\n\
         \x20 return v2\n\
+          }\n\
         }\n",
     );
 }

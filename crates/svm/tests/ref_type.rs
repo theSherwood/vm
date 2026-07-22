@@ -14,8 +14,9 @@ use svm_verify::verify_module;
 
 /// `func (ref) -> (ref) { return v0 }` — the minimal program in which a `ref` value exists.
 const IDENTITY: &str = "func (ref) -> (ref) {\n\
-    block0(v0: ref):\n\
+    block 0 (v0: ref) {\n\
     \x20 return v0\n\
+      }\n\
     }\n";
 
 #[test]

@@ -44,7 +44,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 /// `durable_nesting.rs::PARENT_SELF_LOOP`.)
 const PARENT_SELF_LOOP: &str = "memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 17
@@ -52,23 +52,28 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 0
-  br block1(v2, v3)
-block1(v4: i64, v5: i64):
+  br 1(v2, v3)
+}
+block 1 (v4: i64, v5: i64) {
   v6 = i64.const 100
   v7 = i64.lt_s v4 v6
-  br_if v7 block2(v4, v5) block3(v5)
-block2(v8: i64, v9: i64):
+  br_if v7 2(v4, v5) 3(v5)
+}
+block 2 (v8: i64, v9: i64) {
   v10 = i64.add v9 v8
   v11 = i64.const 1
   v12 = i64.add v8 v11
-  br block1(v12, v10)
-block3(v13: i64):
+  br 1(v12, v10)
+}
+block 3 (v13: i64) {
   return v13
+  }
 }
 ";
 
@@ -143,7 +148,7 @@ const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
 /// (Identical in shape to `durable_nesting.rs::PARENT_DEPTH2`.)
 const PARENT_DEPTH2: &str = "memory 19
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 262144
   v3 = i64.const 18
@@ -151,9 +156,10 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 256
   v2 = i64.const 2
   v3 = i64.const 131072
@@ -162,23 +168,28 @@ block0(v0: i64):
   v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
   v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
   return v7
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v1, v2)
-block1(v3: i64, v4: i64):
+  br 1(v1, v2)
+}
+block 1 (v3: i64, v4: i64) {
   v5 = i64.const 100
   v6 = i64.lt_s v3 v5
-  br_if v6 block2(v3, v4) block3(v4)
-block2(v7: i64, v8: i64):
+  br_if v6 2(v3, v4) 3(v4)
+}
+block 2 (v7: i64, v8: i64) {
   v9 = i64.add v8 v7
   v10 = i64.const 1
   v11 = i64.add v7 v10
-  br block1(v11, v9)
-block3(v12: i64):
+  br 1(v11, v9)
+}
+block 3 (v12: i64) {
   return v12
+  }
 }
 ";
 
@@ -245,7 +256,7 @@ fn jit_durable_depth2_grandchild_matches_interp() {
 /// site, so the synchronous JIT would run it to completion (DURABILITY.md §4 "Freeze model").
 const FREEZE_PARENT: &str = "memory 18
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 131072
   v3 = i64.const 17
@@ -253,28 +264,35 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
-  br block1(v1, v1, v0)
-block1(v2: i64, v3: i64, v4: i32):
+  br 1(v1, v1, v0)
+}
+block 1 (v2: i64, v3: i64, v4: i32) {
   v5 = i64.const 100
   v6 = i64.lt_s v2 v5
-  br_if v6 block2(v2, v3, v4) block3(v3, v4)
-block2(v7: i64, v8: i64, v9: i32):
+  br_if v6 2(v2, v3, v4) 3(v3, v4)
+}
+block 2 (v7: i64, v8: i64, v9: i32) {
   v10 = i64.add v8 v7
   v11 = i64.const 1
   v12 = i64.add v7 v11
-  br block1(v12, v10, v9)
-block3(v13: i64, v14: i32):
+  br 1(v12, v10, v9)
+}
+block 3 (v13: i64, v14: i32) {
   v15 = i32.const 0
-  br_if v15 block4(v14) block5(v13)
-block4(v16: i32):
+  br_if v15 4(v14) 5(v13)
+}
+block 4 (v16: i32) {
   v17 = cap.call 6 1 (i32) -> (i64) v16 (v16)
   return v17
-block5(v18: i64):
+}
+block 5 (v18: i64) {
   return v18
+  }
 }
 ";
 
@@ -453,7 +471,7 @@ fn jit_nested_freeze_thaw_round_trips() {
 /// first loop-header poll — so a freeze captures **two** live `FrozenNested` records.
 const FREEZE_DEPTH2: &str = "memory 19
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 262144
   v3 = i64.const 18
@@ -461,9 +479,10 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 256
   v2 = i64.const 2
   v3 = i64.const 131072
@@ -472,29 +491,36 @@ block0(v0: i64):
   v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
   v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
   return v7
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
-  br block1(v1, v1)
-block1(v2: i64, v3: i64):
+  br 1(v1, v1)
+}
+block 1 (v2: i64, v3: i64) {
   v4 = i64.const 100
   v5 = i64.lt_s v2 v4
-  br_if v5 block2(v2, v3) block3(v3)
-block2(v6: i64, v7: i64):
+  br_if v5 2(v2, v3) 3(v3)
+}
+block 2 (v6: i64, v7: i64) {
   v8 = i64.add v7 v6
   v9 = i64.const 1
   v10 = i64.add v6 v9
-  br block1(v10, v8)
-block3(v11: i64):
+  br 1(v10, v8)
+}
+block 3 (v11: i64) {
   v12 = i32.const 0
-  br_if v12 block4(v11) block5(v11)
-block4(v13: i64):
+  br_if v12 4(v11) 5(v11)
+}
+block 4 (v13: i64) {
   v14 = i32.const 256
   v15 = cap.call 6 1 (i32) -> (i64) v14 (v14)
   return v15
-block5(v16: i64):
+}
+block 5 (v16: i64) {
   return v16
+  }
 }
 ";
 

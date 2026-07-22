@@ -73,7 +73,7 @@ fn assert_outcomes(src: &str, want: &[Result<i64, Trap>]) {
 /// the stack state captured on the root survived the migration intact (a restart would lose it).
 const MIGRATE: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 2
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -82,20 +82,23 @@ block0():
   v6 = thread.spawn 1 v2 v2
   v7 = thread.join v6
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 7
   v1, v2 = cont.resume varg v0
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = suspend varg
   v1 = i64.const 10
   v2 = i64.mul v0 v1
   v3 = i64.add v2 varg
   return v3
+  }
 }
 "#;
 
@@ -121,7 +124,7 @@ fn fiber_suspended_on_root_resumes_on_spawned_vcpu() {
 /// neither could, the fiber's 42 would never be computed (covered by the single-worker control).
 const RACE: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 2
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -131,18 +134,21 @@ block0():
   v6 = thread.join v4
   v7 = i64.add v5 v6
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 1
   v1, v2 = cont.resume varg v0
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 41
   v1 = i64.add varg v0
   return v1
+  }
 }
 "#;
 
@@ -158,25 +164,28 @@ fn racing_resumes_have_exactly_one_winner() {
 /// the non-vacuity half: a foreign resume is genuinely a successful claim, not an always-fault.
 const NO_RACE: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 2
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = thread.spawn 1 v2 v2
   v4 = thread.join v3
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 1
   v1, v2 = cont.resume varg v0
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 41
   v1 = i64.add varg v0
   return v1
+  }
 }
 "#;
 
@@ -194,23 +203,26 @@ fn foreign_vcpu_claim_succeeds_without_a_race() {
 fn fiber_quota_spans_vcpus() {
     let src = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 2
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = thread.spawn 1 v1 v1
   v4 = thread.join v3
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = ref.func 2
   v1 = cont.new v0 varg
   return v1
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   return varg
+  }
 }
 "#;
     let m = module(src);

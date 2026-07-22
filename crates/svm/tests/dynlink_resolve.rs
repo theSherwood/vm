@@ -39,10 +39,11 @@ fn compile_host(src: &str) -> CompiledModule {
 /// A plugin authored against host `F` purely **by name** — its import handle is the `ConstI32`
 /// placeholder a slot binding patches into the `call_indirect` index.
 const PLUGIN_SRC: &str = "func (i32, i32) -> (i32) {\n\
-     block0(v0: i32, v1: i32):\n\
+     block 0 (v0: i32, v1: i32) {\n\
      \x20 v2 = i32.const 0\n\
-     \x20 v3 = call.import \"F\" (i32, i32) -> (i32) v2 (v0, v1)\n\
+     \x20 v3 = call.sym \"F\" (i32, i32) -> (i32) v2 (v0, v1)\n\
      \x20 return v3\n\
+       }\n\
      }\n";
 
 /// The §7 import section + `call.import` survive the binary form (v2 codec): a serialized unit can
@@ -64,11 +65,12 @@ fn host_assisted_resolve_links_a_serialized_plugin_by_name() {
     // The host program: `F(a,b) = a*2 + b`, at function/table slot 0 (also the entry).
     let mut cm = compile_host(
         "func (i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32):\n\
+         block 0 (v0: i32, v1: i32) {\n\
          \x20 v2 = i32.const 2\n\
          \x20 v3 = i32.mul v0 v2\n\
          \x20 v4 = i32.add v3 v1\n\
          \x20 return v4\n\
+           }\n\
          }\n",
     );
 
@@ -122,9 +124,10 @@ fn malformed_blob_fails_closed() {
 #[test]
 fn symbol_table_resolves_a_capability_import_by_name() {
     let unit = "func (i32, i64, i64) -> (i64) {\n\
-                block0(v0: i32, v1: i64, v2: i64):\n\
-                \x20 v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)\n\
+                block 0 (v0: i32, v1: i64, v2: i64) {\n\
+                \x20 v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)\n\
                 \x20 return v3\n\
+                  }\n\
                 }\n";
     let blob = encode_module(&parse_module(unit).expect("parse cap-importing unit"));
 
@@ -134,7 +137,7 @@ fn symbol_table_resolves_a_capability_import_by_name() {
     let funcs = jit_blob_validator(&blob, None, &symtab)
         .expect("the capability import resolves by name and re-verifies");
 
-    // Resolution lowered `call.import "write"` to a concrete `cap.call 3 1` (no import survives).
+    // Resolution lowered `call.sym "write"` to a concrete `cap.call 3 1` (no import survives).
     let lowered_to_cap_call = funcs[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(
             i,

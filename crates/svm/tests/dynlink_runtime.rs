@@ -38,28 +38,30 @@ fn plugin_calls_host_program_by_resolved_slot() {
     // The host program: `F(a,b) = a*2 + b`, at function/table slot 0 (also the entry).
     let mut cm = compile_host(
         "func (i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32):\n\
+         block 0 (v0: i32, v1: i32) {\n\
          \x20 v2 = i32.const 2\n\
          \x20 v3 = i32.mul v0 v2\n\
          \x20 v4 = i32.add v3 v1\n\
          \x20 return v4\n\
+           }\n\
          }\n",
     );
 
     // The plugin, authored against `F` purely **by name** — it has no idea what slot F is at.
     let plugin = parse_module(
         "func (i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32):\n\
+         block 0 (v0: i32, v1: i32) {\n\
          \x20 v2 = i32.const 0\n\
-         \x20 v3 = call.import \"F\" (i32, i32) -> (i32) v2 (v0, v1)\n\
+         \x20 v3 = call.sym \"F\" (i32, i32) -> (i32) v2 (v0, v1)\n\
          \x20 return v3\n\
+           }\n\
          }\n",
     )
     .expect("parse plugin");
     assert_eq!(plugin.imports.len(), 1, "the plugin imports F by name");
 
     // The link step: the loader knows F lives at the host's table slot 0 and binds the plugin's
-    // import to it — `call.import "F"` → `call_indirect 0`.
+    // import to it — `call.sym "F"` → `call_indirect 0`.
     let linked = svm_ir::resolve_imports_with(&plugin, |n| (n == "F").then_some(Resolved::Slot(0)))
         .expect("resolve plugin import to the host's slot");
     verify_module(&linked).expect("verify the linked plugin");
@@ -88,7 +90,8 @@ fn plugin_calls_host_program_by_resolved_slot() {
 #[test]
 fn loaded_client_links_to_a_newly_installed_service_by_name() {
     // A host reserving a 16-slot table (log2 = 4) so units can be installed into the padding slots.
-    let m = parse_module("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n").unwrap();
+    let m =
+        parse_module("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n").unwrap();
     verify_module(&m).unwrap();
     let mut cm = CompiledModule::compile(
         &m,
@@ -108,10 +111,11 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
     // Compile + install the "service" at runtime → its table slot (slot 1, past the host's 1 func).
     let service = parse_module(
         "func (i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32):\n\
+         block 0 (v0: i32, v1: i32) {\n\
          \x20 v2 = i32.mul v0 v0\n\
          \x20 v3 = i32.add v2 v1\n\
          \x20 return v3\n\
+           }\n\
          }\n",
     )
     .unwrap();
@@ -125,10 +129,11 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
     // the client — which now `call_indirect`s the slot into the installed service.
     let client = parse_module(
         "func (i32, i32) -> (i32) {\n\
-         block0(v0: i32, v1: i32):\n\
+         block 0 (v0: i32, v1: i32) {\n\
          \x20 v2 = i32.const 0\n\
-         \x20 v3 = call.import \"service\" (i32, i32) -> (i32) v2 (v0, v1)\n\
+         \x20 v3 = call.sym \"service\" (i32, i32) -> (i32) v2 (v0, v1)\n\
          \x20 return v3\n\
+           }\n\
          }\n",
     )
     .unwrap();

@@ -50,7 +50,7 @@ fn diff(src: &str) {
 fn nine_i64_results_returned_directly() {
     diff(
         "func () -> (i64, i64, i64, i64, i64, i64, i64, i64, i64) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i64.const 100\n\
          \x20 v1 = i64.const 101\n\
          \x20 v2 = i64.const 102\n\
@@ -61,6 +61,7 @@ fn nine_i64_results_returned_directly() {
          \x20 v7 = i64.const 107\n\
          \x20 v8 = i64.const 108\n\
          \x20 return v0 v1 v2 v3 v4 v5 v6 v7 v8\n\
+           }\n\
          }\n",
     );
 }
@@ -71,7 +72,7 @@ fn nine_i64_results_returned_directly() {
 fn mixed_i64_i32_results_via_sret() {
     diff(
         "func () -> (i64, i32, i64, i32, i64, i32) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i64.const 1000\n\
          \x20 v1 = i32.const 11\n\
          \x20 v2 = i64.const 2000\n\
@@ -79,13 +80,14 @@ fn mixed_i64_i32_results_via_sret() {
          \x20 v4 = i64.const 3000\n\
          \x20 v5 = i32.const 33\n\
          \x20 return v0 v1 v2 v3 v4 v5\n\
+           }\n\
          }\n",
     );
 }
 
 /// Six i64 consts as a reusable callee body for the call tests.
 const SIX_RESULT_CALLEE: &str = "func () -> (i64, i64, i64, i64, i64, i64) {\n\
-     block0():\n\
+     block 0 () {\n\
      \x20 v0 = i64.const 200\n\
      \x20 v1 = i64.const 201\n\
      \x20 v2 = i64.const 202\n\
@@ -93,6 +95,7 @@ const SIX_RESULT_CALLEE: &str = "func () -> (i64, i64, i64, i64, i64, i64) {\n\
      \x20 v4 = i64.const 204\n\
      \x20 v5 = i64.const 205\n\
      \x20 return v0 v1 v2 v3 v4 v5\n\
+       }\n\
      }\n";
 
 /// **Direct call to a many-result callee**: the caller allocates the return-area, passes it, and
@@ -101,9 +104,10 @@ const SIX_RESULT_CALLEE: &str = "func () -> (i64, i64, i64, i64, i64, i64) {\n\
 fn direct_call_to_many_result_fn() {
     diff(&format!(
         "func () -> (i64, i64, i64, i64, i64, i64) {{\n\
-         block0():\n\
+         block 0 () {{\n\
          \x20 v0, v1, v2, v3, v4, v5 = call 1()\n\
          \x20 return v0 v1 v2 v3 v4 v5\n\
+           }}\n\
          }}\n{SIX_RESULT_CALLEE}"
     ));
 }
@@ -114,10 +118,11 @@ fn direct_call_to_many_result_fn() {
 fn indirect_call_to_many_result_fn() {
     diff(&format!(
         "func () -> (i64, i64, i64, i64, i64, i64) {{\n\
-         block0():\n\
+         block 0 () {{\n\
          \x20 v0 = ref.func 1\n\
          \x20 v1, v2, v3, v4, v5, v6 = call_indirect () -> (i64, i64, i64, i64, i64, i64) v0()\n\
          \x20 return v1 v2 v3 v4 v5 v6\n\
+           }}\n\
          }}\n{SIX_RESULT_CALLEE}"
     ));
 }
@@ -128,8 +133,9 @@ fn indirect_call_to_many_result_fn() {
 fn tail_call_many_results() {
     diff(&format!(
         "func () -> (i64, i64, i64, i64, i64, i64) {{\n\
-         block0():\n\
+         block 0 () {{\n\
          \x20 return_call 1()\n\
+           }}\n\
          }}\n{SIX_RESULT_CALLEE}"
     ));
 }

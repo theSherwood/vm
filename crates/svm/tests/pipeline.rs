@@ -14,85 +14,98 @@ use svm_verify::{verify_module, VerifyError};
 
 const ADD: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 
 const CONST42: &str = r#"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 42
   return v0
+  }
 }
 "#;
 
 // sum = 1 + 2 + ... + N  (N >= 1), via a back-edge loop with block parameters.
 const LOOP_SUM: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 "#;
 
 // (v0 < v1) ? 100 : (v0 - v1)^2  — exercises sub/mul/lt_s/select/const.
 const ARITH: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.sub v0 v1
   v3 = i32.mul v2 v2
   v4 = i32.lt_s v0 v1
   v5 = i32.const 100
   v6 = select v4 v5 v3
   return v6
+  }
 }
 "#;
 
 // sign-extend i32 -> i64, then add a large i64 constant.
 const CONV: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.extend_i32_s v0
   v2 = i64.const 1000000000000
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
 
 const DIV: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.div_s v0 v1
   return v2
+  }
 }
 "#;
 
 // br_table: idx selects 10/20/30, else default 99.
 const BRTABLE: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
-  br_table v0 [block1(), block2(), block3()] block4()
-block1():
+block 0 (v0: i32) {
+  br_table v0 [1(), 2(), 3()] 4()
+}
+block 1 () {
   v1 = i32.const 10
   return v1
-block2():
+}
+block 2 () {
   v2 = i32.const 20
   return v2
-block3():
+}
+block 3 () {
   v3 = i32.const 30
   return v3
-block4():
+}
+block 4 () {
   v4 = i32.const 99
   return v4
+  }
 }
 "#;
 
@@ -128,7 +141,7 @@ fn text_roundtrip_is_identity() {
 fn data_section_parses_roundtrips_and_verifies() {
     // `data [ro] <offset> "<bytes>"` (§3a / D40): RO + RW segments, incl. non-UTF-8 bytes.
     let src = "data ro 16 \"hi\\x00\\xff\"\ndata 32 \"abc\"\nmemory 8\n\
-               func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n";
+               func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 0\n  return v0\n  }\n}\n";
     let m = parse_module(src).expect("parse");
     assert_eq!(
         m.data,
@@ -157,7 +170,7 @@ fn atomics_parse_roundtrip_and_verify() {
     // assert the text and binary serializations round-trip to the identical IR.
     let src = "memory 16\n\
         func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
+        block 0 (v0: i64) {\n\
         \x20 v1 = i32.atomic.load v0\n\
         \x20 v2 = i64.atomic.load v0 offset=8\n\
         \x20 i32.atomic.store v0 v1\n\
@@ -172,6 +185,7 @@ fn atomics_parse_roundtrip_and_verify() {
         \x20 v10 = i32.atomic.cmpxchg v0 v1 v3\n\
         \x20 v11 = i64.atomic.cmpxchg v0 v2 v9 offset=16\n\
         \x20 return v2\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -194,7 +208,7 @@ fn fibers_parse_roundtrip_and_verify() {
     // binary serializations round-trip to the identical IR. Func 1 is a fiber body
     // `(i64 sp, i64 arg) -> (i64)` that suspends once then returns; func 0 drives it.
     let src = "func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
+        block 0 (v0: i64) {\n\
         \x20 v1 = ref.func 1\n\
         \x20 v2 = i64.const 4096\n\
         \x20 v3 = cont.new v1 v2\n\
@@ -202,11 +216,13 @@ fn fibers_parse_roundtrip_and_verify() {
         \x20 v5, v6 = cont.resume v3 v4\n\
         \x20 v7, v8 = cont.resume v3 v6\n\
         \x20 return v8\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = suspend v1\n\
         \x20 return v2\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -226,7 +242,7 @@ fn fibers_parse_roundtrip_and_verify() {
 fn verify_rejects_out_of_window_data() {
     // window = 2^3 = 8 bytes; a 4-byte segment at offset 6 overruns `[0, 8)`.
     let src = "data 6 \"abcd\"\nmemory 3\n\
-               func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n";
+               func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 0\n  return v0\n  }\n}\n";
     let m = parse_module(src).expect("parse");
     assert!(matches!(
         verify_module(&m),
@@ -237,7 +253,7 @@ fn verify_rejects_out_of_window_data() {
 #[test]
 fn verify_rejects_data_without_memory() {
     let src = "data 0 \"x\"\n\
-               func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n";
+               func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 0\n  return v0\n  }\n}\n";
     let m = parse_module(src).expect("parse");
     assert!(matches!(
         verify_module(&m),
@@ -302,7 +318,7 @@ fn fiber_suspend_then_resume_threads_values() {
     // the resumer), then on the next resume adds 100 to the delivered value and returns it.
     // The root drives it: resume(10) -> (SUSPENDED, 10); resume(7) -> (RETURNED, 107).
     let src = "func () -> (i32, i64, i32, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -311,13 +327,15 @@ fn fiber_suspend_then_resume_threads_values() {
         \x20 v6 = i64.const 7\n\
         \x20 v7, v8 = cont.resume v2 v6\n\
         \x20 return v4 v5 v7 v8\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = suspend v1\n\
         \x20 v3 = i64.const 100\n\
         \x20 v4 = i64.add v2 v3\n\
         \x20 return v4\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -341,22 +359,25 @@ fn fiber_generator_loop_sums_a_sequence() {
     // resuming it, accumulating every delivered value until the status is RETURNED — a
     // workout for repeated resume/suspend with the fiber handle threaded as a block param.
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 0\n\
-        \x20 br block1(v2, v3)\n\
-        block1(v4: i64, v5: i64):\n\
+        \x20 br 1(v2, v3)\n\
+        }\n\
+        block 1 (v4: i64, v5: i64) {\n\
         \x20 v6 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v4 v6\n\
         \x20 v9 = i64.add v5 v8\n\
-        \x20 br_if v7 block2(v9) block1(v4, v9)\n\
-        block2(v10: i64):\n\
+        \x20 br_if v7 2(v9) 1(v4, v9)\n\
+        }\n\
+        block 2 (v10: i64) {\n\
         \x20 return v10\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 1\n\
         \x20 v3 = suspend v2\n\
         \x20 v4 = i64.const 2\n\
@@ -365,6 +386,7 @@ fn fiber_generator_loop_sums_a_sequence() {
         \x20 v7 = suspend v6\n\
         \x20 v8 = i64.const 4\n\
         \x20 return v8\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -380,7 +402,7 @@ fn fiber_nested_resume_chain() {
     // control returns to root. Then unwinding the other way to completion. Exercises a
     // resume chain deeper than one and `suspend` returning to the correct resumer.
     let src = "func () -> (i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -388,9 +410,10 @@ fn fiber_nested_resume_chain() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6, v7 = cont.resume v2 v3\n\
         \x20 return v5 v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = ref.func 2\n\
         \x20 v3 = i64.const 8192\n\
         \x20 v4 = cont.new v2 v3\n\
@@ -399,13 +422,15 @@ fn fiber_nested_resume_chain() {
         \x20 v8 = suspend v7\n\
         \x20 v9, v10 = cont.resume v4 v5\n\
         \x20 return v10\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 11\n\
         \x20 v3 = suspend v2\n\
         \x20 v4 = i64.const 22\n\
         \x20 return v4\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -421,7 +446,7 @@ fn fiber_resume_after_return_traps() {
     // Func 1 returns immediately (no suspend): the first resume yields (RETURNED, arg).
     // Resuming the now-`Done` fiber a second time is inert -> `FiberFault`.
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -429,10 +454,12 @@ fn fiber_resume_after_return_traps() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6, v7 = cont.resume v2 v3\n\
         \x20 return v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -444,10 +471,11 @@ fn fiber_resume_after_return_traps() {
 fn fiber_suspend_at_root_traps() {
     // `suspend` with no resumer (the root computation) traps rather than escaping.
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 5\n\
         \x20 v1 = suspend v0\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -460,11 +488,12 @@ fn fiber_forged_handle_is_inert() {
     // A forged handle (no fiber created) is masked into the table and resolves to the
     // running root, which is in the resume chain -> inert (`FiberFault`), never an escape.
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 999\n\
         \x20 v1 = i64.const 0\n\
         \x20 v2, v3 = cont.resume v0 v1\n\
         \x20 return v3\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -480,9 +509,10 @@ fn verifier_rejects_type_mismatch() {
     let m = parse_module(
         r#"
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.add v0 v0
   return v1
+  }
 }
 "#,
     )
@@ -635,9 +665,10 @@ fn div_traps() {
 
 const REM_S: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.rem_s v0 v1
   return v2
+  }
 }
 "#;
 
@@ -677,9 +708,10 @@ fn shifts_take_amount_mod_bitwidth() {
     // i32.shl by 33 == shl by 1 (amount mod 32).
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.shl v0 v1
   return v2
+  }
 }
 "#;
     assert_eq!(
@@ -694,10 +726,11 @@ fn verifier_rejects_select_type_mismatch() {
     let m = parse_module(
         r#"
 func (i32, i64) -> (i32) {
-block0(v0: i32, v1: i64):
+block 0 (v0: i32, v1: i64) {
   v2 = i32.const 1
   v3 = select v2 v0 v1
   return v3
+  }
 }
 "#,
     )
@@ -713,23 +746,25 @@ block0(v0: i32, v1: i64):
 // area = pi * r * r  (f64), then floor it to an i32 via trunc_sat.
 const CIRCLE: &str = r#"
 func (f64) -> (i32) {
-block0(v0: f64):
+block 0 (v0: f64) {
   v1 = f64.const 3.14159265358979
   v2 = f64.mul v0 v0
   v3 = f64.mul v1 v2
   v4 = f64.floor v3
   v5 = i32.trunc_sat_f64_s v4
   return v5
+  }
 }
 "#;
 
 // round-trip an i32 through f32 and back; also exercises convert + sqrt.
 const FSQRT: &str = r#"
 func (i32) -> (f32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = f32.convert_i32_s v0
   v2 = f32.sqrt v1
   return v2
+  }
 }
 "#;
 
@@ -764,7 +799,7 @@ fn float_arithmetic_results() {
 #[test]
 fn float_const_bits_roundtrip() {
     // f32.const printed and reparsed must preserve bits exactly.
-    let src = "func () -> (f32) {\nblock0():\n  v0 = f32.const 1.5\n  return v0\n}\n";
+    let src = "func () -> (f32) {\nblock 0 () {\n  v0 = f32.const 1.5\n  return v0\n  }\n}\n";
     let m = parse_module(src).unwrap();
     assert_eq!(m, parse_module(&print_module(&m)).unwrap());
     assert_eq!(run1(src, &[]), Ok(vec![Value::F32(1.5)]));
@@ -775,10 +810,11 @@ fn reinterpret_preserves_bits() {
     // f32.reinterpret_i32 then i32.reinterpret_f32 is identity on the bit pattern.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = f32.reinterpret_i32 v0
   v2 = i32.reinterpret_f32 v1
   return v2
+  }
 }
 "#;
     assert_eq!(
@@ -794,10 +830,11 @@ const MEM_ROUNDTRIP: &str = r#"
 memory 16
 
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   i64.store v0 v1
   v2 = i64.load v0
   return v2
+  }
 }
 "#;
 
@@ -806,10 +843,11 @@ const MEM_NARROW: &str = r#"
 memory 16
 
 func (i64, i32) -> (i32) {
-block0(v0: i64, v1: i32):
+block 0 (v0: i64, v1: i32) {
   i32.store8 v0 v1
   v2 = i32.load8_u v0
   return v2
+  }
 }
 "#;
 
@@ -845,10 +883,11 @@ fn narrow_store_load_truncates_and_extends() {
     let signed = r#"
 memory 16
 func (i64, i32) -> (i32) {
-block0(v0: i64, v1: i32):
+block 0 (v0: i64, v1: i32) {
   i32.store8 v0 v1
   v2 = i32.load8_s v0
   return v2
+  }
 }
 "#;
     assert_eq!(
@@ -866,10 +905,11 @@ fn confinement_faults_out_of_window_address() {
     let src = r#"
 memory 16
 func (i64, i64, i64) -> (i64) {
-block0(v0: i64, v1: i64, v2: i64):
+block 0 (v0: i64, v1: i64, v2: i64) {
   i64.store v0 v2
   v3 = i64.load v1
   return v3
+  }
 }
 "#;
     let big = 65536 + 8; // 2^16 + 8 — in the unmapped tail
@@ -897,9 +937,10 @@ fn access_crossing_window_top_faults() {
     let src = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.load v0
   return v1
+  }
 }
 "#;
     assert_eq!(run1(src, &[Value::I64(65536 - 4)]), Err(Trap::MemoryFault));
@@ -913,11 +954,12 @@ fn offset_immediate_folds_into_effective_address() {
     let src = r#"
 memory 16
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 777
   i32.store v0 v1 offset=16
   v2 = i32.load v0 offset=16
   return v2
+  }
 }
 "#;
     assert_eq!(run1(src, &[Value::I64(0)]), Ok(vec![Value::I32(777)]));
@@ -927,7 +969,7 @@ block0(v0: i64):
 fn verifier_rejects_memory_op_without_memory() {
     // load with no `memory` declaration -> rejected.
     let m = parse_module(
-        "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64.load v0\n  return v1\n}\n",
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.load v0\n  return v1\n  }\n}\n",
     )
     .unwrap();
     assert!(matches!(
@@ -941,53 +983,60 @@ fn verifier_rejects_memory_op_without_memory() {
 // func0 returns its arg + arg; func1 calls func0 and adds 1.
 const CALL_SIMPLE: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.add v0 v0
   return v1
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 0(v0)
   v2 = i32.const 1
   v3 = i32.add v1 v2
   return v3
+  }
 }
 "#;
 
 // recursive factorial: func0(n) = n <= 1 ? 1 : n * func0(n-1).
 const FACT: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.le_s v0 v1
-  br_if v2 block1() block2(v0)
-block1():
+  br_if v2 1() 2(v0)
+}
+block 1 () {
   v3 = i32.const 1
   return v3
-block2(v4: i32):
+}
+block 2 (v4: i32) {
   v5 = i32.const 1
   v6 = i32.sub v4 v5
   v7 = call 0(v6)
   v8 = i32.mul v4 v7
   return v8
+  }
 }
 "#;
 
 // func0 returns two values (quotient, remainder); func1 sums them.
 const CALL_MULTI: &str = r#"
 func (i32, i32) -> (i32, i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.div_s v0 v1
   v3 = i32.rem_s v0 v1
   return v2, v3
+  }
 }
 
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2, v3 = call 0(v0, v1)
   v4 = i32.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -1068,14 +1117,16 @@ fn verifier_rejects_call_arg_type_mismatch() {
     let m = parse_module(
         r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 0(v0)
   return v1
+  }
 }
 "#,
     )
@@ -1092,9 +1143,10 @@ fn unbounded_recursion_traps_not_overflows() {
     // StackOverflow (never crash the host stack), well within fuel.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 0(v0)
   return v1
+  }
 }
 "#;
     let m = load(&assemble(src).unwrap()).unwrap();
@@ -1112,15 +1164,17 @@ fn mutual_recursion_traps_not_overflows() {
     // StackOverflow (never host-stack recursion), well within fuel.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1(v0)
   return v1
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 0(v0)
   return v1
+  }
 }
 "#;
     let m = load(&assemble(src).unwrap()).unwrap();
@@ -1144,21 +1198,24 @@ fn run1at(src: &str, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
 // them via call_indirect on a funcref built with ref.func.
 const INDIRECT: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.sub v0 v1
   return v2
+  }
 }
 
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)
   return v3
+  }
 }
 "#;
 
@@ -1189,15 +1246,17 @@ fn indirect_call_type_mismatch_traps() {
     // trap on the signature check rather than misinterpret the call.
     let src = r#"
 func () -> () {
-block0():
+block 0 () {
   return
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 5
   v2 = call_indirect (i32, i32) -> (i32) v0 (v1, v1)
   return v2
+  }
 }
 "#;
     // index 0 selects the ()->() function -> signature mismatch.
@@ -1232,17 +1291,19 @@ fn ref_func_then_indirect_call() {
     // Build a funcref with ref.func, then call through it.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 100
   v2 = i32.add v0 v1
   return v2
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = ref.func 0
   v2 = call_indirect (i32) -> (i32) v1 (v0)
   return v2
+  }
 }
 "#;
     assert_eq!(run1at(src, 1, &[Value::I32(7)]), Ok(vec![Value::I32(107)]));
@@ -1253,13 +1314,14 @@ block0(v0: i32):
 // exercises clz/ctz/popcnt/rotl/rotr/extend8_s and an unreachable arm.
 const BITOPS: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.clz v0
   v2 = i32.ctz v0
   v3 = i32.add v1 v2
   v4 = i32.popcnt v0
   v5 = i32.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -1286,9 +1348,10 @@ fn bitops_roundtrip_and_compute() {
 fn rotate_ops() {
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.rotl v0 v1
   return v2
+  }
 }
 "#;
     // rotl(0x12345678, 8) = 0x34567812
@@ -1307,9 +1370,10 @@ block0(v0: i32, v1: i32):
 fn extend8_s_sign_extends() {
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.extend8_s v0
   return v1
+  }
 }
 "#;
     assert_eq!(
@@ -1326,13 +1390,16 @@ block0(v0: i32):
 fn unreachable_traps() {
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
-  br_if v0 block1() block2()
-block1():
+block 0 (v0: i32) {
+  br_if v0 1() 2()
+}
+block 1 () {
   unreachable
-block2():
+}
+block 2 () {
   v1 = i32.const 7
   return v1
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -1350,16 +1417,19 @@ block2():
 // Values flow between blocks only through block parameters (block-local SSA).
 const TAILSUM: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.eqz v0
-  br_if v2 block1(v1) block2(v0, v1)
-block1(v3: i32):
+  br_if v2 1(v1) 2(v0, v1)
+}
+block 1 (v3: i32) {
   return v3
-block2(v4: i32, v5: i32):
+}
+block 2 (v4: i32, v5: i32) {
   v6 = i32.const -1
   v7 = i32.add v4 v6
   v8 = i32.add v5 v4
   return_call 0(v7, v8)
+  }
 }
 "#;
 
@@ -1404,17 +1474,20 @@ fn return_call_indirect_tail_dispatches() {
     // The tail-sum body, but tail-calling *indirectly* through table index 0.
     let src = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.eqz v0
-  br_if v2 block1(v1) block2(v0, v1)
-block1(v3: i32):
+  br_if v2 1(v1) 2(v0, v1)
+}
+block 1 (v3: i32) {
   return v3
-block2(v4: i32, v5: i32):
+}
+block 2 (v4: i32, v5: i32) {
   v6 = i32.const -1
   v7 = i32.add v4 v6
   v8 = i32.add v5 v4
   v9 = i32.const 0
   return_call_indirect (i32, i32) -> (i32) v9 (v7, v8)
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -1433,14 +1506,16 @@ fn verifier_rejects_tail_call_result_mismatch() {
     let m = parse_module(
         r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   return v1
+  }
 }
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return_call 0(v0)
+  }
 }
 "#,
     )
@@ -1455,9 +1530,10 @@ block0(v0: i32):
 
 const TRUNC_TRAP: &str = r#"
 func (f64) -> (i32) {
-block0(v0: f64):
+block 0 (v0: f64) {
   v1 = i32.trunc_f64_s v0
   return v1
+  }
 }
 "#;
 
@@ -1503,16 +1579,18 @@ fn trapping_vs_saturating_trunc_differ_out_of_range() {
     // Same input, two ops: trunc_sat clamps, trunc traps.
     let sat = r#"
 func (f32) -> (i32) {
-block0(v0: f32):
+block 0 (v0: f32) {
   v1 = i32.trunc_sat_f32_s v0
   return v1
+  }
 }
 "#;
     let trap = r#"
 func (f32) -> (i32) {
-block0(v0: f32):
+block 0 (v0: f32) {
   v1 = i32.trunc_f32_s v0
   return v1
+  }
 }
 "#;
     assert_eq!(
@@ -1530,11 +1608,12 @@ fn ptr_ops_roundtrip_and_compute() {
     // base + offset via ptr.add, bracketed by from_int/to_int provenance casts.
     let src = r#"
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = ptr.from_int v0
   v3 = ptr.add v2 v1
   v4 = ptr.to_int v3
   return v4
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -1560,9 +1639,10 @@ fn verifier_rejects_newer_op_violations() {
             "indirect index not i32",
             r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call_indirect (i64) -> (i64) v0 (v0)
   return v1
+  }
 }
 "#,
         ),
@@ -1571,9 +1651,10 @@ block0(v0: i64):
             "ptr.add on i32",
             r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = ptr.add v0 v0
   return v1
+  }
 }
 "#,
         ),
@@ -1582,9 +1663,10 @@ block0(v0: i32):
             "trunc on i32",
             r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.trunc_f64_s v0
   return v1
+  }
 }
 "#,
         ),
@@ -1594,9 +1676,10 @@ block0(v0: i32):
             r#"
 memory 16
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   i32.store v0 v1
   return v1
+  }
 }
 "#,
         ),
@@ -1613,7 +1696,7 @@ block0(v0: i32, v1: i32):
 #[test]
 fn verifier_rejects_oversized_memory() {
     // A window of 1 << 64 is not representable -> rejected.
-    let m = parse_module("memory 64\nfunc () -> () {\nblock0():\n  return\n}\n").unwrap();
+    let m = parse_module("memory 64\nfunc () -> () {\nblock 0 () {\n  return\n  }\n}\n").unwrap();
     assert!(matches!(
         verify_module(&m),
         Err(VerifyError::MemorySizeTooLarge { .. })
@@ -1623,7 +1706,7 @@ fn verifier_rejects_oversized_memory() {
 #[test]
 fn verifier_rejects_ref_func_out_of_range() {
     let m = parse_module(
-        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = ref.func 9\n  return v0\n}\n",
+        "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = ref.func 9\n  return v0\n  }\n}\n",
     )
     .unwrap();
     assert!(matches!(
@@ -1639,7 +1722,7 @@ const CAP_WRITE: &str = r#"
 memory 16
 
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i32.const 72
   i32.store8 v1 v2
@@ -1650,6 +1733,7 @@ block0(v0: i32):
   v6 = i64.const 2
   v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
+  }
 }
 "#;
 
@@ -1674,12 +1758,13 @@ const CAP_READ: &str = r#"
 memory 16
 
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 4
   v3 = cap.call 0 0 (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.load8_u v1
   return v4
+  }
 }
 "#;
 
@@ -1702,10 +1787,11 @@ fn cap_stream_read_fills_memory() {
 // exit(code) is noreturn; the frontend emits `unreachable` after it.
 const CAP_EXIT: &str = r#"
 func (i32) -> () {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 7
   cap.call 1 0 (i32) -> () v0 (v1)
   unreachable
+  }
 }
 "#;
 
@@ -1722,10 +1808,11 @@ fn cap_exit_traps_with_code() {
 
 const CAP_CLOCK: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
   return v2
+  }
 }
 "#;
 
@@ -1802,11 +1889,12 @@ const CAP_WRITE_OOB: &str = r#"
 memory 16
 
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 100000
   v3 = cap.call 0 1 (i64, i64) -> (i64) v0 (v1, v2)
   return v3
+  }
 }
 "#;
 
@@ -1826,7 +1914,7 @@ fn cap_buffer_out_of_range_is_efault_not_trap() {
 fn verifier_rejects_cap_call_non_i32_handle() {
     // The handle operand must be the i32 index; an i64 handle is rejected.
     let m = parse_module(
-        "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = cap.call 2 0 () -> (i64) v0 ()\n  return v1\n}\n",
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = cap.call 2 0 () -> (i64) v0 ()\n  return v1\n  }\n}\n",
     )
     .unwrap();
     assert!(matches!(

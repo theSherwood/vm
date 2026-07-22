@@ -56,7 +56,7 @@ fn concurrent_atomic_shared_counter_agrees() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 100
   v2 = thread.spawn 1 v0 v1
@@ -70,24 +70,29 @@ block0():
   v10 = i64.const 8
   v11 = i64.atomic.load v10
   return v11
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 8
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 ";
     let init = vec![0u8; 65536];
@@ -117,7 +122,7 @@ fn concurrent_disjoint_plain_stores_confine() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 0
   v2 = thread.spawn 1 v0 v1
@@ -133,13 +138,15 @@ block0():
   v12 = thread.join v8
   v13 = i64.const 0
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i32.const 170
   i32.store8 v0 v1
   v2 = i64.const 0
   return v2
+  }
 }
 ";
     let init = vec![0u8; 65536];
@@ -172,7 +179,7 @@ fn concurrent_out_of_window_atomic_faults_from_thread() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 100
   v2 = thread.spawn 1 v0 v1
@@ -185,24 +192,29 @@ block0():
   v9 = thread.join v5
   v10 = i64.const 0
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 65544
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 ";
     let m = svm::text::parse_module(src).expect("parse");
@@ -237,20 +249,22 @@ fn concurrent_tail_access_detect_and_kills_from_thread() {
     let src = "\
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = i64.const 0
   return v3
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v1 = i64.const 1048576
   v2 = i32.const 123
   i32.store8 v1 v2
   v3 = i64.const 0
   return v3
+  }
 }
 ";
     let m = svm::text::parse_module(src).expect("parse");

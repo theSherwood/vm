@@ -67,7 +67,7 @@ fn check(src: &str) -> (Exhaustive, Exhaustive) {
 const ATOMIC_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -77,13 +77,15 @@ block0():
   vaddr = i64.const 0
   vr = i64.atomic.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vrmw = i64.atomic.rmw.add vaddr varg
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -93,7 +95,7 @@ block0(vsp: i64, varg: i64):
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -103,15 +105,17 @@ block0():
   vaddr = i64.const 0
   vr = i64.load vaddr
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vaddr = i64.const 0
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -123,7 +127,7 @@ block0(vsp: i64, varg: i64):
 const STORE_BUFFER: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 0
   vh0 = thread.spawn 1 vsp va
@@ -134,24 +138,27 @@ block0():
   vt = i64.mul vj0 v2
   vres = i64.add vt vj1
   return vres
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vx = i64.const 0
   v1 = i64.const 1
   i64.store vx v1
   vy = i64.const 8
   vr = i64.load vy
   return vr
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vy = i64.const 8
   v1 = i64.const 1
   i64.store vy v1
   vx = i64.const 0
   vr = i64.load vx
   return vr
+  }
 }
 "#;
 
@@ -161,7 +168,7 @@ block0(vsp: i64, varg: i64):
 const INDEPENDENT_STORES: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 0
   vh0 = thread.spawn 1 vsp va
@@ -170,9 +177,10 @@ block0():
   vj1 = thread.join vh1
   vz = i64.const 0
   return vz
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v1 = i64.const 1
   va0 = i64.const 0
   i64.store va0 v1
@@ -182,9 +190,10 @@ block0(vsp: i64, varg: i64):
   i64.store va16 v1
   vz = i64.const 0
   return vz
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v1 = i64.const 2
   va0 = i64.const 32
   i64.store va0 v1
@@ -194,6 +203,7 @@ block0(vsp: i64, varg: i64):
   i64.store va16 v1
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -260,7 +270,7 @@ fn dpor_reduces_independent_stores() {
 const TWO_CLUSTERS_ATOMIC: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
@@ -279,20 +289,23 @@ block0():
   vt = i64.mul vrx v16
   vres = i64.add vt vry
   return vres
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vx = i64.const 0
   vr = i64.atomic.rmw.add vx varg
   vz = i64.const 0
   return vz
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vy = i64.const 8
   vr = i64.atomic.rmw.add vy varg
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 
@@ -304,7 +317,7 @@ block0(vsp: i64, varg: i64):
 const TWO_CLUSTERS_RACY: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vsp = i64.const 0
   va = i64.const 0
   vh0 = thread.spawn 1 vsp va
@@ -323,9 +336,10 @@ block0():
   vt = i64.mul vrx v16
   vres = i64.add vt vry
   return vres
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vx = i64.const 0
   vc = i64.load vx
   v1 = i64.const 1
@@ -333,9 +347,10 @@ block0(vsp: i64, varg: i64):
   i64.store vx vn
   vz = i64.const 0
   return vz
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vy = i64.const 8
   vc = i64.load vy
   v1 = i64.const 1
@@ -343,6 +358,7 @@ block0(vsp: i64, varg: i64):
   i64.store vy vn
   vz = i64.const 0
   return vz
+  }
 }
 "#;
 

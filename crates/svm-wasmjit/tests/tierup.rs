@@ -190,28 +190,31 @@ const SWEEP: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000, i64::MIN, i64:
 const SPAWN: &str = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 500
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = i64.const 0
   v4 = i64.atomic.load v3
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = call 2 (v0)
   v2 = i64.const 0
   v3 = i64.atomic.rmw.add v2 v1
   v4 = i64.const 0
   return v4
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 2
   v2 = i64.mul v0 v1
   v3 = i64.sub v2 v0
   return v3
+  }
 }
 "#;
 
@@ -229,28 +232,32 @@ fn spawn_only_leaf_is_eligible_and_matches() {
 /// direct call routes to an emitted target), so the tier-up module can run either as an entry.
 const TRANSITIVE: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = call 2 (v0)
   return v1
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 3 (v0)
   v2 = i64.const 7
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 "#;
 
@@ -277,23 +284,26 @@ fn transitive_pure_leaves_both_emitted() {
 const UNROUTABLE_CALLER: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 1 (v0)
   return v1
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.const 1
   v3 = atomic.notify v1 v2
   v4 = call 2 (v0)
   return v4
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 11
   v2 = i64.add v0 v1
   return v2
+  }
 }
 "#;
 
@@ -312,17 +322,19 @@ fn caller_of_nonleaf_is_dropped() {
 /// the whole-module path), so enabling tier-up never regresses a JITtable guest.
 const ALL_SUBSET: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 1 (v0)
   v2 = i64.const 1
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 10
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 "#;
 

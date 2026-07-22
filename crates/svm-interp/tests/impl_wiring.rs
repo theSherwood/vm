@@ -232,10 +232,11 @@ fn a_wired_import_slot_runs_on_both_engines() {
     let m = svm_text::parse_module(
         "import 0 \"adder\" (i64, i64) -> (i64)\n\
          func (i64, i64) -> (i64) {\n\
-         block0(va: i64, vb: i64):\n\
+         block 0 (va: i64, vb: i64) {\n\
            vh = i32.const 0\n\
-           vr = call.import 0 vh (va, vb)\n\
+           vr = call.import 0 (va, vb)\n\
            return vr\n\
+           }\n\
          }\n",
     )
     .expect("parse");
@@ -392,13 +393,14 @@ fn counter_provider() -> svm_ir::Module {
     svm_text::parse_module(
         "memory 16\n\
          func () -> (i64) {\n\
-         block0():\n\
+         block 0 () {\n\
            va = i64.const 0\n\
            vc = i64.load va\n\
            v1 = i64.const 1\n\
            vn = i64.add vc v1\n\
            i64.store va vn\n\
            return vn\n\
+           }\n\
          }\n",
     )
     .expect("provider parses")
@@ -465,7 +467,7 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
          data 0 \"hi\"\n\
          data 8 \"out\"\n\
          func () -> (i64) {\n\
-         block0():\n\
+         block 0 () {\n\
            vp = i64.const 8\n\
            vn = i64.const 3\n\
            vh = cap.self.resolve vp vn\n\
@@ -473,6 +475,7 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
            vlen = i64.const 2\n\
            vw = cap.call 0 1 (i64, i64) -> (i64) vh (vbuf, vlen)\n\
            return vw\n\
+           }\n\
          }\n",
     )
     .expect("provider parses");
@@ -577,14 +580,16 @@ fn provider_module() -> svm_ir::Module {
          type 2 interface { add: 0, dbl: 1 }\n\
          export 0 interface \"svc\" 2 { add: 0, dbl: 1 }\n\n\
          func (i64, i64) -> (i64) {\n\
-         block0(va: i64, vb: i64):\n\
+         block 0 (va: i64, vb: i64) {\n\
            vs = i64.add va vb\n\
            return vs\n\
+           }\n\
          }\n\n\
          func (i64) -> (i64) {\n\
-         block0(va: i64):\n\
+         block 0 (va: i64) {\n\
            vs = i64.add va va\n\
            return vs\n\
+           }\n\
          }\n",
     )
     .expect("provider parses")
@@ -609,10 +614,11 @@ fn grouped_import_coverage_binds_a_subset_with_a_remap() {
          type 1 interface { dbl: 0 }\n\
          import 0 interface \"svc\" 1\n\n\
          func (i64) -> (i64) {\n\
-         block0(va: i64):\n\
+         block 0 (va: i64) {\n\
            vh = i32.const 0\n\
-           vr = call.import 0.dbl vh (va)\n\
+           vr = call.import 0.dbl (va)\n\
            return vr\n\
+           }\n\
          }\n",
     )
     .expect("consumer parses");
@@ -644,17 +650,19 @@ fn reflection_and_dyn_dispatch_run_over_the_registered_self_module() {
          type 2 interface { add: 0, dbl: 1 }\n\
          export 0 interface \"svc\" 2 { add: 0, dbl: 1 }\n\n\
          func (i64, i64) -> (i64) {\n\
-         block0(va: i64, vb: i64):\n\
+         block 0 (va: i64, vb: i64) {\n\
            vs = i64.add va vb\n\
            return vs\n\
+           }\n\
          }\n\n\
          func (i64) -> (i64) {\n\
-         block0(va: i64):\n\
+         block 0 (va: i64) {\n\
            vs = i64.add va va\n\
            return vs\n\
+           }\n\
          }\n\n\
          func (i64, i64) -> (i64) {\n\
-         block0(va: i64, vb: i64):\n\
+         block 0 (va: i64, vb: i64) {\n\
            vt = cap.self.type_id 2\n\
            vh = export.handle 0\n\
            vc = cap.self.covers vh 2\n\
@@ -662,6 +670,7 @@ fn reflection_and_dyn_dispatch_run_over_the_registered_self_module() {
            vcov = i64.extend_i32_u vc\n\
            vsum = i64.add vr vcov\n\
            return vsum\n\
+           }\n\
          }\n";
     let m = Arc::new(svm_text::parse_module(src).expect("parses"));
     svm_verify::verify_module(&m).expect("verifies");
@@ -714,10 +723,11 @@ fn grouped_attach_runs_the_coverage_walk_and_refreshes_the_remap() {
          type 1 interface { dbl: 0 }\n\
          import 0 interface \"nothing\" 1 rebindable\n\n\
          func (i64) -> (i64) {\n\
-         block0(va: i64):\n\
+         block 0 (va: i64) {\n\
            vh = i32.const 0\n\
-           vr = call.import 0.dbl vh (va)\n\
+           vr = call.import 0.dbl (va)\n\
            return vr\n\
+           }\n\
          }\n",
     )
     .expect("consumer parses");

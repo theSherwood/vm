@@ -73,61 +73,72 @@ fn main() {
 /// `acc += n; n -= 1` until zero — a pure scalar/branch recurrence (the ALU kernel).
 const ALU: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const 1
   v6 = i32.sub v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 "#;
 
 /// Each iteration calls a leaf `+1` function — the call/return kernel (window open/close cost).
 const CALL: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = call 1(v3)
   v5 = i32.const 1
   v6 = i32.sub v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 
 /// Each iteration dispatches through the `call_indirect` table — mask + slot read + type-check.
 const CALL_INDIRECT: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.const 1
   v5 = call_indirect (i32) -> (i32) v4 (v3)
   v6 = i32.const 1
   v7 = i32.sub v2 v6
-  br_if v7 block1(v7, v5) block2(v5)
-block2(v8: i32):
+  br_if v7 1(v7, v5) 2(v5)
+}
+block 2 (v8: i32) {
   return v8
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 
@@ -135,10 +146,11 @@ block0(v0: i32):
 /// Phase 2 (width-specialized load/store + inlined confinement) targets.
 const MEM: &str = r#"memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i64.const 0
   i32.store v4 v3
   v5 = i32.load v4
@@ -146,9 +158,11 @@ block1(v2: i32, v3: i32):
   v7 = i32.add v5 v6
   v8 = i32.const 1
   v9 = i32.sub v2 v8
-  br_if v9 block1(v9, v7) block2(v7)
-block2(v10: i32):
+  br_if v9 1(v9, v7) 2(v7)
+}
+block 2 (v10: i32) {
   return v10
+  }
 }
 "#;
 

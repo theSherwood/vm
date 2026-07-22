@@ -17,30 +17,35 @@ const STACK = 1 << 20;
 // pure-compute leaf `f(x)=x*3+7`, the tier-up target. Result = Σ_{i=0}^{4}(3i+7) = 30+35 = 65.
 const SRC = `
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 5
   v2 = i64.const 0
   v3 = i64.const 0
-  br block1(v1, v3, v2)
-block1(v4: i64, v5: i64, v6: i64):
+  br 1(v1, v3, v2)
+}
+block 1 (v4: i64, v5: i64, v6: i64) {
   v7 = i64.lt_s v6 v4
-  br_if v7 block2(v4, v5, v6) block3(v5)
-block2(v8: i64, v9: i64, v10: i64):
+  br_if v7 2(v4, v5, v6) 3(v5)
+}
+block 2 (v8: i64, v9: i64, v10: i64) {
   v11 = call 1 (v10)
   v12 = i64.add v9 v11
   v13 = i64.const 1
   v14 = i64.add v10 v13
-  br block1(v8, v12, v14)
-block3(v15: i64):
+  br 1(v8, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   v3 = i64.const 7
   v4 = i64.add v2 v3
   return v4
+  }
 }
 `;
 
@@ -49,18 +54,20 @@ block0(v0: i64):
 // surfaces as a vCPU trap. Mirrors vcpu_tierup.rs SRC_TRAP.
 const SRC_TRAP = `
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = call 1 (v1)
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.sub v0 v1
   v3 = i64.const 100
   v4 = i64.div_s v3 v2
   return v4
+  }
 }
 `;
 

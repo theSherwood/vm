@@ -1081,14 +1081,23 @@ with its reason recorded:
 - **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
   built-in shapes await their consumers; grouped binding works today through child
   manifests and host-side wiring.
-- **Legacy text forms still parse and should be retired.** The parser accepts the
-  pre-§3.5 spellings — `blockN(…):` indentation labels, unindexed `func` headers,
-  `export "name" N`, the `impl` offer spelling, inline-signature imports, name-inline
-  `call.import "name" (sig)`, bare-index interface/offer elements — as input sugar
-  only; the printer emits none of them. Retirement is a mechanical slice: migrate the
-  hand-written corpora (~2.5k legacy block labels across tests/examples, plus the
-  embedded text-IR generator strings in `svm-posix`) via parse-old → print-new, then
-  delete the legacy parse paths. No wire change; no functionality change.
+- **[BUILT 2026-07-22] Legacy text retirement — the dual grammars are gone.** The
+  parser now rejects the pre-§3.5 spellings: `blockN(…):` indentation labels (braced
+  `block N (…) { … }` only, numeric branch targets), unindexed `export "name" N` and
+  the `impl` offer spelling (indexed `export N func|interface …` only), the name-inline
+  form under the `call.import` keyword, and the retired pre-v8 handle operand on
+  indexed `call.import`. ~2.2k legacy block labels were migrated across the corpora,
+  the text-emitting producers (chibicc's `codegen_ir.c`, the writeln!-style test
+  generators) now emit the settled surface, and negative tests pin every rejection so
+  a legacy path cannot quietly grow back. **Deliberately kept — parts of the one
+  grammar, not legacy:** optional checked `func N`/`type N` labels (same production,
+  optional token; the printer always emits them; ~1.3k unindexed fixture headers make
+  mandatory indices pure churn for zero grammar simplification), and the two
+  *streaming sugars* that are chibicc's emission ABI — inline-signature imports
+  (`import N "name" (sig)`, interning into the type section) and name-inline
+  **`call.sym "name" (sig) v<h> (args)`** (interning the name as a flat import; a
+  streaming frontend cannot pre-collect its import table). No wire change; no
+  functionality change.
 
 ### 3.6 The unified execution model — one world per domain  [DESIGNED 2026-07-21; subsumes the two-world split when the fiber slice lands]
 

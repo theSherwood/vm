@@ -81,71 +81,83 @@ fn min_run(n: i32, run_one: &impl Fn(i32)) -> f64 {
 /// `acc += n; n -= 1` until zero — a pure scalar/branch recurrence (sum 1..n, i32).
 const ALU: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const 1
   v6 = i32.sub v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 "#;
 
 /// Each iteration calls a leaf `+1` function — the call/return kernel (window open/close cost).
 const CALL: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = call 1(v3)
   v5 = i32.const 1
   v6 = i32.sub v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 
 /// Each iteration dispatches through the `call_indirect` table — mask + slot read + type-check.
 const CALL_INDIRECT: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.const 1
   v5 = call_indirect (i32) -> (i32) v4 (v3)
   v6 = i32.const 1
   v7 = i32.sub v2 v6
-  br_if v7 block1(v7, v5) block2(v5)
-block2(v8: i32):
+  br_if v7 1(v7, v5) 2(v5)
+}
+block 2 (v8: i32) {
   return v8
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 
 /// Each iteration does one `i32.store` + one `i32.load` at a fixed address — the memory kernel.
 const MEM: &str = r#"memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i64.const 0
   i32.store v4 v3
   v5 = i32.load v4
@@ -153,9 +165,11 @@ block1(v2: i32, v3: i32):
   v7 = i32.add v5 v6
   v8 = i32.const 1
   v9 = i32.sub v2 v8
-  br_if v9 block1(v9, v7) block2(v7)
-block2(v10: i32):
+  br_if v9 1(v9, v7) 2(v7)
+}
+block 2 (v10: i32) {
   return v10
+  }
 }
 "#;
 
@@ -180,7 +194,7 @@ fn chase_src(mem_log2: u32, size: u32, lcg: bool) -> String {
     format!(
         "memory {mem_log2}
 func (i32) -> (i64) {{
-block0(v0: i32):
+block 0 (v0: i32) {{
   vi0 = i32.const 0
   vrem0 = i32.const {size}
   br binit(vi0, vrem0, v0)
@@ -208,6 +222,7 @@ bchase(vidx: i32, vhops: i64, vk: i32):
   br_if vk2 bchase(vloaded, vhops2, vk2) bret(vhops2)
 bret(vh: i64):
   return vh
+  }}
 }}
 "
     )
@@ -219,7 +234,7 @@ bret(vh: i64):
 /// fixed prelude that cancels in the subtraction).
 const FNV: &str = r#"memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   fi0 = i32.const 0
   frem0 = i32.const 4096
   br finit(fi0, frem0, v0)
@@ -249,6 +264,7 @@ fhash(hrem: i32, hh: i32):
   br_if hrem3 fhash(hrem3, hh2) fret(hh2)
 fret(hf: i32):
   return hf
+  }
 }
 "#;
 
@@ -257,7 +273,7 @@ fret(hf: i32):
 /// Returns `trunc(acc)` so every backend returns an `i32` (no f64-return plumbing in the drivers).
 const FMA: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   pacc0 = f64.const 1.0
   br ploop(v0, pacc0)
 ploop(pk: i32, pacc: f64):
@@ -271,6 +287,7 @@ ploop(pk: i32, pacc: f64):
 pdone(paccf: f64):
   pr = i32.trunc_f64_s paccf
   return pr
+  }
 }
 "#;
 
@@ -280,7 +297,7 @@ pdone(paccf: f64):
 /// — exposing the vectorization gap. Array rebuilt inside (cancels in the subtraction).
 const VSUM: &str = r#"memory 20
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   si0 = i32.const 0
   srem0 = i32.const 262144
   br vinit(si0, srem0, v0)
@@ -307,6 +324,7 @@ vsumloop(vk: i32, vsum: i32, vc: i32):
   br_if vsrem vsumloop(vk2, vsum2, vc) vsret(vsum2)
 vsret(vsf: i32):
   return vsf
+  }
 }
 "#;
 

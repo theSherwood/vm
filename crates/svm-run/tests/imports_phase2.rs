@@ -17,7 +17,7 @@ const ATTACH_START: &str = "memory 17\n\
 import 0 \"out\" (i64, i64) -> (i64) rebindable\n\
 import 1 \"exit\" (i32) -> ()\n\
 func () -> () {\n\
-block0():\n\
+block 0 () {\n\
   vc0 = i32.const 108\n\
   va0 = i64.const 0\n\
   i32.store8 va0 vc0\n\
@@ -48,12 +48,13 @@ block0():\n\
   vst = import.attach 0 vh\n\
   vbuf = i64.const 32\n\
   vn = i64.const 2\n\
-  vw = call.import 0 vh (vbuf, vn)\n\
+  vw = call.import 0 (vbuf, vn)\n\
   vcode = i32.const 7\n\
-  call.import 1 vh (vcode)\n\
+  call.import 1 (vcode)\n\
   unreachable\n\
+  }\n\
 }\n\
-export \"_start\" 0\n";
+export 0 func \"_start\" 0\n";
 
 fn registry() -> Imports {
     Imports::new()
@@ -102,7 +103,7 @@ fn attach_wrong_type_returns_einval() {
 import 0 \"out\" (i64, i64) -> (i64) rebindable\n\
 import 1 \"exit\" (i32) -> ()\n\
 func () -> () {\n\
-block0():\n\
+block 0 () {\n\
   vc0 = i32.const 101\n\
   va0 = i64.const 0\n\
   i32.store8 va0 vc0\n\
@@ -119,10 +120,11 @@ block0():\n\
   vl = i64.const 4\n\
   vh = cap.self.resolve vp vl\n\
   vst = import.attach 0 vh\n\
-  call.import 1 vh (vst)\n\
+  call.import 1 (vst)\n\
   unreachable\n\
+  }\n\
 }\n\
-export \"_start\" 0\n";
+export 0 func \"_start\" 0\n";
     let m = parse_module(guest).expect("parse");
     let inst = instantiate_with_imports(m, registry()).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
@@ -144,16 +146,17 @@ fn unattached_rebindable_slot_traps() {
 import 0 \"out\" (i64, i64) -> (i64) rebindable\n\
 import 1 \"exit\" (i32) -> ()\n\
 func () -> () {\n\
-block0():\n\
+block 0 () {\n\
   vph = i32.const 0\n\
   vbuf = i64.const 32\n\
   vn = i64.const 2\n\
-  vw = call.import 0 vph (vbuf, vn)\n\
+  vw = call.import 0 (vbuf, vn)\n\
   vcode = i32.const 0\n\
-  call.import 1 vph (vcode)\n\
+  call.import 1 (vcode)\n\
   unreachable\n\
+  }\n\
 }\n\
-export \"_start\" 0\n";
+export 0 func \"_start\" 0\n";
     let m = parse_module(guest).expect("parse");
     let inst = instantiate_with_imports(m, registry()).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
@@ -175,10 +178,11 @@ fn attach_static_rules_fail_closed() {
     let m = parse_module(
         "import 0 \"x\" (i64) -> (i64)\n\
 func () -> () {\n\
-block0():\n\
+block 0 () {\n\
   vh = i32.const 0\n\
   vs = import.attach 0 vh\n\
   return\n\
+  }\n\
 }\n",
     )
     .expect("parse");
@@ -192,10 +196,11 @@ block0():\n\
     // Attach past the manifest.
     let m = parse_module(
         "func () -> () {\n\
-block0():\n\
+block 0 () {\n\
   vh = i32.const 0\n\
   vs = import.attach 3 vh\n\
   return\n\
+  }\n\
 }\n",
     )
     .expect("parse");
@@ -228,10 +233,11 @@ fn manifest_completeness_bit() {
     );
     let dynamic = parse_module(
         "func (i32) -> () {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   v1 = i64.const 0\n\
   v2 = cap.call 0 1 (i64, i64) -> (i64) v0 (v1, v1)\n\
   return\n\
+  }\n\
 }\n",
     )
     .expect("parse");
@@ -244,10 +250,11 @@ block0(v0: i32):\n\
     // querying them must not cost the completeness bit.
     let self_query = parse_module(
         "func (i32) -> (i32) {\n\
-block0(v0: i32):\n\
+block 0 (v0: i32) {\n\
   v1 = i64.const 0\n\
   v2 = cap.call 4294967295 5 (i64) -> (i32) v0 (v1)\n\
   return v2\n\
+  }\n\
 }\n",
     )
     .expect("parse");

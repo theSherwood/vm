@@ -97,7 +97,7 @@ try {
 
   // A parse error pins the offending line in that card's editor: a bad opcode on line 3 (unique token).
   await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
-    'func () -> (i64) {\nblock0():\n  v0 = i64.notanopcode 1\n  return v0\n}'), card('hello'));
+    'func () -> (i64) {\nblock 0 () {\n  v0 = i64.notanopcode 1\n  return v0\n  }\n}'), card('hello'));
   await runCard(page, 'hello');
   const mark = await page.evaluate((sel) => {
     const cm = document.querySelector(`${sel} .CodeMirror`).CodeMirror;
@@ -113,7 +113,7 @@ try {
     : fail(`error decoration: ${JSON.stringify(mark)}`);
   // Editing clears the decoration.
   await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
-    'func () -> (i64) {\nblock0():\n  v0 = i64.const 1\n  return v0\n}'), card('hello'));
+    'func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}'), card('hello'));
   const cleared = await page.evaluate((sel) => !document.querySelector(`${sel} .cm-error-widget`), card('hello'));
   cleared ? ok('error decoration clears on edit') : fail('error decoration not cleared on edit');
 
@@ -416,10 +416,10 @@ try {
       vars: document.querySelector(`${sel} .dbg-vars`).textContent,
     };
   }, ftCard);
-  // ≥3 live chips (root + two workers), the stop is inside the fiber (line 35), and the stopped vCPU is a
+  // ≥3 live chips (root + two workers), the stop is inside the fiber (line 37), and the stopped vCPU is a
   // worker (thread id ≠ 1, the root).
-  ftPaused.count >= 3 && ftPaused.stopLine && /line 35\b/.test(ftPaused.vars) && ftPaused.stopped !== '1'
-    ? ok(`fibers+threads card: a worker (thread ${ftPaused.stopped}) stopped inside its fiber (line 35)`)
+  ftPaused.count >= 3 && ftPaused.stopLine && /line 37\b/.test(ftPaused.vars) && ftPaused.stopped !== '1'
+    ? ok(`fibers+threads card: a worker (thread ${ftPaused.stopped}) stopped inside its fiber (line 37)`)
     : fail(`fibers+threads paused: ${JSON.stringify(ftPaused)}`);
   await page.click(`${ftCard} .dbg-controls button[data-cmd="continue"]`);
   await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),

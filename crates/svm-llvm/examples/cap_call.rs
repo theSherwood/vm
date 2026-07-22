@@ -27,19 +27,22 @@ use svm_ir::Module;
 // result. The clock handle and `n` are threaded as block params (cross-block values must be).
 const CAPCALL_SRC: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = i32.const 0
-  br block1(v3, v2, v0, v1)
-block1(v4: i32, v5: i64, v6: i32, v7: i32):
+  br 1(v3, v2, v0, v1)
+}
+block 1 (v4: i32, v5: i64, v6: i32, v7: i32) {
   v8 = cap.call 2 0 () -> (i64) v6 ()
   v9 = i64.add v5 v8
   v10 = i32.const 1
   v11 = i32.add v4 v10
   v12 = i32.lt_s v11 v7
-  br_if v12 block1(v11, v9, v6, v7) block2(v9)
-block2(v13: i64):
+  br_if v12 1(v11, v9, v6, v7) 2(v9)
+}
+block 2 (v13: i64) {
   return v13
+  }
 }
 "#;
 
@@ -47,18 +50,21 @@ block2(v13: i64):
 // equally cheap, fold-resistant body — so subtracting its per-iter leaves just the host-boundary cost.
 const BASELINE_SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i32.const 0
-  br block1(v2, v1, v0)
-block1(v3: i32, v4: i64, v5: i32):
+  br 1(v2, v1, v0)
+}
+block 1 (v3: i32, v4: i64, v5: i32) {
   v6 = i64.add v4 v4
   v7 = i32.const 1
   v8 = i32.add v3 v7
   v9 = i32.lt_s v8 v5
-  br_if v9 block1(v8, v6, v5) block2(v6)
-block2(v10: i64):
+  br_if v9 1(v8, v6, v5) 2(v6)
+}
+block 2 (v10: i64) {
   return v10
+  }
 }
 "#;
 

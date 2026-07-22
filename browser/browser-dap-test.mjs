@@ -27,16 +27,19 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 // variables mapped to their SSA slots — the same fixture the native DAP tests use.
 const LOOP_SUM_DBG = `
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 
 debug.file 0 "sum.c"

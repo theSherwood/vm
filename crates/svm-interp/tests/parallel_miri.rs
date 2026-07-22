@@ -16,14 +16,16 @@ use svm_text::parse_module;
 // 4 vCPUs each `atomic.rmw.add` a shared counter 50× → 200. Real cross-thread atomics on one cell.
 const ATOMICS: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 4
   v3 = i64.lt_u v1 v2
-  br_if v3 block2(v1) block3()
-block2(v4: i64):
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
   v5 = i64.const 50
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
@@ -33,15 +35,18 @@ block2(v4: i64):
   i32.store v10 v6
   v11 = i64.const 1
   v12 = i64.add v4 v11
-  br block1(v12)
-block3():
+  br 1(v12)
+}
+block 3 () {
   v13 = i64.const 0
-  br block4(v13)
-block4(v14: i64):
+  br 4(v13)
+}
+block 4 (v14: i64) {
   v15 = i64.const 4
   v16 = i64.lt_u v14 v15
-  br_if v16 block5(v14) block6()
-block5(v17: i64):
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
   v20 = i64.const 16
@@ -50,36 +55,42 @@ block5(v17: i64):
   v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
-  br block4(v25)
-block6():
+  br 4(v25)
+}
+block 6 () {
   v26 = i64.const 0
   v27 = i64.atomic.load v26
   return v27
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.eq v1 v2
-  br_if v3 block2() block3(v1)
-block3(v4: i64):
+  br_if v3 3() 2(v1)
+}
+block 2 (v4: i64) {
   v5 = i64.const 0
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
   v9 = i64.add v4 v8
-  br block1(v9)
-block2():
+  br 1(v9)
+}
+block 3 () {
   v10 = i64.const 0
   return v10
+  }
 }
 "#;
 
 // Futex handoff (2 threads): the producer parks/wakes a consumer via `memory.wait`/`notify`.
 const FUTEX: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 8
   v1 = i64.const 987654
   i64.atomic.store.release v0 v1
@@ -93,9 +104,10 @@ block0():
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   v2 = i32.const 0
   v3 = i64.const 1000000000
@@ -103,6 +115,7 @@ block0(vsp: i64, v0: i64):
   v5 = i64.const 8
   v6 = i64.atomic.load.acquire v5
   return v6
+  }
 }
 "#;
 
@@ -141,15 +154,17 @@ fn parallel_futex_race_free_under_miri() {
 const CAPS: &str = r#"memory 16
 data 0 "hi\n"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
   v1 = i64.const 0
-  br block1(v1, vh0)
-block1(vi: i64, vhh: i64):
+  br 1(v1, vh0)
+}
+block 1 (vi: i64, vhh: i64) {
   v2 = i64.const 2
   v3 = i64.lt_u vi v2
-  br_if v3 block2(vi, vhh) block3()
-block2(vi2: i64, vhh2: i64):
+  br_if v3 2(vi, vhh) 3()
+}
+block 2 (vi2: i64, vhh2: i64) {
   vsp = i64.const 0
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
@@ -159,15 +174,18 @@ block2(vi2: i64, vhh2: i64):
   i32.store v7 vt
   v8 = i64.const 1
   v9 = i64.add vi2 v8
-  br block1(v9, vhh2)
-block3():
+  br 1(v9, vhh2)
+}
+block 3 () {
   v10 = i64.const 0
-  br block4(v10)
-block4(vj: i64):
+  br 4(v10)
+}
+block 4 (vj: i64) {
   v11 = i64.const 2
   v12 = i64.lt_u vj v11
-  br_if v12 block5(vj) block6()
-block5(vj2: i64):
+  br_if v12 5(vj) 6()
+}
+block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
   v15 = i64.const 16
@@ -176,14 +194,16 @@ block5(vj2: i64):
   v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
-  br block4(v20)
-block6():
+  br 4(v20)
+}
+block 6 () {
   v21 = i64.const 8
   v22 = i64.atomic.load v21
   return v22
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, vh: i64):
+block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 3
@@ -193,6 +213,7 @@ block0(vsp: i64, vh: i64):
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
   return v4
+  }
 }
 "#;
 

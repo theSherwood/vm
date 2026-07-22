@@ -32,12 +32,13 @@ fn interp_i64s(m: &svm_ir::Module) -> Vec<i64> {
 fn vcpu_tls_round_trips_and_reads_write_on_the_root() {
     let src = "memory 16\n\
         func () -> (i64, i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 g0 = vcpu.tls.get\n\
         \x20 f = i64.const 42\n\
         \x20 vcpu.tls.set f\n\
         \x20 g1 = vcpu.tls.get\n\
         \x20 return g0 g1\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -99,7 +100,7 @@ mod threaded {
         // child(sp, idx): store vcpu.tls.get() at 1024 + idx*8, return 0.
         let src = "memory 16\n\
             func () -> (i64, i64, i64) {\n\
-            block0():\n\
+            block 0 () {\n\
             \x20 sp = i64.const 4096\n\
             \x20 a0 = i64.const 0\n\
             \x20 h0 = thread.spawn 1 sp a0\n\
@@ -117,9 +118,10 @@ mod threaded {
             \x20 s2 = i64.const 1040\n\
             \x20 v2 = i64.load s2\n\
             \x20 return v0 v1 v2\n\
+              }\n\
             }\n\
             func (i64, i64) -> (i64) {\n\
-            block0(p0: i64, p1: i64):\n\
+            block 0 (p0: i64, p1: i64) {\n\
             \x20 id = vcpu.tls.get\n\
             \x20 eight = i64.const 8\n\
             \x20 off = i64.mul p1 eight\n\
@@ -128,6 +130,7 @@ mod threaded {
             \x20 i64.store addr id\n\
             \x20 z = i64.const 0\n\
             \x20 return z\n\
+              }\n\
             }\n";
         let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
         verify_module(&m).expect("verify");
@@ -157,7 +160,7 @@ mod threaded {
     fn vcpu_tls_tracks_current_vcpu_across_migration() {
         let src = "memory 16\n\
             func () -> (i64, i64) {\n\
-            block0():\n\
+            block 0 () {\n\
             \x20 fref = ref.func 2\n\
             \x20 fsp = i64.const 4096\n\
             \x20 fh = cont.new fref fsp\n\
@@ -169,15 +172,17 @@ mod threaded {
             \x20 s1 = i64.const 1024\n\
             \x20 r1 = i64.load s1\n\
             \x20 return r1 bret\n\
+              }\n\
             }\n\
             func (i64, i64) -> (i64) {\n\
-            block0(p0: i64, p1: i64):\n\
+            block 0 (p0: i64, p1: i64) {\n\
             \x20 ba = i64.const 0\n\
             \x20 bst, bval = cont.resume p1 ba\n\
             \x20 return bval\n\
+              }\n\
             }\n\
             func (i64, i64) -> (i64) {\n\
-            block0(q0: i64, q1: i64):\n\
+            block 0 (q0: i64, q1: i64) {\n\
             \x20 r1 = vcpu.tls.get\n\
             \x20 s1 = i64.const 1024\n\
             \x20 i64.store s1 r1\n\
@@ -185,6 +190,7 @@ mod threaded {
             \x20 sv = suspend z\n\
             \x20 r2 = vcpu.tls.get\n\
             \x20 return r2\n\
+              }\n\
             }\n";
         let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
         verify_module(&m).expect("verify");

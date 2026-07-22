@@ -177,14 +177,16 @@ const FUEL: u64 = 100_000_000;
 /// The §ROI "alu" i64-LCG recurrence — loops, wrapping mul/add, branches, block args.
 const ALU: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 6364136223846793005
   v11 = i64.mul v8 v10
   v12 = i64.const 1442695040888963407
@@ -192,9 +194,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v14 = i64.add v13 v9
   v15 = i64.const 1
   v16 = i64.add v9 v15
-  br block1(v7, v14, v16)
-block3(v17: i64):
+  br 1(v7, v14, v16)
+}
+block 3 (v17: i64) {
   return v17
+  }
 }
 "#;
 
@@ -206,25 +210,30 @@ fn alu() {
 /// Multi-function direct call in the loop body (the env threading + result plumbing).
 const CALL: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = call 1 (v8, v9)
   v11 = i64.const 1
   v12 = i64.add v9 v11
-  br block1(v7, v10, v12)
-block3(v13: i64):
+  br 1(v7, v10, v12)
+}
+block 3 (v13: i64) {
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.add v0 v1
   return v2
+  }
 }
 "#;
 
@@ -240,22 +249,26 @@ fn call() {
 /// parity, but vacuous); the positive values exercise the actual computation.
 const TAILCALL: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vacc = i64.const 0
   return_call 1 (v0, vacc)
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vn: i64, vacc: i64):
+block 0 (vn: i64, vacc: i64) {
   vz = i64.const 0
   vcmp = i64.eq vn vz
-  br_if vcmp block1(vacc) block2(vn, vacc)
-block1(vr: i64):
+  br_if vcmp 1(vacc) 2(vn, vacc)
+}
+block 1 (vr: i64) {
   return vr
-block2(vn2: i64, vacc2: i64):
+}
+block 2 (vn2: i64, vacc2: i64) {
   vsum = i64.add vacc2 vn2
   vone = i64.const 1
   vnm1 = i64.sub vn2 vone
   return_call 1 (vnm1, vsum)
+  }
 }
 "#;
 
@@ -279,23 +292,27 @@ fn tailcall_deep_is_constant_stack() {
 const MEM: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 8
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9
   v13 = i64.const 1
   v14 = i64.add v9 v13
-  br block1(v7, v12, v14)
-block3(v15: i64):
+  br 1(v7, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+  }
 }
 "#;
 
@@ -308,7 +325,7 @@ fn mem() {
 const MEM_NARROW: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   i64.store8 v1 v0
   v2 = i64.const 40
@@ -327,6 +344,7 @@ block0(v0: i64):
   v13 = i64.add v10 v11
   v14 = i64.add v13 v12
   return v14
+  }
 }
 "#;
 
@@ -340,10 +358,11 @@ fn mem_narrow() {
 const MEM_OOB: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   i64.store v0 v0
   v1 = i64.load v0
   return v1
+  }
 }
 "#;
 
@@ -379,7 +398,7 @@ fn mem_oob() {
 const MEMFILL: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 16
   v2 = i32.wrap_i64 v0
   v3 = i64.const 40
@@ -393,6 +412,7 @@ block0(v0: i64):
   v10 = i64.add v5 v7
   v11 = i64.add v10 v9
   return v11
+  }
 }
 "#;
 
@@ -406,7 +426,7 @@ fn memfill() {
 const MEMCOPY: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   i64.store v1 v0
   v2 = i64.const 64
@@ -415,6 +435,7 @@ block0(v0: i64):
   mem.copy v2 v3 v4
   v5 = i64.load v2
   return v5
+  }
 }
 "#;
 
@@ -428,7 +449,7 @@ fn memcopy() {
 const MEMMOVE: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   i64.store v1 v0
   v2 = i64.const 8
@@ -439,6 +460,7 @@ block0(v0: i64):
   mem.move v3 v4 v5
   v6 = i64.load v3
   return v6
+  }
 }
 "#;
 
@@ -452,13 +474,14 @@ fn memmove() {
 const MEMFILL_OOB: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 171
   v2 = i64.const 8
   mem.fill v0 v1 v2
   v3 = i64.const 0
   v4 = i64.load8_u v3
   return v4
+  }
 }
 "#;
 
@@ -466,12 +489,13 @@ block0(v0: i64):
 const MEMCOPY_OOB_DST: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 8
   mem.copy v0 v1 v2
   v3 = i64.load8_u v1
   return v3
+  }
 }
 "#;
 
@@ -480,12 +504,13 @@ block0(v0: i64):
 const MEMCOPY_OOB_SRC: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 8
   mem.copy v1 v0 v2
   v3 = i64.load8_u v1
   return v3
+  }
 }
 "#;
 
@@ -524,12 +549,13 @@ fn memcopy_oob() {
 const MEMFILL_ZERO: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 255
   v2 = i64.const 0
   mem.fill v0 v1 v2
   v3 = i64.const 7
   return v3
+  }
 }
 "#;
 
@@ -537,11 +563,12 @@ block0(v0: i64):
 const MEMCOPY_ZERO: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   mem.copy v0 v0 v1
   v2 = i64.const 7
   return v2
+  }
 }
 "#;
 
@@ -556,11 +583,12 @@ fn bulk_zero_len_never_traps() {
 const MASK_FILL: &str = r#"
 memory 16
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i32.const 200
   mem.fill v0 v2 v1
   v3 = i64.const 12345
   return v3
+  }
 }
 "#;
 
@@ -569,10 +597,11 @@ block0(v0: i64, v1: i64):
 const MASK_COPY: &str = r#"
 memory 16
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   mem.copy v0 v0 v1
   v2 = i64.const 12345
   return v2
+  }
 }
 "#;
 
@@ -633,7 +662,7 @@ fn bulk_span_masking_sweep() {
 /// div/rem for both signednesses: /0 traps, INT_MIN/-1 traps div_s but not rem_s.
 const DIVREM: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const -1
   v2 = i64.div_s v0 v1
   v3 = i64.const 7
@@ -642,6 +671,7 @@ block0(v0: i64):
   v6 = i64.rem_u v0 v3
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "#;
 
@@ -653,10 +683,11 @@ fn divrem() {
 /// Division by an argument — zero and the overflow pair land in the sweep.
 const DIVARG: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const -9223372036854775808
   v2 = i64.div_s v1 v0
   return v2
+  }
 }
 "#;
 
@@ -669,7 +700,7 @@ fn divarg() {
 /// unsigned compares, select, eqz — the scalar long tail on both widths.
 const BITS: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 13
   v2 = i64.shl v0 v1
   v3 = i64.const 17
@@ -706,6 +737,7 @@ block0(v0: i64):
   v34 = i64.add v33 v32
   v35 = i64.add v34 v29
   return v35
+  }
 }
 "#;
 
@@ -717,22 +749,26 @@ fn bits() {
 /// br_table dispatch — each arm carries different block args (the per-edge landing blocks).
 const BRTABLE: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 100
   v3 = i64.const 200
-  br_table v1 [block1(v2), block2(v3), block1(v3)] block3(v0, v0)
-block1(v4: i64):
+  br_table v1 [1(v2), 2(v3), 1(v3)] 3(v0, v0)
+}
+block 1 (v4: i64) {
   v5 = i64.const 1
   v6 = i64.add v4 v5
   return v6
-block2(v7: i64):
+}
+block 2 (v7: i64) {
   v8 = i64.const 2
   v9 = i64.add v7 v8
   return v9
-block3(v10: i64, v11: i64):
+}
+block 3 (v10: i64, v11: i64) {
   v12 = i64.add v10 v11
   return v12
+  }
 }
 "#;
 
@@ -745,21 +781,25 @@ fn brtable() {
 /// (naive in-order local.set would compute fib wrong).
 const SWAP: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 1
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.const 0
   v7 = i64.gt_s v3 v6
-  br_if v7 block2(v3, v4, v5) block3(v4)
-block2(v8: i64, v9: i64, v10: i64):
+  br_if v7 2(v3, v4, v5) 3(v4)
+}
+block 2 (v8: i64, v9: i64, v10: i64) {
   v11 = i64.const -1
   v12 = i64.add v8 v11
   v13 = i64.add v9 v10
-  br block1(v12, v10, v13)
-block3(v14: i64):
+  br 1(v12, v10, v13)
+}
+block 3 (v14: i64) {
   return v14
+  }
 }
 "#;
 
@@ -771,8 +811,9 @@ fn swap_params() {
 /// Guest `unreachable` → the same trap kind on both engines.
 const UNREACH: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   unreachable
+  }
 }
 "#;
 
@@ -786,12 +827,14 @@ fn unreachable_traps() {
 /// both trap `OutOfFuel`, at different instruction counts.
 const SPIN: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 1
   v3 = i64.add v1 v2
-  br block1(v3)
+  br 1(v3)
+  }
 }
 "#;
 
@@ -803,18 +846,20 @@ fn out_of_fuel() {
 /// Multi-result returns end-to-end (wasm multi-value + reverse result pops at the call site).
 const MULTI: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1, v2 = call 1 (v0)
   v3 = i64.sub v1 v2
   return v3
+  }
 }
 func (i64) -> (i64, i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   v3 = i64.const 10
   v4 = i64.add v0 v3
   return v2, v4
+  }
 }
 "#;
 
@@ -826,14 +871,15 @@ fn multi_value() {
 /// i32-typed params/results across the call boundary (wrap/extend at the edges, i32 arithmetic).
 const I32FN: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = call 1 (v1)
   v3 = i64.extend_i32_s v2
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 1103515245
   v2 = i32.mul v0 v1
   v3 = i32.const 12345
@@ -842,6 +888,7 @@ block0(v0: i32):
   v6 = i32.shr_u v4 v5
   v7 = i32.xor v4 v6
   return v7
+  }
 }
 "#;
 
@@ -872,7 +919,7 @@ const F64_BITS: &[i64] = &[
 /// rounding must match wasm↔interpreter).
 const F64_ARITH: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vf = f64.reinterpret_i64 v0
   va = f64.add vf vf
   vb = f64.mul vf va
@@ -889,6 +936,7 @@ block0(v0: i64):
   vbits = i64.reinterpret_f64 vk
   vr = i64.add vbits vcmp64
   return vr
+  }
 }
 "#;
 
@@ -901,7 +949,7 @@ fn f64_arith() {
 /// (`trunc_sat`) and f32 round-trip (`demote`/`promote`). Result is i64 bits, exact.
 const F64_CONV: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vs = f64.convert_i64_s v0
   vu = f64.convert_i64_u v0
   vsum = f64.add vs vu
@@ -913,6 +961,7 @@ block0(v0: i64):
   vc32bits = i64.reinterpret_f64 vc32
   vr = i64.add vsat vc32bits
   return vr
+  }
 }
 "#;
 
@@ -925,10 +974,11 @@ fn f64_conv() {
 /// trap exactly where the interpreter does. Fed the same f64 bit patterns (inf/NaN trap).
 const F64_TRUNC_TRAP: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vf = f64.reinterpret_i64 v0
   vi = i64.trunc_f64_s vf
   return vi
+  }
 }
 "#;
 
@@ -943,14 +993,16 @@ fn f64_trunc_trap() {
 /// funcs ⇒ a 4-slot table (slot 3 null); the computed index is always 1 or 2, so it never traps.
 const CALL_INDIRECT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 1
   v11 = i64.and v9 v10
   v12 = i64.const 1
@@ -960,21 +1012,25 @@ block2(v7: i64, v8: i64, v9: i64):
   v16 = i64.add v8 v15
   v17 = i64.const 1
   v18 = i64.add v9 v17
-  br block1(v7, v16, v18)
-block3(v19: i64):
+  br 1(v7, v16, v18)
+}
+block 3 (v19: i64) {
   return v19
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 2
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i64.add v0 v1
   return v2
+  }
 }
 "#;
 
@@ -994,23 +1050,26 @@ fn call_indirect() {
 /// with the fixed inner arg 5 (both engines recurse identically), so results still match.
 const CALL_INDIRECT_NULL: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 5
   v3 = call_indirect (i64) -> (i64) v1 (v2)
   return v3
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 2
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i64.add v0 v1
   return v2
+  }
 }
 "#;
 
@@ -1029,19 +1088,21 @@ fn call_indirect_null_trap() {
 /// check) traps `BadSignature`; the interpreter traps `IndirectCallType` — one bucket, both trap.
 const CALL_INDIRECT_BADSIG: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 1
   v2 = i32.wrap_i64 v1
   v3 = i32.wrap_i64 v0
   v4 = call_indirect (i32) -> (i32) v2 (v3)
   v5 = i64.extend_i32_s v4
   return v5
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 2
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 "#;
 
@@ -1064,20 +1125,20 @@ fn fail_closed() {
             // The core v128 lane ops are now in-subset; the *deferred* SIMD family
             // (widening/reduction — here `i16x8.dot_i8x16_s`) is what still fails closed.
             "simd_dot",
-            "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64x2.splat v0\n  v2 = i16x8.dot_i8x16_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}\n",
+            "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64x2.splat v0\n  v2 = i16x8.dot_i8x16_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n  }\n}\n",
         ),
         (
             // scalar `fma` has no core-wasm opcode (relaxed-SIMD only), so it stays interpreter-tier.
             "fma",
-            "func (f64) -> (f64) {\nblock0(v0: f64):\n  v1 = f64.fma v0 v0 v0\n  return v1\n}\n",
+            "func (f64) -> (f64) {\nblock 0 (v0: f64) {\n  v1 = f64.fma v0 v0 v0\n  return v1\n  }\n}\n",
         ),
         (
             "fiber",
-            "func () -> (i64) {\nblock0():\n  v0 = ref.func 1\n  v1 = i64.const 0\n  v2 = cont.new v0 v1\n  v3 = i64.const 7\n  v4, v5 = cont.resume v2 v3\n  return v5\n}\nfunc (i64, i64) -> (i64) {\nblock0(vsp: i64, varg: i64):\n  return varg\n}\n",
+            "func () -> (i64) {\nblock 0 () {\n  v0 = ref.func 1\n  v1 = i64.const 0\n  v2 = cont.new v0 v1\n  v3 = i64.const 7\n  v4, v5 = cont.resume v2 v3\n  return v5\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  return varg\n  }\n}\n",
         ),
         (
             "threads",
-            "memory 16\nfunc () -> (i64) {\nblock0():\n  v0 = i64.const 0\n  v1 = thread.spawn 1 v0 v0\n  v2 = thread.join v1\n  return v2\n}\nfunc (i64, i64) -> (i64) {\nblock0(vsp: i64, v0: i64):\n  v1 = i64.const 0\n  return v1\n}\n",
+            "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  v1 = thread.spawn 1 v0 v0\n  v2 = thread.join v1\n  return v2\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, v0: i64) {\n  v1 = i64.const 0\n  return v1\n  }\n}\n",
         ),
         // (`tailcall` was here — `return_call`/`return_call_indirect` are now lowered; see `fn tailcall`.)
     ] {
@@ -1130,9 +1191,10 @@ const ATOMIC_ADDR_PROBE: &[i64] = &[
 const ATOMIC_LOAD32: &str = r#"
 memory 16
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.atomic.load v0
   return v1
+  }
 }
 "#;
 
@@ -1140,9 +1202,10 @@ block0(v0: i64):
 const ATOMIC_LOAD64: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.atomic.load v0
   return v1
+  }
 }
 "#;
 
@@ -1151,11 +1214,12 @@ block0(v0: i64):
 const ATOMIC_STORE_ROUNDTRIP: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 12345
   i64.atomic.store v0 v1
   v2 = i64.atomic.load v0
   return v2
+  }
 }
 "#;
 
@@ -1183,7 +1247,7 @@ fn atomic_rmw_value_semantics() {
         let src = format!(
             "memory 16\n\
              func (i64) -> (i64) {{\n\
-             block0(v0: i64):\n\
+             block 0 (v0: i64) {{\n\
              \x20 v1 = i64.const 8\n\
              \x20 v2 = i64.const 100\n\
              \x20 i64.atomic.store v1 v2\n\
@@ -1191,6 +1255,7 @@ fn atomic_rmw_value_semantics() {
              \x20 v4 = i64.atomic.load v1\n\
              \x20 v5 = i64.add v3 v4\n\
              \x20 return v5\n\
+               }}\n\
              }}\n"
         );
         diff(&format!("atomic_rmw_{op}"), &src, ATOMIC_VAL_SWEEP, FUEL);
@@ -1203,7 +1268,7 @@ fn atomic_rmw_value_semantics() {
 const ATOMIC_CMPXCHG: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 8
   v2 = i64.const 100
   i64.atomic.store v1 v2
@@ -1212,6 +1277,7 @@ block0(v0: i64):
   v5 = i64.atomic.load v1
   v6 = i64.add v4 v5
   return v6
+  }
 }
 "#;
 

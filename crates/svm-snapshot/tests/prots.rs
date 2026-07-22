@@ -15,9 +15,10 @@ const NPAGES: usize = WINDOW / PAGE; // 32
 // checks the geometry against `memory.size_log2`.
 const SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 7
   return v1
+  }
 }
 "#;
 

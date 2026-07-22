@@ -14,7 +14,7 @@ memory 16
 data 0 "hi from resolve\n"
 data 17000 "stdout"
 func (i32, i32, i32) -> (i32) {
-block0(v0: i32, v1: i32, v2: i32):
+block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 17000
   v4 = i64.const 6
   v5 = cap.self.resolve v3 v4
@@ -23,6 +23,7 @@ block0(v0: i32, v1: i32, v2: i32):
   v8 = cap.call 0 1 (i64, i64) -> (i64) v5(v6, v7)
   v9 = i32.const 0
   return v9
+  }
 }
 "#;
 

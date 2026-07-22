@@ -62,12 +62,13 @@ fn out_of_window_store_faults_identically() {
     let src = "\
 memory 8
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 261
   v2 = i32.const 171
   i32.store8 v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 ";
     let (it, jo, imem, _jmem) = both_windows_disposition(src, &[0u8; 256]);
@@ -91,12 +92,13 @@ fn far_address_and_offset_fault_identically() {
     let src = "\
 memory 8
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 9223372036854775807
   v2 = i32.const 200
   i32.store8 v1 v2 offset=8
   v3 = i32.const 0
   return v3
+  }
 }
 ";
     let (it, jo, imem, _jmem) = both_windows_disposition(src, &[0u8; 256]);
@@ -122,8 +124,9 @@ fn seed_survives_when_untouched() {
     let src = "\
 memory 8
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 ";
     let (imem, jmem) = both_windows(src, &init);
@@ -141,7 +144,7 @@ fn elided_bounded_address_confines() {
     let src = "\
 memory 8
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 7
   v2 = i64.and v0 v1
   v3 = i64.const 8
@@ -150,6 +153,7 @@ block0(v0: i64):
   i64.store v4 v5
   v6 = i64.load v4
   return v6
+  }
 }
 ";
     let m = svm::text::parse_module(src).expect("parse");
@@ -209,12 +213,13 @@ fn reserved_tail_access_faults_identically() {
     let src = "\
 memory 12
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 4096
   v2 = i32.const 7
   i32.store8 v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 ";
     // Fully mapped (reserved == mapped == 4 KiB): 4096 is one past the top ⇒ fault on both backends
@@ -251,7 +256,7 @@ fn reserved_in_mapped_access_matches() {
     let src = "\
 memory 12
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 511
   v2 = i64.and v0 v1
   v3 = i64.const 8
@@ -260,6 +265,7 @@ block0(v0: i64):
   i32.store8 v4 v5
   v6 = i32.const 0
   return v6
+  }
 }
 ";
     for n in [0i64, 1, 7, 511, 512, i64::MAX, -1] {
@@ -308,7 +314,7 @@ fn sub_window_confines_child_to_its_slice() {
     let src = "\
 memory 12
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 261
   v2 = i32.const 171
   i32.store8 v1 v2
@@ -320,6 +326,7 @@ block0(v0: i32):
   i32.store8 v5 v6
   v7 = i32.const 0
   return v7
+  }
 }
 ";
     // Seed the whole parent with a non-zero pattern so an escaped write (or a divergent read)
@@ -364,12 +371,13 @@ fn sub_window_out_of_child_faults() {
     let src = "\
 memory 12
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 4101
   v2 = i32.const 200
   i32.store8 v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 ";
     let init: Vec<u8> = (0..PARENT)
@@ -403,12 +411,13 @@ fn guard_page_fault_is_detect_and_kill() {
     let src = "\
 memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65532
   v2 = i64.const 0
   i64.store v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 ";
     let m = svm::text::parse_module(src).expect("parse");

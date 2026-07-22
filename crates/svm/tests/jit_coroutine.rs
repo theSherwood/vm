@@ -60,7 +60,7 @@ fn both(src: &str, win_log2: u8) -> BothOut {
 fn coro_src() -> &'static str {
     "memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -79,9 +79,10 @@ block0(v0: i32):
   v19 = i64.mul v17 v18
   v20 = i64.add v16 v19
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = i32.const 7
@@ -94,6 +95,7 @@ block0(v0: i64):
   v9 = i64.const 999
   v10 = i64.add v9 v8
   return v10
+  }
 }
 "
 }
@@ -142,7 +144,7 @@ fn jit_coroutine_yielder_handle_matches_interp() {
     }
     let src = "memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 0
   v3 = i64.const 16
@@ -151,10 +153,12 @@ block0(v0: i32):
   v6 = i64.const 0
   v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   return v8
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   return v0
+  }
 }
 ";
     let (ir, _imem, jo, _jmem) = both(src, 17);
@@ -187,7 +191,7 @@ fn jit_demand_coroutine_matches_interp() {
     // and resumes; the child's load re-executes and returns the byte (RETURNED).
     let src = "memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -208,13 +212,15 @@ block0(v0: i32):
   v19 = i64.add v12 v15
   v20 = i64.add v19 v18
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 ";
     let (ir, imem, jo, jmem) = both(src, 17);
@@ -241,7 +247,7 @@ fn jit_demand_coroutine_fault_address_matches_interp() {
     }
     let src = "memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -250,13 +256,15 @@ block0(v0: i32):
   v6 = i64.const 0
   v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   return v8
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 ";
     let (ir, _imem, jo, _jmem) = both(src, 17);
@@ -278,7 +286,7 @@ fn jit_coroutine_suspends_and_propagates_traps() {
     // (a) first resume → SUSPENDED.
     let src = "memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 0
   v3 = i64.const 16
@@ -288,13 +296,15 @@ block0(v0: i32):
   v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   v9 = i64.extend_i32_s v7
   return v9
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 42
   v3 = cap.call 7 0 (i64) -> (i64) v1 (v2)
   return v3
+  }
 }
 ";
     let (ir, _i, jo, _j) = both(src, 17);
@@ -308,7 +318,7 @@ block0(v0: i64):
     // (b) a child trap after a yield propagates at the *second* resume, on both backends.
     let src = "memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 0
   v3 = i64.const 16
@@ -318,13 +328,15 @@ block0(v0: i32):
   v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   v9, v10 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   return v10
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 1
   v3 = cap.call 7 0 (i64) -> (i64) v1 (v2)
   unreachable
+  }
 }
 ";
     let (ir, _i, jo, _j) = both(src, 17);

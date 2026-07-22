@@ -46,7 +46,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 // the clock once, returns clock + 10.
 const SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65536
   i32.store v1 v0
   v2 = i64.const 0
@@ -57,9 +57,10 @@ block0(v0: i32):
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
@@ -67,6 +68,7 @@ block0(v0: i64, v1: i64):
   v6 = i64.const 10
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "#;
 
@@ -362,7 +364,7 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
 // `svm-durable/tests/multivcpu.rs::child_owns_fiber_through_freeze_thaw`.)
 const SRC_CHILD_FIBER: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 0
   v3 = thread.spawn 1 v1 v2
@@ -371,9 +373,10 @@ block0(v0: i32):
   v6 = thread.join v3
   v7 = i64.add v5 v6
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = ref.func 2
   v3 = i64.const 4096
   v4 = cont.new v2 v3
@@ -382,14 +385,16 @@ block0(v0: i64, v1: i64):
   v8 = i64.const 100
   v9 = i64.add v7 v8
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 5
   v3 = suspend v2
   v4 = i64.const 1000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -558,7 +563,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
 // `svm-durable/tests/multivcpu.rs::nested_spawn_tree_freezes_and_thaws`.)
 const SRC_NESTED: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65536
   i32.store v1 v0
   v2 = i64.const 0
@@ -569,9 +574,10 @@ block0(v0: i32):
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i64.const 0
@@ -582,14 +588,16 @@ block0(v0: i64, v1: i64):
   v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
   v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
   return v5
+  }
 }
 "#;
 

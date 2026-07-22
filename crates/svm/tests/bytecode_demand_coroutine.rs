@@ -22,7 +22,7 @@ const RETURNED: i64 = 1;
 /// load reads it and RETURNs. Result `123 + FAULTED*1e6 + RETURNED*1e3`.
 const DEMAND_SAME: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -43,13 +43,15 @@ block0(v0: i32):
   v19 = i64.add v12 v15
   v20 = i64.add v19 v18
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 "#;
 
@@ -57,7 +59,7 @@ block0(v0: i64):
 /// coordinates (window offset 64 KiB) — the parent returns it directly.
 const DEMAND_FAULT_ADDR: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -66,13 +68,15 @@ block0(v0: i32):
   v6 = i64.const 0
   v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   return v8
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 "#;
 
@@ -115,7 +119,7 @@ fn demand_coroutine_reports_fault_address() {
 const MODULE_CHILD: &str = r#"memory 16
 data 100 "VM"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.const 0
@@ -125,12 +129,13 @@ block0(v0: i64):
   v6 = i64.const 1000
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "#;
 
 const DEMAND_MODULE_PARENT: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -147,6 +152,7 @@ block0(v0: i32, v1: i32):
   v17 = i64.add v10 v13
   v18 = i64.add v17 v16
   return v18
+  }
 }
 "#;
 

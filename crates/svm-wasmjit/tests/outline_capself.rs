@@ -18,11 +18,12 @@ const SRC: &str = r#"
 memory 16
 data 0 "exit"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 4
   v2 = cap.self.resolve v0 v1
   return v2
+  }
 }
 "#;
 

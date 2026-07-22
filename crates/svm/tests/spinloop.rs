@@ -32,15 +32,15 @@ macro_rules! spin_worker {
     ($body:literal) => {
         concat!(
             "func (i64, i64) -> (i64) {\n",
-            "block0(vsp: i64, varg: i64):\n  br block1()\n",
-            "block1():\n",
+            "block 0 (vsp: i64, varg: i64) {\n  br 1()\n  }\n",
+            "block 1 () {\n",
             "  vz = i32.const 0\n  vo = i32.const 1\n  vlock = i64.const 0\n",
             "  vold = i32.atomic.cmpxchg vlock vz vo\n",
-            "  vok = i32.eq vold vz\n  br_if vok block2() block1()\n",
-            "block2():\n",
+            "  vok = i32.eq vold vz\n  br_if vok 2() 1()\n  }\n",
+            "block 2 () {\n",
             $body,
             "  vlock2 = i64.const 0\n  vrel = i32.const 0\n  i32.atomic.store vlock2 vrel\n",
-            "  vret = i64.const 0\n  return vret\n}\n"
+            "  vret = i64.const 0\n  return vret\n  }\n}\n"
         )
     };
 }
@@ -52,11 +52,11 @@ macro_rules! spin_worker {
 const SPIN_COUNTER: &str = concat!(
     "memory 16\n",
     "func () -> (i64) {\n",
-    "block0():\n",
+    "block 0 () {\n",
     "  vsp = i64.const 100\n  va = i64.const 1\n",
     "  vh0 = thread.spawn 1 vsp va\n  vh1 = thread.spawn 1 vsp va\n",
     "  vj0 = thread.join vh0\n  vj1 = thread.join vh1\n",
-    "  vc = i64.const 8\n  vr = i64.load vc\n  return vr\n}\n",
+    "  vc = i64.const 8\n  vr = i64.load vc\n  return vr\n  }\n}\n",
     spin_worker!("  vc = i64.const 8\n  vcur = i64.load vc\n  v1 = i64.const 1\n  vnew = i64.add vcur v1\n  i64.store vc vnew\n"),
     spin_worker!("  vc = i64.const 8\n  vcur = i64.load vc\n  v1 = i64.const 1\n  vnew = i64.add vcur v1\n  i64.store vc vnew\n"),
 );
@@ -69,11 +69,11 @@ const SPIN_COUNTER: &str = concat!(
 const SPIN_ASYM: &str = concat!(
     "memory 16\n",
     "func () -> (i64) {\n",
-    "block0():\n",
+    "block 0 () {\n",
     "  vsp = i64.const 100\n  va = i64.const 1\n",
     "  vh0 = thread.spawn 1 vsp va\n  vh1 = thread.spawn 2 vsp va\n",
     "  vj0 = thread.join vh0\n  vj1 = thread.join vh1\n",
-    "  vc = i64.const 8\n  vr = i64.load vc\n  return vr\n}\n",
+    "  vc = i64.const 8\n  vr = i64.load vc\n  return vr\n  }\n}\n",
     spin_worker!("  vc = i64.const 8\n  vcur = i64.load vc\n  v1 = i64.const 1\n  vnew = i64.add vcur v1\n  i64.store vc vnew\n"),
     spin_worker!("  vc = i64.const 8\n  vcur = i64.load vc\n  v3 = i64.const 3\n  vnew = i64.mul vcur v3\n  i64.store vc vnew\n"),
 );

@@ -10,32 +10,37 @@ use svm_text::{parse_module, print_module};
 // sum = 1 + 2 + ... + N via a back-edge loop with block parameters (same shape as pipeline.rs).
 const LOOP_SUM: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 "#;
 
 // A callee + caller, to exercise a multi-frame backtrace.
 const CALLER: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 7
   v2 = call 1 (v0)
   return v2
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 
@@ -185,12 +190,13 @@ fn reads_window_memory_a_store_left_behind() {
     let src = r#"
 memory 17
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 1234605616436508552
   i64.store v0 v1
   v2 = i32.const 0
   return v2
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -204,12 +210,13 @@ block0():
 const STORE_PROG: &str = r#"
 memory 17
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 1234605616436508552
   i64.store v0 v1
   v2 = i32.const 0
   return v2
+  }
 }
 "#;
 
@@ -253,10 +260,11 @@ fn write_watchpoint_does_not_fire_on_a_read_and_read_watch_does() {
     let src = r#"
 memory 17
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.load v0
   return v1
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -305,7 +313,7 @@ fn watchpoint_outside_the_accessed_range_does_not_fire() {
 const CAP_WRITE: &str = r#"
 memory 16
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i32.const 72
   i32.store8 v1 v2
@@ -316,6 +324,7 @@ block0(v0: i32):
   v6 = i64.const 2
   v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
+  }
 }
 "#;
 
@@ -377,16 +386,19 @@ fn cap_call_stops_off_by_default() {
 // loop variables mapped to their block-relative SSA value indices (i = v2, acc = v3 in block1).
 const LOOP_SUM_DBG: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.add v3 v2
   v5 = i32.const -1
   v6 = i32.add v2 v5
-  br_if v6 block1(v6, v4) block2(v4)
-block2(v7: i32):
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
   return v7
+  }
 }
 
 debug.file 0 "sum.c"
@@ -439,9 +451,10 @@ fn debug_info_round_trips_through_text() {
     // (trailing id), and a var with *no* type id (back-compat: name string only).
     let src = r#"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 0
   return v0
+  }
 }
 
 debug.file 0 "a.c"
@@ -524,15 +537,17 @@ fn ssalist_resolves_the_right_value_per_pc() {
     // v6 = v5+v5 = 36. `x`'s value index: (block0,inst0)→v0=0, (block1,inst0)→v3=0, (block1,inst2)→v5=2.
     let src = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
-  br block1(v2)
-block1(v3: i32):
+  br 1(v2)
+}
+block 1 (v3: i32) {
   v4 = i32.const 5
   v5 = i32.add v3 v4
   v6 = i32.add v5 v5
   return v6
+  }
 }
 
 debug.file 0 "x.c"
@@ -571,13 +586,14 @@ fn windowvia_reads_through_a_runtime_base_value() {
     let src = r#"
 memory 17
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 77
   v2 = i64.const 8
   v3 = i64.add v0 v2
   i32.store v3 v1
   v4 = i32.const 0
   return v4
+  }
 }
 
 debug.file 0 "w.c"
@@ -698,11 +714,12 @@ fn seek_past_the_end_finishes() {
 // cannot reproduce without the recorded tape.
 const CLOCK_SUM: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 2 0 () -> (i64) v0 ()
   v2 = cap.call 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
 
@@ -746,13 +763,14 @@ fn captape_replays_clock_inputs_for_faithful_seek() {
 const STDIN_FIRST: &str = r#"
 memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 2
   v3 = cap.call 0 0 (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i64.const 0
   v5 = i32.load8_u v4
   return v5
+  }
 }
 "#;
 
@@ -794,11 +812,12 @@ fn captape_replays_stdin_read_into_the_buffer_for_faithful_seek() {
 // reproduce its outputs across time-travel.
 const HOSTFN_SUM: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = cap.call 13 0 () -> (i64) v0 ()
   v2 = cap.call 13 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
 
@@ -836,17 +855,19 @@ fn captape_replays_host_fn_inputs_for_faithful_seek() {
 // to land after stepping over the call); helper(x) = x + 10, so the caller returns helper(5)+1 = 16.
 const CALL_THEN_MORE: &str = r#"
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i32.const 1
   v3 = i32.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   return v2
+  }
 }
 "#;
 

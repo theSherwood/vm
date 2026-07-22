@@ -45,12 +45,13 @@ fn compile(src: &str) -> CompiledModule {
 const STORE_OOB_DBG: &str = "\
 memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65532
   v2 = i64.const 0
   i64.store v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 debug.file 0 \"fault.c\"
 debug.loc 0 0 2 0 10 3
@@ -64,19 +65,21 @@ debug.loc 0 0 2 0 10 3
 const CALL_THEN_FAULT_DBG: &str = "\
 memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i32.const 1
   v3 = i32.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65532
   v2 = i64.const 0
   i64.store v1 v2
   v3 = i32.const 0
   return v3
+  }
 }
 debug.file 0 \"fault.c\"
 debug.loc 0 0 0 0 20 5
@@ -133,10 +136,11 @@ fn trap_backtrace_walks_the_caller_chain() {
 /// (the `const 0` is 0), mapped to source line 30.
 const DIV_BY_ZERO_DBG: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = i32.div_s v0 v1
   return v2
+  }
 }
 debug.file 0 \"div.c\"
 debug.fname 0 \"divzero\"
@@ -148,17 +152,19 @@ debug.loc 0 0 1 0 30 3
 /// The call is func0 instruction 0 (line 40); the div is func1 instruction 1 (line 30).
 const CALL_THEN_DIV_DBG: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = call 1 (v0)
   v2 = i32.const 1
   v3 = i32.add v1 v2
   return v3
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = i32.div_s v0 v1
   return v2
+  }
 }
 debug.file 0 \"div.c\"
 debug.loc 0 0 0 0 40 5
@@ -216,18 +222,20 @@ fn explicit_trap_backtrace_walks_the_caller_chain() {
 /// The div is func1 block0 instruction 2, mapped to line 50.
 const SPAWN_THEN_DIV_DBG: &str = "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i32.const 5
   v3 = i32.const 0
   v4 = i32.div_s v2 v3
   v5 = i64.const 0
   return v5
+  }
 }
 debug.file 0 \"thr.c\"
 debug.loc 1 0 2 0 50 3
@@ -312,8 +320,9 @@ fn no_trap_leaves_an_empty_backtrace() {
     let mut clean = compile(
         "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 ",
     );

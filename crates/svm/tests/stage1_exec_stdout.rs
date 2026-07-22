@@ -120,7 +120,7 @@ fn parent_src(argv: &[&[u8]], wide: bool) -> String {
     format!(
         r#"memory 18
 func (i32, i32, i32) -> (i64) {{
-block0(vinst: i32, vmod: i32, vout: i32):
+block 0 (vinst: i32, vmod: i32, vout: i32) {{
   r0 = i64.const 0
   n100 = i32.const 100
   i32.store r0 n100
@@ -159,6 +159,7 @@ block0(vinst: i32, vmod: i32, vout: i32):
   ch = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> ({chty}) vinst (me, gp, gn, ent, off, sl, qz)
   r = cap.call 6 1 ({jarg}) -> (i64) vinst (ch)
   return r
+  }}
 }}
 "#
     )

@@ -1,23 +1,24 @@
 ; A minimal sandboxed program in text IR (no frontend needed). Its entry is the powerbox
 ; shape (IMPORTS.md phase 4): a paramless `_start` (func 0, exported by name) whose named
 ; `write` import binds to a capability slot at instantiation — so `svm-run` grants the real
-; powerbox and wires stdout to the terminal. The handle operand at the call site is a
-; vestigial dummy (`i32.const 0`); the slot binding is the dispatch. It writes a greeting
-; and returns 0.
+; powerbox and wires stdout to the terminal. The call site names the slot directly (v8: no
+; handle operand — the slot binding is the dispatch). It writes a greeting and returns 0.
 ;
 ;   svm-run crates/svm-run/demos/hello.svm
 memory 16
 
 data 0 "hello, sandbox!\n"
 
-export "_start" 0
+import 0 "write" (i64, i64) -> (i64)
+
+export 0 func "_start" 0
 
 func () -> (i32) {
-block0():
-  v0 = i32.const 0
-  v1 = i64.const 0
-  v2 = i64.const 16
-  v3 = call.import "write" (i64, i64) -> (i64) v0 (v1, v2)
-  v4 = i32.const 0
-  return v4
+block 0 () {
+  v0 = i64.const 0
+  v1 = i64.const 16
+  v2 = call.import 0 (v0, v1)
+  v3 = i32.const 0
+  return v3
+  }
 }

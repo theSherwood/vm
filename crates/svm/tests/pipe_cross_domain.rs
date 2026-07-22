@@ -22,7 +22,7 @@ use svm_verify::verify_module;
 /// `Stream.write(0, 2)` through the **granted write end**, then return 7.
 const SRC: &str = "memory 17\n\
 func (i32, i32, i32) -> (i64) {\n\
-block0(vinst: i32, vread: i32, vwrite: i32):\n\
+block 0 (vinst: i32, vread: i32, vwrite: i32) {\n\
   vwrite64 = i64.extend_i32_u vwrite\n\
   ventry = i64.const 1\n\
   voff = i64.const 0\n\
@@ -45,9 +45,10 @@ block0(vinst: i32, vread: i32, vwrite: i32):\n\
   t3 = i32.add t2 vb1\n\
   vresult = i64.extend_i32_u t3\n\
   return vresult\n\
+  }\n\
 }\n\
 func (i64, i64, i64) -> (i64) {\n\
-block0(vci: i64, vca: i64, vcw: i64):\n\
+block 0 (vci: i64, vca: i64, vcw: i64) {\n\
   a0 = i64.const 0\n\
   ch = i32.const 104\n\
   i32.store8 a0 ch\n\
@@ -59,6 +60,7 @@ block0(vci: i64, vca: i64, vcw: i64):\n\
   vw = cap.call 0 1 (i64, i64) -> (i64) vwh (a0, vlen)\n\
   v7 = i64.const 7\n\
   return v7\n\
+  }\n\
 }\n";
 
 fn grant_hooks() -> GrantChildHooks {

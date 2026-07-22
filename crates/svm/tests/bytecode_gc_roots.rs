@@ -89,7 +89,7 @@ fn check(src: &str, lo: u64, hi: u64, expected: &[u64]) {
 /// backends see exactly the same `frame.vals`, so the sets are equal — `{4096, 5000}`.
 const BASELINE: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   va = i64.const 4096
   vb = i64.const 5000
   vc = i64.const 5000
@@ -101,6 +101,7 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
 
@@ -116,10 +117,11 @@ fn baseline_caller_frame_roots() {
 /// equality.
 const CROSS_BLOCK_DEAD: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vdead = i64.const 5000
-  br block1()
-block1():
+  br 1()
+}
+block 1 () {
   va = i64.const 4096
   vlo = i64.const 4096
   vhi = i64.const 8192
@@ -128,6 +130,7 @@ block1():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
 
@@ -140,7 +143,7 @@ fn cross_block_dead_value_is_sound_superset() {
 /// is range-tested and emitted. Both backends apply the same mask, so both recover `5000`.
 const TAGGED: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   va = i64.const 9151314442816852872
   vlo = i64.const 4096
   vhi = i64.const 8192
@@ -149,6 +152,7 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
 
@@ -163,14 +167,15 @@ fn tagged_pointer_mask_recovers_offset() {
 /// backends). The callee also contributes its own in-range constant.
 const CALLER_FRAME: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vroot = i64.const 5000
   vt = call 1()
   vsum = i64.add vt vroot
   return vsum
+  }
 }
 func () -> (i64) {
-block0():
+block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const -1
@@ -178,6 +183,7 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
 
@@ -223,7 +229,7 @@ fn caller_frame_root_across_call() {
 /// runs `gc.roots`; both backends report `{4096 (caller), 5000 (parked fiber)}`.
 const PARKED_FIBER: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   vf = ref.func 1
   vsp = i64.const 0
   vk = cont.new vf vsp
@@ -236,14 +242,16 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   vroot = i64.const 5000
   vy = i64.const 1
   vr = suspend vy
   vsum = i64.add vroot vr
   return vsum
+  }
 }
 "#;
 
@@ -257,7 +265,7 @@ fn parked_fiber_root_is_enumerated() {
 /// §3/§6).
 const FOLD_DOWN_MASK: &str = r#"memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   va = i64.const 5000
   vlo = i64.const 4096
   vhi = i64.const 8192
@@ -266,6 +274,7 @@ block0():
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
+  }
 }
 "#;
 

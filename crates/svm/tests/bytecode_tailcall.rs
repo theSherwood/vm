@@ -25,16 +25,19 @@ fn check(src: &str, args: &[Value], want: Result<i32, Trap>) {
 /// must run in O(1) state (window reuse). `f(5, 1) = 120`.
 const TAIL_RECURSION: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i32.eqz v0
-  br_if v2 block1(v1) block2(v0, v1)
-block1(v3: i32):
+  br_if v2 1(v1) 2(v0, v1)
+}
+block 1 (v3: i32) {
   return v3
-block2(v4: i32, v5: i32):
+}
+block 2 (v4: i32, v5: i32) {
   v6 = i32.mul v5 v4
   v7 = i32.const -1
   v8 = i32.add v4 v7
   return_call 0(v8, v6)
+  }
 }
 "#;
 
@@ -42,20 +45,23 @@ block2(v4: i32, v5: i32):
 /// idx 2 = `*2`; idx 0 selects func 0 (the wrong signature) → `IndirectCallType` trap.
 const TAIL_INDIRECT: &str = r#"
 func (i32, i32) -> (i32) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   return_call_indirect (i32) -> (i32) v0 (v1)
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 10
   v2 = i32.add v0 v1
   return v2
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 2
   v2 = i32.mul v0 v1
   return v2
+  }
 }
 "#;
 

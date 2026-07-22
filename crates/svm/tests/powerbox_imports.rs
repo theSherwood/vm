@@ -2,7 +2,7 @@
 //! declares arbitrarily-named capability imports and is bound to a host-provided registry **by name**
 //! (wasm-style linking), then run through the differential wrapper. This exercises decision #2: the
 //! host offers capabilities under arbitrary names/interfaces/counts, `instantiate_with_imports`
-//! matches each `call.import "<name>"` to a [`svm_run::HostCap`] and binds slot `i` ↔ import `i` at
+//! matches each `call.sym "<name>"` to a [`svm_run::HostCap`] and binds slot `i` ↔ import `i` at
 //! instantiation — the fixed §3e powerbox is just one preset over this.
 //!
 //! Gated `#![cfg(unix)]` like the other JIT differential suites.
@@ -19,15 +19,16 @@ use svm_run::{
 /// returns `(5+7)*3 = 36`.
 const SRC: &str = "\
 memory 15
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 5
-  v2 = call.import \"add_seven\" (i64) -> (i64) v0 (v1)
+  v2 = call.sym \"add_seven\" (i64) -> (i64) v0 (v1)
   v3 = i32.const 0
-  v4 = call.import \"triple\" (i64) -> (i64) v3 (v2)
+  v4 = call.sym \"triple\" (i64) -> (i64) v3 (v2)
   return v4
+  }
 }
 ";
 
@@ -77,18 +78,19 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
 /// itself proves the instance is shared. All three backends.
 const MODULE_SRC: &str = "\
 memory 15
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 41
-  v2 = call.import \"kv.set\" (i64) -> (i64) v0 (v1)
+  v2 = call.sym \"kv.set\" (i64) -> (i64) v0 (v1)
   v3 = i32.const 0
   v4 = i64.const 0
-  v5 = call.import \"kv.get\" (i64) -> (i64) v3 (v4)
+  v5 = call.sym \"kv.get\" (i64) -> (i64) v3 (v4)
   v6 = i64.const 1
   v7 = i64.add v5 v6
   return v7
+  }
 }
 ";
 
@@ -152,15 +154,16 @@ fn standard_names_are_just_a_preset() {
     let src = "\
 memory 15
 data ro 16384 \"hi via registry\\n\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 16384
   v2 = i64.const 16
-  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.const 0
   return v4
+  }
 }
 ";
     let module = svm_text::parse_module(src).expect("parse");
@@ -186,17 +189,18 @@ const RESOLVE_SRC: &str = "\
 memory 15
 data ro 16384 \"via resolve\\n\"
 data ro 17000 \"write\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 17000
   v1 = i64.const 5
   v2 = cap.self.resolve v0 v1
   v3 = i64.const 16384
   v4 = i64.const 12
-  v5 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v4)
+  v5 = call.sym \"write\" (i64, i64) -> (i64) v2 (v3, v4)
   v6 = i32.const 0
   return v6
+  }
 }
 ";
 
@@ -222,13 +226,14 @@ fn resolve_capability_by_name_at_runtime() {
 const RESOLVE_BOGUS_SRC: &str = "\
 memory 15
 data ro 17000 \"nope\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 17000
   v1 = i64.const 4
   v2 = cap.self.resolve v0 v1
   return v2
+  }
 }
 ";
 
@@ -250,15 +255,16 @@ fn resolve_unknown_name_is_fail_closed() {
 const CANON_SRC: &str = "\
 memory 15
 data ro 16384 \"exit\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 4
   v2 = cap.self.resolve v0 v1
   v3 = i32.const 7
   cap.call 1 0 (i32) -> () v2(v3)
   unreachable
+  }
 }
 ";
 
@@ -288,9 +294,9 @@ fn canonical_powerbox_names_resolve_to_working_handles() {
 const LABEL_SRC: &str = "\
 memory 15
 data ro 16384 \"write\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 5
   v2 = cap.self.resolve v0 v1
@@ -298,9 +304,10 @@ block0():
   v4 = i64.const 64
   v5 = cap.self.label v2 v3 v4
   v6 = i64.extend_i32_s v5
-  v7 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v6)
+  v7 = call.sym \"write\" (i64, i64) -> (i64) v2 (v3, v6)
   v8 = i32.const 0
   return v8
+  }
 }
 ";
 
@@ -326,9 +333,9 @@ fn label_a_handle_to_its_registered_name() {
 const LABEL_SMALL_SRC: &str = "\
 memory 15
 data ro 16384 \"write\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 5
   v2 = cap.self.resolve v0 v1
@@ -336,8 +343,9 @@ block0():
   v4 = i64.const 2
   v5 = cap.self.label v2 v3 v4
   v6 = i64.const 0
-  v7 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v6)
+  v7 = call.sym \"write\" (i64, i64) -> (i64) v2 (v3, v6)
   return v5
+  }
 }
 ";
 

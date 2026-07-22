@@ -158,7 +158,7 @@ const F64_BITS: &[i64] = &[
 /// i64x2 add/sub/mul, i16x8 add/mul, i8x16 add/sub.
 const INT_LANES: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i32x4.splat v1
   v3 = i32.const 3
@@ -178,6 +178,7 @@ block0(v0: i64):
   v17 = i64.extend_i32_s v12
   v18 = i64.add v16 v17
   return v18
+  }
 }
 "#;
 
@@ -189,7 +190,7 @@ fn int_lanes() {
 /// Lane compares → the i32-producing reductions (bitmask / all_true / any_true).
 const INT_CMP_REDUCE: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i32x4.splat v1
   v3 = i32.const 0
@@ -203,6 +204,7 @@ block0(v0: i64):
   v11 = i32.add v10 v9
   v12 = i64.extend_i32_u v11
   return v12
+  }
 }
 "#;
 
@@ -214,7 +216,7 @@ fn int_cmp_reduce() {
 /// Lane shifts (shl/shr_s/shr_u) across i8x16/i16x8/i32x4/i64x2.
 const SHIFTS: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64x2.splat v0
   v3 = i32.const 3
@@ -229,6 +231,7 @@ block0(v0: i64):
   v12 = i64.extend_i32_s v10
   v13 = i64.add v11 v12
   return v13
+  }
 }
 "#;
 
@@ -240,7 +243,7 @@ fn shifts() {
 /// Unary integer (abs/neg), saturating add/sub, avgr_u, popcnt — the i8x16/i16x8 long tail.
 const SAT_UNARY: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i8x16.splat v1
   v3 = i8x16.neg v2
@@ -256,6 +259,7 @@ block0(v0: i64):
   v13 = i32.add v11 v12
   v14 = i64.extend_i32_s v13
   return v14
+  }
 }
 "#;
 
@@ -267,7 +271,7 @@ fn sat_unary() {
 /// Whole-vector bitwise: and/or/xor/andnot/not/bitselect.
 const BITWISE: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i64.const -1
   v3 = i64x2.splat v2
@@ -281,6 +285,7 @@ block0(v0: i64):
   v11 = i64x2.extract_lane 1 v8
   v12 = i64.add v10 v11
   return v12
+  }
 }
 "#;
 
@@ -292,7 +297,7 @@ fn bitwise() {
 /// f64x2 / f32x4 arithmetic + IEEE min/max + pmin/pmax, exact via reinterpret of lane bits.
 const FLOAT_ARITH: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vf = f64.reinterpret_i64 v0
   v1 = f64x2.splat vf
   v2 = f64x2.add v1 v1
@@ -306,6 +311,7 @@ block0(v0: i64):
   v10 = f64x2.extract_lane 0 v9
   v11 = i64.reinterpret_f64 v10
   return v11
+  }
 }
 "#;
 
@@ -317,7 +323,7 @@ fn float_arith() {
 /// f64x2 unary: abs/neg/sqrt/ceil/floor/trunc/nearest, exact.
 const FLOAT_UNARY: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vf = f64.reinterpret_i64 v0
   v1 = f64x2.splat vf
   v2 = f64x2.abs v1
@@ -330,6 +336,7 @@ block0(v0: i64):
   v9 = f64x2.extract_lane 0 v8
   v10 = i64.reinterpret_f64 v9
   return v10
+  }
 }
 "#;
 
@@ -343,7 +350,7 @@ fn float_unary() {
 /// inf/NaN inputs). Covers eq/ne/lt/gt/le/ge across f64x2/f32x4.
 const FLOAT_CMP: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   vf = f64.reinterpret_i64 v0
   v1 = f64x2.splat vf
   v2 = f64x2.add v1 v1
@@ -366,6 +373,7 @@ block0(v0: i64):
   v19 = i32.add v18 v14
   v20 = i64.extend_i32_u v19
   return v20
+  }
 }
 "#;
 
@@ -377,7 +385,7 @@ fn float_cmp() {
 /// Lane int↔float / float↔float conversions (trunc_sat is non-trapping — NaN→0, clamp).
 const CONVERT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i32x4.splat v1
   v3 = f32x4.convert_i32x4_s v2
@@ -396,6 +404,7 @@ block0(v0: i64):
   v15 = i32x4.extract_lane 0 v14
   v16 = i64.extend_i32_s v15
   return v16
+  }
 }
 "#;
 
@@ -407,7 +416,7 @@ fn convert() {
 /// i8x16.shuffle (constant byte permute) + i8x16.swizzle (dynamic byte select).
 const SHUFFLE: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i8x16.shuffle 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0 v1 v1
   v3 = i8x16.swizzle v1 v2
@@ -415,6 +424,7 @@ block0(v0: i64):
   v5 = i64x2.extract_lane 1 v2
   v6 = i64.add v4 v5
   return v6
+  }
 }
 "#;
 
@@ -426,7 +436,7 @@ fn shuffle_swizzle() {
 /// v128.const materialization + a lane op + width probe (`simd.width_bytes` == 16).
 const CONST_VEC: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
   v2 = i64x2.splat v0
   v3 = i64x2.add v1 v2
@@ -435,6 +445,7 @@ block0(v0: i64):
   v6 = i64.extend_i32_u v5
   v7 = i64.add v4 v6
   return v7
+  }
 }
 "#;
 
@@ -447,7 +458,7 @@ fn const_vec() {
 const MEM: &str = r#"
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64x2.splat v0
   v2 = i64.const 16
   v128.store v2 v1
@@ -455,6 +466,7 @@ block0(v0: i64):
   v4 = i64x2.add v3 v1
   v5 = i64x2.extract_lane 1 v4
   return v5
+  }
 }
 "#;
 
@@ -467,7 +479,7 @@ fn mem() {
 /// (`narrow_s`, i16x8→i8x16 and i32x4→i16x8).
 const WIDEN_NARROW: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i8x16.splat v1
   v3 = i16x8.extend_low_s v2
@@ -488,6 +500,7 @@ block0(v0: i64):
   v18 = i64.extend_i32_s v17
   v19 = i64.add v14 v18
   return v19
+  }
 }
 "#;
 
@@ -500,7 +513,7 @@ fn widen_narrow() {
 /// reductions, and extended pairwise add (`extadd_pairwise_<src>_s/u`).
 const EXTMUL_DOT: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i8x16.splat v1
   v3 = i16x8.extmul_low_i8x16_s v2 v2
@@ -526,6 +539,7 @@ block0(v0: i64):
   v23 = i64.extend_i32_s v22
   v24 = i64.add v23 v21
   return v24
+  }
 }
 "#;
 
@@ -543,7 +557,7 @@ fn fail_closed_simd() {
         ("fma", "vf = f64.reinterpret_i64 v0\n  v1 = f64x2.splat vf\n  v2 = f64x2.fma v1 v1 v1\n  v3 = f64x2.extract_lane 0 v2\n  v4 = i64.reinterpret_f64 v3\n  return v4"),
         ("dot_i8", "v1 = i64x2.splat v0\n  v2 = i16x8.dot_i8x16_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
     ] {
-        let src = format!("func (i64) -> (i64) {{\nblock0(v0: i64):\n  {body}\n}}\n");
+        let src = format!("func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  {body}\n  }}\n}}\n");
         let m = svm_text::parse_module(&src).unwrap_or_else(|e| panic!("{name}: {e}"));
         svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
         assert!(

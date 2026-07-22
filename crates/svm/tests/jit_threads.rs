@@ -21,14 +21,16 @@ use svm_verify::verify_module;
 /// A 4-thread × 100 atomic-increment counter (→ 400), shared by the differential and seed-sweep tests.
 const ATOMIC4: &str = "memory 16\n\
     func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = i64.const 0\n\
-    \x20 br block1(v0)\n\
-    block1(v1: i64):\n\
+    \x20 br 1(v0)\n\
+    }\n\
+    block 1 (v1: i64) {\n\
     \x20 v2 = i64.const 4\n\
     \x20 v3 = i64.lt_u v1 v2\n\
-    \x20 br_if v3 block2(v1) block3()\n\
-    block2(v4: i64):\n\
+    \x20 br_if v3 2(v1) 3()\n\
+    }\n\
+    block 2 (v4: i64) {\n\
     \x20 v5 = i64.const 100\n\
     \x20 v6 = thread.spawn 1 v5 v5\n\
     \x20 v7 = i64.const 4\n\
@@ -38,15 +40,18 @@ const ATOMIC4: &str = "memory 16\n\
     \x20 i32.store v10 v6\n\
     \x20 v11 = i64.const 1\n\
     \x20 v12 = i64.add v4 v11\n\
-    \x20 br block1(v12)\n\
-    block3():\n\
+    \x20 br 1(v12)\n\
+    }\n\
+    block 3 () {\n\
     \x20 v13 = i64.const 0\n\
-    \x20 br block4(v13)\n\
-    block4(v14: i64):\n\
+    \x20 br 4(v13)\n\
+    }\n\
+    block 4 (v14: i64) {\n\
     \x20 v15 = i64.const 4\n\
     \x20 v16 = i64.lt_u v14 v15\n\
-    \x20 br_if v16 block5(v14) block6()\n\
-    block5(v17: i64):\n\
+    \x20 br_if v16 5(v14) 6()\n\
+    }\n\
+    block 5 (v17: i64) {\n\
     \x20 v18 = i64.const 4\n\
     \x20 v19 = i64.mul v17 v18\n\
     \x20 v20 = i64.const 16\n\
@@ -55,29 +60,35 @@ const ATOMIC4: &str = "memory 16\n\
     \x20 v23 = thread.join v22\n\
     \x20 v24 = i64.const 1\n\
     \x20 v25 = i64.add v17 v24\n\
-    \x20 br block4(v25)\n\
-    block6():\n\
+    \x20 br 4(v25)\n\
+    }\n\
+    block 6 () {\n\
     \x20 v26 = i64.const 0\n\
     \x20 v27 = i64.atomic.load v26\n\
     \x20 return v27\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(vsp: i64, v0: i64):\n\
-    \x20 br block1(v0)\n\
-    block1(v1: i64):\n\
+    block 0 (vsp: i64, v0: i64) {\n\
+    \x20 br 1(v0)\n\
+    }\n\
+    block 1 (v1: i64) {\n\
     \x20 v2 = i64.const 0\n\
     \x20 v3 = i64.eq v1 v2\n\
-    \x20 br_if v3 block2() block3(v1)\n\
-    block3(v4: i64):\n\
+    \x20 br_if v3 3() 2(v1)\n\
+    }\n\
+    block 2 (v4: i64) {\n\
     \x20 v5 = i64.const 0\n\
     \x20 v6 = i64.const 1\n\
     \x20 v7 = i64.atomic.rmw.add v5 v6\n\
     \x20 v8 = i64.const -1\n\
     \x20 v9 = i64.add v4 v8\n\
-    \x20 br block1(v9)\n\
-    block2():\n\
+    \x20 br 1(v9)\n\
+    }\n\
+    block 3 () {\n\
     \x20 v10 = i64.const 0\n\
     \x20 return v10\n\
+      }\n\
     }\n";
 
 fn to_slot(v: &Value) -> i64 {
@@ -121,7 +132,7 @@ fn assert_jit_matches_interp(src: &str) {
 #[test]
 fn thread_spawn_join_sums_results() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 10\n\
         \x20 v2 = thread.spawn 1 v0 v1\n\
@@ -135,10 +146,12 @@ fn thread_spawn_join_sums_results() {
         \x20 v10 = i64.add v7 v8\n\
         \x20 v11 = i64.add v10 v9\n\
         \x20 return v11\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -174,7 +187,7 @@ fn thread_parallel_atomic_counter() {
 /// `atomic.notify` end to end.
 const FUTEX: &str = "memory 16\n\
     func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = i64.const 8\n\
     \x20 v1 = i64.const 987654\n\
     \x20 i64.atomic.store.release v0 v1\n\
@@ -188,9 +201,10 @@ const FUTEX: &str = "memory 16\n\
     \x20 v8 = atomic.notify v6 v7\n\
     \x20 v9 = thread.join v3\n\
     \x20 return v9\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(vsp: i64, v0: i64):\n\
+    block 0 (vsp: i64, v0: i64) {\n\
     \x20 v1 = i64.const 0\n\
     \x20 v2 = i32.const 0\n\
     \x20 v3 = i64.const 1000000000\n\
@@ -198,6 +212,7 @@ const FUTEX: &str = "memory 16\n\
     \x20 v5 = i64.const 8\n\
     \x20 v6 = i64.atomic.load.acquire v5\n\
     \x20 return v6\n\
+      }\n\
     }\n";
 
 #[test]
@@ -227,15 +242,16 @@ fn thread_parallel_futex_handoff() {
 #[test]
 fn thread_with_fiber_inside() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 5\n\
         \x20 v2 = thread.spawn 1 v0 v1\n\
         \x20 v3 = thread.join v2\n\
         \x20 return v3\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = ref.func 2\n\
         \x20 v1 = i64.const 0\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -243,13 +259,15 @@ fn thread_with_fiber_inside() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6 = i64.add v5 varg\n\
         \x20 return v6\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = i64.const 42\n\
         \x20 v1 = suspend v0\n\
         \x20 v2 = i64.const 0\n\
         \x20 return v2\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -262,14 +280,16 @@ fn thread_with_fiber_inside() {
 fn thread_parallel_with_fibers() {
     let src = "memory 16\n\
         func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 0\n\
-        \x20 br block1(v0)\n\
-        block1(v1: i64):\n\
+        \x20 br 1(v0)\n\
+        }\n\
+        block 1 (v1: i64) {\n\
         \x20 v2 = i64.const 4\n\
         \x20 v3 = i64.lt_u v1 v2\n\
-        \x20 br_if v3 block2(v1) block3()\n\
-        block2(v4: i64):\n\
+        \x20 br_if v3 2(v1) 3()\n\
+        }\n\
+        block 2 (v4: i64) {\n\
         \x20 v5 = i64.const 10\n\
         \x20 v6 = i64.mul v4 v5\n\
         \x20 v7 = thread.spawn 1 v4 v6\n\
@@ -280,15 +300,18 @@ fn thread_parallel_with_fibers() {
         \x20 i32.store v11 v7\n\
         \x20 v12 = i64.const 1\n\
         \x20 v13 = i64.add v4 v12\n\
-        \x20 br block1(v13)\n\
-        block3():\n\
+        \x20 br 1(v13)\n\
+        }\n\
+        block 3 () {\n\
         \x20 v14 = i64.const 0\n\
-        \x20 br block4(v14, v14)\n\
-        block4(v15: i64, v16: i64):\n\
+        \x20 br 4(v14, v14)\n\
+        }\n\
+        block 4 (v15: i64, v16: i64) {\n\
         \x20 v17 = i64.const 4\n\
         \x20 v18 = i64.lt_u v15 v17\n\
-        \x20 br_if v18 block5(v15, v16) block6(v16)\n\
-        block5(v19: i64, v20: i64):\n\
+        \x20 br_if v18 5(v15, v16) 6(v16)\n\
+        }\n\
+        block 5 (v19: i64, v20: i64) {\n\
         \x20 v21 = i64.const 4\n\
         \x20 v22 = i64.mul v19 v21\n\
         \x20 v23 = i64.const 16\n\
@@ -298,12 +321,14 @@ fn thread_parallel_with_fibers() {
         \x20 v27 = i64.add v20 v26\n\
         \x20 v28 = i64.const 1\n\
         \x20 v29 = i64.add v19 v28\n\
-        \x20 br block4(v29, v27)\n\
-        block6(v30: i64):\n\
+        \x20 br 4(v29, v27)\n\
+        }\n\
+        block 6 (v30: i64) {\n\
         \x20 return v30\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = ref.func 2\n\
         \x20 v1 = i64.const 0\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -311,13 +336,15 @@ fn thread_parallel_with_fibers() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6 = i64.add v5 varg\n\
         \x20 return v6\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = i64.const 42\n\
         \x20 v1 = suspend v0\n\
         \x20 v2 = i64.const 0\n\
         \x20 return v2\n\
+          }\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -336,17 +363,19 @@ fn thread_parallel_with_fibers() {
 #[test]
 fn thread_double_join_traps() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 7\n\
         \x20 v2 = thread.spawn 1 v0 v1\n\
         \x20 v3 = thread.join v2\n\
         \x20 v4 = thread.join v2\n\
         \x20 return v4\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(v0: i64, v1: i64):\n\
+        block 0 (v0: i64, v1: i64) {\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
 }
@@ -360,7 +389,7 @@ fn thread_double_join_traps() {
 #[test]
 fn fiber_namespace_is_domain_wide() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 2\n\
         \x20 v1 = i64.const 0\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -373,9 +402,10 @@ fn fiber_namespace_is_domain_wide() {
         \x20 v10 = i64.add v9 v7\n\
         \x20 v11 = i64.add v10 v2\n\
         \x20 return v11\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = ref.func 2\n\
         \x20 v1 = cont.new v0 vsp\n\
         \x20 v2 = i64.const 1\n\
@@ -384,12 +414,14 @@ fn fiber_namespace_is_domain_wide() {
         \x20 v6 = i64.sub v4 v5\n\
         \x20 v7 = i64.add v1 v6\n\
         \x20 return v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = i64.const 41\n\
         \x20 v1 = i64.add varg v0\n\
         \x20 return v1\n\
+          }\n\
         }\n";
     assert_jit_matches_interp(src);
     // Pin the absolute result too (worker handle 1 ⇒ join 1 ⇒ 100, + root fiber's 7+41 = 148):
@@ -410,7 +442,7 @@ fn fiber_namespace_is_domain_wide() {
 #[test]
 fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
     let src = "func () -> (i64) {\n\
-        block0():\n\
+        block 0 () {\n\
         \x20 v0 = ref.func 2\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
@@ -419,20 +451,23 @@ fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
         \x20 v6 = thread.spawn 1 v2 v2\n\
         \x20 v7 = thread.join v6\n\
         \x20 return v7\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = i64.const 7\n\
         \x20 v1, v2 = cont.resume varg v0\n\
         \x20 return v2\n\
+          }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, varg: i64):\n\
+        block 0 (vsp: i64, varg: i64) {\n\
         \x20 v0 = suspend varg\n\
         \x20 v1 = i64.const 10\n\
         \x20 v2 = i64.mul v0 v1\n\
         \x20 v3 = i64.add v2 varg\n\
         \x20 return v3\n\
+          }\n\
         }\n";
     // Both backends agree (the differential)…
     assert_jit_matches_interp(src);
@@ -463,16 +498,18 @@ fn concurrent_fiber_steal_stress() {
     let worker = |idx_addr: u64| -> String {
         format!(
             "func (i64, i64) -> (i64) {{\n\
-             block0(v0: i64, v1: i64):\n\
-             \x20 br block1()\n\
-             block1():\n\
+             block 0 (v0: i64, v1: i64) {{\n\
+             \x20 br 1()\n\
+             }}\n\
+             block 1 () {{\n\
              \x20 v2 = i64.const {idx_addr}\n\
              \x20 v3 = i32.const 1\n\
              \x20 v4 = i32.atomic.rmw.add v2 v3\n\
              \x20 v5 = i32.const 16\n\
              \x20 v6 = i32.lt_u v4 v5\n\
-             \x20 br_if v6 block2(v4) block3()\n\
-             block2(v7: i32):\n\
+             \x20 br_if v6 2(v4) 3()\n\
+             }}\n\
+             block 2 (v7: i32) {{\n\
              \x20 v8 = i64.extend_i32_u v7\n\
              \x20 v9 = i64.const 8\n\
              \x20 v10 = i64.mul v8 v9\n\
@@ -483,10 +520,12 @@ fn concurrent_fiber_steal_stress() {
              \x20 v15, v16 = cont.resume v13 v14\n\
              \x20 v17 = i64.const 128\n\
              \x20 v18 = i64.atomic.rmw.add v17 v16\n\
-             \x20 br block1()\n\
-             block3():\n\
+             \x20 br 1()\n\
+             }}\n\
+             block 3 () {{\n\
              \x20 v19 = i64.const 0\n\
              \x20 return v19\n\
+               }}\n\
              }}\n"
         )
     };
@@ -494,14 +533,16 @@ fn concurrent_fiber_steal_stress() {
     let mut root = String::from(
         "memory 16\n\
          func () -> (i64) {\n\
-         block0():\n\
+         block 0 () {\n\
          \x20 v0 = i64.const 0\n\
-         \x20 br block1(v0)\n\
-         block1(v1: i64):\n\
+         \x20 br 1(v0)\n\
+         }\n\
+         block 1 (v1: i64) {\n\
          \x20 v2 = i64.const 16\n\
          \x20 v3 = i64.lt_u v1 v2\n\
-         \x20 br_if v3 block2(v1) block3()\n\
-         block2(v4: i64):\n\
+         \x20 br_if v3 2(v1) 3()\n\
+         }\n\
+         block 2 (v4: i64) {\n\
          \x20 v5 = ref.func 3\n\
          \x20 v6 = cont.new v5 v4\n\
          \x20 v7 = i64.const 8\n\
@@ -511,8 +552,9 @@ fn concurrent_fiber_steal_stress() {
          \x20 i64.store v10 v6\n\
          \x20 v11 = i64.const 1\n\
          \x20 v12 = i64.add v4 v11\n\
-         \x20 br block1(v12)\n\
-         block3():\n",
+         \x20 br 1(v12)\n\
+         }\n\
+         block 3 () {\n",
     );
     // Two rounds: spawn 4 workers of func `r` (1 then 2), storing thread handles at 256+…, then
     // join all 4 — the barrier between first-resumes and the migrating second-resumes.
@@ -548,6 +590,7 @@ fn concurrent_fiber_steal_stress() {
         "\x20 v{a} = i64.const 128\n\
          \x20 v{b} = i64.atomic.load v{a}\n\
          \x20 return v{b}\n\
+         \x20 }}\n\
          }}\n",
         a = v,
         b = v + 1,
@@ -557,7 +600,7 @@ fn concurrent_fiber_steal_stress() {
     root.push_str(&worker(20));
     root.push_str(
         "func (i64, i64) -> (i64) {\n\
-         block0(v0: i64, v1: i64):\n\
+         block 0 (v0: i64, v1: i64) {\n\
          \x20 v2 = i64.const 3\n\
          \x20 v3 = i64.mul v0 v2\n\
          \x20 v4 = i64.const 1\n\
@@ -568,6 +611,7 @@ fn concurrent_fiber_steal_stress() {
          \x20 v9 = i64.const 2\n\
          \x20 v10 = i64.add v8 v9\n\
          \x20 return v10\n\
+           }\n\
          }\n",
     );
     let m = parse_module(&root).unwrap_or_else(|e| panic!("parse: {e:?}\n{root}"));

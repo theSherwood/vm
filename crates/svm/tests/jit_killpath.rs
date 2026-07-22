@@ -34,12 +34,14 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// per-back-edge kill-path check.
 const INFINITE_LOOP: &str = "\
 func (i64) -> (i64) {
-block0(v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 1
   v3 = i64.add v1 v2
-  br block1(v3)
+  br 1(v3)
+  }
 }
 ";
 
@@ -47,10 +49,11 @@ block1(v1: i64):
 /// native stack, so it never faults; only the *function-entry* kill-path check can stop it.
 const INFINITE_TAIL_RECURSION: &str = "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 1
   v2 = i64.add v0 v1
   return_call 0(v2)
+  }
 }
 ";
 
@@ -58,14 +61,17 @@ block0(v0: i64):
 /// correctly (the poll sees the cell stay zero every iteration and never false-trips).
 const FINITE_COUNTDOWN: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
-  br block1(v0)
-block1(v1: i32):
+block 0 (v0: i32) {
+  br 1(v0)
+}
+block 1 (v1: i32) {
   v2 = i32.const -1
   v3 = i32.add v1 v2
-  br_if v3 block1(v3) block2(v3)
-block2(v4: i32):
+  br_if v3 1(v3) 2(v3)
+}
+block 2 (v4: i32) {
   return v4
+  }
 }
 ";
 
@@ -192,7 +198,7 @@ fn jit_unarmed_path_is_unchanged() {
 const PARENT_WITH_RUNAWAY_CHILD: &str = "\
 memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 0
   v3 = i64.const 16
@@ -200,14 +206,17 @@ block0(v0: i32):
   v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 1
   v3 = i64.add v1 v2
-  br block1(v3)
+  br 1(v3)
+  }
 }
 ";
 

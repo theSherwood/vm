@@ -36,7 +36,7 @@ fn src(token: &[u8; 3]) -> String {
     format!(
         "memory 17
 func (i32, i32) -> (i64) {{
-block0(vinst: i32, vout: i32):
+block 0 (vinst: i32, vout: i32) {{
 {seed}  vgh = i64.extend_i32_u vout
   ventry = i64.const 1
   voff = i64.const {CARVE}
@@ -45,14 +45,16 @@ block0(vinst: i32, vout: i32):
   vch = cap.call 6 8 (i64, i64, i64, i64, i64) -> (i32) vinst (vgh, ventry, voff, vsl, vq)
   vres = cap.call 6 1 (i32) -> (i64) vinst (vch)
   return vres
+  }}
 }}
 func (i64, i64, i64) -> (i64) {{
-block0(vcinst: i64, vcas: i64, vcstream: i64):
+block 0 (vcinst: i64, vcas: i64, vcstream: i64) {{
   vsh = i32.wrap_i64 vcstream
   vptr = i64.const 0
   vlen = i64.const 3
   vw = cap.call 0 1 (i64, i64) -> (i64) vsh (vptr, vlen)
   return vw
+  }}
 }}
 "
     )

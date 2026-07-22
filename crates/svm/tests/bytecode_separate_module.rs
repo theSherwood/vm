@@ -18,7 +18,7 @@ use svm_text::parse_module;
 const CHILD_SRC: &str = r#"memory 16
 data 100 "VM"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.const 0
@@ -28,6 +28,7 @@ block0(v0: i64):
   v6 = i64.const 1000
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "#;
 
@@ -76,7 +77,7 @@ fn check(parent_src: &str, child_src: &str, want: Result<Vec<Value>, ()>) {
 /// result. The child read its own data segment ('V' = 86) and returned `86 + 1000 = 1086`.
 const PARENT: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -84,6 +85,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = cap.call 6 1 (i32) -> (i64) v0 (v6)
   return v7
+  }
 }
 "#;
 
@@ -96,7 +98,7 @@ fn module_child_runs_with_its_data_segments() {
 /// and the child's data byte — proving the foreign module ran confined over the shared backing.
 const PARENT_READBACK: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -110,6 +112,7 @@ block0(v0: i32, v1: i32):
   v12 = i64.mul v7 v11
   v13 = i64.add v12 v10
   return v13
+  }
 }
 "#;
 
@@ -127,7 +130,7 @@ fn module_child_writes_visible_to_parent() {
 /// rejected with `-EINVAL` — §14 transparency (the plugin must run exactly as it would standalone).
 const PARENT_BAD_SIZE: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -135,6 +138,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
+  }
 }
 "#;
 
@@ -147,7 +151,7 @@ fn carve_must_equal_declared_memory() {
 /// module handle, which was never granted).
 const PARENT_FORGED: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 999
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -155,6 +159,7 @@ block0(v0: i32, v1: i32):
   v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
+  }
 }
 "#;
 
@@ -168,25 +173,27 @@ fn forged_module_handle_faults_identically() {
 /// tree-walker — name → funcidx through the generic `cap_dispatch_slots` seam.
 const NAMED_CHILD_SRC: &str = r#"memory 16
 data 100 "VM"
-export "alpha" 0
-export "beta" 1
+export 0 func "alpha" 0
+export 1 func "beta" 1
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 1000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 100
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 2000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -195,7 +202,7 @@ block0(v0: i64):
 const PARENT_BY_NAME: &str = r#"memory 17
 data 200 "beta"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 200
   v3 = i64.const 4
   v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
@@ -206,6 +213,7 @@ block0(v0: i32, v1: i32):
   v9 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
   v10 = cap.call 6 1 (i32) -> (i64) v0 (v9)
   return v10
+  }
 }
 "#;
 
@@ -219,7 +227,7 @@ fn module_child_addressed_by_export_name_matches_treewalker() {
 /// 0 to exercise its confined window too.
 const CORO_CHILD: &str = r#"memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   va = i64.const 0
   vb = i32.const 7
@@ -232,6 +240,7 @@ block0(v0: i64):
   v9 = i64.const 999
   v10 = i64.add v9 v8
   return v10
+  }
 }
 "#;
 
@@ -239,7 +248,7 @@ block0(v0: i64):
 /// (delivering 0, 10, 20). Yields 100, 210, then returns 1019; `100 + 210 + 1019 + RETURNED*1e6`.
 const PARENT_CORO: &str = r#"memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.extend_i32_s v1
   v3 = i64.const 0
   v4 = i64.const 65536
@@ -259,6 +268,7 @@ block0(v0: i32, v1: i32):
   v21 = i64.mul v19 v20
   v22 = i64.add v18 v21
   return v22
+  }
 }
 "#;
 

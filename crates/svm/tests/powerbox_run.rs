@@ -13,15 +13,16 @@ use svm_run::{instantiate, Backend, Instance, Limits, Outcome, RunConfig, Value}
 const HELLO: &str = "\
 memory 15
 data ro 16384 \"hello, powerbox\\n\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 16384
   v2 = i64.const 16
-  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.const 0
   return v4
+  }
 }
 ";
 

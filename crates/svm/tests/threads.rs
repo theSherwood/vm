@@ -38,19 +38,21 @@ fn spawned_thread_shares_memory() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 43981
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = i64.const 0
   v4 = i64.atomic.load v3
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   i64.atomic.store v1 v0
   return v0
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(43981));
@@ -64,17 +66,19 @@ fn join_returns_thread_result() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 7
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   return v2
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(21));
@@ -90,7 +94,7 @@ fn concurrent_atomic_increments_sum_exactly() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 1000
   v1 = thread.spawn 1 v0 v0
   v2 = thread.spawn 1 v0 v0
@@ -103,11 +107,13 @@ block0():
   v9 = i64.const 0
   v10 = i64.atomic.load v9
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
-  br block1(v0)
-block1(v1: i64):
+block 0 (vsp: i64, v0: i64) {
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 1
   v4 = i64.atomic.rmw.add v2 v3
@@ -115,10 +121,12 @@ block1(v1: i64):
   v6 = i64.add v1 v5
   v7 = i64.const 0
   v8 = i64.ne v6 v7
-  br_if v8 block1(v6) block2()
-block2():
+  br_if v8 1(v6) 2()
+}
+block 2 () {
   v9 = i64.const 0
   return v9
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(4000));
@@ -132,17 +140,19 @@ fn forged_join_handle_is_inert() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 99
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = i32.const 1234567
   v4 = thread.join v3
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   return v0
+  }
 }
 "#;
     assert_eq!(run_i64(src), Err(Trap::ThreadFault));
@@ -156,11 +166,12 @@ fn sequential_spawns_exceed_concurrency_cap() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 0
-  br block1(v0, v1)
-block1(v2: i64, v3: i64):
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
   v4 = thread.spawn 1 v3 v3
   v5 = thread.join v4
   v6 = i64.add v2 v5
@@ -168,13 +179,16 @@ block1(v2: i64, v3: i64):
   v8 = i64.add v3 v7
   v9 = i64.const 200
   v10 = i64.lt_u v8 v9
-  br_if v10 block1(v6, v8) block2(v6)
-block2(v11: i64):
+  br_if v10 1(v6, v8) 2(v6)
+}
+block 2 (v11: i64) {
   return v11
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   return v0
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(19900));
@@ -189,34 +203,39 @@ fn many_green_threads_on_a_small_pool() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
-  br block1(v0)
-block1(v1: i64):
+  br 1(v0)
+}
+block 1 (v1: i64) {
   v2 = thread.spawn 1 v1 v1
   v3 = i64.const 1
   v4 = i64.add v1 v3
   v5 = i64.const 1000
   v6 = i64.lt_u v4 v5
-  br_if v6 block1(v4) block2()
-block2():
+  br_if v6 1(v4) 2()
+}
+block 2 () {
   v7 = i64.const 0
   v8 = i64.atomic.load v7
   v9 = i64.const 1000
   v10 = i64.eq v8 v9
-  br_if v10 block3() block2()
-block3():
+  br_if v10 3() 2()
+}
+block 3 () {
   v11 = i64.const 0
   v12 = i64.atomic.load v11
   return v12
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
   return v4
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(1000));
@@ -229,16 +248,18 @@ fn double_join_is_inert() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 5
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   return v0
+  }
 }
 "#;
     assert_eq!(run_i64(src), Err(Trap::ThreadFault));
@@ -252,17 +273,19 @@ fn child_trap_propagates_through_join() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 1
   i64.atomic.store v1 v0
   return v0
+  }
 }
 "#;
     assert_eq!(run_i64(src), Err(Trap::MemoryFault));
@@ -275,17 +298,19 @@ fn capture_reflects_thread_writes() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 255
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 8
   i64.atomic.store v1 v0
   return v0
+  }
 }
 "#;
     let m = module(src);
@@ -304,15 +329,17 @@ fn verify_rejects_bad_thread_entry_signature() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 1
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   return v0
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -330,15 +357,17 @@ fn thread_ops_round_trip() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 1
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   return v0
+  }
 }
 "#;
     let m = module(src);
@@ -358,7 +387,7 @@ fn wait_returns_not_equal() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 7
   v2 = i64.const 1000000
@@ -369,6 +398,7 @@ block0():
   v7 = i64.const 0
   v8 = select v5 v6 v7
   return v8
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(1));
@@ -381,7 +411,7 @@ fn wait_times_out() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 0
   v2 = i64.const 1000000
@@ -392,6 +422,7 @@ block0():
   v7 = i64.const 0
   v8 = select v5 v6 v7
   return v8
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(1));
@@ -406,29 +437,33 @@ fn notify_wakes_waiting_thread() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  br block1(v1)
-block1(v2: i32):
+  br 1(v1)
+}
+block 1 (v2: i32) {
   v3 = i64.const 8
   v4 = i64.atomic.load v3
   v5 = i64.const 1
   v6 = i64.eq v4 v5
-  br_if v6 block2(v2) block1(v2)
-block2(v7: i32):
+  br_if v6 2(v2) 1(v2)
+}
+block 2 (v7: i32) {
   v8 = i64.const 0
   v9 = i32.const 1
   v10 = atomic.notify v8 v9
   v11 = i32.const 0
   v12 = i32.ne v10 v11
-  br_if v12 block3(v7) block2(v7)
-block3(v13: i32):
+  br_if v12 3(v7) 2(v7)
+}
+block 3 (v13: i32) {
   v14 = thread.join v13
   return v14
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, v0: i64):
+block 0 (vsp: i64, v0: i64) {
   v1 = i64.const 8
   v2 = i64.const 1
   i64.atomic.store v1 v2
@@ -442,6 +477,7 @@ block0(vsp: i64, v0: i64):
   v10 = i64.const 200
   v11 = select v8 v9 v10
   return v11
+  }
 }
 "#;
     assert_eq!(run_i64(src), Ok(100));
@@ -453,7 +489,7 @@ fn wait_notify_round_trip() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 0
   v2 = i64.const 1000
@@ -462,6 +498,7 @@ block0():
   v5 = atomic.notify v0 v4
   v6 = i64.atomic.load v0
   return v6
+  }
 }
 "#;
     let m = module(src);
@@ -478,7 +515,7 @@ fn ordering_and_fence_round_trip() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.atomic.load.acquire v0
   v2 = i32.const 1
@@ -492,6 +529,7 @@ block0():
   atomic.fence.acquire
   v8 = i64.atomic.load v0
   return v8
+  }
 }
 "#;
     let m = module(src);
@@ -511,11 +549,12 @@ fn verify_rejects_release_load() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.atomic.load.release v0
   v2 = i64.const 0
   return v2
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -531,12 +570,13 @@ fn verify_rejects_acquire_store() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 1
   i32.atomic.store.acquire v0 v1
   v2 = i64.const 0
   return v2
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");
@@ -553,7 +593,7 @@ fn ordered_atomics_and_fence_execute() {
     let src = r#"
 memory 16
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i64.const 5
   i64.atomic.store.release v0 v1
@@ -564,6 +604,7 @@ block0():
   v5 = i64.atomic.load v0
   v6 = i64.add v2 v5
   return v6
+  }
 }
 "#;
     // v2 = 5 (acquire load), v5 = 8 (after +3); returns 5 + 8 = 13.
@@ -575,13 +616,14 @@ block0():
 fn verify_rejects_wait_without_memory() {
     let src = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 0
   v1 = i32.const 0
   v2 = i64.const 0
   v3 = i32.atomic.wait v0 v1 v2
   v4 = i64.const 0
   return v4
+  }
 }
 "#;
     let m = parse_module(src).expect("parse");

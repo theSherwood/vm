@@ -151,7 +151,7 @@ fn thaw(
 // stores its total to its own slot; the clock read after the loop just makes the child may-suspend too.
 const SRC_LOOPS: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65560
   i32.store v2 v0
   v3 = i64.const 65544
@@ -161,35 +161,41 @@ block0(v0: i32, v1: i32):
   v7 = i32.const 0
   v8 = cap.call 13 0 (i32) -> (i64) v1 (v7)
   v9 = i64.const 0
-  br block1(v9)
-block1(v10: i64):
+  br 1(v9)
+}
+block 1 (v10: i64) {
   v11 = i64.const 1
   v12 = i64.add v10 v11
   v13 = i64.const 100000000
   v14 = i64.lt_s v12 v13
-  br_if v14 block1(v12) block2(v12)
-block2(v15: i64):
+  br_if v14 1(v12) 2(v12)
+}
+block 2 (v15: i64) {
   v16 = i64.const 65536
   i64.store v16 v15
   return v15
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i64.const 0
-  br block1(v1, v3, v4)
-block1(v5: i64, v6: i32, v7: i64):
+  br 1(v1, v3, v4)
+}
+block 1 (v5: i64, v6: i32, v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v5, v6, v9) block2(v5, v6, v9)
-block2(v12: i64, v13: i32, v14: i64):
+  br_if v11 1(v5, v6, v9) 2(v5, v6, v9)
+}
+block 2 (v12: i64, v13: i32, v14: i64) {
   v15 = i32.const 0
   v16 = cap.call 2 0 (i32) -> (i64) v13 (v15)
   i64.store v12 v14
   return v14
+  }
 }
 "#;
 
@@ -232,31 +238,35 @@ fn concurrent_children_self_unwind_and_thaw_reproduces_the_result() {
 // isn't in the snapshot — so the freeze must capture it and the thaw deliver it to the re-executed join.
 const SRC_JOIN: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 7
   v3 = thread.spawn 1 v2 v2
   v4 = i32.const 0
   v5 = cap.call 13 0 (i32) -> (i64) v1 (v4)
   v6 = i64.const 0
-  br block1(v3, v6)
-block1(v7: i32, v8: i64):
+  br 1(v3, v6)
+}
+block 1 (v7: i32, v8: i64) {
   v9 = i64.const 1
   v10 = i64.add v8 v9
   v11 = i64.const 100000000
   v12 = i64.lt_s v10 v11
-  br_if v12 block1(v7, v10) block2(v7, v10)
-block2(v13: i32, v14: i64):
+  br_if v12 1(v7, v10) 2(v7, v10)
+}
+block 2 (v13: i32, v14: i64) {
   v15 = thread.join v13
   v16 = i64.add v14 v15
   v17 = i64.const 65536
   i64.store v17 v16
   return v16
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1000
   v3 = i64.add v1 v2
   return v3
+  }
 }
 "#;
 
@@ -301,28 +311,31 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
 // host fn flips the same flag regardless of caller.)
 const SRC_CHILD_FIBER: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65568
   i32.store v2 v1
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
   v5 = i64.const 0
-  br block1(v0, v5)
-block1(v6: i32, v7: i64):
+  br 1(v0, v5)
+}
+block 1 (v6: i32, v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v6, v9) block2(v6, v9)
-block2(v12: i32, v13: i64):
+  br_if v11 1(v6, v9) 2(v6, v9)
+}
+block 2 (v12: i32, v13: i64) {
   v14 = i32.const 0
   v15 = cap.call 2 0 (i32) -> (i64) v12 (v14)
   v16 = i64.const 65536
   i64.store v16 v13
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = ref.func 2
   v3 = i64.const 4096
   v4 = cont.new v2 v3
@@ -333,26 +346,30 @@ block0(v0: i64, v1: i64):
   v10 = i32.const 0
   v11 = cap.call 13 0 (i32) -> (i64) v9 (v10)
   v12 = i64.const 0
-  br block1(v7, v12)
-block1(v13: i64, v14: i64):
+  br 1(v7, v12)
+}
+block 1 (v13: i64, v14: i64) {
   v15 = i64.const 1
   v16 = i64.add v14 v15
   v17 = i64.const 100000000
   v18 = i64.lt_s v16 v17
-  br_if v18 block1(v13, v16) block2(v13, v16)
-block2(v19: i64, v20: i64):
+  br_if v18 1(v13, v16) 2(v13, v16)
+}
+block 2 (v19: i64, v20: i64) {
   v21 = i64.add v19 v20
   v22 = i64.const 65544
   i64.store v22 v21
   return v21
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 5
   v3 = suspend v2
   v4 = i64.const 1000
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
 
@@ -400,66 +417,75 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
 // yielded value reproduce `K + 5`, and the root reproduces `K`.
 const SRC_CHILD_FIBER_ACTIVE: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65568
   i32.store v2 v1
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
   v5 = i64.const 0
-  br block1(v0, v5)
-block1(v6: i32, v7: i64):
+  br 1(v0, v5)
+}
+block 1 (v6: i32, v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v6, v9) block2(v6, v9)
-block2(v12: i32, v13: i64):
+  br_if v11 1(v6, v9) 2(v6, v9)
+}
+block 2 (v12: i32, v13: i64) {
   v14 = i32.const 0
   v15 = cap.call 2 0 (i32) -> (i64) v12 (v14)
   v16 = i64.const 65536
   i64.store v16 v13
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = ref.func 2
   v3 = i64.const 4096
   v4 = cont.new v2 v3
   v5 = i64.const 0
   v6, v7 = cont.resume v4 v5
   v12 = i64.const 0
-  br block1(v7, v12)
-block1(v13: i64, v14: i64):
+  br 1(v7, v12)
+}
+block 1 (v13: i64, v14: i64) {
   v15 = i64.const 1
   v16 = i64.add v14 v15
   v17 = i64.const 100000000
   v18 = i64.lt_s v16 v17
-  br_if v18 block1(v13, v16) block2(v13, v16)
-block2(v19: i64, v20: i64):
+  br_if v18 1(v13, v16) 2(v13, v16)
+}
+block 2 (v19: i64, v20: i64) {
   v21 = i64.add v19 v20
   v22 = i64.const 65544
   i64.store v22 v21
   return v21
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65568
   v3 = i32.load v2
   v4 = i32.const 0
   v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
-  br block1(v6)
-block1(v7: i64):
+  br 1(v6)
+}
+block 1 (v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v9) block2(v9)
-block2(v12: i64):
+  br_if v11 1(v9) 2(v9)
+}
+block 2 (v12: i64) {
   v14 = suspend v12
   v15 = i64.const 1000
   v16 = i64.add v14 v15
   return v16
+  }
 }
 "#;
 
@@ -503,7 +529,7 @@ fn concurrent_child_owns_active_chain_fiber_through_freeze_thaw() {
 // re-issue the join so it resolves the re-run child's result.
 const SRC_BLOCKED_JOIN: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65560
   i32.store v2 v1
   v3 = i64.const 0
@@ -512,25 +538,29 @@ block0(v0: i32, v1: i32):
   v6 = i64.const 65536
   i64.store v6 v5
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
   v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
-  br block1(v6)
-block1(v7: i64):
+  br 1(v6)
+}
+block 1 (v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v9) block2(v9)
-block2(v12: i64):
+  br_if v11 1(v9) 2(v9)
+}
+block 2 (v12: i64) {
   v13 = i64.const 65544
   i64.store v13 v12
   return v12
+  }
 }
 "#;
 
@@ -572,23 +602,26 @@ fn concurrent_freeze_while_root_blocked_in_join() {
 // a grandchild; with no freeze, the grandchild's value (42) flows back through both joins.
 const SRC_NESTED: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = thread.spawn 1 v1 v1
   v3 = thread.join v2
   return v3
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   v3 = thread.spawn 2 v2 v2
   v4 = thread.join v3
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 42
   return v2
+  }
 }
 "#;
 
@@ -632,63 +665,72 @@ fn nested_concurrent_spawn_returns_grandchild_value() {
 // child, child under root) from the frozen residue and reproduces the uninterrupted result.
 const SRC_NESTED_FREEZE: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65560
   i32.store v2 v1
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
   v5 = i64.const 0
-  br block1(v4, v5)
-block1(v6: i32, v7: i64):
+  br 1(v4, v5)
+}
+block 1 (v6: i32, v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v6, v9) block2(v6, v9)
-block2(v12: i32, v13: i64):
+  br_if v11 1(v6, v9) 2(v6, v9)
+}
+block 2 (v12: i32, v13: i64) {
   v14 = thread.join v12
   v15 = i64.add v13 v14
   v16 = i64.const 65536
   i64.store v16 v15
   return v15
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   v3 = thread.spawn 2 v2 v2
   v4 = i64.const 0
-  br block1(v3, v4)
-block1(v5: i32, v6: i64):
+  br 1(v3, v4)
+}
+block 1 (v5: i32, v6: i64) {
   v7 = i64.const 1
   v8 = i64.add v6 v7
   v9 = i64.const 100000000
   v10 = i64.lt_s v8 v9
-  br_if v10 block1(v5, v8) block2(v5, v8)
-block2(v11: i32, v12: i64):
+  br_if v10 1(v5, v8) 2(v5, v8)
+}
+block 2 (v11: i32, v12: i64) {
   v13 = thread.join v11
   v14 = i64.add v12 v13
   v15 = i64.const 65544
   i64.store v15 v14
   return v14
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
   v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
-  br block1(v6)
-block1(v7: i64):
+  br 1(v6)
+}
+block 1 (v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v9) block2(v9)
-block2(v12: i64):
+  br_if v11 1(v9) 2(v9)
+}
+block 2 (v12: i64) {
   v13 = i64.const 65552
   i64.store v13 v12
   return v12
+  }
 }
 "#;
 
@@ -737,7 +779,7 @@ fn nested_concurrent_tree_freezes_and_thaws() {
 // wake landed as a value change that rode the snapshot.
 const SRC_WAIT_WORKS: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65560
   i32.store v2 v1
   v3 = i64.const 0
@@ -750,18 +792,21 @@ block0(v0: i32, v1: i32):
   i32.store v9 v8
   v10 = i64.const 0
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
-  br block1(v2)
-block1(v3: i64):
+  br 1(v2)
+}
+block 1 (v3: i64) {
   v4 = i64.const 1
   v5 = i64.add v3 v4
   v6 = i64.const 100000000
   v7 = i64.lt_s v5 v6
-  br_if v7 block1(v5) block2(v5)
-block2(v8: i64):
+  br_if v7 1(v5) 2(v5)
+}
+block 2 (v8: i64) {
   v9 = i64.const 65568
   v10 = i32.const 1
   i32.atomic.store v9 v10
@@ -772,6 +817,7 @@ block2(v8: i64):
   v15 = i64.const 65544
   i64.store v15 v8
   return v8
+  }
 }
 "#;
 
@@ -828,7 +874,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
 // fail-closed, and without hanging. (The sibling-notify counterpart resolves; see the next test.)
 const SRC_WAIT_DEADLOCK: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65560
   i32.store v2 v1
   v3 = i64.const 0
@@ -841,25 +887,29 @@ block0(v0: i32, v1: i32):
   i32.store v9 v8
   v10 = i64.const 0
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
   v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
-  br block1(v6)
-block1(v7: i64):
+  br 1(v6)
+}
+block 1 (v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v9) block2(v9)
-block2(v12: i64):
+  br_if v11 1(v9) 2(v9)
+}
+block 2 (v12: i64) {
   v13 = i64.const 65544
   i64.store v13 v12
   return v12
+  }
 }
 "#;
 
@@ -897,7 +947,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
 // their own threads against their own words and re-synchronise on the real futex.
 const SRC_WAIT_NOTIFY: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65560
   i32.store v2 v1
   v3 = i64.const 0
@@ -910,22 +960,25 @@ block0(v0: i32, v1: i32):
   i32.store v9 v8
   v10 = i64.const 0
   return v10
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
   v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
-  br block1(v6)
-block1(v7: i64):
+  br 1(v6)
+}
+block 1 (v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v9) block2(v9)
-block2(v12: i64):
+  br_if v11 1(v9) 2(v9)
+}
+block 2 (v12: i64) {
   v13 = i64.const 65568
   v14 = i32.const 1
   i32.atomic.store v13 v14
@@ -934,6 +987,7 @@ block2(v12: i64):
   v17 = i64.const 65544
   i64.store v17 v12
   return v12
+  }
 }
 "#;
 
@@ -980,7 +1034,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify() {
 // A fresh run suffices (the detection is general); the freeze/thaw path inherits it.
 const SRC_MUTUAL_BLOCK: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
   v4 = thread.spawn 2 v2 v2
@@ -988,24 +1042,27 @@ block0(v0: i32, v1: i32):
   v6 = thread.join v4
   v7 = i64.const 0
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65576
   v3 = i32.const 0
   v4 = i64.const -1
   v5 = i32.atomic.wait v2 v3 v4
   v6 = i64.const 0
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65568
   v3 = i32.const 0
   v4 = i64.const -1
   v5 = i32.atomic.wait v2 v3 v4
   v6 = i64.const 0
   return v6
+  }
 }
 "#;
 
@@ -1053,7 +1110,7 @@ fn mutual_wait_block_fails_closed_not_hangs() {
 // mutual-*block* above — the same two-vCPU cross-wait, but with the notifies that make it resolve.
 const SRC_MUTUAL_RENDEZVOUS: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
   v4 = thread.spawn 2 v2 v2
@@ -1061,9 +1118,10 @@ block0(v0: i32, v1: i32):
   v6 = thread.join v4
   v7 = i64.const 0
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65568
   v3 = i32.const 1
   i32.atomic.store v2 v3
@@ -1077,9 +1135,10 @@ block0(v0: i64, v1: i64):
   v11 = i64.const 7
   i64.store v10 v11
   return v11
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65576
   v3 = i32.const 1
   i32.atomic.store v2 v3
@@ -1093,6 +1152,7 @@ block0(v0: i64, v1: i64):
   v11 = i64.const 7
   i64.store v10 v11
   return v11
+  }
 }
 "#;
 
@@ -1177,7 +1237,7 @@ fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
 // vCPU. The thaw reloads A's join result (A is never re-run) and reproduces every total.
 const SRC_RECYCLE: &str = r#"
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65560
   i32.store v2 v0
   v3 = i64.const 7
@@ -1188,42 +1248,49 @@ block0(v0: i32, v1: i32):
   v8 = i32.const 0
   v9 = cap.call 13 0 (i32) -> (i64) v1 (v8)
   v10 = i64.const 0
-  br block1(v5, v10)
-block1(v11: i64, v12: i64):
+  br 1(v5, v10)
+}
+block 1 (v11: i64, v12: i64) {
   v13 = i64.const 1
   v14 = i64.add v12 v13
   v15 = i64.const 100000000
   v16 = i64.lt_s v14 v15
-  br_if v16 block1(v11, v14) block2(v11, v14)
-block2(v17: i64, v18: i64):
+  br_if v16 1(v11, v14) 2(v11, v14)
+}
+block 2 (v17: i64, v18: i64) {
   v19 = i64.add v18 v17
   v20 = i64.const 65536
   i64.store v20 v19
   return v19
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 1000
   v3 = i64.add v1 v2
   return v3
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i64.const 0
-  br block1(v1, v3, v4)
-block1(v5: i64, v6: i32, v7: i64):
+  br 1(v1, v3, v4)
+}
+block 1 (v5: i64, v6: i32, v7: i64) {
   v8 = i64.const 1
   v9 = i64.add v7 v8
   v10 = i64.const 100000000
   v11 = i64.lt_s v9 v10
-  br_if v11 block1(v5, v6, v9) block2(v5, v6, v9)
-block2(v12: i64, v13: i32, v14: i64):
+  br_if v11 1(v5, v6, v9) 2(v5, v6, v9)
+}
+block 2 (v12: i64, v13: i32, v14: i64) {
   v15 = i32.const 0
   v16 = cap.call 2 0 (i32) -> (i64) v13 (v15)
   i64.store v12 v14
   return v14
+  }
 }
 "#;
 

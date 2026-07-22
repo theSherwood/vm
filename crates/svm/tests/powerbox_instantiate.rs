@@ -12,22 +12,23 @@
 use svm_run::{instantiate, Outcome, Value};
 
 /// A frontend's IR, hand-written in text form: a paramless `_start` (func 0, exported by name —
-/// the phase-4 powerbox entry marker) whose `call.import "write"` emits a read-only string
+/// the phase-4 powerbox entry marker) whose `call.sym "write"` emits a read-only string
 /// segment, then returns 0. The handle operand is a vestigial dummy (`i32.const 0`); the runtime
 /// binds the `write` slot at instantiation — exactly what a non-C frontend that targets SVM-IR +
 /// manifest capability imports produces.
 const HELLO: &str = "\
 memory 15
 data ro 16384 \"hello, powerbox\\n\"
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 16384
   v2 = i64.const 16
-  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.const 0
   return v4
+  }
 }
 ";
 
@@ -69,16 +70,18 @@ fn handwritten_ir_runs_through_the_powerbox_wrapper() {
 /// it as a **bare kernel** (args in, results out, interp == jit), with no powerbox capabilities.
 const KERNEL: &str = "\
 memory 15
-export \"square\" 1
+export 0 func \"square\" 1
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 0
   return v1
+  }
 }
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.mul v0 v0
   return v1
+  }
 }
 ";
 
@@ -133,15 +136,16 @@ fn wrapper_guards_misuse() {
 fn unbound_import_fails_closed() {
     let src = "\
 memory 15
-export \"_start\" 0
+export 0 func \"_start\" 0
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = i32.const 0
   v1 = i64.const 0
   v2 = i64.const 0
-  v3 = call.import \"no_such_cap\" (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.sym \"no_such_cap\" (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.const 0
   return v4
+  }
 }
 ";
     let module = svm_text::parse_module(src).expect("parse");
@@ -157,11 +161,12 @@ block0():
 fn dangling_export_fails_verification() {
     let src = "\
 memory 15
-export \"ghost\" 9
+export 0 func \"ghost\" 9
 func (i64) -> (i32) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.const 0
   return v1
+  }
 }
 ";
     let module = svm_text::parse_module(src).expect("parse");

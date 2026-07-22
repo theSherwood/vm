@@ -12,14 +12,16 @@ use svm_text::parse_module;
 // takes the two stream handles positionally. Reading an empty stdin under blocking mode parks it.
 const ECHO: &str = r#"memory 16
 func (i32, i32) -> (i64) {
-block0(vin: i32, vout: i32):
-  br block1(vin, vout)
-block1(vin1: i32, vout1: i32):
+block 0 (vin: i32, vout: i32) {
+  br 1(vin, vout)
+}
+block 1 (vin1: i32, vout1: i32) {
   vptr = i64.const 1024
   vlen = i64.const 64
   vn = cap.call 0 0 (i64, i64) -> (i64) vin1 (vptr, vlen)
   vw = cap.call 0 1 (i64, i64) -> (i64) vout1 (vptr, vn)
-  br block1(vin1, vout1)
+  br 1(vin1, vout1)
+  }
 }
 "#;
 
@@ -69,11 +71,12 @@ fn stdin_read_parks_and_resumes() {
 // returns EOF and the guest runs to completion, unchanged. Here the guest reads once and returns `n`.
 const READ_ONCE: &str = r#"memory 16
 func (i32) -> (i64) {
-block0(vin: i32):
+block 0 (vin: i32) {
   vptr = i64.const 1024
   vlen = i64.const 64
   vn = cap.call 0 0 (i64, i64) -> (i64) vin (vptr, vlen)
   return vn
+  }
 }
 "#;
 

@@ -82,10 +82,12 @@ fn mutated_valid_modules_never_panic() {
     // Start from valid encodings and flip bytes — exercises the decoder's recovery
     // paths closer to the valid manifold than pure random noise reaches.
     let seeds = [
-        r#"func (i32,i32)->(i32){block0(v0:i32,v1:i32): v2 = i32.add v0 v1
- return v2}"#,
-        r#"func ()->(i64){block0(): v0 = i64.const 7
- return v0}"#,
+        r#"func (i32,i32)->(i32){
+block 0 (v0:i32,v1:i32) { v2 = i32.add v0 v1
+ return v2 } }"#,
+        r#"func ()->(i64){
+block 0 () { v0 = i64.const 7
+ return v0 } }"#,
     ];
     let mut rng = Rng(0xD1B54A32D192ED03);
     for seed in seeds {

@@ -29,36 +29,40 @@ fn check_fiber(src: &str, args: &[Value]) {
 /// `arg + 100 = 107`, so the resumer sees `(RETURNED, 107)`.
 const RUN_TO_COMPLETION: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = i64.const 7
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 100
   v1 = i64.add varg v0
   return v1
+  }
 }
 "#;
 
 /// The status of a run-to-completion fiber is RETURNED — return it (proves the i32 status result).
 const RETURN_STATUS: &str = r#"
 func () -> (i32) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = i64.const 7
   v4, v5 = cont.resume v2 v3
   return v4
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   return varg
+  }
 }
 "#;
 
@@ -67,7 +71,7 @@ block0(vsp: i64, varg: i64):
 /// RETURNED). Result: `v5 + v8 = 11 + 25 = 36`.
 const SUSPEND_ROUNDTRIP: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -77,15 +81,17 @@ block0():
   v7, v8 = cont.resume v2 v6
   v9 = i64.add v5 v8
   return v9
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = i64.const 1
   v1 = i64.add varg v0
   v2 = suspend v1
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -94,7 +100,7 @@ block0(vsp: i64, varg: i64):
 /// same fiber and the suspend-result delivery across many switches.
 const SUSPEND_LOOP: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 0
   v2 = cont.new v0 v1
@@ -107,14 +113,16 @@ block0():
   v12 = i64.add v5 v8
   v13 = i64.add v12 v11
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {
   v0 = suspend varg
   v1 = suspend v0
   v2 = i64.add varg v0
   v3 = i64.add v2 v1
   return v3
+  }
 }
 "#;
 
@@ -141,21 +149,23 @@ fn fiber_suspend_loop() {
 /// Resuming a never-created handle is an inert `FiberFault` on both engines.
 const FORGED_RESUME: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i32.const 99
   v1 = i64.const 5
   v2, v3 = cont.resume v0 v1
   return v3
+  }
 }
 "#;
 
 /// The root activation cannot `suspend` (no resumer) — `FiberFault` on both engines.
 const ROOT_SUSPEND: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = i64.const 5
   v1 = suspend v0
   return v1
+  }
 }
 "#;
 

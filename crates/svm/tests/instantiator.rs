@@ -23,7 +23,7 @@ fn nest_src(off: u64, size_log2: u64) -> String {
     format!(
         "memory 17\n\
          func (i32) -> (i64) {{\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {{\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.const {off}\n\
          \x20 v3 = i64.const {size_log2}\n\
@@ -31,9 +31,10 @@ fn nest_src(off: u64, size_log2: u64) -> String {
          \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
          \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
+           }}\n\
          }}\n\
          func (i64) -> (i64) {{\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {{\n\
          \x20 v1 = i64.const 0\n\
          \x20 v2 = i32.const 171\n\
          \x20 i32.store8 v1 v2\n\
@@ -42,6 +43,7 @@ fn nest_src(off: u64, size_log2: u64) -> String {
          \x20 i32.store8 v3 v4\n\
          \x20 v5 = i64.const 42\n\
          \x20 return v5\n\
+           }}\n\
          }}\n"
     )
 }
@@ -110,7 +112,7 @@ fn nesting_composes_to_depth_two() {
     // level's window — proving the grandchild is confined to its 1 KiB, nested two deep.
     let src = "memory 17\n\
          func (i32) -> (i64) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.const 65536\n\
          \x20 v3 = i64.const 12\n\
@@ -118,9 +120,10 @@ fn nesting_composes_to_depth_two() {
          \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
          \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
+           }\n\
          }\n\
          func (i64) -> (i64) {\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {\n\
          \x20 v1 = i32.wrap_i64 v0\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 171\n\
@@ -132,9 +135,10 @@ fn nesting_composes_to_depth_two() {
          \x20 v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)\n\
          \x20 v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)\n\
          \x20 return v9\n\
+           }\n\
          }\n\
          func (i64) -> (i64) {\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {\n\
          \x20 v1 = i64.const 0\n\
          \x20 v2 = i32.const 200\n\
          \x20 i32.store8 v1 v2\n\
@@ -143,6 +147,7 @@ fn nesting_composes_to_depth_two() {
          \x20 i32.store8 v3 v4\n\
          \x20 v5 = i64.const 77\n\
          \x20 return v5\n\
+           }\n\
          }\n";
     let (res, mem) = run_nested(src, 17);
     assert_eq!(
@@ -186,7 +191,7 @@ fn child_manages_its_own_pages_via_address_space() {
     const SPAN: u64 = 16 << 10; // unmap the child's first 16 KiB (a whole multiple of any host page)
     let src = "memory 18\n\
          func (i32) -> (i64) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.const 65536\n\
          \x20 v3 = i64.const 16\n\
@@ -194,14 +199,16 @@ fn child_manages_its_own_pages_via_address_space() {
          \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
          \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
+           }\n\
          }\n\
          func (i64, i64) -> (i64) {\n\
-         block0(v0: i64, v1: i64):\n\
+         block 0 (v0: i64, v1: i64) {\n\
          \x20 v2 = i32.wrap_i64 v1\n\
          \x20 v3 = i64.const 0\n\
          \x20 v4 = i64.const 16384\n\
          \x20 v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n\
          \x20 return v5\n\
+           }\n\
          }\n";
     let (res, mem) = run_nested(src, 18); // 256 KiB window so a 64 KiB child fits at 64 KiB
     assert_eq!(
@@ -234,7 +241,7 @@ fn instantiate_rejects_out_of_range_carve() {
     // negative handle; the parent returns it without joining (joining a bad handle would fault).
     let src = "memory 17\n\
          func (i32) -> (i64) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.const 131072\n\
          \x20 v3 = i64.const 12\n\
@@ -242,11 +249,13 @@ fn instantiate_rejects_out_of_range_carve() {
          \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
          \x20 v6 = i64.extend_i32_s v5\n\
          \x20 return v6\n\
+           }\n\
          }\n\
          func (i64) -> (i64) {\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {\n\
          \x20 v1 = i64.const 0\n\
          \x20 return v1\n\
+           }\n\
          }\n";
     let (res, _mem) = run_nested(src, 17);
     assert_eq!(
@@ -261,7 +270,7 @@ fn child_trap_propagates_on_join() {
     // The child traps (`unreachable`); `join` must surface it as the parent's trap, not a value.
     let src = "memory 17\n\
          func (i32) -> (i64) {\n\
-         block0(v0: i32):\n\
+         block 0 (v0: i32) {\n\
          \x20 v1 = i64.const 1\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i64.const 12\n\
@@ -269,10 +278,12 @@ fn child_trap_propagates_on_join() {
          \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
          \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
+           }\n\
          }\n\
          func (i64) -> (i64) {\n\
-         block0(v0: i64):\n\
+         block 0 (v0: i64) {\n\
          \x20 unreachable\n\
+           }\n\
          }\n";
     let (res, _mem) = run_nested(src, 17);
     assert!(

@@ -74,7 +74,7 @@ fn diff1(src: &str, args: &[Value]) -> i64 {
 fn simd_text_and_binary_roundtrip() {
     let src = "memory 16\n\
         func (i32, f32) -> (i32) {\n\
-        block0(v0: i32, v1: f32):\n\
+        block 0 (v0: i32, v1: f32) {\n\
           v2 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
           v3 = i32x4.splat v0\n\
           v4 = f32x4.splat v1\n\
@@ -125,6 +125,7 @@ fn simd_text_and_binary_roundtrip() {
           v31 = v128.load v30\n\
           v32 = i32x4.extract_lane 1 v31\n\
           return v32\n\
+          }\n\
         }\n";
     let m = build(src);
 
@@ -148,12 +149,13 @@ fn simd_text_and_binary_roundtrip() {
 fn v128_const_and_i32x4_extract() {
     // i32x4 = [1, 2, 3, 4] (little-endian lane bytes).
     let src = "func () -> (i32) {\n\
-        block0():\n\
+        block 0 () {\n\
           v0 = v128.const 1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0\n\
           v1 = i32x4.extract_lane 0 v0\n\
           v2 = i32x4.extract_lane 3 v0\n\
           v3 = i32.add v1 v2\n\
           return v3\n\
+          }\n\
         }\n";
     assert_eq!(interp1(src, &[]), Value::I32(5)); // 1 + 4
 }
@@ -161,24 +163,24 @@ fn v128_const_and_i32x4_extract() {
 #[test]
 fn i8x16_extract_sign_vs_zero() {
     // Lane 0 byte = 0xFF; signed extract = -1, unsigned = 255.
-    let s = "func () -> (i32) {\nblock0():\n\
+    let s = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 255 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-        v1 = i8x16.extract_lane_s 0 v0\n  return v1\n}\n";
+        v1 = i8x16.extract_lane_s 0 v0\n  return v1\n  }\n}\n";
     assert_eq!(interp1(s, &[]), Value::I32(-1));
-    let u = "func () -> (i32) {\nblock0():\n\
+    let u = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 255 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-        v1 = i8x16.extract_lane_u 0 v0\n  return v1\n}\n";
+        v1 = i8x16.extract_lane_u 0 v0\n  return v1\n  }\n}\n";
     assert_eq!(interp1(u, &[]), Value::I32(255));
 }
 
 #[test]
 fn i8x16_shuffle_interleaves() {
     // Interleave low bytes of a=[0..16] and b=[100..116]: result lane0=a0, lane1=b0, ...
-    let s = "func () -> (i32) {\nblock0():\n\
+    let s = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15\n\
         v1 = v128.const 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115\n\
         v2 = i8x16.shuffle 0 16 1 17 2 18 3 19 4 20 5 21 6 22 7 23 v0 v1\n\
-        v3 = i8x16.extract_lane_u 1 v2\n  return v3\n}\n";
+        v3 = i8x16.extract_lane_u 1 v2\n  return v3\n  }\n}\n";
     // Result byte 1 = b[0] = 100.
     assert_eq!(interp1(s, &[]), Value::I32(100));
 }
@@ -186,19 +188,19 @@ fn i8x16_shuffle_interleaves() {
 #[test]
 fn i8x16_swizzle_indexes_and_zeroes() {
     // a[i]=i; indices select a[3] into lane0, and an out-of-range (200) → 0 into lane1.
-    let s = "func () -> (i32) {\nblock0():\n\
+    let s = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15\n\
         v1 = v128.const 3 200 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
         v2 = i8x16.swizzle v0 v1\n\
         v3 = i8x16.extract_lane_u 0 v2\n\
         v4 = i8x16.extract_lane_u 1 v2\n\
-        v5 = i32.add v3 v4\n  return v5\n}\n";
+        v5 = i32.add v3 v4\n  return v5\n  }\n}\n";
     assert_eq!(interp1(s, &[]), Value::I32(3)); // a[3]=3, plus 0
 }
 
 #[test]
 fn simd_width_is_fixed_128() {
-    let s = "func () -> (i32) {\nblock0():\n  v0 = simd.width_bytes\n  return v0\n}\n";
+    let s = "func () -> (i32) {\nblock 0 () {\n  v0 = simd.width_bytes\n  return v0\n  }\n}\n";
     assert_eq!(interp1(s, &[]), Value::I32(16));
 }
 
@@ -209,12 +211,12 @@ fn simd_width_is_fixed_128() {
 #[test]
 fn diff_i32x4_splat_add_extract() {
     let s = "func (i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32):\n\
+        block 0 (v0: i32, v1: i32) {\n\
           v2 = i32x4.splat v0\n\
           v3 = i32x4.splat v1\n\
           v4 = i32x4.add v2 v3\n\
           v5 = i32x4.extract_lane 2 v4\n\
-          return v5\n}\n";
+          return v5\n  }\n}\n";
     for (a, b) in [(1, 2), (-5, 9), (i32::MAX, 1), (0, 0)] {
         let r = diff1(s, &[Value::I32(a), Value::I32(b)]);
         assert_eq!(r as i32, a.wrapping_add(b));
@@ -224,12 +226,12 @@ fn diff_i32x4_splat_add_extract() {
 #[test]
 fn diff_i32x4_mul_and_sub() {
     let s = "func (i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32):\n\
+        block 0 (v0: i32, v1: i32) {\n\
           v2 = i32x4.splat v0\n\
           v3 = i32x4.splat v1\n\
           v4 = i32x4.mul v2 v3\n\
           v5 = i32x4.sub v4 v3\n\
-          v6 = i32x4.extract_lane 0 v5\n  return v6\n}\n";
+          v6 = i32x4.extract_lane 0 v5\n  return v6\n  }\n}\n";
     for (a, b) in [(3, 4), (-2, 7), (1000, 1000)] {
         let r = diff1(s, &[Value::I32(a), Value::I32(b)]);
         assert_eq!(r as i32, a.wrapping_mul(b).wrapping_sub(b));
@@ -241,11 +243,11 @@ fn diff_i8x16_mul() {
     // `i8x16.mul` has no single x86 instruction (no `PMULLB`), so the JIT emulates it
     // (widen → `i16x8` multiply → low-byte pack). Pin JIT == interp and the wrapping-byte oracle.
     let s = "func (i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32):\n\
+        block 0 (v0: i32, v1: i32) {\n\
           v2 = i8x16.splat v0\n\
           v3 = i8x16.splat v1\n\
           v4 = i8x16.mul v2 v3\n\
-          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}\n";
+          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n  }\n}\n";
     for (a, b) in [
         (3i32, 4i32),
         (7, 7),
@@ -264,11 +266,11 @@ fn diff_i8x16_mul() {
 fn diff_f32x4_arith() {
     // (x*x + x) / 2 lanewise, observed at lane 0.
     let s = "func (f32) -> (f32) {\n\
-        block0(v0: f32):\n\
+        block 0 (v0: f32) {\n\
           v1 = f32x4.splat v0\n\
           v2 = f32x4.mul v1 v1\n\
           v3 = f32x4.add v2 v1\n\
-          v4 = f32x4.extract_lane 0 v3\n  return v4\n}\n";
+          v4 = f32x4.extract_lane 0 v3\n  return v4\n  }\n}\n";
     for x in [0.0f32, 1.5, -3.25, 1e9, 0.1] {
         let r = diff1(s, &[Value::F32(x)]);
         let want = (x * x + x).to_bits() as i64;
@@ -279,13 +281,13 @@ fn diff_f32x4_arith() {
 #[test]
 fn diff_f64x2_min_max_sqrt() {
     let s = "func (f64, f64) -> (f64) {\n\
-        block0(v0: f64, v1: f64):\n\
+        block 0 (v0: f64, v1: f64) {\n\
           v2 = f64x2.splat v0\n\
           v3 = f64x2.splat v1\n\
           v4 = f64x2.max v2 v3\n\
           v5 = f64x2.min v4 v3\n\
           v6 = f64x2.sqrt v5\n\
-          v7 = f64x2.extract_lane 1 v6\n  return v7\n}\n";
+          v7 = f64x2.extract_lane 1 v6\n  return v7\n  }\n}\n";
     for (a, b) in [(4.0f64, 9.0), (16.0, 2.0), (1.0, 100.0)] {
         diff1(s, &[Value::F64(a), Value::F64(b)]);
     }
@@ -299,11 +301,11 @@ fn diff_f64x2_min_max_sqrt() {
 fn f32x4_pminmax(op: &str, a: f32, b: f32) -> f32 {
     let s = format!(
         "func (f32, f32) -> (f32) {{\n\
-        block0(v0: f32, v1: f32):\n\
+        block 0 (v0: f32, v1: f32) {{\n\
           v2 = f32x4.splat v0\n\
           v3 = f32x4.splat v1\n\
           v4 = f32x4.{op} v2 v3\n\
-          v5 = f32x4.extract_lane 0 v4\n  return v5\n}}\n"
+          v5 = f32x4.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
     );
     f32::from_bits(diff1(&s, &[Value::F32(a), Value::F32(b)]) as u32)
 }
@@ -312,11 +314,11 @@ fn f32x4_pminmax(op: &str, a: f32, b: f32) -> f32 {
 fn f64x2_pminmax(op: &str, a: f64, b: f64) -> f64 {
     let s = format!(
         "func (f64, f64) -> (f64) {{\n\
-        block0(v0: f64, v1: f64):\n\
+        block 0 (v0: f64, v1: f64) {{\n\
           v2 = f64x2.splat v0\n\
           v3 = f64x2.splat v1\n\
           v4 = f64x2.{op} v2 v3\n\
-          v5 = f64x2.extract_lane 1 v4\n  return v5\n}}\n"
+          v5 = f64x2.extract_lane 1 v4\n  return v5\n  }}\n}}\n"
     );
     f64::from_bits(diff1(&s, &[Value::F64(a), Value::F64(b)]) as u64)
 }
@@ -402,12 +404,12 @@ fn diff_f32x4_fma() {
     let fma = |op: &str, a: f32, b: f32, c: f32| -> f32 {
         let s = format!(
             "func (f32, f32, f32) -> (f32) {{\n\
-            block0(v0: f32, v1: f32, v2: f32):\n\
+            block 0 (v0: f32, v1: f32, v2: f32) {{\n\
               v3 = f32x4.splat v0\n\
               v4 = f32x4.splat v1\n\
               v5 = f32x4.splat v2\n\
               v6 = f32x4.{op} v3 v4 v5\n\
-              v7 = f32x4.extract_lane 0 v6\n  return v7\n}}\n"
+              v7 = f32x4.extract_lane 0 v6\n  return v7\n  }}\n}}\n"
         );
         f32::from_bits(diff1(&s, &[Value::F32(a), Value::F32(b), Value::F32(c)]) as u32)
     };
@@ -436,12 +438,12 @@ fn diff_f64x2_fma() {
     let fma = |op: &str, a: f64, b: f64, c: f64| -> f64 {
         let s = format!(
             "func (f64, f64, f64) -> (f64) {{\n\
-            block0(v0: f64, v1: f64, v2: f64):\n\
+            block 0 (v0: f64, v1: f64, v2: f64) {{\n\
               v3 = f64x2.splat v0\n\
               v4 = f64x2.splat v1\n\
               v5 = f64x2.splat v2\n\
               v6 = f64x2.{op} v3 v4 v5\n\
-              v7 = f64x2.extract_lane 1 v6\n  return v7\n}}\n"
+              v7 = f64x2.extract_lane 1 v6\n  return v7\n  }}\n}}\n"
         );
         f64::from_bits(diff1(&s, &[Value::F64(a), Value::F64(b), Value::F64(c)]) as u64)
     };
@@ -466,14 +468,14 @@ fn diff_f64x2_fma() {
 fn diff_scalar_fma() {
     let f32fma = |a: f32, b: f32, c: f32| -> f32 {
         let s = "func (f32, f32, f32) -> (f32) {\n\
-            block0(v0: f32, v1: f32, v2: f32):\n\
-              v3 = f32.fma v0 v1 v2\n  return v3\n}\n";
+            block 0 (v0: f32, v1: f32, v2: f32) {\n\
+              v3 = f32.fma v0 v1 v2\n  return v3\n  }\n}\n";
         f32::from_bits(diff1(s, &[Value::F32(a), Value::F32(b), Value::F32(c)]) as u32)
     };
     let f64fma = |a: f64, b: f64, c: f64| -> f64 {
         let s = "func (f64, f64, f64) -> (f64) {\n\
-            block0(v0: f64, v1: f64, v2: f64):\n\
-              v3 = f64.fma v0 v1 v2\n  return v3\n}\n";
+            block 0 (v0: f64, v1: f64, v2: f64) {\n\
+              v3 = f64.fma v0 v1 v2\n  return v3\n  }\n}\n";
         f64::from_bits(diff1(s, &[Value::F64(a), Value::F64(b), Value::F64(c)]) as u64)
     };
     for (a, b, c) in [(2.0f32, 3.0, 4.0), (1e20, 1e20, -1e30), (0.1, 0.2, 0.3)] {
@@ -493,8 +495,8 @@ fn diff_scalar_fma() {
     // Text + binary round-trip of the scalar `Fma` op (both widths).
     let m = build(
         "func (f32, f64) -> (f32) {\n\
-        block0(v0: f32, v1: f64):\n\
-          v2 = f32.fma v0 v0 v0\n  v3 = f64.fma v1 v1 v1\n  return v2\n}\n",
+        block 0 (v0: f32, v1: f64) {\n\
+          v2 = f32.fma v0 v0 v0\n  v3 = f64.fma v1 v1 v1\n  return v2\n  }\n}\n",
     );
     assert_eq!(
         parse_module(&print_module(&m)).expect("reparse"),
@@ -515,10 +517,10 @@ fn diff_scalar_fma() {
 fn diff_i8x16_popcnt() {
     // Splat the low byte of an i32 across i8x16, popcnt, read lane 0 (unsigned).
     let s = "func (i32) -> (i32) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
           v1 = i8x16.splat v0\n\
           v2 = i8x16.popcnt v1\n\
-          v3 = i8x16.extract_lane_u 0 v2\n  return v3\n}\n";
+          v3 = i8x16.extract_lane_u 0 v2\n  return v3\n  }\n}\n";
     for byte in [0x00u8, 0xFF, 0x01, 0x80, 0xAA, 0x7F, 0x42] {
         let got = diff1(s, &[Value::I32(byte as i32)]);
         assert_eq!(got, byte.count_ones() as i64, "popcnt 0x{byte:02x}");
@@ -530,11 +532,11 @@ fn diff_i8x16_popcnt() {
 #[test]
 fn diff_i8x16_avgr_u() {
     let s = "func (i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32):\n\
+        block 0 (v0: i32, v1: i32) {\n\
           v2 = i8x16.splat v0\n\
           v3 = i8x16.splat v1\n\
           v4 = i8x16.avgr_u v2 v3\n\
-          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}\n";
+          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n  }\n}\n";
     for (a, b) in [(0u8, 0u8), (255, 255), (3, 4), (1, 2), (255, 1), (100, 101)] {
         let want = ((a as u32 + b as u32 + 1) >> 1) as i64;
         assert_eq!(
@@ -548,11 +550,11 @@ fn diff_i8x16_avgr_u() {
 #[test]
 fn diff_i16x8_avgr_u() {
     let s = "func (i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32):\n\
+        block 0 (v0: i32, v1: i32) {\n\
           v2 = i16x8.splat v0\n\
           v3 = i16x8.splat v1\n\
           v4 = i16x8.avgr_u v2 v3\n\
-          v5 = i16x8.extract_lane_u 0 v4\n  return v5\n}\n";
+          v5 = i16x8.extract_lane_u 0 v4\n  return v5\n  }\n}\n";
     for (a, b) in [
         (0u16, 0u16),
         (65535, 65535),
@@ -575,11 +577,11 @@ fn diff_i16x8_avgr_u() {
 /// there is no JIT bail list).
 #[test]
 fn avgr_roundtrip_and_shape_reject() {
-    let src = "func () -> (i32) {\nblock0():\n\
+    let src = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
         v1 = i8x16.avgr_u v0 v0\n\
         v2 = i16x8.avgr_u v0 v0\n\
-        v3 = i8x16.extract_lane_u 0 v1\n  return v3\n}\n";
+        v3 = i8x16.extract_lane_u 0 v1\n  return v3\n  }\n}\n";
     let m = build(src);
     assert_eq!(
         parse_module(&print_module(&m)).expect("reparse"),
@@ -594,9 +596,9 @@ fn avgr_roundtrip_and_shape_reject() {
 
     // i32x4 avgr_u is not a wasm op and the verifier rejects it.
     let bad = parse_module(
-        "func () -> () {\nblock0():\n\
+        "func () -> () {\nblock 0 () {\n\
          v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-         v1 = i32x4.avgr_u v0 v0\n  return\n}\n",
+         v1 = i32x4.avgr_u v0 v0\n  return\n  }\n}\n",
     )
     .expect("parses (shape check is at verify)");
     assert!(
@@ -621,11 +623,11 @@ fn diff_i32x4_dot() {
     };
     for lane in 0..4u8 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n\
+            "func () -> (i32) {{\nblock 0 () {{\n\
                v0 = v128.const {}\n\
                v1 = v128.const {}\n\
                v2 = i32x4.dot_i16x8_s v0 v1\n\
-               v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n",
+               v3 = i32x4.extract_lane {lane} v2\n  return v3\n  }}\n}}\n",
             bytes(&a),
             bytes(&b)
         );
@@ -641,11 +643,11 @@ fn diff_i32x4_dot() {
         m[0], m[1], m[0], m[1]
     );
     let s = format!(
-        "func () -> (i32) {{\nblock0():\n\
+        "func () -> (i32) {{\nblock 0 () {{\n\
            v0 = v128.const {row}\n\
            v1 = v128.const {row}\n\
            v2 = i32x4.dot_i16x8_s v0 v1\n\
-           v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+           v3 = i32x4.extract_lane 0 v2\n  return v3\n  }}\n}}\n"
     );
     let want = (-32768i32)
         .wrapping_mul(-32768)
@@ -668,11 +670,11 @@ fn diff_i16x8_dot_i8() {
     };
     for lane in 0..8u8 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n\
+            "func () -> (i32) {{\nblock 0 () {{\n\
                v0 = v128.const {}\n\
                v1 = v128.const {}\n\
                v2 = i16x8.dot_i8x16_s v0 v1\n\
-               v3 = i16x8.extract_lane_s {lane} v2\n  return v3\n}}\n",
+               v3 = i16x8.extract_lane_s {lane} v2\n  return v3\n  }}\n}}\n",
             bytes(&a),
             bytes(&b)
         );
@@ -684,10 +686,10 @@ fn diff_i16x8_dot_i8() {
     // Wrap corner: lane 0 of all-(-128) → −128·−128 + −128·−128 = 32768, wraps to −32768 in i16.
     let row = "128 128 0 0 0 0 0 0 0 0 0 0 0 0 0 0"; // i8 −128 = 0x80
     let s = format!(
-        "func () -> (i32) {{\nblock0():\n\
+        "func () -> (i32) {{\nblock 0 () {{\n\
            v0 = v128.const {row}\n  v1 = v128.const {row}\n\
            v2 = i16x8.dot_i8x16_s v0 v1\n\
-           v3 = i16x8.extract_lane_s 0 v2\n  return v3\n}}\n"
+           v3 = i16x8.extract_lane_s 0 v2\n  return v3\n  }}\n}}\n"
     );
     assert_eq!(diff1(&s, &[]) as i32, -32768, "dot_i8 wrap corner");
 }
@@ -695,7 +697,7 @@ fn diff_i16x8_dot_i8() {
 #[test]
 fn diff_bitwise_and_bitselect() {
     let s = "func (i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32):\n\
+        block 0 (v0: i32, v1: i32) {\n\
           v2 = i32x4.splat v0\n\
           v3 = i32x4.splat v1\n\
           v4 = v128.and v2 v3\n\
@@ -704,7 +706,7 @@ fn diff_bitwise_and_bitselect() {
           v7 = v128.not v6\n\
           v8 = v128.andnot v7 v2\n\
           v9 = v128.bitselect v2 v3 v8\n\
-          v10 = i32x4.extract_lane 0 v9\n  return v10\n}\n";
+          v10 = i32x4.extract_lane 0 v9\n  return v10\n  }\n}\n";
     for (a, b) in [
         (0xF0F0_F0F0u32 as i32, 0x0FF0_0FF0),
         (0, -1),
@@ -717,12 +719,12 @@ fn diff_bitwise_and_bitselect() {
 #[test]
 fn diff_shuffle_swizzle() {
     let s = "func (i32) -> (i32) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
           v1 = i32x4.splat v0\n\
           v2 = v128.const 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15\n\
           v3 = i8x16.shuffle 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0 v1 v2\n\
           v4 = i8x16.swizzle v3 v2\n\
-          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}\n";
+          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n  }\n}\n";
     for v in [0, 1, -1, 0x01020304] {
         diff1(s, &[Value::I32(v)]);
     }
@@ -734,12 +736,12 @@ fn diff_v128_load_store_roundtrip() {
     // Store a splatted vector to the window, load it back, extract a lane — same on both backends.
     let s = "memory 16\n\
         func (i32) -> (i32) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
           v1 = i64.const 32\n\
           v2 = i32x4.splat v0\n\
           v128.store v1 v2\n\
           v3 = v128.load v1\n\
-          v4 = i32x4.extract_lane 3 v3\n  return v4\n}\n";
+          v4 = i32x4.extract_lane 3 v3\n  return v4\n  }\n}\n";
     for v in [0, 42, -7, i32::MIN] {
         let r = diff1(s, &[Value::I32(v)]);
         assert_eq!(r as i32, v);
@@ -750,12 +752,12 @@ fn diff_v128_load_store_roundtrip() {
 #[test]
 fn diff_replace_lane() {
     let s = "func (i32, i32) -> (i32) {\n\
-        block0(v0: i32, v1: i32):\n\
+        block 0 (v0: i32, v1: i32) {\n\
           v2 = i32x4.splat v0\n\
           v3 = i32x4.replace_lane 2 v2 v1\n\
           v4 = i32x4.extract_lane 2 v3\n\
           v5 = i32x4.extract_lane 1 v3\n\
-          v6 = i32.add v4 v5\n  return v6\n}\n";
+          v6 = i32.add v4 v5\n  return v6\n  }\n}\n";
     for (a, b) in [(10, 20), (-1, 5), (0, 0)] {
         let r = diff1(s, &[Value::I32(a), Value::I32(b)]);
         assert_eq!(r as i32, b.wrapping_add(a)); // lane2 replaced with b, lane1 still a
@@ -770,7 +772,7 @@ fn diff_replace_lane() {
 #[test]
 fn lane_compare_roundtrip() {
     let src = "func (i32) -> (i32) {\n\
-        block0(v0: i32):\n\
+        block 0 (v0: i32) {\n\
           v1 = i8x16.splat v0\n\
           v2 = i16x8.splat v0\n\
           v3 = i32x4.splat v0\n\
@@ -792,6 +794,7 @@ fn lane_compare_roundtrip() {
           v19 = i64x2.lt_s v3 v3\n\
           v20 = i32x4.extract_lane 0 v16\n\
           return v20\n\
+          }\n\
         }\n";
     let m = build(src);
     let reparsed = parse_module(&print_module(&m)).expect("reparse");
@@ -804,9 +807,9 @@ fn lane_compare_roundtrip() {
 /// `0` false). `diff1` asserts interp == JIT; the expectation is Rust's own comparison (the oracle).
 fn i32x4_cmp(op: &str, a: i32, b: i32) -> i32 {
     let s = format!(
-        "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+        "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
          \x20 v2 = i32x4.splat v0\n  v3 = i32x4.splat v1\n  v4 = i32x4.{op} v2 v3\n\
-         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
     );
     diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
 }
@@ -840,9 +843,9 @@ fn diff_i32x4_lane_compares() {
 /// `0xFF`-vs-`1` case pins the signed/unsigned distinction (`-1 <_s 1` true, `255 <_u 1` false).
 fn i8x16_cmp(op: &str, a: i32, b: i32) -> i32 {
     let s = format!(
-        "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+        "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
          \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
-         \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n}}\n"
+         \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n  }}\n}}\n"
     );
     diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
 }
@@ -864,9 +867,9 @@ fn diff_i8x16_lane_compares_signedness() {
 fn diff_i16x8_and_i64x2_lane_compares() {
     let i16x8 = |op: &str, a: i32, b: i32| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
              \x20 v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n  v4 = i16x8.{op} v2 v3\n\
-             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
     };
@@ -877,9 +880,9 @@ fn diff_i16x8_and_i64x2_lane_compares() {
 
     let i64x2 = |op: &str, a: i64, b: i64| -> i64 {
         let s = format!(
-            "func (i64, i64) -> (i64) {{\nblock0(v0: i64, v1: i64):\n\
+            "func (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v1: i64) {{\n\
              \x20 v2 = i64x2.splat v0\n  v3 = i64x2.splat v1\n  v4 = i64x2.{op} v2 v3\n\
-             \x20 v5 = i64x2.extract_lane 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i64x2.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I64(a), Value::I64(b)])
     };
@@ -902,9 +905,9 @@ fn diff_i16x8_and_i64x2_lane_compares() {
 /// the expectation is Rust's own `min`/`max` (the oracle).
 fn i32x4_minmax(op: &str, a: i32, b: i32) -> i32 {
     let s = format!(
-        "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+        "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
          \x20 v2 = i32x4.splat v0\n  v3 = i32x4.splat v1\n  v4 = i32x4.{op} v2 v3\n\
-         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
     );
     diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
 }
@@ -934,9 +937,9 @@ fn diff_i32x4_min_max() {
 fn diff_i8x16_and_i16x8_min_max() {
     let i8 = |op: &str, a: i32, b: i32| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
              \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
-             \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
     };
@@ -947,9 +950,9 @@ fn diff_i8x16_and_i16x8_min_max() {
 
     let i16 = |op: &str, a: i32, b: i32| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
              \x20 v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n  v4 = i16x8.{op} v2 v3\n\
-             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
     };
@@ -970,7 +973,7 @@ fn diff_i8x16_and_i16x8_min_max() {
 #[test]
 fn float_lane_compare_roundtrip() {
     let src = "func (f32, f64) -> (i32) {\n\
-        block0(v0: f32, v1: f64):\n\
+        block 0 (v0: f32, v1: f64) {\n\
           v2 = f32x4.splat v0\n\
           v3 = f64x2.splat v1\n\
           v4 = f32x4.eq v2 v2\n\
@@ -981,6 +984,7 @@ fn float_lane_compare_roundtrip() {
           v9 = f64x2.gt v3 v3\n\
           v10 = i32x4.extract_lane 0 v4\n\
           return v10\n\
+          }\n\
         }\n";
     let m = build(src);
     assert_eq!(
@@ -999,9 +1003,9 @@ fn float_lane_compare_roundtrip() {
 /// true / `0` false). Oracle = Rust's float operators (which share wasm's ordered/`ne`-unordered rule).
 fn f32x4_cmp(op: &str, a: f32, b: f32) -> i32 {
     let s = format!(
-        "func (f32, f32) -> (i32) {{\nblock0(v0: f32, v1: f32):\n\
+        "func (f32, f32) -> (i32) {{\nblock 0 (v0: f32, v1: f32) {{\n\
          \x20 v2 = f32x4.splat v0\n  v3 = f32x4.splat v1\n  v4 = f32x4.{op} v2 v3\n\
-         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
     );
     diff1(&s, &[Value::F32(a), Value::F32(b)]) as i32
 }
@@ -1032,9 +1036,9 @@ fn diff_f32x4_lane_compares() {
 fn diff_f64x2_lane_compares() {
     let f64x2 = |op: &str, a: f64, b: f64| -> i64 {
         let s = format!(
-            "func (f64, f64) -> (i64) {{\nblock0(v0: f64, v1: f64):\n\
+            "func (f64, f64) -> (i64) {{\nblock 0 (v0: f64, v1: f64) {{\n\
              \x20 v2 = f64x2.splat v0\n  v3 = f64x2.splat v1\n  v4 = f64x2.{op} v2 v3\n\
-             \x20 v5 = i64x2.extract_lane 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i64x2.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::F64(a), Value::F64(b)])
     };
@@ -1061,8 +1065,8 @@ fn vshift(shape: &str, op: &str, ext: &str, val: i64, amt: i32) -> i64 {
         ("i32", &format!("{shape}.splat")[..], "i32")
     };
     let s = format!(
-        "func ({ity}, i32) -> ({vty}) {{\nblock0(v0: {ity}, v1: i32):\n\
-         \x20 v2 = {splat} v0\n  v3 = {shape}.{op} v2 v1\n  v4 = {shape}.{ext} v3\n  return v4\n}}\n"
+        "func ({ity}, i32) -> ({vty}) {{\nblock 0 (v0: {ity}, v1: i32) {{\n\
+         \x20 v2 = {splat} v0\n  v3 = {shape}.{op} v2 v1\n  v4 = {shape}.{ext} v3\n  return v4\n  }}\n}}\n"
     );
     let arg0 = if shape == "i64x2" {
         Value::I64(val)
@@ -1140,8 +1144,8 @@ fn diff_lane_shifts() {
 fn diff_lane_abs_neg() {
     let i32x4 = |op: &str, x: i32| -> i32 {
         let s = format!(
-            "func (i32) -> (i32) {{\nblock0(v0: i32):\n\
-             \x20 v1 = i32x4.splat v0\n  v2 = i32x4.{op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+            "func (i32) -> (i32) {{\nblock 0 (v0: i32) {{\n\
+             \x20 v1 = i32x4.splat v0\n  v2 = i32x4.{op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(x)]) as i32
     };
@@ -1153,8 +1157,8 @@ fn diff_lane_abs_neg() {
     // i8x16: low byte, observed via signed extract. `abs(-128)` wraps to -128 (two's complement).
     let i8 = |op: &str, x: i32| -> i32 {
         let s = format!(
-            "func (i32) -> (i32) {{\nblock0(v0: i32):\n\
-             \x20 v1 = i8x16.splat v0\n  v2 = i8x16.{op} v1\n  v3 = i8x16.extract_lane_s 0 v2\n  return v3\n}}\n"
+            "func (i32) -> (i32) {{\nblock 0 (v0: i32) {{\n\
+             \x20 v1 = i8x16.splat v0\n  v2 = i8x16.{op} v1\n  v3 = i8x16.extract_lane_s 0 v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(x)]) as i32
     };
@@ -1165,8 +1169,8 @@ fn diff_lane_abs_neg() {
     // i64x2 (also probes i64x2.abs JIT legalization — diff1 runs both backends).
     let i64 = |op: &str, x: i64| -> i64 {
         let s = format!(
-            "func (i64) -> (i64) {{\nblock0(v0: i64):\n\
-             \x20 v1 = i64x2.splat v0\n  v2 = i64x2.{op} v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}}\n"
+            "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n\
+             \x20 v1 = i64x2.splat v0\n  v2 = i64x2.{op} v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I64(x)])
     };
@@ -1182,7 +1186,7 @@ fn diff_lane_abs_neg() {
 /// Build `() -> i32` from a body and run it on both backends (interp == JIT), returning the result.
 fn reduce_i32(body: &str) -> i32 {
     diff1(
-        &format!("func () -> (i32) {{\nblock0():\n{body}\n}}\n"),
+        &format!("func () -> (i32) {{\nblock 0 () {{\n{body}\n  }}\n}}\n"),
         &[],
     ) as i32
 }
@@ -1227,14 +1231,14 @@ fn diff_bool_reductions() {
 /// `bitmask` round-trips through text + binary; `all_true`/`any_true` too.
 #[test]
 fn reduction_roundtrip() {
-    let src = "func () -> (i32) {\nblock0():\n\
+    let src = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
         v1 = v128.any_true v0\n\
         v2 = i8x16.all_true v0\n\
         v3 = i16x8.bitmask v0\n\
         v4 = i32x4.all_true v0\n\
         v5 = i64x2.bitmask v0\n\
-        v6 = i32.add v1 v3\n  return v6\n}\n";
+        v6 = i32.add v1 v3\n  return v6\n  }\n}\n";
     let m = build(src);
     assert_eq!(
         parse_module(&print_module(&m)).expect("reparse"),
@@ -1257,18 +1261,18 @@ fn diff_saturating_add_sub() {
     // i8x16, signed result via extract_lane_s.
     let i8s = |op: &str, a: i32, b: i32| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
              \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
-             \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
     };
     // i8x16, unsigned result via extract_lane_u.
     let i8u = |op: &str, a: i32, b: i32| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
              \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
-             \x20 v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i8x16.extract_lane_u 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
     };
@@ -1307,9 +1311,9 @@ fn diff_saturating_add_sub() {
     // i16x8 spot checks.
     let i16s = |op: &str, a: i32, b: i32| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
              \x20 v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n  v4 = i16x8.{op} v2 v3\n\
-             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
     };
@@ -1328,12 +1332,12 @@ fn diff_saturating_add_sub() {
 /// Saturating ops round-trip through text + binary; the verifier rejects a wide shape.
 #[test]
 fn saturating_roundtrip_and_shape_reject() {
-    let src = "func () -> (i32) {\nblock0():\n\
+    let src = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
         v1 = i8x16.add_sat_s v0 v0\n\
         v2 = i8x16.sub_sat_u v0 v0\n\
         v3 = i16x8.add_sat_u v0 v0\n\
-        v4 = i8x16.extract_lane_s 0 v1\n  return v4\n}\n";
+        v4 = i8x16.extract_lane_s 0 v1\n  return v4\n  }\n}\n";
     let m = build(src);
     assert_eq!(
         parse_module(&print_module(&m)).expect("reparse"),
@@ -1348,9 +1352,9 @@ fn saturating_roundtrip_and_shape_reject() {
 
     // i32x4 saturating add is not a wasm op and the verifier rejects it.
     let bad = parse_module(
-        "func () -> () {\nblock0():\n\
+        "func () -> () {\nblock 0 () {\n\
          v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-         v1 = i32x4.add_sat_s v0 v0\n  return\n}\n",
+         v1 = i32x4.add_sat_s v0 v0\n  return\n  }\n}\n",
     )
     .expect("parses (shape check is at verify)");
     assert!(
@@ -1369,8 +1373,8 @@ fn diff_widen_extend() {
     let src8 = "128 1 2 3 4 5 6 7 200 9 10 11 12 13 14 15";
     let w16 = |op: &str, ext: &str, lane: u8| -> i32 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src8}\n\
-             \x20 v1 = i16x8.{op} v0\n  v2 = i16x8.{ext} {lane} v1\n  return v2\n}}\n"
+            "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {src8}\n\
+             \x20 v1 = i16x8.{op} v0\n  v2 = i16x8.{ext} {lane} v1\n  return v2\n  }}\n}}\n"
         );
         diff1(&s, &[]) as i32
     };
@@ -1400,8 +1404,8 @@ fn diff_widen_extend() {
     let src16 = "255 255 1 0 2 0 3 0 7 0 8 0 9 0 10 0";
     let w32 = |op: &str, lane: u8| -> i32 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src16}\n\
-             \x20 v1 = i32x4.{op} v0\n  v2 = i32x4.extract_lane {lane} v1\n  return v2\n}}\n"
+            "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {src16}\n\
+             \x20 v1 = i32x4.{op} v0\n  v2 = i32x4.extract_lane {lane} v1\n  return v2\n  }}\n}}\n"
         );
         diff1(&s, &[]) as i32
     };
@@ -1417,8 +1421,8 @@ fn diff_widen_extend() {
     let src32 = "255 255 255 255 5 0 0 0 9 0 0 0 11 0 0 0";
     let w64 = |op: &str, lane: u8| -> i64 {
         let s = format!(
-            "func () -> (i64) {{\nblock0():\n  v0 = v128.const {src32}\n\
-             \x20 v1 = i64x2.{op} v0\n  v2 = i64x2.extract_lane {lane} v1\n  return v2\n}}\n"
+            "func () -> (i64) {{\nblock 0 () {{\n  v0 = v128.const {src32}\n\
+             \x20 v1 = i64x2.{op} v0\n  v2 = i64x2.extract_lane {lane} v1\n  return v2\n  }}\n}}\n"
         );
         diff1(&s, &[])
     };
@@ -1430,12 +1434,12 @@ fn diff_widen_extend() {
 /// Widen round-trips; the verifier rejects widening to `i8x16` (no narrower source).
 #[test]
 fn widen_roundtrip_and_shape_reject() {
-    let src = "func () -> (i32) {\nblock0():\n\
+    let src = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
         v1 = i16x8.extend_low_s v0\n\
         v2 = i32x4.extend_high_u v0\n\
         v3 = i64x2.extend_low_s v0\n\
-        v4 = i16x8.extract_lane_s 0 v1\n  return v4\n}\n";
+        v4 = i16x8.extract_lane_s 0 v1\n  return v4\n  }\n}\n";
     let m = build(src);
     assert_eq!(
         parse_module(&print_module(&m)).expect("reparse"),
@@ -1449,9 +1453,9 @@ fn widen_roundtrip_and_shape_reject() {
     );
 
     let bad = parse_module(
-        "func () -> () {\nblock0():\n\
+        "func () -> () {\nblock 0 () {\n\
          v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-         v1 = i8x16.extend_low_s v0\n  return\n}\n",
+         v1 = i8x16.extend_low_s v0\n  return\n  }\n}\n",
     )
     .expect("parses");
     assert!(
@@ -1471,8 +1475,8 @@ fn diff_narrow() {
     let b = "5 0 6 0 0 0 0 0 0 0 0 0 0 0 0 0"; // i16 [5, 6, 0, ...]
     let n8 = |op: &str, ext: &str, lane: u8| -> i32 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {a}\n  v1 = v128.const {b}\n\
-             \x20 v2 = i8x16.{op} v0 v1\n  v3 = i8x16.{ext} {lane} v2\n  return v3\n}}\n"
+            "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {a}\n  v1 = v128.const {b}\n\
+             \x20 v2 = i8x16.{op} v0 v1\n  v3 = i8x16.{ext} {lane} v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[]) as i32
     };
@@ -1491,8 +1495,8 @@ fn diff_narrow() {
     let neg = "255 255 255 255 0 0 0 0 0 0 0 0 0 0 0 0"; // i32 [-1, 0, ...]
     let n16 = |aa: &str, op: &str, ext: &str| -> i32 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {aa}\n  v1 = v128.const {aa}\n\
-             \x20 v2 = i16x8.{op} v0 v1\n  v3 = i16x8.{ext} 0 v2\n  return v3\n}}\n"
+            "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {aa}\n  v1 = v128.const {aa}\n\
+             \x20 v2 = i16x8.{op} v0 v1\n  v3 = i16x8.{ext} 0 v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[]) as i32
     };
@@ -1512,9 +1516,9 @@ fn diff_extmul() {
     // i16x8 ← i8x16: splat two i8 byte patterns, extmul, read i16 lane 0.
     let em16 = |op: &str, a: u8, b: u8| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
                v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n\
-               v4 = i16x8.{op} v2 v3\n  v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+               v4 = i16x8.{op} v2 v3\n  v5 = i16x8.extract_lane_s 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a as i32), Value::I32(b as i32)]) as i32
     };
@@ -1533,9 +1537,9 @@ fn diff_extmul() {
     // i32x4 ← i16x8 and i64x2 ← i32x4 width steps (splatted), read the wide lane.
     let em32 = |op: &str, a: i16, b: i16| -> i32 {
         let s = format!(
-            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32) {{\n\
                v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n\
-               v4 = i32x4.{op} v2 v3\n  v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+               v4 = i32x4.{op} v2 v3\n  v5 = i32x4.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a as i32), Value::I32(b as i32)]) as i32
     };
@@ -1546,9 +1550,9 @@ fn diff_extmul() {
     );
     let em64 = |op: &str, a: i32, b: i32| -> i64 {
         let s = format!(
-            "func (i32, i32) -> (i64) {{\nblock0(v0: i32, v1: i32):\n\
+            "func (i32, i32) -> (i64) {{\nblock 0 (v0: i32, v1: i32) {{\n\
                v2 = i32x4.splat v0\n  v3 = i32x4.splat v1\n\
-               v4 = i64x2.{op} v2 v3\n  v5 = i64x2.extract_lane 0 v4\n  return v5\n}}\n"
+               v4 = i64x2.{op} v2 v3\n  v5 = i64x2.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(a), Value::I32(b)])
     };
@@ -1562,8 +1566,8 @@ fn diff_extmul() {
     let src = "1 0 2 0 3 0 4 0 9 0 10 0 11 0 12 0"; // i8 lanes 0..15
     let half = |op: &str| -> i32 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src}\n\
-               v1 = i16x8.{op} v0 v0\n  v2 = i16x8.extract_lane_s 0 v1\n  return v2\n}}\n"
+            "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {src}\n\
+               v1 = i16x8.{op} v0 v0\n  v2 = i16x8.extract_lane_s 0 v1\n  return v2\n  }}\n}}\n"
         );
         diff1(&s, &[]) as i32
     };
@@ -1579,8 +1583,8 @@ fn diff_extadd_pairwise() {
     let src = "255 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15";
     let ea = |op: &str| -> i32 {
         let s = format!(
-            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src}\n\
-               v1 = i16x8.{op} v0\n  v2 = i16x8.extract_lane_s 0 v1\n  return v2\n}}\n"
+            "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {src}\n\
+               v1 = i16x8.{op} v0\n  v2 = i16x8.extract_lane_s 0 v1\n  return v2\n  }}\n}}\n"
         );
         diff1(&s, &[]) as i32
     };
@@ -1592,16 +1596,16 @@ fn diff_extadd_pairwise() {
     assert_eq!(ea("extadd_pairwise_i8x16_u"), 256, "u: 255 + 1 = 256");
     // lane 1 of the result = a[2]+a[3] = 2+3 = 5.
     let s = format!(
-        "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src}\n\
-           v1 = i16x8.extadd_pairwise_i8x16_s v0\n  v2 = i16x8.extract_lane_s 1 v1\n  return v2\n}}\n"
+        "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {src}\n\
+           v1 = i16x8.extadd_pairwise_i8x16_s v0\n  v2 = i16x8.extract_lane_s 1 v1\n  return v2\n  }}\n}}\n"
     );
     assert_eq!(diff1(&s, &[]), 5, "lane1 = 2+3");
 
     // i32x4 ← i16x8 width step. i16 lanes 0/1 = [1000, 2000] → 3000.
     let src16 = "232 3 208 7 0 0 0 0 0 0 0 0 0 0 0 0"; // i16 [1000, 2000, 0, ...]
     let s2 = format!(
-        "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src16}\n\
-           v1 = i32x4.extadd_pairwise_i16x8_s v0\n  v2 = i32x4.extract_lane 0 v1\n  return v2\n}}\n"
+        "func () -> (i32) {{\nblock 0 () {{\n  v0 = v128.const {src16}\n\
+           v1 = i32x4.extadd_pairwise_i16x8_s v0\n  v2 = i32x4.extract_lane 0 v1\n  return v2\n  }}\n}}\n"
     );
     assert_eq!(diff1(&s2, &[]), 3000, "1000 + 2000");
 }
@@ -1611,9 +1615,9 @@ fn diff_extadd_pairwise() {
 #[test]
 fn diff_q15mulr_sat() {
     let q = |a: i16, b: i16| -> i32 {
-        let s = "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n\
+        let s = "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n\
                v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n\
-               v4 = i16x8.q15mulr_sat_s v2 v3\n  v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}\n";
+               v4 = i16x8.q15mulr_sat_s v2 v3\n  v5 = i16x8.extract_lane_s 0 v4\n  return v5\n  }\n}\n";
         diff1(s, &[Value::I32(a as i32), Value::I32(b as i32)]) as i32
     };
     for (a, b) in [
@@ -1631,11 +1635,11 @@ fn diff_q15mulr_sat() {
 /// Narrow round-trips; the verifier rejects narrowing to `i32x4`.
 #[test]
 fn narrow_roundtrip_and_shape_reject() {
-    let src = "func () -> (i32) {\nblock0():\n\
+    let src = "func () -> (i32) {\nblock 0 () {\n\
         v0 = v128.const 1 0 2 0 3 0 4 0 5 0 6 0 7 0 8 0\n\
         v1 = i8x16.narrow_s v0 v0\n\
         v2 = i16x8.narrow_u v0 v0\n\
-        v3 = i8x16.extract_lane_s 0 v1\n  return v3\n}\n";
+        v3 = i8x16.extract_lane_s 0 v1\n  return v3\n  }\n}\n";
     let m = build(src);
     assert_eq!(
         parse_module(&print_module(&m)).expect("reparse"),
@@ -1649,9 +1653,9 @@ fn narrow_roundtrip_and_shape_reject() {
     );
 
     let bad = parse_module(
-        "func () -> () {\nblock0():\n\
+        "func () -> () {\nblock 0 () {\n\
          v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-         v1 = i32x4.narrow_s v0 v0\n  return\n}\n",
+         v1 = i32x4.narrow_s v0 v0\n  return\n  }\n}\n",
     )
     .expect("parses");
     assert!(
@@ -1669,8 +1673,8 @@ fn diff_int_float_conversions() {
     // i32 → f32 (observe the f32 bits via i32x4.extract_lane).
     let cvt = |op: &str, x: i32| -> i32 {
         let s = format!(
-            "func (i32) -> (i32) {{\nblock0(v0: i32):\n  v1 = i32x4.splat v0\n\
-             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+            "func (i32) -> (i32) {{\nblock 0 (v0: i32) {{\n  v1 = i32x4.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(x)]) as i32
     };
@@ -1690,8 +1694,8 @@ fn diff_int_float_conversions() {
     // f32 → i32 saturating (NaN → 0, clamp to the int range) — exactly Rust's `as`.
     let ts = |op: &str, x: f32| -> i32 {
         let s = format!(
-            "func (f32) -> (i32) {{\nblock0(v0: f32):\n  v1 = f32x4.splat v0\n\
-             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+            "func (f32) -> (i32) {{\nblock 0 (v0: f32) {{\n  v1 = f32x4.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::F32(x)]) as i32
     };
@@ -1719,8 +1723,8 @@ fn diff_demote_promote() {
     // f64 → f32 demote (lanes 0/1; lanes 2/3 zeroed). Observe f32 bits.
     let demote = |x: f64, lane: u8| -> i32 {
         let s = format!(
-            "func (f64) -> (i32) {{\nblock0(v0: f64):\n  v1 = f64x2.splat v0\n\
-             \x20 v2 = f32x4.demote_f64x2_zero v1\n  v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n"
+            "func (f64) -> (i32) {{\nblock 0 (v0: f64) {{\n  v1 = f64x2.splat v0\n\
+             \x20 v2 = f32x4.demote_f64x2_zero v1\n  v3 = i32x4.extract_lane {lane} v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::F64(x)]) as i32
     };
@@ -1731,8 +1735,8 @@ fn diff_demote_promote() {
 
     // f32 → f64 promote_low. Observe f64 bits.
     let promote = |x: f32| -> i64 {
-        let s = "func (f32) -> (i64) {\nblock0(v0: f32):\n  v1 = f32x4.splat v0\n\
-                 \x20 v2 = f64x2.promote_low_f32x4 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}\n";
+        let s = "func (f32) -> (i64) {\nblock 0 (v0: f32) {\n  v1 = f32x4.splat v0\n\
+                 \x20 v2 = f64x2.promote_low_f32x4 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n  }\n}\n";
         diff1(s, &[Value::F32(x)])
     };
     for x in [1.5f32, -2.25, 0.1, f32::INFINITY] {
@@ -1749,8 +1753,8 @@ fn diff_f64_i32_convert() {
     // i32 → f64 convert_low (signed + unsigned), observe f64 bits of lane 0.
     let cl = |op: &str, x: i32| -> i64 {
         let s = format!(
-            "func (i32) -> (i64) {{\nblock0(v0: i32):\n  v1 = i32x4.splat v0\n\
-             \x20 v2 = {op} v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}}\n"
+            "func (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  v1 = i32x4.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::I32(x)])
     };
@@ -1770,8 +1774,8 @@ fn diff_f64_i32_convert() {
     // f64 → i32 trunc_sat_zero (signed + unsigned), observe i32 lane.
     let ts = |op: &str, x: f64, lane: u8| -> i32 {
         let s = format!(
-            "func (f64) -> (i32) {{\nblock0(v0: f64):\n  v1 = f64x2.splat v0\n\
-             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n"
+            "func (f64) -> (i32) {{\nblock 0 (v0: f64) {{\n  v1 = f64x2.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane {lane} v2\n  return v3\n  }}\n}}\n"
         );
         diff1(&s, &[Value::F64(x)]) as i32
     };
@@ -1807,7 +1811,7 @@ fn diff_f64_i32_convert() {
 /// Conversions round-trip through text + binary (whole-instruction mnemonics).
 #[test]
 fn conversion_roundtrip() {
-    let src = "func (i32) -> (i32) {\nblock0(v0: i32):\n\
+    let src = "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n\
         v1 = i32x4.splat v0\n\
         v2 = f32x4.convert_i32x4_s v1\n\
         v3 = i32x4.trunc_sat_f32x4_u v2\n\
@@ -1817,7 +1821,7 @@ fn conversion_roundtrip() {
         v8 = f64x2.convert_low_i32x4_u v1\n\
         v9 = i32x4.trunc_sat_f64x2_s_zero v7\n\
         v10 = i32x4.trunc_sat_f64x2_u_zero v8\n\
-        v6 = i32x4.extract_lane 0 v3\n  return v6\n}\n";
+        v6 = i32x4.extract_lane 0 v3\n  return v6\n  }\n}\n";
     let m = build(src);
     assert_eq!(
         parse_module(&print_module(&m)).expect("reparse"),

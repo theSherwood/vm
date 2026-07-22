@@ -19,21 +19,25 @@ use svm_text::parse_module;
 const LOOP_WITH_MEM: &str = "\
 memory 16
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.eqz v2
-  br_if v4 block2(v3) block3(v2, v3)
-block2(v5: i32):
+  br_if v4 2(v3) 3(v2, v3)
+}
+block 2 (v5: i32) {
   return v5
-block3(v6: i32, v7: i32):
+}
+block 3 (v6: i32, v7: i32) {
   v8 = i32.add v7 v6
   v9 = i32.const 0
   i32.store v9 v8
   v10 = i32.const -1
   v11 = i32.add v6 v10
-  br block1(v11, v8)
+  br 1(v11, v8)
+  }
 }
 ";
 
@@ -165,19 +169,23 @@ fn out_of_subset_run_keeps_replaying_from_zero() {
     // over-broad); then assert a memoryless variant also matches cold.
     const SCALAR: &str = "\
 func (i32) -> (i32) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i32.const 0
-  br block1(v0, v1)
-block1(v2: i32, v3: i32):
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
   v4 = i32.eqz v2
-  br_if v4 block2(v3) block3(v2, v3)
-block2(v5: i32):
+  br_if v4 2(v3) 3(v2, v3)
+}
+block 2 (v5: i32) {
   return v5
-block3(v6: i32, v7: i32):
+}
+block 3 (v6: i32, v7: i32) {
   v8 = i32.add v7 v6
   v9 = i32.const -1
   v10 = i32.add v6 v9
-  br block1(v10, v8)
+  br 1(v10, v8)
+  }
 }
 ";
     let m = parse_module(SCALAR).expect("parse");

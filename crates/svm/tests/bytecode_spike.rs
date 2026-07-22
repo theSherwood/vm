@@ -21,14 +21,16 @@ use svm_ir::{BinOp, CmpOp, Func, Inst, IntTy, Module, Terminator};
 
 const ALU: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 6364136223846793005
   v11 = i64.mul v8 v10
   v12 = i64.const 1442695040888963407
@@ -36,9 +38,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v14 = i64.add v13 v9
   v15 = i64.const 1
   v16 = i64.add v9 v15
-  br block1(v7, v14, v16)
-block3(v17: i64):
+  br 1(v7, v14, v16)
+}
+block 3 (v17: i64) {
   return v17
+  }
 }
 "#;
 
@@ -409,25 +413,30 @@ fn bytecode_spike_alu() {
 // acc += leaf(acc, i) per iteration, leaf(a,b) = a + b — a direct call + return each step.
 const CALL: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = call 1 (v8, v9)
   v11 = i64.const 1
   v12 = i64.add v9 v11
-  br block1(v7, v10, v12)
-block3(v13: i64):
+  br 1(v7, v10, v12)
+}
+block 3 (v13: i64) {
   return v13
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.add v0 v1
   return v2
+  }
 }
 "#;
 

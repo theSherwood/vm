@@ -21,7 +21,7 @@ use svm_verify::verify_module;
 /// own window first), write `'O'` to the former and `'E'` to the latter, return 7.
 const SRC: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
-block0(vinst: i32, vout: i32, verr: i32):
+block 0 (vinst: i32, vout: i32, verr: i32) {
   a0 = i64.const 0
   n100 = i32.const 100
   i32.store a0 n100
@@ -82,9 +82,10 @@ block0(vinst: i32, vout: i32, verr: i32):
   vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
   r = cap.call 6 1 (i32) -> (i64) vinst (vch)
   return r
+  }
 }
 func (i64) -> (i64) {
-block0(vci: i64):
+block 0 (vci: i64) {
   cs = i32.const 115
   ct = i32.const 116
   cd = i32.const 100
@@ -130,6 +131,7 @@ block0(vci: i64):
   we = cap.call 0 1 (i64, i64) -> (i64) herr (a40, one)
   v7 = i64.const 7
   return v7
+  }
 }
 "#;
 

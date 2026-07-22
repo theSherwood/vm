@@ -24,7 +24,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 // returns arg+100. (The §12 raw-fiber shape from `jit_fibers.rs`.)
 const SRC: &str = r#"
 func () -> (i32, i64, i32, i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -33,13 +33,15 @@ block0():
   v6 = i64.const 7
   v7, v8 = cont.resume v2 v6
   return v4 v5 v7 v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = suspend v1
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -164,21 +166,23 @@ fn freeze_driver_flattens_a_parked_fiber_into_its_region() {
     // Root resumes F once; F suspends 42 then (if ever run forward) would compute 42+7 and return.
     const SRC2: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
   v3 = i64.const 99
   v4, v5 = cont.resume v2 v3
   return v5
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 42
   v3 = suspend v2
   v4 = i64.const 7
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
     let mut m = svm_text::parse_module(SRC2).expect("parse");
@@ -249,7 +253,7 @@ block0(v0: i64, v1: i64):
 fn single_fiber_freeze_thaw_round_trips() {
     const SRC3: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -258,14 +262,16 @@ block0():
   v6 = i64.const 7
   v7, v8 = cont.resume v2 v6
   return v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 42
   v3 = suspend v2
   v4 = i64.const 100
   v5 = i64.add v3 v4
   return v5
+  }
 }
 "#;
     let mut m = svm_text::parse_module(SRC3).expect("parse");
@@ -323,7 +329,7 @@ fn active_resume_chain_fiber_freezes_and_thaws() {
     // calls the clock, and returns clock + 5 — no `suspend`, so at freeze F is *running*.
     const SRC: &str = r#"
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65536
   i32.store v1 v0
   v2 = ref.func 1
@@ -332,9 +338,10 @@ block0(v0: i32):
   v5 = i64.const 0
   v6, v7 = cont.resume v4 v5
   return v7
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
@@ -342,6 +349,7 @@ block0(v0: i64, v1: i64):
   v6 = i64.const 5
   v7 = i64.add v5 v6
   return v7
+  }
 }
 "#;
     let mut m = svm_text::parse_module(SRC).expect("parse");
@@ -443,24 +451,26 @@ fn forged_fiber_generation_is_rejected() {
     // Genuine handle (slot 0, generation 0 == 0): the fiber runs and returns 99.
     const OK: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
   v4 = i64.const 0
   v5, v6 = cont.resume v2 v4
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 99
   return v2
+  }
 }
 "#;
     // Forged handle `(1 << 24) | 0`: same slot 0 (the mask clamps it), generation 1 ≠ 0 ⇒ FiberFault.
     const FORGED: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -468,11 +478,13 @@ block0():
   v4 = i64.const 0
   v5, v6 = cont.resume v3 v4
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 99
   return v2
+  }
 }
 "#;
     let mut ok = svm_text::parse_module(OK).expect("parse OK");
@@ -506,7 +518,7 @@ fn recycling_reuses_a_freed_slot_with_a_bumped_generation() {
     // its handle is `(1 << 24) | 0 == 16777216`. Returning the i64 handle makes the reuse observable.
     const REUSE: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -514,11 +526,13 @@ block0():
   v4, v5 = cont.resume v2 v3
   v6 = cont.new v0 v1
   return v6
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 7
   return v2
+  }
 }
 "#;
     let mut reuse = svm_text::parse_module(REUSE).expect("parse REUSE");
@@ -535,7 +549,7 @@ block0(v0: i64, v1: i64):
     // must fault — even though slot 0 is live — because the generation no longer matches.
     const STALE: &str = r#"
 func () -> (i64) {
-block0():
+block 0 () {
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
@@ -545,11 +559,13 @@ block0():
   v9 = i64.const 0
   v7, v8 = cont.resume v9 v3
   return v8
+  }
 }
 func (i64, i64) -> (i64) {
-block0(v0: i64, v1: i64):
+block 0 (v0: i64, v1: i64) {
   v2 = i64.const 7
   return v2
+  }
 }
 "#;
     let mut stale = svm_text::parse_module(STALE).expect("parse STALE");

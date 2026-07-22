@@ -19,11 +19,12 @@ use svm_browser::{onramp_exec, STATUS_OK, STATUS_UNSUPPORTED};
 /// manifest entry shape (paramless func 0 exported `_start`) must **fail closed**.
 const LEGACY_POSITIONAL: &str = r#"memory 16
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 5
-  v3 = call.import "write" (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.sym "write" (i64, i64) -> (i64) v0 (v1, v2)
   return v3
+  }
 }
 "#;
 

@@ -83,7 +83,7 @@ fn gen_program(seed: u64) -> Program {
         expected[w.cell as usize] += w.amount * w.iters;
     }
 
-    let mut main = String::from("func () -> (i64) {\nblock0():\n  vsp = i64.const 0\n");
+    let mut main = String::from("func () -> (i64) {\nblock 0 () {\n  vsp = i64.const 0\n");
     for (t, w) in workers.iter().enumerate() {
         let arg = (w.cell << 32) | (w.amount << 16) | w.iters;
         main.push_str(&format!("  varg{t} = i64.const {arg}\n"));
@@ -102,11 +102,11 @@ fn gen_program(seed: u64) -> Program {
         main.push_str(&format!("  vm{c} = i64.mul vld{c} vwt{c}\n"));
         main.push_str(&format!("  vacc{} = i64.add vacc{c} vm{c}\n", c + 1));
     }
-    main.push_str(&format!("  return vacc{cells}\n}}\n"));
+    main.push_str(&format!("  return vacc{cells}\n  }}\n}}\n"));
 
     let worker = format!(
         r#"func (i64, i64) -> (i64) {{
-block0(vsp: i64, varg: i64):
+block 0 (vsp: i64, varg: i64) {{
   c32 = i64.const 32
   hi = i64.shr_u varg c32
   mask = i64.const 65535
@@ -120,18 +120,22 @@ block0(vsp: i64, varg: i64):
   base = i64.const {base}
   off = i64.add base coff
   zero = i64.const 0
-  br block1(zero, off, amount, iters)
-block1(i: i64, off1: i64, amount1: i64, iters1: i64):
+  br 1(zero, off, amount, iters)
+}}
+block 1 (i: i64, off1: i64, amount1: i64, iters1: i64) {{
   cmp = i64.lt_u i iters1
-  br_if cmp block2(i, off1, amount1, iters1) block3()
-block2(i2: i64, off2: i64, amount2: i64, iters2: i64):
+  br_if cmp 2(i, off1, amount1, iters1) 3()
+}}
+block 2 (i2: i64, off2: i64, amount2: i64, iters2: i64) {{
   rmw = i64.atomic.rmw.add off2 amount2
   one = i64.const 1
   inext = i64.add i2 one
-  br block1(inext, off2, amount2, iters2)
-block3():
+  br 1(inext, off2, amount2, iters2)
+}}
+block 3 () {{
   ret = i64.const 0
   return ret
+  }}
 }}
 "#
     );

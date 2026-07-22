@@ -170,7 +170,7 @@ fn check(src: &str) {
 /// `base = 107`.
 const FIBER_SRC: &str = "memory 17\n\
     func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = ref.func 1\n\
     \x20 v1 = i64.const 4096\n\
     \x20 v2 = cont.new v0 v1\n\
@@ -179,14 +179,16 @@ const FIBER_SRC: &str = "memory 17\n\
     \x20 v6 = i64.const 7\n\
     \x20 v7, v8 = cont.resume v2 v6\n\
     \x20 return v8\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 42\n\
     \x20 v3 = suspend v2\n\
     \x20 v4 = i64.const 100\n\
     \x20 v5 = i64.add v3 v4\n\
     \x20 return v5\n\
+      }\n\
     }\n";
 
 #[test]
@@ -200,7 +202,7 @@ fn parked_fiber_freeze_thaw_round_trip() {
 /// completion. `base = (7 + 100) + (8 + 100)`.
 const TWO_FIBERS_SRC: &str = "memory 17\n\
     func () -> (i64) {\n\
-    block0():\n\
+    block 0 () {\n\
     \x20 v0 = ref.func 1\n\
     \x20 v1 = i64.const 4096\n\
     \x20 v2 = cont.new v0 v1\n\
@@ -216,14 +218,16 @@ const TWO_FIBERS_SRC: &str = "memory 17\n\
     \x20 v15, v16 = cont.resume v7 v14\n\
     \x20 v17 = i64.add v13 v16\n\
     \x20 return v17\n\
+      }\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
-    block0(v0: i64, v1: i64):\n\
+    block 0 (v0: i64, v1: i64) {\n\
     \x20 v2 = i64.const 42\n\
     \x20 v3 = suspend v2\n\
     \x20 v4 = i64.const 100\n\
     \x20 v5 = i64.add v3 v4\n\
     \x20 return v5\n\
+      }\n\
     }\n";
 
 #[test]

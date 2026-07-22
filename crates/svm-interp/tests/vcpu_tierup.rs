@@ -16,29 +16,34 @@ use svm_text::parse_module;
 // target. No memory, all-i64 signature: exactly the shape the browser tiers up.
 const SRC: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = call 1 (v9)
   v11 = i64.add v8 v10
   v12 = i64.const 1
   v13 = i64.add v9 v12
-  br block1(v7, v11, v13)
-block3(v14: i64):
+  br 1(v7, v11, v13)
+}
+block 3 (v14: i64) {
   return v14
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   v3 = i64.const 7
   v4 = i64.add v2 v3
   return v4
+  }
 }
 "#;
 
@@ -127,17 +132,19 @@ fn tierup_matches_pure_interp() {
 /// divides by `(x - 3)`, trapping at `x == 3`. The tier-up run must trap iff the pure-interp run does.
 const SRC_TRAP: &str = r#"
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = call 1 (v0)
   return v1
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 3
   v2 = i64.sub v0 v1
   v3 = i64.const 100
   v4 = i64.div_s v3 v2
   return v4
+  }
 }
 "#;
 

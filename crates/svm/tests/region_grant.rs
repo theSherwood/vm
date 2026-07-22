@@ -47,7 +47,7 @@ fn run_interp(src: &str) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
 fn minted_region_granted_to_child_shares_bytes() {
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65536
   v3 = cap.call 5 5 (i64) -> (i64) v1 (v2)
   v4 = i32.wrap_i64 v3
@@ -67,9 +67,10 @@ block0(v0: i32, v1: i32):
   v19 = i64.mul v17 v18
   v20 = i64.add v16 v19
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = cap.call 7 0 (i64) -> (i64) v1 (v2)
@@ -80,6 +81,7 @@ block0(v0: i64):
   v8 = i32.load8_u v2
   v9 = i64.extend_i32_u v8
   return v9
+  }
 }
 ";
     let (res, _mem) = run_interp(src);
@@ -99,7 +101,7 @@ block0(v0: i64):
 fn child_write_via_granted_region_reaches_parent() {
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65536
   v3 = cap.call 5 5 (i64) -> (i64) v1 (v2)
   v4 = i32.wrap_i64 v3
@@ -115,9 +117,10 @@ block0(v0: i32, v1: i32):
   v16 = i32.load8_u v5
   v17 = i64.extend_i32_u v16
   return v17
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = cap.call 7 0 (i64) -> (i64) v1 (v2)
@@ -129,6 +132,7 @@ block0(v0: i64):
   i32.store8 v2 v8
   v9 = i64.const 0
   return v9
+  }
 }
 ";
     let (res, _mem) = run_interp(src);
@@ -147,10 +151,11 @@ fn create_and_grant_validation() {
     // len = 0 → -EINVAL.
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = cap.call 5 5 (i64) -> (i64) v1 (v2)
   return v3
+  }
 }
 ";
     let (res, _m) = run_interp(src);
@@ -159,10 +164,11 @@ block0(v0: i32, v1: i32):
     // len > the 256 MiB per-region cap → -EINVAL.
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 268435457
   v3 = cap.call 5 5 (i64) -> (i64) v1 (v2)
   return v3
+  }
 }
 ";
     let (res, _m) = run_interp(src);
@@ -171,13 +177,14 @@ block0(v0: i32, v1: i32):
     // grant to a nonexistent coroutine child → CapFault.
     let src = "memory 17
 func (i32, i32) -> (i64) {
-block0(v0: i32, v1: i32):
+block 0 (v0: i32, v1: i32) {
   v2 = i64.const 65536
   v3 = cap.call 5 5 (i64) -> (i64) v1 (v2)
   v4 = i32.wrap_i64 v3
   v5 = i32.const 7
   v6 = cap.call 4 4 (i32) -> (i64) v4 (v5)
   return v6
+  }
 }
 ";
     let (res, _m) = run_interp(src);
@@ -200,7 +207,7 @@ fn jit_minted_region_aliases_match_interp() {
     // `granule`, store 171 at 0, load at `granule` — the alias must read it back.
     let src = "memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 65536
   v2 = cap.call 5 5 (i64) -> (i64) v0 (v1)
   v3 = i32.wrap_i64 v2
@@ -214,6 +221,7 @@ block0(v0: i32):
   v10 = i32.load8_u v4
   v11 = i64.extend_i32_u v10
   return v11
+  }
 }
 ";
     let m = parse_module(src).expect("parse");
@@ -277,7 +285,7 @@ fn jit_minted_ring_buffer_straddle_matches_interp() {
     let src = format!(
         "memory 17
 func (i32) -> (i64) {{
-block0(v0: i32):
+block 0 (v0: i32) {{
   v1 = i64.const 65536
   v2 = cap.call 5 5 (i64) -> (i64) v0 (v1)
   v3 = i32.wrap_i64 v2
@@ -304,6 +312,7 @@ block0(v0: i32):
   v23 = i64.sub v12 v11
   v24 = i64.add v22 v23
   return v24
+  }}
 }}
 "
     );
