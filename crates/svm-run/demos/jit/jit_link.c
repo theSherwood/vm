@@ -85,7 +85,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 5);  // format v5 (import/export/impl-export sections + the per-import mode byte)
+  eb(buf, 7);  // format v7 (§3.5: shape-referencing imports + named interface elements)
   eb(buf, 1);  // memory present
   eb(buf, 16); // size_log2 = 16 (must match this module's 64 KiB window)
   eb(buf, 0);  // no data segments
@@ -106,6 +106,7 @@ static long emit_service(char *buf) {
   emit_header(buf);
   eb(buf, 0); // 0 imports
   eb(buf, 0); // 0 exports (v3 export section)
+  eb(buf, 0); // 0 interfaces (v6)
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
@@ -132,13 +133,18 @@ static long emit_service(char *buf) {
 // Values: v0,v1 = params; v2 = handle const; v3 = F(a,b); v4 = 100; v5 = v3+v4.
 static long emit_client(char *buf) {
   emit_header(buf);
-  // Import section: one import, "F" : (i64, i64) -> (i64).
+  // Import section (v7): one import, ("", "F") : func -> type entry 0.
   eb(buf, 1); // 1 import
+  eb(buf, 0); // ns length (unnamespaced)
   eb(buf, 1); // name length
   eb(buf, 'F');
-  emit_i64_pair_sig(buf); // the import's op signature
+  eb(buf, 0);             // shape tag: func
+  uleb(buf, 0);           //   -> type entry 0
   eb(buf, 0);             // mode: required (v4)
   eb(buf, 0);             // 0 exports (v3 export section)
+  eb(buf, 1);             // 1 type entry (v7 type section)
+  eb(buf, 0);             //   tag: Func
+  emit_i64_pair_sig(buf); //   (i64, i64) -> (i64)
   eb(buf, 0);             // 0 impl exports (v5 impl-export section)
   eb(buf, 1);             // 1 function
   emit_i64_pair_sig(buf);
@@ -151,6 +157,7 @@ static long emit_client(char *buf) {
   sleb(buf, 0);
   eb(buf, 0x7C);          // v3 = call.import "F" ...
   uleb(buf, 0);           //   import index 0
+  uleb(buf, 0);           //   consumer-local op 0 (v7)
   emit_i64_pair_sig(buf); //   self-describing sig (i64, i64) -> (i64)
   uleb(buf, 2);           //   handle operand = v2
   eb(buf, 2);             //   2 args

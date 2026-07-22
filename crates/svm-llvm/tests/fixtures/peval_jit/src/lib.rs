@@ -143,6 +143,7 @@ fn build_module(win_log2: u8) -> Module {
         }],
     };
     Module {
+        types: vec![],
         funcs: vec![entry, helper],
         memory: Some(Memory {
             size_log2: win_log2,

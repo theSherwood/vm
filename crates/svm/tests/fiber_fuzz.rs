@@ -225,6 +225,7 @@ fn gen_module(g: &mut Rng) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: Vec::new(),
+        types: Vec::new(),
         debug_info: None,
     }
 }
@@ -247,6 +248,7 @@ fn gen_module_acyclic(g: &mut Rng) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: Vec::new(),
+        types: Vec::new(),
         debug_info: None,
     }
 }

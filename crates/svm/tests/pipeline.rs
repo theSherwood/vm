@@ -518,6 +518,7 @@ fn verifier_rejects_forward_value_reference() {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: vec![],
+        types: vec![],
         debug_info: None,
     };
     assert!(matches!(
@@ -547,6 +548,7 @@ fn verifier_rejects_bad_branch_target() {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: vec![],
+        types: vec![],
         debug_info: None,
     };
     assert!(matches!(
@@ -573,6 +575,7 @@ fn verifier_rejects_entry_param_mismatch() {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: vec![],
+        types: vec![],
         debug_info: None,
     };
     assert!(matches!(
@@ -1050,6 +1053,7 @@ fn verifier_rejects_call_to_missing_function() {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: vec![],
+        types: vec![],
         debug_info: None,
     };
     assert!(matches!(

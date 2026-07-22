@@ -43,7 +43,7 @@ use svm_snapshot::{freeze, restore};
 
 fn from_slot(t: ValType, s: i64) -> Value {
     match t {
-        ValType::I32 => Value::I32(s as i32),
+        ValType::I32 | ValType::Cap => Value::I32(s as i32),
         ValType::I64 => Value::I64(s),
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),

@@ -233,7 +233,9 @@ impl<'g> BB<'g> {
             ValType::V128 => Inst::ConstV128(self.g.v128bytes()),
             // The generator never produces `ref`-typed values (it's an svm GC reservation, not in
             // `valtype()`); there is no const-ref instruction to synthesize one.
-            ValType::Ref => unreachable!("irgen does not generate ref-typed values"),
+            ValType::Ref | ValType::Cap => {
+                unreachable!("irgen does not generate ref/cap-typed values")
+            }
         };
         self.push(inst, ty)
     }
@@ -981,6 +983,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         impl_exports: Vec::new(),
+        types: Vec::new(),
         debug_info: None,
     }
 }
@@ -1024,7 +1027,9 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
             ValType::F32 => Value::F32(f32::from_bits(g.f32bits())),
             ValType::F64 => Value::F64(f64::from_bits(g.f64bits())),
             ValType::V128 => Value::V128(g.v128bytes()),
-            ValType::Ref => unreachable!("irgen does not generate ref-typed params"),
+            ValType::Ref | ValType::Cap => {
+                unreachable!("irgen does not generate ref/cap-typed params")
+            }
         })
         .collect()
 }
@@ -1058,7 +1063,7 @@ fn to_slot(v: Value) -> i64 {
 }
 fn from_slot(t: ValType, s: i64) -> Value {
     match t {
-        ValType::I32 => Value::I32(s as i32),
+        ValType::I32 | ValType::Cap => Value::I32(s as i32),
         ValType::I64 => Value::I64(s),
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),

@@ -232,6 +232,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // import lowers to `call.import <slot>`; the host binds each slot at instantiation. Nothing is
     // threaded through the guest — no leading handle params, no spawn stash.
     let mut manifest: Vec<svm_ir::Import> = Vec::new();
+    // §3.5: manifest signatures live in the type section; intern each import's sig once.
+    let mut manifest_types: Vec<svm_ir::TypeEntry> = Vec::new();
     // §12 wasm threads: the wasm function index of the `wasi:thread/spawn` import, if present. Its
     // `call` lowers to `thread.spawn` (not a cap.call); see the spawn-shim synthesis.
     let mut spawn_import: Option<u32> = None;
@@ -308,9 +310,17 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     // lowers to `call.import <slot>` with nothing threaded through the guest.
                     let name = format!("{}.{}", imp.module, imp.name);
                     let idx = manifest.len() as u32;
+                    let t = manifest_types
+                        .iter()
+                        .position(|e| matches!(e, svm_ir::TypeEntry::Func(f) if *f == sig))
+                        .unwrap_or_else(|| {
+                            manifest_types.push(svm_ir::TypeEntry::Func(sig.clone()));
+                            manifest_types.len() - 1
+                        }) as u32;
                     manifest.push(svm_ir::Import {
+                        ns: String::new(),
                         name,
-                        sig: sig.clone(),
+                        shape: svm_ir::ImportShape::Func(t),
                         mode: svm_ir::ImportMode::Required,
                     });
                     imports.push((idx, sig));
@@ -729,6 +739,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                 .collect(),
             // wasm has no provider-side interface offers (IMPORTS.md §3.2) — nothing to transpile.
             impl_exports: vec![],
+            types: manifest_types,
             // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7) and
             // carry every `.debug_*` section through as a rich blob.
             debug_info: build_debug_info(debug_line.as_deref(), op_locs, local_locs, debug_blobs),
@@ -1609,6 +1620,8 @@ fn lower_func(
             ValType::V128 => lo.emit(Inst::ConstV128([0; 16])),
             // WASM never declares a `ref` local (it's an svm-only GC reservation); treat as i64.
             ValType::Ref => lo.emit(Inst::ConstI64(0)),
+            // `cap` is svm-only (§3.5); wasm never declares one. i32-width zero.
+            ValType::Cap => lo.emit(Inst::ConstI32(0)),
         };
         lo.locals.push(v);
     }
@@ -2132,6 +2145,7 @@ fn load_op(ty: ValType) -> LoadOp {
     match ty {
         ValType::I32 => LoadOp::I32,
         ValType::I64 | ValType::V128 | ValType::Ref => LoadOp::I64,
+        ValType::Cap => LoadOp::I32,
         ValType::F32 => LoadOp::F32,
         ValType::F64 => LoadOp::F64,
     }
@@ -2140,6 +2154,7 @@ fn store_op(ty: ValType) -> StoreOp {
     match ty {
         ValType::I32 => StoreOp::I32,
         ValType::I64 | ValType::V128 | ValType::Ref => StoreOp::I64,
+        ValType::Cap => StoreOp::I32,
         ValType::F32 => StoreOp::F32,
         ValType::F64 => StoreOp::F64,
     }
@@ -2168,6 +2183,7 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         let handle = lo.emit(Inst::ConstI32(0));
         let inst = Inst::CallImport {
             import: slot,
+            op: 0,
             sig,
             handle,
             args,

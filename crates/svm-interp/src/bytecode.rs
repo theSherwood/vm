@@ -268,6 +268,15 @@ enum Op {
     CapSelfAttest {
         dst: u32,
     },
+    /// §3.5 self-namespace extensions through the shared dispatch entry: `op` packs
+    /// `(selfop | idx << 8)` (6 = `cap.self.type_id`, 7 = `cap.self.covers`, 8 =
+    /// `export.handle`); `handle` is the optional live handle-register (covers only). One
+    /// `i32` result.
+    CapSelfExt {
+        op: u32,
+        handle: Option<u32>,
+        dst: u32,
+    },
     /// §7 reflection `cap.self.get` — the `idx`-th held cap as `(handle, type_id)` (two `i32`
     /// results in `dst`, `dst+1`).
     CapSelfGet {
@@ -1326,16 +1335,50 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         // still a live register; pass it like `cap.call`'s — the dispatch ignores it.
         Inst::CallImport {
             import,
+            op,
             sig,
             handle,
             args,
         } => Op::CapCall {
             type_id: svm_ir::CAP_IMPORT_TYPE_ID,
-            op: *import,
+            // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
+            op: *import | (*op << 16),
             handle: g(*handle),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
             results: sig.results.clone().into(),
+        },
+        // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
+        // `(type_idx | op << 16)`; the handle register is live.
+        Inst::CallImportDyn {
+            ty,
+            op,
+            sig,
+            handle,
+            args,
+        } => Op::CapCall {
+            type_id: svm_ir::CAP_DYN_TYPE_ID,
+            op: *ty | (*op << 16),
+            handle: g(*handle),
+            args: args.iter().map(|a| g(*a)).collect(),
+            dst,
+            results: sig.results.clone().into(),
+        },
+        // §3.5 self-namespace extensions (see `Op::CapSelfExt`).
+        Inst::ExportHandle { export } => Op::CapSelfExt {
+            op: 8 | (*export << 8),
+            handle: None,
+            dst,
+        },
+        Inst::CapSelfTypeId { ty } => Op::CapSelfExt {
+            op: 6 | (*ty << 8),
+            handle: None,
+            dst,
+        },
+        Inst::CapSelfCovers { handle, ty } => Op::CapSelfExt {
+            op: 7 | (*ty << 8),
+            handle: Some(g(*handle)),
+            dst,
         },
         // Phase-2 `import.attach` (IMPORTS.md): the attach sentinel with the handle value as the
         // one argument — the same shared host entry as the tree-walker and the JIT.
@@ -7941,6 +7984,19 @@ impl Vm {
                     // §6 attestation op 4 — same `self_dispatch` the tree-walker / JIT thunk use.
                     let res = host.with(|p| p.self_dispatch(4, &[]))?;
                     r!(*dst) = Reg::from_i32(res[0] as i32);
+                    pc += 1;
+                }
+                Op::CapSelfExt { op, handle, dst } => {
+                    // §3.5 self-namespace extensions — through the shared &mut dispatch entry
+                    // (interning / reification mutate host state), same as the tree-walker.
+                    let argv: Vec<i64> = match handle {
+                        Some(h) => vec![r!(*h).i32() as i64],
+                        None => Vec::new(),
+                    };
+                    let res = host.with(|p| {
+                        p.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, *op, 0, &argv, None)
+                    })?;
+                    r!(*dst) = Reg::from_i32(*res.first().ok_or(Trap::CapFault)? as i32);
                     pc += 1;
                 }
                 Op::CapSelfGet { idx, dst } => {

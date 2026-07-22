@@ -1446,8 +1446,11 @@ pub unsafe extern "C" fn child_bind_imports(
     let parent = &*(parent_ctx as *mut Host);
     let child = &mut *(child_ctx as *mut Host);
     if let Some(imports) = parent.module_imports(module as i32) {
+        let types = parent
+            .module_types(module as i32)
+            .unwrap_or_else(|| Arc::from(Vec::new()));
         // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL).
-        if child.bind_child_manifest(&imports).is_err() {
+        if child.bind_child_manifest(&imports, &types).is_err() {
             return -22;
         }
     }
@@ -2617,6 +2620,7 @@ fn typed(t: ValType, v: i64) -> Value {
         ValType::F32 => Value::F32(f32::from_bits(v as u32)),
         ValType::F64 => Value::F64(f64::from_bits(v as u64)),
         ValType::Ref => Value::Ref(v as u64), // opaque i64-width reference
+        ValType::Cap => Value::I32(v as i32), // §3.5 i32-width handle marker
         // CLI entry args are scalar `i64` slots; a `v128` entry param is out of scope. Total arm:
         // zero-extend the slot into the low lanes.
         ValType::V128 => {
@@ -3766,7 +3770,9 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
             continue;
         };
         let f = &off.funcs[off.ops[off.op as usize] as usize];
-        let declared = &module.imports[i].sig;
+        let declared = module
+            .import_op_sig(i as u32, 0)
+            .ok_or_else(|| format!("import `{name}` has a malformed type-section reference"))?;
         if declared.params != f.params || declared.results != f.results {
             return Err(format!(
                 "import `{name}` declares {:?} -> {:?} but the wired offer's op {} implements \
@@ -4056,6 +4062,9 @@ impl Instance {
     /// the fixed §3e powerbox. The entry takes no positional args (IMPORTS.md phase 4 — the slot
     /// binding IS the capability delivery).
     fn grant_caps(&self, h: &mut Host, win: u64) {
+        // §3.5: register the module's self-referential surface so `call.import.dyn`,
+        // `cap.self.type_id`/`covers`, and `export.handle` resolve host-side.
+        h.set_self_module(&Arc::new(self.module.clone()));
         // Hooks first: the instrumented module bakes the handle of a fresh host's first grant.
         self.grant_mem_hooks(h);
         match &self.binding {
@@ -4099,7 +4108,10 @@ impl Instance {
                         }
                         .expect("offer validated at instantiation");
                         h.register_cap_name(name, handle);
-                        let declared = &self.module.imports[i].sig;
+                        let declared = self
+                            .module
+                            .import_op_sig(i as u32, 0)
+                            .expect("import shape validated at instantiation");
                         bindings.push(
                             h.bound_import_for_impl(handle, off.op, declared, rebindable)
                                 .expect("offer signature validated at instantiation"),

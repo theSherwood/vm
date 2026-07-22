@@ -94,8 +94,19 @@ fn impl_export_ops_are_dfe_roots() {
             add_const(1),     // 2: live helper
             add_const(7),     // 3: only referenced by the offer's op list
         ],
+        types: vec![
+            svm_ir::TypeEntry::Func(FuncType {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32],
+            }),
+            svm_ir::TypeEntry::Interface(vec![svm_ir::IfaceOp {
+                name: "add".into(),
+                ty: 0,
+            }]),
+        ],
         impl_exports: vec![svm_ir::ImplExport {
             name: "adder".into(),
+            interface: 1,
             ops: vec![3],
         }],
         ..Default::default()

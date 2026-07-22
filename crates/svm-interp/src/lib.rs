@@ -146,6 +146,8 @@ impl Reg {
             ValType::F64 => Value::F64(self.f64()),
             ValType::V128 => Value::V128(self.v128()),
             ValType::Ref => Value::Ref(self.lo),
+            // `cap` is i32-width handle data everywhere in guest code (§3.5 reservation).
+            ValType::Cap => Value::I32(self.i32()),
         }
     }
 }
@@ -5254,6 +5256,7 @@ type ModArc = (
     bool,
     [u8; 32],
     Arc<[svm_ir::Import]>,
+    Arc<[svm_ir::TypeEntry]>,
 );
 
 /// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
@@ -6309,6 +6312,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     g.durable,
                                     g.digest,
                                     g.imports.clone(),
+                                    g.types.clone(),
                                 )
                             };
                             (
@@ -6401,6 +6405,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     g.durable,
                                     g.digest,
                                     g.imports.clone(),
+                                    g.types.clone(),
                                 )
                             };
                             let grants_ptr =
@@ -6432,7 +6437,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => (o, None, 0, None, Vec::new()),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _, _)| f);
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _, _, _)| f);
                     match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
@@ -6478,7 +6483,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -6489,8 +6494,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // drain-then-unwind, so admitting it would stop the subtree being
                             // snapshottable as a unit. A same-module child (`None`) runs the
                             // parent's own (already instrumented) funcs — always admissible.
-                            let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _)| *d);
+                            let mod_durable_ok = !durable
+                                || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6507,7 +6512,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // bounded them to its declared window == the carve). RO protection of
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
-                                if let (Some((_, _, data, _, _, _)), Some(m)) =
+                                if let (Some((_, _, data, _, _, _, _)), Some(m)) =
                                     (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
@@ -6573,8 +6578,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // slot with nothing to bind fails the spawn closed — probeable
                                 // `-EINVAL`, before any child code runs.
                                 let manifest_ok = match &child_mod {
-                                    Some((_, _, _, _, _, cimports)) => {
-                                        ch.bind_child_manifest(cimports).is_ok()
+                                    Some((_, _, _, _, _, cimports, ctypes)) => {
+                                        ch.bind_child_manifest(cimports, ctypes).is_ok()
                                     }
                                     None => true,
                                 };
@@ -6597,7 +6602,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     };
                                     let cfuncs = child_mod.as_ref().map_or_else(
                                         || Arc::clone(&funcs),
-                                        |(f, _, _, _, _, _)| Arc::clone(f),
+                                        |(f, _, _, _, _, _, _)| Arc::clone(f),
                                     );
                                     let csched = sched.clone();
                                     // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
@@ -6680,7 +6685,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 entry: entry as u32,
                                                 module_digest: child_mod
                                                     .as_ref()
-                                                    .map(|(_, _, _, _, d, _)| *d),
+                                                    .map(|(_, _, _, _, d, _, _)| *d),
                                             });
                                             frames[top]
                                                 .vals
@@ -6734,15 +6739,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // transparency), exactly as for `instantiate_module`.
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
                             // §4 enforcement, exactly as for `instantiate`: a durable domain
                             // admits only freezable (durable-attested) separate-module children.
-                            let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _)| *d);
+                            let mod_durable_ok = !durable
+                                || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6763,7 +6768,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // in the parent's backing while the child's pages start unmapped — so
                                 // a plugin's data segments are *supplied lazily*, page by page, as it
                                 // first touches them (the §14 parent-as-pager model, for free).
-                                if let (Some((_, _, data, _, _, _)), Some(m)) =
+                                if let (Some((_, _, data, _, _, _, _)), Some(m)) =
                                     (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
@@ -6790,7 +6795,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let cfuncs = child_mod.as_ref().map_or_else(
                                     || Arc::clone(&funcs),
-                                    |(f, _, _, _, _, _)| Arc::clone(f),
+                                    |(f, _, _, _, _, _, _)| Arc::clone(f),
                                 );
                                 // A co-fiber child is its own domain → its own dispatch table.
                                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
@@ -7034,7 +7039,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }
                 Inst::CallImport {
-                    import, sig, args, ..
+                    import,
+                    op,
+                    sig,
+                    args,
+                    ..
                 } => {
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
@@ -7042,11 +7051,77 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
+                    let packed = *import | (*op << 16);
                     let results =
-                        hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                        hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
+                }
+                // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry
+                // packs `(type_idx | op << 16)`; the handle operand is the live handle value.
+                Inst::CallImportDyn {
+                    ty,
+                    op,
+                    sig,
+                    handle,
+                    args,
+                } => {
+                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args {
+                        argv.push(get(&frames[top].vals, *a)?.i64());
+                    }
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let packed = *ty | (*op << 16);
+                    let results =
+                        hg.cap_dispatch_slots(svm_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
+                    for (s, tyv) in results.iter().zip(&sig.results) {
+                        frames[top]
+                            .vals
+                            .push(Reg::from_value(slot_to_val(*tyv, *s)));
+                    }
+                }
+                // §3.5 self-namespace extensions: reify own offer / intern own shape / probe
+                // coverage — all through the shared dispatch entry (op packs `selfop | idx << 8`).
+                Inst::ExportHandle { export } => {
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results = hg.cap_dispatch_slots(
+                        svm_ir::CAP_SELF_TYPE_ID,
+                        8 | (*export << 8),
+                        0,
+                        &[],
+                        None,
+                    )?;
+                    let r = *results.first().ok_or(Trap::CapFault)?;
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::CapSelfTypeId { ty } => {
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results = hg.cap_dispatch_slots(
+                        svm_ir::CAP_SELF_TYPE_ID,
+                        6 | (*ty << 8),
+                        0,
+                        &[],
+                        None,
+                    )?;
+                    let r = *results.first().ok_or(Trap::CapFault)?;
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::CapSelfCovers { handle, ty } => {
+                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results = hg.cap_dispatch_slots(
+                        svm_ir::CAP_SELF_TYPE_ID,
+                        7 | (*ty << 8),
+                        0,
+                        &[h as i64],
+                        None,
+                    )?;
+                    let r = *results.first().ok_or(Trap::CapFault)?;
+                    frames[top].vals.push(Reg::from_i32(r as i32));
                 }
                 // Phase-2 `import.attach` (IMPORTS.md): rebind rebindable slot `import` to the
                 // handle value — routed through the shared attach dispatch entry, so all three
@@ -7907,14 +7982,19 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::ConstI64(c) => Reg::from_i64(*c),
         // §7 executable named imports (+ phase-2 attach) need the host's import-binding table,
         // so they're serviced in the eval loop (like `cap.call`), never in this pure-op helper.
-        Inst::CallImport { .. } | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
+        Inst::CallImport { .. }
+        | Inst::CallImportDyn { .. }
+        | Inst::ExportHandle { .. }
+        | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
         Inst::CapSelfCount
         | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. } => return Err(Trap::Malformed),
+        | Inst::CapSelfLabel { .. }
+        | Inst::CapSelfTypeId { .. }
+        | Inst::CapSelfCovers { .. } => return Err(Trap::Malformed),
         // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
         // loop (`run_inner`), never here.
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
@@ -9951,11 +10031,46 @@ pub type HostFnRegion = Box<
 /// ([`Host::wire_impl`]) — declaring an offer confers nothing; this entry existing in a domain's
 /// table is what moves authority. Op `i` runs `funcs[ops[i]]` as a **v1 pure dispatch** (see
 /// [`Binding::GuestImpl`]): windowless, empty powerbox, fixed fuel — arguments in, results out.
+/// §3.5 coverage walk: for every required `(name, sig)`, find the same-named,
+/// signature-equal provider op; extra provider ops are ignored. Name-less providers (legacy
+/// wires) fall back to exact positional matching. Returns the consumer→provider op remap, or
+/// `None` (does not cover).
+pub fn coverage_remap(
+    req_names: &[String],
+    req_sigs: &[FuncType],
+    prov_names: &[String],
+    prov_sigs: &[FuncType],
+) -> Option<Arc<[u32]>> {
+    if prov_names.is_empty() {
+        // Legacy name-less provider: match each required op to the *first* provider op with an
+        // equal signature (the pre-§3.5 "first sig-matching op" rule, generalized per-op).
+        let mut remap = Vec::with_capacity(req_sigs.len());
+        for sig in req_sigs {
+            remap.push(prov_sigs.iter().position(|s| s == sig)? as u32);
+        }
+        return Some(remap.into());
+    }
+    let mut remap = Vec::with_capacity(req_sigs.len());
+    for (n, sig) in req_names.iter().zip(req_sigs) {
+        let p = prov_names.iter().position(|pn| pn == n)?;
+        if prov_sigs.get(p)? != sig {
+            return None;
+        }
+        remap.push(p as u32);
+    }
+    Some(remap.into())
+}
+
 #[derive(Clone)]
 pub struct GuestImplEntry {
     pub funcs: Arc<[Func]>,
     pub ops: Arc<[u32]>,
     pub sigs: Arc<[FuncType]>,
+    /// §3.5 declared op **names** (the coverage-binding contract), from the offer's interface
+    /// declaration when wired through a module-aware path; empty for name-less legacy wires
+    /// (coverage then falls back to exact positional matching). Names are never identity —
+    /// `type_id` interns the shape alone.
+    pub names: Arc<[String]>,
     pub type_id: u32,
     /// §3.1 **provenance depth**: how many domain boundaries stand between the holder and the
     /// implementation — `1` where the offer was wired, `+1` per re-grant into a child. Every
@@ -10095,6 +10210,21 @@ pub struct Host {
     /// id-equality ≡ structural equality within this table. Flat and scanned linearly — offers
     /// are few; boring beats a map.
     iface_intern: Vec<Arc<[FuncType]>>,
+    /// §3.5 grouped-import **op remaps**, parallel to `import_bindings`: slot `i`'s entry, when
+    /// present, maps consumer-local op indices to provider op indices (frozen at the binding
+    /// act by the coverage walk). `None` = flat binding (consumer op must be 0).
+    import_remaps: Vec<Option<Arc<[u32]>>>,
+    /// §3.5 **self-module registration**: the running module's type-section interfaces, offers,
+    /// and function table, registered at run setup so `call.import.dyn`, `cap.self.type_id`,
+    /// `cap.self.covers`, and `export.handle` resolve through one host-side entry on all three
+    /// backends. `None` until registered (the ops then fail closed, probeable).
+    self_module: Option<Arc<Module>>,
+    /// The domain's one shared service state for offers it reifies (`export.handle` — all of a
+    /// domain's reified offers share it), created lazily on first reification.
+    self_instance: Option<Arc<Mutex<ProviderState>>>,
+    /// Memoized reified-offer handles by impl-export index (re-reifying returns the same
+    /// backing).
+    self_reified: BTreeMap<u32, i32>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -10295,6 +10425,9 @@ struct ModuleGrant {
     /// bind each slot against the child's granted powerbox - the child executes `call.import`
     /// through these bindings; nothing is rewritten and no handle is stashed in its window.
     imports: Arc<[svm_ir::Import]>,
+    /// The module's type section (§3.5): retained beside `imports` so the child-spawn binder
+    /// can resolve each import's requirement set (names + signatures) for the coverage walk.
+    types: Arc<[svm_ir::TypeEntry]>,
     /// DURABILITY.md §4: the granting host attests this module is **freezable** (it ran
     /// `svm_durable::transform_module` on it — a compile-mode fact only the host knows, like
     /// verification). A durable domain refuses to instantiate a grant without this bit, so its
@@ -10318,9 +10451,10 @@ fn module_digest(m: &Module) -> [u8; 32] {
         memory: m.memory,
         data: m.data.clone(),
         exports: m.exports.clone(),
-        // Interface offers are semantic (they are what wiring resolves against), so they ride
-        // the identity digest like function exports do.
+        // Interface offers and the interface section are semantic (they are what wiring
+        // resolves against), so they ride the identity digest like function exports do.
         impl_exports: m.impl_exports.clone(),
+        types: m.types.clone(),
         imports: Vec::new(),
         debug_info: None,
     };
@@ -10358,6 +10492,10 @@ impl Host {
             host_fns_region: Vec::new(),
             guest_impls: Vec::new(),
             iface_intern: Vec::new(),
+            import_remaps: Vec::new(),
+            self_module: None,
+            self_instance: None,
+            self_reified: BTreeMap::new(),
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -10390,6 +10528,12 @@ impl Host {
         self.resolve_module(handle).ok().map(|g| g.imports.clone())
     }
 
+    /// The type section of a granted §14 `Module` (§3.5): read beside [`Host::module_imports`]
+    /// by the child-manifest binder to resolve each import's requirement set.
+    pub fn module_types(&self, handle: i32) -> Option<Arc<[svm_ir::TypeEntry]>> {
+        self.resolve_module(handle).ok().map(|g| g.types.clone())
+    }
+
     /// S2.1 / IMPORTS.md phase 3 + §3.3: bind a **child** module's import manifest against this
     /// (child) host's granted powerbox, so the child's `call.import`s dispatch through instance
     /// bindings — no rewrite, no window stash. Binding, per slot, in order:
@@ -10407,7 +10551,11 @@ impl Host {
     ///
     /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
     /// lockstep).
-    pub fn bind_child_manifest(&mut self, imports: &[svm_ir::Import]) -> Result<(), u32> {
+    pub fn bind_child_manifest(
+        &mut self,
+        imports: &[svm_ir::Import],
+        tsec: &[svm_ir::TypeEntry],
+    ) -> Result<(), u32> {
         if imports.is_empty() {
             return Ok(());
         }
@@ -10424,22 +10572,58 @@ impl Host {
                     .then_some(((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32)
             })
         };
+        // Resolve an import's §3.5 requirement set — `(names, sigs)` — through the child's
+        // type section: a flat import is the singleton `[(name, sig)]`, a grouped import its
+        // interface's named op list. `None` = a malformed reference (unverified module).
+        let requirement = |im: &svm_ir::Import| -> Option<(Vec<String>, Vec<FuncType>)> {
+            let named: Vec<(&str, &FuncType)> = match im.shape {
+                svm_ir::ImportShape::Func(t) => match tsec.get(t as usize)? {
+                    svm_ir::TypeEntry::Func(ft) => vec![(im.name.as_str(), ft)],
+                    _ => return None,
+                },
+                svm_ir::ImportShape::Interface(t) => match tsec.get(t as usize)? {
+                    svm_ir::TypeEntry::Interface(elems) => elems
+                        .iter()
+                        .map(|e| match tsec.get(e.ty as usize)? {
+                            svm_ir::TypeEntry::Func(ft) => Some((e.name.as_str(), ft)),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                    _ => return None,
+                },
+            };
+            Some((
+                named.iter().map(|(n, _)| n.to_string()).collect(),
+                named.iter().map(|&(_, ft)| ft.clone()).collect(),
+            ))
+        };
         let mut bindings = Vec::with_capacity(imports.len());
+        let mut remaps: Vec<Option<Arc<[u32]>>> = Vec::with_capacity(imports.len());
         for (i, im) in imports.iter().enumerate() {
             let rebindable = im.mode == svm_ir::ImportMode::Rebindable;
-            // §3.3: a named offer grant binds directly — the parent's wrap/override.
+            let Some((req_names, req_sigs)) = requirement(im) else {
+                return Err(i as u32);
+            };
+            // §3.3: a named offer grant binds directly — the parent's wrap/override. §3.5: the
+            // match is the coverage walk (name-keyed against a named provider; exact positional
+            // against a name-less legacy wire), producing the slot's frozen op remap.
             if let Some(h) = self.resolve_cap_name(&im.name) {
                 if let Ok(entry) = self.resolve_guest_impl(h) {
-                    let op = entry.sigs.iter().position(|s| *s == im.sig);
-                    match op.and_then(|op| {
-                        self.bound_import_for_impl(h, op as u32, &im.sig, rebindable)
+                    let (en, es) = (Arc::clone(&entry.names), Arc::clone(&entry.sigs));
+                    let cov = coverage_remap(&req_names, &req_sigs, &en, &es);
+                    match cov.and_then(|remap| {
+                        let b =
+                            self.bound_import_for_impl(h, remap[0], &req_sigs[0], rebindable)?;
+                        Some((b, remap))
                     }) {
-                        Some(b) => {
+                        Some((b, remap)) => {
                             bindings.push(b);
+                            remaps.push(Some(remap));
                             continue;
                         }
                         None if rebindable => {
                             bindings.push(BoundImport::rebindable(0, 0, None));
+                            remaps.push(None);
                             continue;
                         }
                         None => return Err(i as u32),
@@ -10448,12 +10632,23 @@ impl Host {
             }
             match policy(&im.name).and_then(|(tid, iop)| first_of(self, tid).map(|c| (tid, iop, c)))
             {
-                Some((tid, iop, c)) => bindings.push(BoundImport::required(tid, iop, c)),
-                None if rebindable => bindings.push(BoundImport::rebindable(0, 0, None)),
+                Some((tid, iop, c)) => {
+                    bindings.push(BoundImport::required(tid, iop, c));
+                    remaps.push(None);
+                }
+                None if rebindable => {
+                    bindings.push(BoundImport::rebindable(0, 0, None));
+                    remaps.push(None);
+                }
                 None => return Err(i as u32),
             }
         }
         self.set_import_bindings(bindings);
+        for (i, r) in remaps.into_iter().enumerate() {
+            if let Some(r) = r {
+                self.set_import_remap(i, r);
+            }
+        }
         Ok(())
     }
 
@@ -10486,6 +10681,7 @@ impl Host {
                 .all(|b| b.type_id != svm_ir::CAP_IMPORT_TYPE_ID),
             "an import binding can never target the import-dispatch pseudo-type_id"
         );
+        self.import_remaps = vec![None; bindings.len()];
         self.import_bindings = bindings;
     }
 
@@ -11199,6 +11395,7 @@ impl Host {
             funcs: Arc::clone(funcs),
             ops: ops.into(),
             sigs,
+            names: Arc::from(Vec::new()),
             type_id,
             depth: 1,
             state: None,
@@ -11238,6 +11435,7 @@ impl Host {
             funcs,
             ops: ops.into(),
             sigs,
+            names: Arc::from(Vec::new()),
             type_id,
             depth: 1,
             state: Some(Arc::new(Mutex::new(ProviderState {
@@ -11247,6 +11445,107 @@ impl Host {
             }))),
         });
         Some(self.grant(type_id, Binding::GuestImpl(idx)))
+    }
+
+    /// §3.5: register the running module's self-referential surface (type-section interfaces,
+    /// impl exports, function table, memory template) so `call.import.dyn`,
+    /// `cap.self.type_id`, `cap.self.covers`, and `export.handle` resolve through one host-side
+    /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
+    pub fn set_self_module(&mut self, m: &Arc<Module>) {
+        self.self_module = Some(Arc::clone(m));
+    }
+
+    /// The named-op view of self interface `ty`: `(names, sigs)`, or `None` when no self module
+    /// is registered or `ty` is not a well-formed interface entry.
+    fn self_iface(&self, ty: u32) -> Option<(Vec<String>, Vec<FuncType>)> {
+        let m = self.self_module.as_ref()?;
+        let ops = m.interface_named_ops(ty)?;
+        Some((
+            ops.iter().map(|(n, _)| n.to_string()).collect(),
+            ops.iter().map(|&(_, ft)| ft.clone()).collect(),
+        ))
+    }
+
+    /// §3.5 `cap.self.type_id`: intern this domain's declared interface `ty` and return the
+    /// runtime id — authority-neutral pure reflection (the shape is the module's own).
+    pub fn self_type_id(&mut self, ty: u32) -> Result<u32, Trap> {
+        let (_, sigs) = self.self_iface(ty).ok_or(Trap::CapFault)?;
+        Ok(self.intern_interface(&sigs))
+    }
+
+    /// §3.5 `cap.self.covers`: does the live capability behind `handle` **cover** self
+    /// interface `ty`? `1` covers, `0` live-but-does-not, `-EBADF` dead/forged.
+    pub fn self_covers(&mut self, handle: i32, ty: u32) -> Result<i64, Trap> {
+        let (names, sigs) = self.self_iface(ty).ok_or(Trap::CapFault)?;
+        let Some(tid) = self.type_id_of(handle) else {
+            return Ok(-9); // EBADF: dead or forged — probeable, never a trap
+        };
+        // Exact shape ⇒ covers by construction (same interned id).
+        if tid == self.intern_interface(&sigs) {
+            return Ok(1);
+        }
+        // A wired guest impl may cover a subset requirement — the name-keyed walk.
+        if let Ok(e) = self.resolve_guest_impl(handle) {
+            let (en, es) = (Arc::clone(&e.names), Arc::clone(&e.sigs));
+            return Ok(coverage_remap(&names, &sigs, &en, &es).is_some() as i64);
+        }
+        Ok(0)
+    }
+
+    /// §3.5 `export.handle`: reify this domain's own impl export `k` as a capability — the only
+    /// guest-reachable source of offer wiring rights (offer exposure is consent-based). All of
+    /// a domain's reified offers share **one** service state (created lazily from the module's
+    /// memory declaration + data segments); re-reifying returns the same handle.
+    pub fn reify_export(&mut self, k: u32) -> Result<i32, Trap> {
+        if let Some(&h) = self.self_reified.get(&k) {
+            return Ok(h);
+        }
+        let m = self.self_module.clone().ok_or(Trap::CapFault)?;
+        let e = m.impl_exports.get(k as usize).ok_or(Trap::CapFault)?;
+        let funcs: Arc<[Func]> = m.funcs.clone().into();
+        if e.ops.is_empty() || e.ops.iter().any(|&f| f as usize >= funcs.len()) {
+            return Err(Trap::CapFault);
+        }
+        let named = m.interface_named_ops(e.interface).ok_or(Trap::CapFault)?;
+        let sigs: Arc<[FuncType]> = named.iter().map(|&(_, ft)| ft.clone()).collect();
+        let names: Arc<[String]> = named.iter().map(|(n, _)| n.to_string()).collect();
+        let state = self
+            .self_instance
+            .get_or_insert_with(|| {
+                let mem = m.memory.map(|mc| {
+                    let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+                    mm.init_data(&m.data);
+                    mm
+                });
+                Arc::new(Mutex::new(ProviderState {
+                    mem,
+                    host: Host::new(),
+                    fuel: PROVIDER_FUEL_RESERVE,
+                }))
+            })
+            .clone();
+        let type_id = self.intern_interface(&sigs);
+        let idx = self.guest_impls.len() as u32;
+        self.guest_impls.push(GuestImplEntry {
+            funcs,
+            ops: Arc::from(e.ops.clone()),
+            sigs,
+            names,
+            type_id,
+            depth: 1,
+            state: Some(state),
+        });
+        let h = self.grant(type_id, Binding::GuestImpl(idx));
+        self.self_reified.insert(k, h);
+        Ok(h)
+    }
+
+    /// §3.5: freeze a grouped slot's bind-time op remap (consumer-local op → provider op),
+    /// computed by the coverage walk at the binding act. No-op for an out-of-range slot.
+    pub fn set_import_remap(&mut self, slot: usize, remap: Arc<[u32]>) {
+        if let Some(r) = self.import_remaps.get_mut(slot) {
+            *r = Some(remap);
+        }
     }
 
     /// Re-grant one of **this** domain's capabilities into the provider instance behind `offer`,
@@ -11406,6 +11705,7 @@ impl Host {
             data: m.data.clone().into(),
             exports: m.exports.clone().into(),
             imports: m.imports.clone().into(),
+            types: m.types.clone().into(),
             durable,
             digest: module_digest(m),
         });
@@ -12014,19 +12314,58 @@ impl Host {
         // handle argument is ignored: the binding carries the granted handle (the operand is
         // vestigial in static dispatch — IMPORTS.md §2.5).
         let (type_id, op, handle) = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+            // §3.5: `op` packs `(slot | consumer_op << 16)`. A grouped binding translates the
+            // consumer-local op through its bind-time remap (frozen by the coverage walk); a
+            // flat binding requires consumer_op 0 and uses the bound op. Fail-closed on an
+            // out-of-range consumer op — probeable, like every capability fault.
+            let slot = op & 0xFFFF;
+            let cop = op >> 16;
             let b = self
                 .import_bindings
-                .get(op as usize)
+                .get(slot as usize)
                 .copied()
                 .ok_or(Trap::CapFault)?;
             // An unbound rebindable slot (declared, never attached — phase 2) is fail-closed.
             if !b.bound {
                 return Err(Trap::CapFault);
             }
-            (b.type_id, b.op, b.handle)
+            let eff_op = match self
+                .import_remaps
+                .get(slot as usize)
+                .and_then(|r| r.as_ref())
+            {
+                Some(remap) => *remap.get(cop as usize).ok_or(Trap::CapFault)?,
+                None if cop == 0 => b.op,
+                None => return Err(Trap::CapFault),
+            };
+            (b.type_id, eff_op, b.handle)
+        } else if type_id == svm_ir::CAP_DYN_TYPE_ID {
+            // §3.5 dynamic mode by type-section reference: `op` packs `(type_idx | op << 16)`;
+            // intern the registered self-module shape and re-enter with the effective id — the
+            // ordinary §3c use-site check below does the rest (exact-id fast path).
+            let ty = op & 0xFFFF;
+            let dop = op >> 16;
+            let id = self.self_type_id(ty)?;
+            (id, dop, handle)
         } else {
             (type_id, op, handle)
         };
+        // §3.5 self-namespace extensions (dispatch form, exempt from manifest-completeness like
+        // the rest of `cap.self.*`): op packs `(selfop | idx << 8)` for selfop ≥ 6 —
+        // 6 = `type_id` (intern self interface `idx`), 7 = `covers` (probe the handle argument
+        // against self interface `idx`), 8 = `export.handle` (reify own offer `idx`).
+        if type_id == svm_ir::CAP_SELF_TYPE_ID && (op & 0xFF) >= 6 {
+            let idx = op >> 8;
+            return match op & 0xFF {
+                6 => Ok(vec![self.self_type_id(idx)? as i32 as i64]),
+                7 => {
+                    let h = *args.first().ok_or(Trap::CapFault)? as i32;
+                    Ok(vec![self.self_covers(h, idx)?])
+                }
+                8 => Ok(vec![self.reify_export(idx)? as i64]),
+                _ => Err(Trap::CapFault),
+            };
+        }
         // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
         // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
         if is_recorded_input(type_id, op) {
@@ -14517,7 +14856,7 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
         // `v128` never reaches here — its loads go through the dedicated 16-byte path, not
         // a `LoadOp` (whose widths are ≤8). Total arm for exhaustiveness only.
         ValType::V128 => Value::V128([0; 16]),
-        ValType::I32 | ValType::I64 | ValType::Ref => {
+        ValType::I32 | ValType::I64 | ValType::Ref | ValType::Cap => {
             let bits = width * 8;
             let ext = if signed && bits < 64 {
                 let shift = 64 - bits;
@@ -14526,7 +14865,7 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
                 raw
             };
             match rty {
-                ValType::I32 => Value::I32(ext as i32),
+                ValType::I32 | ValType::Cap => Value::I32(ext as i32),
                 ValType::Ref => Value::Ref(ext), // opaque, stored/loaded as an i64-width word
                 _ => Value::I64(ext as i64),
             }
@@ -14867,6 +15206,7 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),
         ValType::Ref => Value::Ref(s as u64), // opaque i64-width reference
+        ValType::Cap => Value::I32(s as i32), // §3.5: i32-width handle marker
         // `v128` cap results are out of MVP scope; zero-extend the slot into the low lanes.
         ValType::V128 => {
             let mut b = [0u8; 16];

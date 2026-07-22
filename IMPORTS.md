@@ -503,7 +503,7 @@ leaving the tree with five conventions instead of four.
 
 ---
 
-## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 v1 landed (exporter-domain state pending); §3.4 built]
+## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 landed; §3.4 built; §3.5 built (wire v7); §3.6 designed — the end-state execution model, awaits the shell personality]
 
 ### 3.1 Binding provenance in `cap.self.attest`
 
@@ -511,7 +511,10 @@ leaving the tree with five conventions instead of four.
 op 5, reached via dynamic dispatch on the reserved `cap.self` id (no new instruction, no
 wire change): `0` = platform-terminated, `d ≥ 1` = ancestor-terminated `d` domain
 boundaries up (1 where the offer was wired, +1 per §3.3 re-grant hop). A forged/closed
-handle is an inert `CapFault`. PROCESS.md §6's growth-criterion list updated to name it.*
+handle is an inert `CapFault`. PROCESS.md §6's growth-criterion list updated to name it.
+`manifest_complete()` exempts `cap.call`s on the reserved self-namespace immediate:
+completeness measures capability **egress**, and the self namespace is authority-neutral
+reflection — a manifest-complete module may query provenance without losing the bit.*
 
 Extends `PROCESS.md` §6 (and shares its status and its sign-off requirements).
 The handle table is host-owned, so the TCB knows, per entry, whether its
@@ -576,7 +579,11 @@ parent's resources. Not a loophole; the point of the model.
    no nominal interface name (`Log` above was illustrative): interface identity is the
    structural op-signature list, interned per-host to a `type_id`
    (`Host::intern_interface`, id-equality ≡ structural equality — D59 applied to capability
-   interfaces; the OQ3 interned-section wire format remains open, this intern is host-side).
+   interfaces). *v6 addendum:* the OQ3 **type section** has since landed — a module
+   declares its shapes in one index space (`type (sig)` entries + `interface { idx, ... }`
+   tuples over them) and each offer names the interface entry it implements
+   (`export "n" impl <iface> : <funcidx>...`), verifier-checked exactly; the host-side intern
+   remains the runtime identity.
 2. **v1 executes a wired op as a *pure dispatch*, not in the exporter's domain.** Wiring
    (`Host::wire_impl` + `bound_import_for_impl`, surfaced as
    `svm_run::HostCap::impl_offer`) is exactly as designed: authority moves only at the wiring
@@ -644,6 +651,523 @@ Three tiers of guest access, all over one table:
 
 The manifest bounds *requirements*, not *reach*. Reach is bounded by grants —
 the correct ocap bound.
+
+### 3.5 Interface-grouped imports  [BUILT 2026-07-21 (wire v7) — as-built notes at the end]
+
+The type section's recorded next consumer (OQ3), now designed: one slot binds a
+whole interface, the op moves to the call site, and the flat one-op import is
+the degenerate case of the same mechanism.
+
+**Surface** (consumer side; syntax settled 2026-07-21):
+
+```
+type 0 func (i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { read: 0, len: 1 }   ; op names required
+
+import 0 interface "env" "fs" 2 required   ; grouped: one slot, the whole requirement
+import 1 func "env" "log" 1 rebindable     ; flat: a singleton requirement
+
+func 0 () -> (i64) {
+  block 0 {
+    v1 = i64.const 4096
+    v2 = i64.const 64
+    v3 = call.import 0.read (v1, v2)   ; by name — resolved to the op index at parse
+    v4 = call.import 0.1 (v1)          ; or positional — identical wire form
+    v5 = call.import [v6] interface 2 . read (v1, v2)  ; dynamic: handle from a
+    return v5                          ; value, requirement by type-section ref
+  }
+}
+```
+
+**Text-format rules (settled with the surface):**
+
+- **One declaration grammar:** `keyword index [kind] [names] payload`. Every
+  definition — `type`, `import`, `func`, `export`, `block` — carries its
+  index as a *checked positional label* (the parser verifies label =
+  position; the wire stays positional — pure legibility: greppable
+  references, stable diffs, precise errors). Exactly two kind keywords,
+  **`func`** and **`interface`**, used identically in `type`, `import`, and
+  `export`; the spellings `iface` and `impl` are retired (Rust follows:
+  `ImplExport.iface` → `interface`; the `iface::` constants module renames in
+  a follow-up).
+- **One grouping construct:** `{ }` — function bodies, blocks, interface
+  declarations, offer maps; indentation is never significant. One map syntax,
+  `{ name: idx, … }` (in `type … interface` the values are type indices; in
+  `export … interface` they are func indices — the kind keyword up front says
+  which). One signature syntax, `(params) -> (results)`, appearing only in
+  `type … func` entries; everything else references a type index.
+- **Import names are two-level**: `("env", "fs")` — the first level names the
+  provider binding point, the second the bundle (grouped) or op (flat).
+  Resolver vocabulary.
+- **Index spaces stay per-section** (types / imports / funcs / exports).
+  Import index = handle-table slot is ABI (plus the reserved child prefix);
+  folding types into the import numbering would put a "subtract the
+  definitions above me" step into the slot path for zero semantic gain.
+- **There is deliberately no `import type`.** Under structural identity a type
+  import is redundant — declaring the shape locally *is* having the type
+  (same interned id, D59) — and load-time verification needs concrete shapes.
+  Cross-suite shape dedup is the linker's job (it already merges type
+  sections, §2.5); the abstract-type use case is served by capability handles.
+
+**Coverage binding — the binding relation (settled 2026-07-21).** A consumer's
+interface declaration is a **requirement set**, not a claimed identity: "ops
+with these names and these signatures." Binding succeeds iff the provider
+**covers** it — every consumer `(name, sig)` has a same-named,
+signature-equal op in the provider's interface; extra provider ops are
+ignored; a missing name or a signature mismatch fails closed. At bind time
+the host computes a per-slot **op remap** (consumer-local index → provider
+index) and freezes it; call sites use the consumer's own numbering.
+
+- **Forward compatibility, both directions:** providers evolve by *adding*
+  ops without breaking any consumer; consumers declare only what they use and
+  tolerate any covering provider. Coverage is name-keyed, so declaration
+  *order* never matters for binding (it only assigns consumer-local indices).
+- **Names are the binding contract; `type_id` stays shape-only** — the ELF
+  split: link by symbol name, run by address. Matching must be by name
+  because signature-only subset matching is ambiguous the moment two ops
+  share a signature (`read`/`write`). The price, stated plainly: renaming an
+  op is a breaking provider change, like renaming an exported symbol. An
+  interposer declares the same names as what it wraps, so interposition
+  invisibility is unaffected.
+- **A flat `func` import is a singleton requirement set** — wasm's per-op
+  import is the degenerate case of the same mechanism, not a competing mode.
+  Grouped adds what wasm cannot express: one slot, one fail-closed act, one
+  attach, one provenance answer, one revocation point for a coherent bundle.
+- **Exact matching is the trivial case** (coverage happens to be total); no
+  second mechanism exists.
+- The coverage walk runs only at **binding acts** — instantiation,
+  `import.attach`, child-manifest binding, wiring — once per binding, off the
+  hot path. `required` slots stay devirtualizable (the remap is an instance
+  constant).
+
+**Semantics:**
+
+- A grouped slot's binding state is `(type_id, handle, remap)`. The static
+  form's verifier check resolves `import 0` → `types[2]` → op → signature,
+  all at load; execution passes the remapped op through the existing
+  `cap_dispatch_slots(CAP_IMPORT_TYPE_ID, slot, op, …)` path (the `op`
+  argument exists today and is always `0` — it starts carrying information).
+- The dynamic form (`call.import [v] interface k . op`) keeps the **exact-id
+  fast path**: `entry.type_id == intern(types[k])` plus generation at the use
+  site — the same §3c check, now *expressible for interned interfaces*. This
+  closes the recorded encoding gap: `cap.call` needs a compile-time `type_id`
+  immediate, which a guest cannot know for a wired offer; a type-section
+  reference is resolvable at instantiation. To drive a
+  covering-but-not-equal capability discovered at runtime, attach it to a
+  rebindable slot — the coverage walk happens once, there — then use static
+  calls. `cap.call` stays as the escape hatch for undeclared grants and the
+  reserved self namespace.
+- **Intern pre-seeding.** Built-in interfaces publish canonical shapes,
+  pre-seeded into the per-host intern, so a structurally equal guest
+  declaration interns *to the built-in id* (D59 extended across the
+  host-native/guest-impl divide). `HOST_FN` is the deliberate exception — its
+  semantics are per-registration embedder code with no canonical shape; it
+  binds by name through the registry, the (trusted) embedder asserting the
+  shape it implements.
+- **Reflection gains two authority-neutral ops:** `cap.self.type_id k` —
+  intern *this module's* `types[k]`, return the runtime id (exact-shape
+  discovery: iterate `cap.self.get`, compare ids) — and `cap.self.covers
+  vh, k` — "does the capability behind this handle cover my `types[k]`?"
+  (subset discovery; a failed `import.attach` works as the probe even
+  without it). `import.attach` on a grouped slot runs the coverage walk in
+  one act. `resolve` (by name) is unchanged; D46 schema reflection returns
+  op names alongside signatures (both are stored for pre-seeded and guest
+  ids alike).
+- **Child manifests** (§3.3): a grouped import matches a named grant by one
+  name-keyed coverage walk — `bind_child_manifest`'s per-op signature probe
+  becomes exactly that walk, computing the remap as it goes.
+
+**Offer exposure — who may wire (settled 2026-07-21).** Declaring an offer
+confers nothing (§3.2); *wirable* offers are capabilities, and the initial
+holder is the domain that implements them:
+
+- **`export.handle k` → `i32`** (mirror of `import.handle i`): the exporting
+  domain reifies its own export entry `k` as an ordinary capability handle.
+  Wiring rights propagate only by granting that handle: down to its own
+  children at spawn (bind their manifests with it), up to its parent or out
+  to a sibling *iff it chooses to send it*.
+- **One rule, not two export semantics: bytes are ambient, instances are
+  consensual.** Every export — `func` or `interface` — is an inert
+  declaration in the module *bytes*, visible to whoever holds the bytes.
+  Invoking a `func` export (a spawn entry, the embedder's `call("main")`)
+  creates or enters *the caller's own instantiation* — caller's window,
+  caller's bindings, caller's fuel; no pre-existing state of any exporting
+  domain is involved, because none exists. Likewise, anyone holding the
+  bytes (the embedder registry via `wire_impl*`/`impl_service`, or a parent
+  holding a `Module` grant) may wire an offer as **its own** provider
+  instance — your *code*, but the wirer's authority, seed state, and fuel;
+  harmless to the authoring domain. What consent guards is *this domain's*
+  instance — the one backed by its aliased imports and accumulated service
+  state — and `export.handle` is the only path to it. No guest-reachable op
+  harvests it: a parent holding a child's `Instantiator` cannot
+  enumerate-and-wire the child's *live* offers. A hostile parent can always
+  run your code; it can never reach into your service.
+- **Honest limit:** this controls who can *call through* your offers. In
+  window-exposed tiers a §14 parent already reads and writes the child's
+  entire carve — export protection cannot create confidentiality the memory
+  model doesn't provide. That is `attest`'s job: a child that finds itself
+  window-exposed to an untrusted parent should refuse to hold secrets at
+  all; distrust means separate processes (§1a). The two compose: attest
+  tells you which world you are in; `export.handle` keeps offer wiring
+  consent-based in the worlds where isolation is real.
+- **The `cap` value type — boundary translation (settled 2026-07-21).** A raw
+  `i32` handle crossing domains is deliberately inert (it would index the
+  *receiver's* table — the forgeability guarantee). Authority crosses only
+  where a signature says so: a parameter or result declared `cap` makes the
+  host translate at the capability-call / entry-result boundary — resolve in
+  the sender's table (must be live), re-grant into the receiver's, substitute
+  the receiver-local packed handle. This is the guest↔guest half of §2.3's
+  "objects are arguments" (today only trusted built-ins like
+  `Instantiator.join` interpret arguments as handles); unmarked integers keep
+  the existing inertness. In guest code `cap` is `i32`-width data; only
+  boundaries treat it specially.
+- **What offer calls run over — as built (v2) vs the end state (§3.6).** As
+  built, offers execute over a **passive provider instance**: a second
+  window + powerbox distinct from the live run — own lock, provider-pays
+  fuel, shared by all offers the domain reifies, its import slots aliasing
+  the reifier's bindings as of reification, deadlock-free by construction
+  (providers never hold offers; lock order domain → provider). This bought
+  exporter-domain execution with no fiber machinery — **implementation
+  sequencing, not principle**. The end state is §3.6's **unified model**:
+  one world per domain, offers served as handler fibers over the *same*
+  window and powerbox as `main`; the separate-instance concept dissolves (a
+  provider wired from bytes is simply a domain whose `main` never ran). The
+  passive instance approximates the unified model exactly for the common
+  provider — a domain with no concurrently active live run — and diverges
+  for a domain that serves *while* running; the divergence is documented
+  below and is the motivation for unifying.
+
+**The two-world divergence, concretely (interim — dissolves under §3.6).**
+The tempting-but-natural version, which the as-built split silently breaks:
+
+```
+func 0 () -> (i64) {                ; stats.get — an offer impl
+  block 0 { v0 = i64.load ...TICK... return v0 }  ; reads the INSTANCE window
+}
+func 2 () -> () {                   ; the live loop
+  block 0 { ... i64.store TICK, t ... }           ; writes the LIVE window
+}
+; nothing faults — `get` just reports 0 forever. Two worlds.
+```
+
+The workarounds, in preference order:
+
+1. **Be a client of your own service.** The domain attaches its own
+   `export.handle` to a rebindable slot and *calls its own offer* to write
+   (`self_stats.bump()` per tick) — legal, deadlock-free (lock order is
+   domain → provider; the live run is just another caller), and the instance
+   becomes the one shared cell both worlds see through the same door. Cost:
+   one dispatch per write.
+2. **A shared stream/pipe** both sides hold — for flowing data and event
+   patterns.
+3. **Reify-time seeding** (data segments into the instance) — for config and
+   constants.
+4. **Split-phase** for request/response *with* the live run: the offer op
+   records the request in instance state (or takes a `cap` callback) and
+   returns "pending"; the live loop polls and responds. An offer op must
+   never block waiting on the live domain — that recreates the exact cycle
+   this design removes.
+
+What remains inexpressible even with workarounds: an offer op that must
+**block on the live run** (an interposed stdin `read` — split-phase requires
+the *caller* to cooperate, and a posix child calling `read(0, …)` expects to
+block; transparent interposition cannot demand caller changes), zero-copy
+sharing of live-window buffers with the service, and guest services layered
+on guest services (the offers-in-providers refusal). These are lifted by
+**reactor domains** — §3.6, designed for exactly this; anything shell-like
+is its consumer.
+
+**Wire (v7 — one bump, six riders):** `Import` replaces its inline `FuncType`
+with `shape: Func(typeidx) | Interface(typeidx)` and gains the second name
+level; `TypeEntry::Interface` elements become `(name, typeidx)` pairs (names
+required); `CallImport` gains an `op` immediate and **drops the vestigial
+handle operand** (whose retirement was already scheduled for "the next wire
+bump" — this is it); dynamic mode gains the type-section-reference form;
+`export.handle` joins `import.handle`; **`cap` joins the value types**
+(`i32`-width in guest code; special only at boundaries). Backend cost is the
+op immediate plus one remap load threading through the one generic dispatch;
+JIT devirtualization of `required` grouped slots stays legal per §2.2
+(immutable binding, bind-time-constant remap).
+
+**Host-side provider, Rust** (embedder registry — sketch):
+
+```rust
+let fs_shape = IfaceShape::new()      // op names required, mirroring the text form
+    .op("open", sig_open())
+    .op("read", sig_read())
+    .op("write", sig_write())
+    .op("len", sig_len());
+Imports::new()
+    // host-native: the (trusted) embedder asserts the shape it implements
+    .provide("fs", HostCap::iface(&fs_shape, fs_handle))
+    // or a guest offer as the provider — shape and names come from the offer
+    .provide("fs", HostCap::impl_service(&fs_module, "fs")?)
+```
+
+Instantiation runs the coverage walk: every `(name, sig)` the consumer's
+declared entry requires must appear in the provided shape — the same
+fail-closed check as `wire_impl`, applied at the registry boundary. A
+consumer requiring only `{ read, len }` binds against this four-op provider.
+
+**Parent domain with a nested child, svm-ir** (the §3.3 wrap, grouped —
+subset consumer):
+
+```
+; ---- parent (the provider; here also an interposer) ----
+type 0 func (i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { log: 0, flush: 1 }
+
+func 0 (i64, i64) -> (i64) {
+  block 0 (v0: i64, v1: i64) {
+    ; record, then forward
+  }
+}
+func 1 (i64) -> (i64) { ... }
+
+export 0 interface "log" 2 { log: 0, flush: 1 }
+; parent main: reify `export.handle 0`, grant it under the child's import
+; name; manifest binding accepts it (wrap/override); an aliased own-binding
+; forwards; no grant under the name + `required` ⇒ the spawn fails closed.
+
+; ---- child (the consumer — requires only the op it uses) ----
+type 0 func (i64, i64) -> (i64)
+type 1 interface { log: 0 }
+
+import 0 interface "parent" "log" 1 required   ; slot 2 at runtime (child prefix)
+
+func 0 (i64, i64) -> (i64) {
+  block 0 (v0: i64, v1: i64) {
+    v2 = call.import 0.log (v0, v1)    ; by name — or positionally, `0.0`
+    return v2
+  }
+}
+```
+
+The child's one-op requirement binds against the parent's two-op offer —
+coverage, remap `[0→0]`. The offer flows the other way just as well: a child
+reifying its own offer and returning the handle *up* through a `cap`-typed
+result is how a child chooses to serve its parent — exposure is always
+module→holder, authority flow is per-wiring, consent-based via
+`export.handle`. Provenance reports the wrapped binding ancestor-terminated
+at depth 1: the child can see *that* it is interposed, never *what* the
+interposer does.
+
+**The full triangle** (worked example: P above, M in the middle, C below —
+one passthrough down, one wrap down, a *different* offer up):
+
+```
+; ---- P: M's parent ----
+type 0 func () -> (i64)
+type 1 interface { count: 0 }                 ; what P wants FROM M
+import 2 interface "m" "metrics" 1 rebindable ; starts EMPTY — filled only if M delivers
+; (P also holds a stream "out" and an Instantiator "kids"; decls elided)
+
+  v0 = call.import kids.spawn (...)   ; spawn M; §3.3: forward own "out" to M
+  v1 = call.import kids.join (v0)     ; M's entry result is `cap` -> host-translated
+  import.attach 2 v1                  ; coverage-checked against P's interface 1
+  v2 = call.import 2.count ()         ; P drives M's metrics
+
+; ---- M: the middle domain ----
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0 }             ; consumes (from P)
+type 2 interface { log: 0 }               ; offers DOWN (wrap of write)
+type 3 func () -> (i64)
+type 4 interface { count: 3 }             ; offers UP (a different capability)
+
+import 0 interface "p" "out"  1 required
+import 1 interface "p" "kids" ... required
+
+func 0 (i64, i64) -> (i64) {              ; log impl: bump counter, forward
+  block 0 (v0: i64, v1: i64) {
+    ; ...increment counter in M's provider-instance memory...
+    v2 = call.import 0.write (v0, v1)     ; instance slot aliases M's "out"
+    return v2
+  }
+}
+func 1 () -> (i64) { block 0 { ... } }    ; count impl: read the counter
+
+export 0 interface "log"     2 { log: 0 }
+export 1 interface "metrics" 4 { count: 1 }
+export 2 func "main" 2                    ; M's entry — what spawn runs
+
+func 2 () -> (cap) {                      ; the setup run
+  block 0 {
+    v0 = import.handle 0                  ; the ORIGINAL stream    (passthrough)
+    v1 = export.handle 0                  ; M's log wrap           (for C)
+    v2 = export.handle 1                  ; M's metrics            (for P)
+    v3 = call.import 1.spawn (...)        ; spawn C
+    v4 = call.import 1.grant (v3, v0)     ; C's "out" <- passthrough
+    v5 = call.import 1.grant (v3, v1)     ; C's "log" <- the wrap
+    return v2                             ; metrics goes UP — only because M returns it
+  }
+}
+
+; ---- C: M's child ----
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0 }
+type 2 interface { log: 0 }
+import 0 interface "m" "out" 1 required   ; passthrough: provenance = the original's
+import 1 interface "m" "log" 2 required   ; wrap: provenance = ancestor depth 1
+
+  v2 = call.import 0.write (v0, v1)       ; straight to the original stream
+  v3 = call.import 1.log (v0, v1)         ; through M's counter, then the stream
+```
+
+Everything load-bearing is visible here: `metrics` reaches P *only* because
+M's entry returns it through a `cap`-typed result (an unmarked `i64` would
+arrive as an inert number); `log` never flows up, so P has nothing to bind;
+C's two imports answer provenance differently (the passthrough keeps the
+original's answer; the wrap reports depth 1); and after `main` returns, M's
+live run is over but its provider instance keeps serving both C's `log`
+calls and P's `count` calls — the counter they share lives in the instance,
+not in the finished run.
+
+**As built (2026-07-21, wire v7).** Everything above is landed — coverage binding with
+bind-time remaps (child manifests + host wiring; name-less legacy wires fall back to
+first-signature-position matching), the settled declaration surface (indices, kinds,
+required op names, `{ name: idx }` maps, legacy sugar kept where free), the `op`
+immediate, `call.import.dyn`, `export.handle` (memoized; one shared service state per
+domain), `cap.self.type_id`/`covers`, and `ValType::Cap` as an i32-width reservation —
+verified by both verifiers, executed by all three backends through the one generic
+dispatch (the import dispatch packs `slot | op << 16`; dyn packs `ty | op << 16` under
+a reserved id; the self extensions pack `selfop | idx << 8`). Deliberate deferrals,
+each with its reason recorded:
+
+- **The vestigial `call.import` handle operand is retained**, not retired: it is *live*
+  in link-form modules (the §7 loader ABI reads it as the cap-symbol handle and the
+  `Slot` patch target), so its retirement rides the future migration of that ABI to
+  manifest/attach — not this bump.
+- **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
+  the type is reserved and lowers as `i32` everywhere.
+- **Text cosmetics** — braced numbered blocks, `func N` labels — are a follow-up print
+  pass; the parser accepts todays's bodies unchanged.
+- **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
+  built-in shapes await their consumers; grouped binding works today through child
+  manifests and host-side wiring.
+- **`import.attach` on grouped rebindable slots** currently takes the exact-id path
+  (attach-time coverage walk + remap refresh is a small follow-up).
+
+### 3.6 The unified execution model — one world per domain  [DESIGNED 2026-07-21; subsumes the two-world split when the fiber slice lands]
+
+The end state, settled after review: **a domain is a program over one
+world** — one window, one powerbox. `main` runs; if the domain has reified
+offers, dispatches run as handler fibers over that *same* world — while
+`main` computes, after it returns (the domain persists as a service for as
+long as anyone holds its handles), or never (a provider wired from bytes is
+a domain whose `main` never ran — setup is data segments, or a designated
+init export). There is no second state: what `main` writes, handlers read.
+A domain that *wants* isolated service state says so explicitly — spawn a
+child and hand out the child's offer. §3.5's passive instance is the landed
+interim implementation of exactly the degenerate case (no concurrently
+active live run) and dissolves as a concept when this lands; `export.handle`
+has one semantics, no mode flag.
+
+What this makes expressible (fatal gaps of the two-world split, the first
+fatal to anything shell-like): an offer op that **blocks on live activity**
+(an interposed stdin `read` — a posix child calling `read(0, …)` expects to
+block, and transparent interposition cannot demand caller-side cooperation,
+so split-phase is a non-starter); zero-copy service access to the domain's
+buffers; and guest services layered on guest services.
+
+- **Scheduling — explicit service points, per-vCPU, host-run.** The
+  scheduler lives host-side (the same machinery that already parks and
+  wakes vCPUs at blocking ops — no new TCB category), but *when handlers
+  may run* is guest-controlled. Dispatches **queue** (bounded, fail-closed:
+  a full queue is a probeable fault at the caller). `svc.wait` and
+  `svc.poll` **park the calling fiber** — the vCPU idles only if it has no
+  other runnable fiber, ordinary §12 multiplexing. Handler fibers execute
+  *only inside `svc.*` windows*, on the vCPU that opened them: a fresh
+  dispatch (or a previously parked handler that has since been notified)
+  runs to completion or to its next park; the window closes and control
+  returns to the loop (`svc.poll`: run all runnable, return; `svc.wait`:
+  park until something is runnable, run it, return). A domain's *own*
+  parks — `memory.wait`, a blocking platform read — are **not** service
+  points: blocking for your own reasons never invites reentrancy, and
+  handler interleaving is *greppable* — exactly the `svc.*` lines.
+- **One loop or a pool — the guest chooses.** One vCPU in
+  `loop { svc.wait(…); own work }` is the classic sequential event loop
+  (the shell shape): handlers never overlap, no locks needed, `svc.wait`
+  doubling as the multiplex point (park until a dispatch *or* a watched
+  capability is ready — waitset detail pinned when the slice is built).
+  N vCPUs sitting in `svc.wait` are a worker pool: handlers run in true
+  parallel and the guest synchronizes with the same §12 tools it already
+  owes its own threads — it opted into shared-memory concurrency by
+  spawning vCPUs; handlers are just more work items. Other guest fibers
+  in the domain are untouched: they never see handlers except through
+  memory.
+- **Synchrony is a fiber-level property; asynchrony is protocol.** Every
+  cross-domain call is synchronous to *the calling fiber* — its program
+  order is call → results, nothing of that fiber runs in between — and
+  implies nothing beyond it: A[f1] parking on a call into B leaves A[f2]
+  running, A's other vCPUs running, and A[f1]'s own vCPU multiplexing onto
+  other runnable fibers; on B's side the dispatch queues until a service
+  point opens. Two corollaries: **a domain serves while it waits** (with
+  A[f1] parked, A's loop fiber in `svc.wait` still admits handlers — the
+  re-entry story above); and **non-blocking calls need no platform
+  primitive** — spawn a fiber to make the synchronous call, and the park
+  is confined to it (fiber-level synchrony + cheap fibers, the Go recipe).
+  A callee wanting async *semantics* builds it in the interface — accept,
+  record, return early, deliver later through a `cap` callback or a pipe
+  (split-phase by choice, not by force). The type system deliberately does
+  not encode "may park" on ops — the same honesty as posix and wasm;
+  annotate later only if a consumer demands it.
+- **Termination: `exit` is still `exit`.** A domain ends immediately on
+  explicit exit; its outstanding offer handles go stale through the
+  generation bump, so callers get a clean probeable `CapFault`, never a
+  hang — death is revocation (D37). "Entry returned" keeps the domain
+  alive *only if* it reified offers that are still held — the runtime then
+  provides the implicit serve loop, dispatches serialized one at a time
+  (exactly the passive instance's observable behavior, which is why the
+  interim is equivalence there, not approximation). A program that never
+  reified an offer ends when `main` returns, precisely as today.
+- **Entry naming — no magic names.** The entry is whatever export the
+  spawner or wirer designates (true today already); `"main"` for programs
+  and `"init"` (or none — data segments may be the whole setup) for
+  providers is *convention, not semantics*.
+- **Blocking becomes expressible.** A handler parks on guest state
+  (`memory.wait`) and the live run wakes it (`memory.notify`), or vice
+  versa. The interposed `read` then blocks its *caller* exactly as a
+  platform stream read would — the caller's vCPU parks at the host boundary,
+  which is already a concept, not new machinery.
+- **Re-entry is a new fiber, not a deadlock.** A's fiber calling B parks at
+  a suspension point — and parked fibers are exactly what suspension points
+  release, so when B's handler calls back into A, the dispatch runs as a
+  *fresh* handler fiber A[f2] while A[f1] stays parked. Call **cycles are
+  recursion, not deadlock**: A→B→A→B… deepens the fiber/park chain and is
+  bounded the way recursion always is — fuel plus the domain's existing
+  fiber quota (`max_fibers`); exhaustion faults the innermost call
+  (probeable), never hangs. No wait-for graph, no detection machinery,
+  nothing added to the TCB.
+- **The honest hazard is reentrancy, not deadlock** — the classic event-loop
+  footgun: a handler holding a *guest-level* lock (a mutex in guest memory)
+  across a cross-domain call self-deadlocks when the re-entrant handler
+  tries to take it (`memory.wait` on a cell only the parked fiber will
+  release — which it never will, since it is waiting on the caller). That is
+  the guest's locking discipline to keep, as in every reentrant system; the
+  rule of thumb is the usual one — don't hold guest locks across
+  cross-domain calls — and fuel remains the backstop for getting it wrong.
+- **Service-on-service unlocks.** The offers-in-providers refusal was a
+  property of the interim passive instance; under the unified model handlers
+  hold and call whatever the domain holds, including other domains' offers.
+  Layered guest services (a shell's pipeline stages, fs-on-blockdev) become
+  expressible, with cycles handled as above — recursion, bounded, faulting.
+- **Metering:** the domain serves on its own fuel — §5.3 provider-pays
+  generalizes unchanged (its code, its choice to serve). A parked caller
+  burns nothing while parked.
+- **Unchanged:** provenance, attest, coverage binding, the `cap` type, and
+  the consent rule — `export.handle` remains the only path to a domain's
+  service.
+
+Cost, honestly: fiber-per-dispatch scheduling and caller parking touch the
+dispatch path on all three backends — a slice far larger than the passive
+instance was, with new cross-domain blocking semantics to
+differential-test. Sequencing: the landed passive instance keeps serving
+the no-live-run case correctly today and is *behaviorally identical* to the
+unified model there, so nothing regresses; the fiber slice replaces it
+when its consumer (the shell personality, STAGE1) is ready to drive it, and
+the instance concept is deleted rather than kept as a second mode.
 
 ---
 
@@ -756,21 +1280,69 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    in phase 3; the browser adds no independent assumption (its `env.*` wasm
    imports are unrelated to SVM capability imports, and capability dispatch
    bounces to the interpreter tier).
-3. Wire format for the manifest's interface declarations: reuse the inline
-   `FuncType` list per import (status quo shape) vs an interned interface
-   section (§13's deferred idea). Phase 2 wants this for interface-grouped
-   imports (the `op`-immediate form, §2.1) and op-schema checks.
-4. `import.attach` concurrency semantics under §12 threads (the table is
-   `Arc<Mutex<Host>>` shared across vCPUs — audited — so attach is
-   serialized; specify the ordering guarantee observed by concurrent
-   `call.import` on the same slot).
-5. Whether dynamic mode keeps the `cap.call` mnemonic on the wire for
-   compatibility during migration, or renames at a format bump.
-6. Snapshot digest wiring once the rewrite is removed: freeze/restore must be
-   handed the same manifest-carrying module on both sides (the existing
-   digest gate enforces this; a doc/wiring note, not a codec change — the
-   digest becomes per-module instead of per-instantiation, a strict
-   improvement).
+3. ~~Wire format for the manifest's interface declarations~~ — **RESOLVED
+   (wire v6, 2026-07-20): the single type section landed.** A module declares
+   shapes in one index space — `type (params) -> (results)` entries are
+   function signatures, `interface { 0, 1 }` entries are tuples of indices to
+   `type` entries — so each signature is written once and shared. Every
+   `impl` export names the interface entry it implements
+   (`export "n" impl <iface> : <funcidx>...`), with both verifiers checking
+   the implementation matches exactly (and that interface entries reference
+   only `Func` entries — interfaces never nest). Entries are deliberately
+   *not* dedup-canonicalized on the wire — identity is structural (D59) and
+   the host intern canonicalizes at wiring; the linker merges sections across
+   units with index-offset remapping. Imports still carry the inline per-op
+   `FuncType` (the status-quo shape); **interface-grouped imports** and
+   **type-referencing call sites** (the `op`-immediate form, §2.1) are the
+   recorded next consumers of the section and were deliberately not built
+   here (they touch the binding tables and all three backends' `call.import`
+   lowering — their own slice, when a consumer demands them). *Since
+   designed: §3.5 (2026-07-21).*
+4. ~~`import.attach` concurrency semantics under §12 threads~~ — **RESOLVED
+   (specified):** every capability dispatch — `import.attach` and
+   `call.import` alike — executes under the domain's one `Host` lock, so
+   attach is **atomic with respect to concurrent calls on the same slot**: a
+   concurrent `call.import` observes either the entire old binding or the
+   entire new one (`(type_id, op, handle, bound)` read as a unit under the
+   lock), never a torn mixture; attaches from different vCPUs serialize in
+   lock-acquisition order, and there is no fairness guarantee beyond the
+   lock's. This is the guarantee the shared dispatch entry has mechanically
+   provided since phase 2; it is now pinned as spec rather than accident.
+5. ~~`cap.call` mnemonic at a format bump~~ — **RESOLVED (phase 2, restated):
+   `cap.call` keeps its mnemonic and wire form** — it simply *is* dynamic
+   mode (dispatch on a live handle value); two bumps (v5, v6) have since
+   shipped without renaming it, confirming the decision.
+6. ~~Snapshot digest wiring~~ — **RESOLVED (doc note, as designed):**
+   freeze/restore must be handed the same manifest-carrying module on both
+   sides; the existing digest gate enforces this mechanically (the §4
+   `module_digest` covers functions, memory, data, exports, offers, and — as
+   of v6 — the interface section), and with the rewrite deleted the digest
+   is per-module instead of per-instantiation, a strict improvement. No
+   codec change was needed.
+7. **Globals (wasm parity) — OPEN, design wanted (2026-07-21).** svm-ir has
+   no globals of any kind: state is SSA values, the window, or host-side
+   capability state. Wasm uses globals for three distinct jobs, and any
+   design should treat them separately rather than import the feature
+   wholesale: **(a) linker constants** (`__heap_base`, `__stack_pointer` as
+   an immutable base) — today answered by data segments, entry arguments, or
+   host-side configuration (posix `grant(heap_base, …)`); **(b)
+   embedder-supplied configuration values** at instantiation — today
+   squeezed through the same channels, awkwardly; **(c) shared mutable
+   registers** between linked instances (the dynamic-linking stack pointer) —
+   today a plain memory cell in the shared window, since shared-everything
+   linking is same-domain here. Design questions: immutable value imports
+   only (spawn-time constants — pure value plumbing, no authority, no new
+   state class) vs mutable globals (a register file beside the window — a
+   new state class touching all three backends, snapshots, and the digest);
+   window-backed (a linker-reserved address — no new machinery, but
+   occupies guest address space) vs register-backed (fast and clean, but
+   new machinery everywhere); and whether they enter the import/export
+   system — if so they should be type-section entries like everything else
+   (a `value` case beside `Func`/`Interface`), groupable per §3.5. Recorded
+   lean: start with **immutable spawn-time value imports** (covers (a) and
+   (b), which is all current frontends need) and add mutable globals only
+   when a concrete linking consumer demands them — the prime directive
+   applies.
 
 ---
 

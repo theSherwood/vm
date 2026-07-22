@@ -430,3 +430,61 @@ block0(v0: i32, v1: i32):
         .expect_err("non-const handle must fail closed");
     assert_eq!(err, svm_ir::ImportError::SlotHandleNotConst);
 }
+
+/// The linker merges the units' impl surfaces (IMPORTS.md §3.2/OQ3): interfaces concatenate
+/// with a per-unit index offset, offers reindex their interface reference and op funcidxs
+/// through the same offsets as function exports, and an offer name colliding with any symbol
+/// fails closed like a duplicate export.
+#[test]
+fn link_merges_impl_surfaces_across_units() {
+    let provider = unit(
+        "type (i32, i32) -> (i32)\n\
+         interface { add: 0 }\n\
+         export \"adder\" impl 1 : 0\n\n\
+         func (i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32):\n\
+           v2 = i32.add v0 v1\n\
+           return v2\n\
+         }\n",
+        &[],
+    );
+    let other = unit(MATH_UNIT, &[("add", 0)]);
+    // `other` first, so the provider's funcs and interface reindex across a nonzero offset.
+    let m = svm_ir::link(&[other, provider]).expect("links");
+    svm_verify::verify_module(&m).expect("merged module verifies");
+    assert_eq!(
+        m.types.len(),
+        2,
+        "type section merged (one Func + one Interface)"
+    );
+    let offer = m
+        .resolve_impl_export("adder")
+        .expect("offer survives the merge");
+    assert_eq!(offer.interface, 1);
+    assert_eq!(
+        offer.ops,
+        vec![1],
+        "op funcidx reindexed past the first unit"
+    );
+
+    // An offer name colliding with a function export symbol fails closed.
+    let clash = unit(
+        "type (i32, i32) -> (i32)\n\
+         interface { add: 0 }\n\
+         export \"add\" impl 1 : 0\n\n\
+         func (i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32):\n\
+           v2 = i32.add v0 v1\n\
+           return v2\n\
+         }\n",
+        &[],
+    );
+    let named = unit(MATH_UNIT, &[("add", 0)]);
+    assert!(
+        matches!(
+            svm_ir::link(&[named, clash]),
+            Err(svm_ir::LinkError::DuplicateSymbol(n)) if n == "add"
+        ),
+        "offer/export name collision fails the link closed"
+    );
+}

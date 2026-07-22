@@ -239,4 +239,20 @@ block0(v0: i32):\n\
         !svm_verify::manifest_complete(&dynamic),
         "a cap.call makes the module open-world"
     );
+    // The reserved self namespace is exempt (§3.1): its dispatch-form ops (e.g. provenance)
+    // are authority-neutral reflection, statically identifiable from the type_id immediate —
+    // querying them must not cost the completeness bit.
+    let self_query = parse_module(
+        "func (i32) -> (i32) {\n\
+block0(v0: i32):\n\
+  v1 = i64.const 0\n\
+  v2 = cap.call 4294967295 5 (i64) -> (i32) v0 (v1)\n\
+  return v2\n\
+}\n",
+    )
+    .expect("parse");
+    assert!(
+        svm_verify::manifest_complete(&self_query),
+        "a cap.self dispatch (reserved immediate) keeps the completeness bit"
+    );
 }

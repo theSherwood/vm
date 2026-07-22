@@ -94,8 +94,8 @@ fn read_val(r: &mut Reader, t: svm_ir::ValType) -> SpecVal {
         V::I64 => SpecVal::I64(r.u64() as i64),
         V::F32 => SpecVal::F32(r.u32()),
         V::F64 => SpecVal::F64(r.u64()),
-        // `all_rows()` (scalar + float value ops) never takes a v128/ref operand.
-        V::V128 | V::Ref => unreachable!("ops driver row took a {t:?} operand"),
+        // `all_rows()` (scalar + float value ops) never takes a v128/ref/cap operand.
+        V::V128 | V::Ref | V::Cap => unreachable!("ops driver row took a {t:?} operand"),
     }
 }
 
@@ -293,7 +293,7 @@ fn mutate(m: &mut Module, kind: u64) {
                             ValType::F32 => ValType::F64,
                             ValType::F64 => ValType::V128,
                             ValType::V128 => ValType::Ref,
-                            ValType::Ref => ValType::I32,
+                            ValType::Ref | ValType::Cap => ValType::I32,
                         };
                         return;
                     }

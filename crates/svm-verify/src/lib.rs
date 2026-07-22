@@ -126,6 +126,33 @@ pub enum VerifyError {
     /// Two export entries share a name. Function exports and impl exports (interface offers,
     /// IMPORTS.md §3.2) are one namespace: the host addresses both by name.
     DuplicateImplExport { export: u32 },
+    /// An [`Module::impl_exports`] offer's `iface` does not name a well-formed
+    /// [`svm_ir::TypeDef::Interface`] in [`Module::types`] (out of range, a `Func` entry, or
+    /// an interface whose elements don't all name `Func` entries).
+    ImplExportIfaceOutOfRange { export: u32, iface: u32 },
+    /// An [`Module::impl_exports`] offer does not implement its declared interface: the op
+    /// count differs, or op `op`'s function type differs from the interface's op-`op`
+    /// signature (structural, exact — IMPORTS.md OQ3/v6).
+    ImplExportIfaceMismatch { export: u32, op: u32 },
+    /// A [`Module::imports`] entry's shape reference (§3.5, v7) does not name a well-formed
+    /// type-section entry of its declared kind (`func` → a `Func` entry; `interface` → an
+    /// `Interface` entry whose elements all resolve to `Func` entries).
+    ImportShapeInvalid { import: u32 },
+    /// A [`Inst::CallImport`]'s `op` immediate is out of range for the import's declared
+    /// shape (a flat `func` import has exactly op 0; a grouped import has its interface's
+    /// op count).
+    ImportOpOutOfRange {
+        func: u32,
+        block: u32,
+        import: u32,
+        op: u32,
+    },
+    /// A §3.5 instruction's type-section reference (`call.import.dyn`, `cap.self.type_id`,
+    /// `cap.self.covers`) does not name a well-formed interface entry, or its `op` is out of
+    /// range / its self-describing `sig` differs from the type-section resolution.
+    DynIfaceInvalid { func: u32, block: u32, ty: u32 },
+    /// An [`Inst::ExportHandle`]'s index is past the end of [`Module::impl_exports`].
+    ExportHandleOutOfRange { func: u32, block: u32, export: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -169,7 +196,29 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     }
     let has_memory = m.memory.is_some();
     for (fi, f) in m.funcs.iter().enumerate() {
-        verify_func(fi as u32, f, &m.funcs, &m.imports, has_memory)?;
+        verify_func(
+            fi as u32,
+            f,
+            &m.funcs,
+            &m.imports,
+            &m.types,
+            m.impl_exports.len(),
+            has_memory,
+        )?;
+    }
+    // §3.5 import shapes: every import must reference a well-formed type-section entry of its
+    // declared kind — a `func` import a `Func` entry, an `interface` import an `Interface`
+    // entry whose elements all resolve to `Func` entries. Fail-closed before any binding act.
+    for (ii, imp) in m.imports.iter().enumerate() {
+        let ok = match imp.shape {
+            svm_ir::ImportShape::Func(t) => {
+                matches!(m.types.get(t as usize), Some(svm_ir::TypeEntry::Func(_)))
+            }
+            svm_ir::ImportShape::Interface(t) => m.interface_ops(t).is_some(),
+        };
+        if !ok {
+            return Err(VerifyError::ImportShapeInvalid { import: ii as u32 });
+        }
     }
     // Named exports must point at a real function and be uniquely addressable (backends ignore the
     // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
@@ -202,6 +251,31 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
                 });
             }
         }
+        // v6 (OQ3): the offer must implement its **declared** interface exactly — same op
+        // count, and op `i`'s function type equal to the interface's op-`i` signature
+        // (resolved through the type section's one index space). Makes "implemented the
+        // wrong interface" a verify error, not a wiring surprise.
+        let Some(iface) = m.interface_ops(e.interface) else {
+            return Err(VerifyError::ImplExportIfaceOutOfRange {
+                export: ei as u32,
+                iface: e.interface,
+            });
+        };
+        if e.ops.len() != iface.len() {
+            return Err(VerifyError::ImplExportIfaceMismatch {
+                export: ei as u32,
+                op: e.ops.len().min(iface.len()) as u32,
+            });
+        }
+        for (oi, (&f, want)) in e.ops.iter().zip(&iface).enumerate() {
+            let ft = &m.funcs[f as usize];
+            if ft.params != want.params || ft.results != want.results {
+                return Err(VerifyError::ImplExportIfaceMismatch {
+                    export: ei as u32,
+                    op: oi as u32,
+                });
+            }
+        }
         if m.impl_exports[..ei].iter().any(|o| o.name == e.name)
             || m.exports.iter().any(|o| o.name == e.name)
         {
@@ -217,21 +291,72 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
 /// checkable per-module property — tooling can report it, and a host policy may require it for
 /// high-assurance slots. Reflection (`cap.self.*`) is authority-neutral and does not affect the
 /// bit: discovering a handle confers nothing without a `cap.call` to drive it, which the bit
-/// catches. Modules needing open-world discovery (shells, plugin hosts) legitimately report
-/// `false` — their egress is bounded by grants instead (the ocap bound).
+/// catches. That exemption extends to a `cap.call` whose `type_id` **immediate** is the reserved
+/// [`svm_ir::CAP_SELF_TYPE_ID`] — the self namespace's dispatch-form ops (e.g. §3.1
+/// `provenance`) are the same authority-neutral reflection, statically identifiable from the
+/// immediate, so querying them does not cost the completeness bit. Modules needing open-world
+/// discovery (shells, plugin hosts) legitimately report `false` — their egress is bounded by
+/// grants instead (the ocap bound).
 pub fn manifest_complete(m: &Module) -> bool {
     m.funcs.iter().all(|f| {
-        f.blocks
-            .iter()
-            .all(|b| !b.insts.iter().any(|i| matches!(i, Inst::CapCall { .. })))
+        f.blocks.iter().all(|b| {
+            !b.insts.iter().any(|i| {
+                matches!(i, Inst::CapCall { type_id, .. } if *type_id != svm_ir::CAP_SELF_TYPE_ID)
+                    // §3.5: dynamic-mode dispatch by type-section reference is dispatch on a
+                    // runtime handle value — it costs the bit exactly like `cap.call`.
+                    || matches!(i, Inst::CallImportDyn { .. })
+            })
+        })
     })
 }
 
+/// Resolve import `import`'s op-`op` signature through the type section (the §3.5 view):
+/// a flat `func` import has exactly op 0; a grouped import resolves its interface element.
+fn import_op_sig<'a>(
+    imports: &[svm_ir::Import],
+    ts: &'a [svm_ir::TypeEntry],
+    import: u32,
+    op: u32,
+) -> Option<&'a svm_ir::FuncType> {
+    match imports.get(import as usize)?.shape {
+        svm_ir::ImportShape::Func(t) => match (op, ts.get(t as usize)?) {
+            (0, svm_ir::TypeEntry::Func(ft)) => Some(ft),
+            _ => None,
+        },
+        svm_ir::ImportShape::Interface(t) => iface_op_sig(ts, t, op),
+    }
+}
+
+/// Resolve interface entry `t`'s op-`op` signature, or `None` if `t` is not a well-formed
+/// interface reference or `op` is out of range.
+fn iface_op_sig(ts: &[svm_ir::TypeEntry], t: u32, op: u32) -> Option<&svm_ir::FuncType> {
+    match ts.get(t as usize)? {
+        svm_ir::TypeEntry::Interface(elems) => match ts.get(elems.get(op as usize)?.ty as usize)? {
+            svm_ir::TypeEntry::Func(ft) => Some(ft),
+            svm_ir::TypeEntry::Interface(_) => None,
+        },
+        svm_ir::TypeEntry::Func(_) => None,
+    }
+}
+
+/// Whether `t` names a well-formed interface entry (every element a `Func` reference).
+fn iface_well_formed(ts: &[svm_ir::TypeEntry], t: u32) -> bool {
+    match ts.get(t as usize) {
+        Some(svm_ir::TypeEntry::Interface(elems)) => elems
+            .iter()
+            .all(|e| matches!(ts.get(e.ty as usize), Some(svm_ir::TypeEntry::Func(_)))),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn verify_func(
     fi: u32,
     f: &Func,
     funcs: &[Func],
     imports: &[svm_ir::Import],
+    type_section: &[svm_ir::TypeEntry],
+    n_impl_exports: usize,
     has_memory: bool,
 ) -> Result<(), VerifyError> {
     // Per function: the entry block's parameters are the function's parameters.
@@ -352,19 +477,30 @@ fn verify_func(
             // a value reference that must be well-formed). Arg/result typing mirrors `cap.call`.
             if let Inst::CallImport {
                 import,
+                op,
                 sig,
                 handle,
                 args,
             } = inst
             {
-                let Some(decl) = imports.get(*import as usize) else {
+                if imports.get(*import as usize).is_none() {
                     return Err(VerifyError::UnresolvedImport {
                         func: fi,
                         block: bi,
                         import: *import,
                     });
+                }
+                // §3.5: resolve the consumer-local op through the import's declared shape and
+                // the type section — op range + exact signature, at load.
+                let Some(want) = import_op_sig(imports, type_section, *import, *op) else {
+                    return Err(VerifyError::ImportOpOutOfRange {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                        op: *op,
+                    });
                 };
-                if decl.sig != *sig {
+                if want != sig {
                     return Err(VerifyError::ImportSigMismatch {
                         func: fi,
                         block: bi,
@@ -490,6 +626,94 @@ fn verify_func(
                 types.push(ValType::I32); // label length (0 = none)
                 continue;
             }
+            // §3.5 dynamic-mode dispatch by type-section reference: `ty` must name a
+            // well-formed interface, `op` in range, and the self-describing `sig` must equal
+            // the resolution — the same canonical-interface check as static mode, at load.
+            if let Inst::CallImportDyn {
+                ty,
+                op,
+                sig,
+                handle,
+                args,
+            } = inst
+            {
+                let Some(want) = iface_op_sig(type_section, *ty, *op) else {
+                    return Err(VerifyError::DynIfaceInvalid {
+                        func: fi,
+                        block: bi,
+                        ty: *ty,
+                    });
+                };
+                if want != sig {
+                    return Err(VerifyError::DynIfaceInvalid {
+                        func: fi,
+                        block: bi,
+                        ty: *ty,
+                    });
+                }
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*handle, ValType::I32)?;
+                if args.len() != sig.params.len() {
+                    return Err(VerifyError::CallArgCountMismatch {
+                        func: fi,
+                        block: bi,
+                        expected: sig.params.len(),
+                        found: args.len(),
+                    });
+                }
+                for (a, want) in args.iter().zip(&sig.params) {
+                    cx.expect(*a, *want)?;
+                }
+                types.extend_from_slice(&sig.results);
+                continue;
+            }
+            // §3.5 `export.handle`: the index must name a declared impl export. Appends the
+            // reified handle (`i32`).
+            if let Inst::ExportHandle { export } = inst {
+                if *export as usize >= n_impl_exports {
+                    return Err(VerifyError::ExportHandleOutOfRange {
+                        func: fi,
+                        block: bi,
+                        export: *export,
+                    });
+                }
+                types.push(ValType::I32);
+                continue;
+            }
+            // §3.5 reflection: both reference a well-formed interface entry of *this* module's
+            // type section; both append an `i32`.
+            if let Inst::CapSelfTypeId { ty } = inst {
+                if !iface_well_formed(type_section, *ty) {
+                    return Err(VerifyError::DynIfaceInvalid {
+                        func: fi,
+                        block: bi,
+                        ty: *ty,
+                    });
+                }
+                types.push(ValType::I32); // the runtime type_id
+                continue;
+            }
+            if let Inst::CapSelfCovers { handle, ty } = inst {
+                if !iface_well_formed(type_section, *ty) {
+                    return Err(VerifyError::DynIfaceInvalid {
+                        func: fi,
+                        block: bi,
+                        ty: *ty,
+                    });
+                }
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*handle, ValType::I32)?;
+                types.push(ValType::I32); // 1 covers / 0 does not / -errno
+                continue;
+            }
             // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
             // thread-entry type `(i64 sp, i64 arg) -> i64`, so — like `call` — it needs whole-module
             // info.
@@ -588,8 +812,13 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
             // Executable named import (IMPORTS.md phase 1): the verifier checked `sig` equals the
             // manifest's declared signature, so the self-describing copy is authoritative here.
             Inst::CallImport { sig, .. } => types.extend_from_slice(&sig.results),
+            Inst::CallImportDyn { sig, .. } => types.extend_from_slice(&sig.results),
             // Phase-2 attach: one `i32` status.
             Inst::ImportAttach { .. } => types.push(ValType::I32),
+            // §3.5 single-i32 appends.
+            Inst::ExportHandle { .. } | Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => {
+                types.push(ValType::I32)
+            }
             // Everything else (single result, or `Store`/no result) goes through the shared
             // `check_inst` rules — the single source of truth for those types.
             _ => {
@@ -742,16 +971,22 @@ fn check_inst(
         Inst::ConstI64(_) => ValType::I64,
         // §7 executable named imports + phase-2 attach append their results in the
         // multi-result/call section of `verify_func` (manifest-checked there); unreachable here.
-        Inst::CallImport { .. } | Inst::ImportAttach { .. } => {
-            unreachable!("CallImport/ImportAttach handled before check_inst's value match")
+        Inst::CallImport { .. } | Inst::CallImportDyn { .. } | Inst::ImportAttach { .. } => {
+            unreachable!(
+                "CallImport/CallImportDyn/ImportAttach handled before check_inst's value match"
+            )
         }
-        // §7 reflection appends its results in the multi-result section above; unreachable here.
+        // §7 reflection + §3.5 ops append their results in the multi-result section above;
+        // unreachable here.
         Inst::CapSelfCount
         | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. } => {
-            unreachable!("cap.self.* handled before check_inst's value match")
+        | Inst::CapSelfLabel { .. }
+        | Inst::CapSelfTypeId { .. }
+        | Inst::CapSelfCovers { .. }
+        | Inst::ExportHandle { .. } => {
+            unreachable!("cap.self.*/export.handle handled before check_inst's value match")
         }
         // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
         // `set` consumes an i64 and yields nothing (handled like `store`).

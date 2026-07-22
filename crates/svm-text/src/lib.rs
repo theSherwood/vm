@@ -63,8 +63,35 @@ pub fn print_module(m: &Module) -> String {
         let _ = writeln!(s, "memory {}", mem.size_log2);
         s.push('\n');
     }
-    // §7 named capability imports, one per line, in declaration order (the index a
-    // `call.import` references): `import <idx> "<name>" (params) -> (results)`.
+    // The type section (§3.5 surface), one entry per line with its checked positional label:
+    // `type <idx> func (params) -> (results)` declares a signature; `type <idx> interface
+    // { name: ty, ... }` declares an interface with required op names. Printed before the
+    // imports that reference it.
+    if !m.types.is_empty() {
+        for (i, t) in m.types.iter().enumerate() {
+            match t {
+                svm_ir::TypeEntry::Func(sig) => {
+                    let _ = writeln!(
+                        s,
+                        "type {i} func ({}) -> ({})",
+                        types(&sig.params),
+                        types(&sig.results)
+                    );
+                }
+                svm_ir::TypeEntry::Interface(elems) => {
+                    let ops: Vec<String> = elems
+                        .iter()
+                        .map(|e| format!("{}: {}", e.name, e.ty))
+                        .collect();
+                    let _ = writeln!(s, "type {i} interface {{ {} }}", ops.join(", "));
+                }
+            }
+        }
+        s.push('\n');
+    }
+    // §7 capability imports (§3.5 surface): `import <idx> func|interface ["ns"] "name"
+    // <typeidx> [rebindable]` — the shape is a type-section reference; the namespace level
+    // is omitted when empty.
     if !m.imports.is_empty() {
         for (i, imp) in m.imports.iter().enumerate() {
             // A `rebindable` suffix marks the phase-2 mode; `required` (the default) is implicit.
@@ -72,32 +99,46 @@ pub fn print_module(m: &Module) -> String {
                 svm_ir::ImportMode::Required => "",
                 svm_ir::ImportMode::Rebindable => " rebindable",
             };
+            let (kind, t) = match imp.shape {
+                svm_ir::ImportShape::Func(t) => ("func", t),
+                svm_ir::ImportShape::Interface(t) => ("interface", t),
+            };
+            let ns = if imp.ns.is_empty() {
+                String::new()
+            } else {
+                format!("\"{}\" ", imp.ns)
+            };
+            let _ = writeln!(s, "import {i} {kind} {ns}\"{}\" {t}{mode}", imp.name);
+        }
+        s.push('\n');
+    }
+    // Function exports (§3.5 surface): `export <idx> func "<name>" <funcidx>`.
+    if !m.exports.is_empty() {
+        for (i, e) in m.exports.iter().enumerate() {
+            let _ = writeln!(s, "export {i} func \"{}\" {}", e.name, e.func);
+        }
+        s.push('\n');
+    }
+    // Interface offers (§3.5 surface): `export <idx> interface "<name>" <t> { op: funcidx,
+    // ... }` — map keys are the interface's declared op names; if the interface reference
+    // does not resolve (an unverifiable module), fall back to bare positional funcidxs.
+    if !m.impl_exports.is_empty() {
+        for (i, e) in m.impl_exports.iter().enumerate() {
+            let entries: Vec<String> = match m.types.get(e.interface as usize) {
+                Some(svm_ir::TypeEntry::Interface(elems)) if elems.len() == e.ops.len() => elems
+                    .iter()
+                    .zip(&e.ops)
+                    .map(|(el, f)| format!("{}: {f}", el.name))
+                    .collect(),
+                _ => e.ops.iter().map(|f| f.to_string()).collect(),
+            };
             let _ = writeln!(
                 s,
-                "import {i} \"{}\" ({}) -> ({}){mode}",
-                imp.name,
-                types(&imp.sig.params),
-                types(&imp.sig.results)
+                "export {i} interface \"{}\" {} {{ {} }}",
+                e.name,
+                e.interface,
+                entries.join(", ")
             );
-        }
-        s.push('\n');
-    }
-    // First-class function exports, one per line, in declaration order: `export "<name>" <funcidx>`.
-    if !m.exports.is_empty() {
-        for e in &m.exports {
-            let _ = writeln!(s, "export \"{}\" {}", e.name, e.func);
-        }
-        s.push('\n');
-    }
-    // Interface offers (IMPORTS.md §3.2), one per line: `export "<name>" impl <funcidx>...` —
-    // one funcidx per op, in op order; the op signatures are the named functions' types.
-    if !m.impl_exports.is_empty() {
-        for e in &m.impl_exports {
-            let _ = write!(s, "export \"{}\" impl", e.name);
-            for &f in &e.ops {
-                let _ = write!(s, " {f}");
-            }
-            s.push('\n');
         }
         s.push('\n');
     }
@@ -106,7 +147,7 @@ pub fn print_module(m: &Module) -> String {
         if i > 0 {
             s.push('\n');
         }
-        print_func(&mut s, f, &fn_results);
+        print_func(&mut s, f, &fn_results, m);
     }
     print_debug_info(&mut s, m);
     s
@@ -251,7 +292,7 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
-fn print_func(s: &mut String, f: &Func, fn_results: &[usize]) {
+fn print_func(s: &mut String, f: &Func, fn_results: &[usize], m: &Module) {
     let _ = writeln!(
         s,
         "func ({}) -> ({}) {{",
@@ -273,10 +314,10 @@ fn print_func(s: &mut String, f: &Func, fn_results: &[usize]) {
             let n = inst.result_count(fn_results);
             if n == 0 {
                 // No-result instruction (`store`, void `call`): no `vN =` binding.
-                let _ = writeln!(s, "  {}", print_inst(inst));
+                let _ = writeln!(s, "  {}", print_inst(inst, m));
             } else {
                 let lhs: Vec<String> = (0..n).map(|k| format!("v{}", next + k as u32)).collect();
-                let _ = writeln!(s, "  {} = {}", lhs.join(", "), print_inst(inst));
+                let _ = writeln!(s, "  {} = {}", lhs.join(", "), print_inst(inst, m));
                 next += n as u32;
             }
         }
@@ -285,7 +326,7 @@ fn print_func(s: &mut String, f: &Func, fn_results: &[usize]) {
     s.push_str("}\n");
 }
 
-fn print_inst(inst: &Inst) -> String {
+fn print_inst(inst: &Inst, m: &Module) -> String {
     match inst {
         Inst::ConstI32(c) => format!("i32.const {c}"),
         Inst::ConstI64(c) => format!("i64.const {c}"),
@@ -404,15 +445,62 @@ fn print_inst(inst: &Inst) -> String {
             types(&sig.results),
             arglist(args)
         ),
-        // §7 named import call: `call.import <idx> v<handle> (args)`. The op signature is
-        // recovered from the module's `import <idx>` declaration on re-parse, so it is not
-        // re-printed here (the import index is the link).
+        // §7 import call (§3.5): `call.import <idx>[.<opname> | op <n>] v<handle> (args)`.
+        // The op signature is recovered from the declaration through the type section on
+        // re-parse; the op prints by name when the grouped import's interface resolves,
+        // numerically otherwise, and not at all for op 0 of a flat import.
         Inst::CallImport {
             import,
+            op,
             handle,
             args,
             ..
-        } => format!("call.import {import} v{handle}{}", arglist(args)),
+        } => {
+            let opsel = if *op == 0
+                && matches!(
+                    m.imports.get(*import as usize).map(|i| i.shape),
+                    Some(svm_ir::ImportShape::Func(_))
+                ) {
+                String::new()
+            } else {
+                match m
+                    .imports
+                    .get(*import as usize)
+                    .and_then(|i| match i.shape {
+                        svm_ir::ImportShape::Interface(t) => Some(t),
+                        svm_ir::ImportShape::Func(_) => None,
+                    })
+                    .and_then(|t| match m.types.get(t as usize) {
+                        Some(svm_ir::TypeEntry::Interface(elems)) => {
+                            elems.get(*op as usize).map(|e| e.name.clone())
+                        }
+                        _ => None,
+                    }) {
+                    Some(name) => format!(".{name}"),
+                    None => format!(" op {op}"),
+                }
+            };
+            format!("call.import {import}{opsel} v{handle}{}", arglist(args))
+        }
+        // §3.5 dynamic mode: `call.import.dyn <ty>[.<opname> | op <n>] v<handle> (args)`.
+        Inst::CallImportDyn {
+            ty,
+            op,
+            handle,
+            args,
+            ..
+        } => {
+            let opsel = match m.types.get(*ty as usize) {
+                Some(svm_ir::TypeEntry::Interface(elems)) => match elems.get(*op as usize) {
+                    Some(e) => format!(".{}", e.name),
+                    None => format!(" op {op}"),
+                },
+                _ => format!(" op {op}"),
+            };
+            format!("call.import.dyn {ty}{opsel} v{handle}{}", arglist(args))
+        }
+        // §3.5 offer reification: `export.handle <impl-export idx>`.
+        Inst::ExportHandle { export } => format!("export.handle {export}"),
         // Phase-2 `import.attach <idx> v<handle>`: rebind a rebindable slot to a held capability.
         Inst::ImportAttach { import, handle } => format!("import.attach {import} v{handle}"),
         // §7 capability reflection intrinsics.
@@ -427,6 +515,8 @@ fn print_inst(inst: &Inst) -> String {
             buf_ptr,
             buf_cap,
         } => format!("cap.self.label v{handle} v{buf_ptr} v{buf_cap}"),
+        Inst::CapSelfTypeId { ty } => format!("cap.self.type_id {ty}"),
+        Inst::CapSelfCovers { handle, ty } => format!("cap.self.covers v{handle} {ty}"),
         Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
         Inst::DurableShadowBase => "durable.shadow_base".to_string(),
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
@@ -685,6 +775,9 @@ enum Tok {
     Comma,
     Equals,
     Arrow,
+    /// A standalone `.` — the §3.5 `call.import <imp>.<op>` separator. Only emitted where a
+    /// `.` is neither inside a float literal nor inside a dotted identifier.
+    Dot,
     Ident(String),
     Int(i64),
     Float(f64),
@@ -751,6 +844,10 @@ fn tokenize(src: &str) -> Result<(Vec<Tok>, Vec<u32>), ParseError> {
                 emit!(Tok::Colon);
                 i += 1;
             }
+            b'.' => {
+                emit!(Tok::Dot);
+                i += 1;
+            }
             b',' => {
                 emit!(Tok::Comma);
                 i += 1;
@@ -763,6 +860,10 @@ fn tokenize(src: &str) -> Result<(Vec<Tok>, Vec<u32>), ParseError> {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
                     emit!(Tok::Arrow);
                     i += 2;
+                } else if bytes[i + 1..].starts_with(b"inf") {
+                    // `-inf`, as the float printer's `{:?}` emits it.
+                    emit!(Tok::Float(f64::NEG_INFINITY));
+                    i += 4;
                 } else {
                     let (tok, ni) = lex_number(bytes, i)?;
                     emit!(tok);
@@ -808,7 +909,9 @@ fn lex_number(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
         i += 1;
         has_digit = true;
     }
-    if i < bytes.len() && bytes[i] == b'.' {
+    // A `.` continues the number only when a digit follows — `0.5` is a float, but `0.read`
+    // (the §3.5 `call.import <imp>.<op>` form) is `Int(0)`, `Dot`, `Ident(read)`.
+    if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
         is_float = true;
         i += 1;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -945,6 +1048,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         pos: 0,
         fn_results,
         imports: Vec::new(),
+        types: Vec::new(),
         auto_debug,
         auto_locs: Vec::new(),
         auto_vars: Vec::new(),
@@ -1156,19 +1260,45 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     .map_err(|_| ParseError(format!("memory size_log2 out of range: {n}")))?;
                 memory = Some(Memory { size_log2 });
             }
-            // §7 named import: `import <idx> "<name>" (params) -> (results)`. Indices are
-            // dense and in declaration order (they are what `call.import` references).
+            // §7 named import, dense indices in declaration order. v7 form:
+            // `import <idx> func|interface ["ns"] "name" <typeidx> [mode]` — the shape is a
+            // type-section reference. Legacy sugar: `import <idx> "name" (params) ->
+            // (results) [mode]` interns the signature as a `Func` type entry.
             Some(Tok::Ident(s)) if s == "import" => {
                 p.next()?;
                 let n = p.parse_int()?;
                 if n < 0 || n as usize != p.imports.len() {
                     return err("import indices must be dense and in declaration order");
                 }
-                let name = String::from_utf8(p.parse_str()?)
-                    .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
-                let params = p.parse_type_list()?;
-                p.expect(&Tok::Arrow)?;
-                let results = p.parse_type_list()?;
+                let (ns, name, shape) = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func" || k == "interface")
+                {
+                    let kind = p.parse_ident()?;
+                    let first = String::from_utf8(p.parse_str()?)
+                        .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
+                    // One string = unnamespaced name; two = ("ns", "name").
+                    let (ns, name) = if matches!(p.peek(), Some(Tok::Str(_))) {
+                        let second = String::from_utf8(p.parse_str()?)
+                            .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
+                        (first, second)
+                    } else {
+                        (String::new(), first)
+                    };
+                    let t = p.parse_u32()?;
+                    let shape = if kind == "func" {
+                        svm_ir::ImportShape::Func(t)
+                    } else {
+                        svm_ir::ImportShape::Interface(t)
+                    };
+                    (ns, name, shape)
+                } else {
+                    let name = String::from_utf8(p.parse_str()?)
+                        .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
+                    let params = p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    let results = p.parse_type_list()?;
+                    let t = p.intern_func_type(FuncType { params, results });
+                    (String::new(), name, svm_ir::ImportShape::Func(t))
+                };
                 // Optional phase-2 mode suffix; absent = `required` (the default).
                 let mode = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "rebindable") {
                     p.next()?;
@@ -1177,8 +1307,9 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     svm_ir::ImportMode::Required
                 };
                 p.imports.push(Import {
+                    ns,
                     name,
-                    sig: FuncType { params, results },
+                    shape,
                     mode,
                 });
             }
@@ -1199,28 +1330,94 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     bytes,
                 });
             }
-            // First-class function export `export "<name>" <funcidx>`, or an interface offer
-            // (IMPORTS.md §3.2) `export "<name>" impl <funcidx>...` — one funcidx per op.
+            // The type section (OQ3; §3.5 surface): `type <idx> func (params) -> (results)`
+            // declares a signature entry; `type <idx> interface { name: ty, ... }` declares an
+            // interface entry with **required op names**. The index is a checked positional
+            // label (optional, as is the `func` kind keyword, for legacy sugar); a standalone
+            // `interface { ... }` line is also accepted.
+            Some(Tok::Ident(s)) if s == "type" => {
+                p.next()?;
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    let n = p.parse_int()?;
+                    if n < 0 || n as usize != p.types.len() {
+                        return err("type indices must be dense and in declaration order");
+                    }
+                }
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "interface") {
+                    p.next()?;
+                    let elems = p.parse_iface_elems()?;
+                    p.types.push(svm_ir::TypeEntry::Interface(elems));
+                } else {
+                    if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func") {
+                        p.next()?;
+                    }
+                    let params = p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    let results = p.parse_type_list()?;
+                    p.types
+                        .push(svm_ir::TypeEntry::Func(FuncType { params, results }));
+                }
+            }
+            Some(Tok::Ident(s)) if s == "interface" => {
+                p.next()?;
+                let elems = p.parse_iface_elems()?;
+                p.types.push(svm_ir::TypeEntry::Interface(elems));
+            }
+            // Exports. v7 forms (§3.5): `export <idx> func "name" <funcidx>` and
+            // `export <idx> interface "name" <t> { op: funcidx, ... }` (offer; map keys must
+            // match the interface's declared op names, or bare funcidxs positionally).
+            // Legacy: `export "name" <funcidx>` / `export "name" impl <iface> : <funcidx>...`.
             Some(Tok::Ident(s)) if s == "export" => {
                 p.next()?;
-                let name = String::from_utf8(p.parse_str()?)
-                    .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
-                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
-                    p.next()?;
-                    let mut ops = Vec::new();
-                    while matches!(p.peek(), Some(Tok::Int(_))) {
-                        let n = p.parse_int()?;
-                        let f = u32::try_from(n).map_err(|_| {
-                            ParseError(format!("impl export funcidx out of range: {n}"))
-                        })?;
-                        ops.push(f);
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    let idx = p.parse_int()?;
+                    let kind = p.parse_ident()?;
+                    let name = String::from_utf8(p.parse_str()?)
+                        .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
+                    match kind.as_str() {
+                        "func" => {
+                            if idx < 0 || idx as usize != exports.len() {
+                                return err(
+                                    "export indices must be dense and in declaration order",
+                                );
+                            }
+                            let func = p.parse_u32()?;
+                            exports.push(Export { name, func });
+                        }
+                        "interface" => {
+                            if idx < 0 || idx as usize != impl_exports.len() {
+                                return err("offer indices must be dense and in declaration order");
+                            }
+                            let interface = p.parse_u32()?;
+                            let ops = p.parse_offer_ops(interface)?;
+                            impl_exports.push(ImplExport {
+                                name,
+                                interface,
+                                ops,
+                            });
+                        }
+                        k => return err(format!("export kind must be func or interface: {k}")),
                     }
-                    impl_exports.push(ImplExport { name, ops });
                 } else {
-                    let n = p.parse_int()?;
-                    let func = u32::try_from(n)
-                        .map_err(|_| ParseError(format!("export funcidx out of range: {n}")))?;
-                    exports.push(Export { name, func });
+                    let name = String::from_utf8(p.parse_str()?)
+                        .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
+                    if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
+                        p.next()?;
+                        let interface = p.parse_u32()?;
+                        p.expect(&Tok::Colon)?;
+                        let mut ops = Vec::new();
+                        while matches!(p.peek(), Some(Tok::Int(_))) {
+                            ops.push(p.parse_u32()?);
+                        }
+                        impl_exports.push(ImplExport {
+                            name,
+                            interface,
+                            ops,
+                        });
+                    } else {
+                        let func = p.parse_u32()?;
+                        exports.push(Export { name, func });
+                    }
                 }
             }
             _ => funcs.push(p.parse_func(funcs.len() as u32)?),
@@ -1262,6 +1459,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         imports: std::mem::take(&mut p.imports),
         exports,
         impl_exports,
+        types: p.types,
         debug_info,
     })
 }
@@ -1275,6 +1473,7 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
         pos: 0,
         fn_results: Vec::new(),
         imports: Vec::new(),
+        types: Vec::new(),
         auto_debug: false,
         auto_locs: Vec::new(),
         auto_vars: Vec::new(),
@@ -1286,14 +1485,24 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.next()?;
                 p.parse_int()?;
             }
-            // §7 `import <idx> "<name>" (params) -> (results)` — skip in the header prescan.
+            // §7 imports — skip in the header prescan. v7 form: `import <idx> func|interface
+            // ["ns"] "name" <typeidx> [mode]`; legacy: `import <idx> "name" (sig) [mode]`.
             Some(Tok::Ident(s)) if s == "import" => {
                 p.next()?;
                 p.parse_int()?;
-                p.parse_str()?;
-                p.parse_type_list()?;
-                p.expect(&Tok::Arrow)?;
-                p.parse_type_list()?;
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func" || k == "interface") {
+                    p.next()?;
+                    p.parse_str()?;
+                    if matches!(p.peek(), Some(Tok::Str(_))) {
+                        p.parse_str()?;
+                    }
+                    p.parse_int()?;
+                } else {
+                    p.parse_str()?;
+                    p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    p.parse_type_list()?;
+                }
                 // Optional phase-2 mode suffix.
                 if matches!(p.peek(), Some(Tok::Ident(k)) if k == "rebindable") {
                     p.next()?;
@@ -1308,18 +1517,66 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_int()?;
                 p.parse_str()?;
             }
-            // `export "<name>" <funcidx>` / `export "<name>" impl <funcidx>...` — skip past it
-            // in the header prescan.
+            // Type-section entries — skip in the header prescan. v7 form: `type <idx> func
+            // (sig)` / `type <idx> interface { ... }`; legacy: `type (sig)`.
+            Some(Tok::Ident(s)) if s == "type" => {
+                p.next()?;
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?;
+                }
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "interface") {
+                    p.next()?;
+                    p.expect(&Tok::LBrace)?;
+                    while !matches!(p.peek(), Some(Tok::RBrace)) {
+                        p.next()?;
+                    }
+                    p.expect(&Tok::RBrace)?;
+                } else {
+                    if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func") {
+                        p.next()?;
+                    }
+                    p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    p.parse_type_list()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "interface" => {
+                p.next()?;
+                p.expect(&Tok::LBrace)?;
+                while !matches!(p.peek(), Some(Tok::RBrace)) {
+                    p.next()?;
+                }
+                p.expect(&Tok::RBrace)?;
+            }
+            // Exports — skip past them in the header prescan. v7 forms: `export <idx> func
+            // "name" <funcidx>` / `export <idx> interface "name" <t> { ... }`; legacy:
+            // `export "name" <funcidx>` / `export "name" impl <iface> : <funcidx>...`.
             Some(Tok::Ident(s)) if s == "export" => {
                 p.next()?;
-                p.parse_str()?;
-                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
-                    p.next()?;
-                    while matches!(p.peek(), Some(Tok::Int(_))) {
-                        p.parse_int()?;
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?;
+                    let kind = p.parse_ident()?;
+                    p.parse_str()?;
+                    p.parse_int()?;
+                    if kind == "interface" {
+                        p.expect(&Tok::LBrace)?;
+                        while !matches!(p.peek(), Some(Tok::RBrace)) {
+                            p.next()?;
+                        }
+                        p.expect(&Tok::RBrace)?;
                     }
                 } else {
-                    p.parse_int()?;
+                    p.parse_str()?;
+                    if matches!(p.peek(), Some(Tok::Ident(s)) if s == "impl") {
+                        p.next()?;
+                        p.parse_int()?;
+                        p.expect(&Tok::Colon)?;
+                        while matches!(p.peek(), Some(Tok::Int(_))) {
+                            p.parse_int()?;
+                        }
+                    } else {
+                        p.parse_int()?;
+                    }
                 }
             }
             Some(Tok::Ident(s)) if s == "func" => {
@@ -1438,6 +1695,10 @@ struct Parser<'a> {
     /// §7 named imports declared at module top, in order; a `call.import <idx>` recovers its
     /// op signature from here (imports always precede the functions that reference them).
     imports: Vec<Import>,
+    /// The type section accumulated so far (v7): import shapes reference it, `call.import`
+    /// resolves op signatures/names through it, and legacy inline-signature sugar interns
+    /// into it.
+    types: Vec<svm_ir::TypeEntry>,
     /// When set, synthesize debug info (a line table + SSA-value names) for a program that carries no
     /// explicit `debug` section, so any hand-written SVM text is debuggable. Accumulated below.
     auto_debug: bool,
@@ -1644,6 +1905,162 @@ impl<'a> Parser<'a> {
             results,
             blocks,
         })
+    }
+
+    /// Intern a signature into the accumulated type section (legacy inline-signature sugar).
+    fn intern_func_type(&mut self, ft: FuncType) -> u32 {
+        if let Some(i) = self
+            .types
+            .iter()
+            .position(|t| matches!(t, svm_ir::TypeEntry::Func(f) if *f == ft))
+        {
+            return i as u32;
+        }
+        self.types.push(svm_ir::TypeEntry::Func(ft));
+        (self.types.len() - 1) as u32
+    }
+
+    /// Resolve an op *name* against interface entry `ty`'s declared elements.
+    fn resolve_iface_op(&self, ty: u32, opname: &str) -> Result<u32, ParseError> {
+        let Some(svm_ir::TypeEntry::Interface(elems)) = self.types.get(ty as usize) else {
+            return err(format!("type {ty} is not a declared interface"));
+        };
+        elems
+            .iter()
+            .position(|e| e.name == opname)
+            .map(|i| i as u32)
+            .ok_or_else(|| ParseError(format!("interface {ty} has no op named `{opname}`")))
+    }
+
+    /// The signature of interface `ty`'s op `op`, resolved through the type section.
+    fn iface_op_sig(&self, ty: u32, op: u32) -> Result<FuncType, ParseError> {
+        let Some(svm_ir::TypeEntry::Interface(elems)) = self.types.get(ty as usize) else {
+            return err(format!("type {ty} is not a declared interface"));
+        };
+        let e = elems
+            .get(op as usize)
+            .ok_or_else(|| ParseError(format!("interface {ty} has no op {op}")))?;
+        match self.types.get(e.ty as usize) {
+            Some(svm_ir::TypeEntry::Func(ft)) => Ok(ft.clone()),
+            _ => err(format!(
+                "interface {ty} op {op} references type {}, which is not a func entry",
+                e.ty
+            )),
+        }
+    }
+
+    /// Resolve an op name through import `import`'s declared shape.
+    fn resolve_import_op(&self, import: u32, opname: &str) -> Result<u32, ParseError> {
+        let imp = self.imports.get(import as usize).ok_or_else(|| {
+            ParseError(format!("call.import references undeclared import {import}"))
+        })?;
+        match imp.shape {
+            svm_ir::ImportShape::Func(_) => {
+                if opname == imp.name {
+                    Ok(0)
+                } else {
+                    err(format!("flat import {import} has no op named `{opname}`"))
+                }
+            }
+            svm_ir::ImportShape::Interface(t) => self.resolve_iface_op(t, opname),
+        }
+    }
+
+    /// The signature of import `import`'s op `op`, resolved through the type section.
+    fn import_op_sig(&self, import: u32, op: u32) -> Result<FuncType, ParseError> {
+        let imp = self.imports.get(import as usize).ok_or_else(|| {
+            ParseError(format!("call.import references undeclared import {import}"))
+        })?;
+        match imp.shape {
+            svm_ir::ImportShape::Func(t) => {
+                if op != 0 {
+                    return err(format!("flat import {import} has only op 0, got {op}"));
+                }
+                match self.types.get(t as usize) {
+                    Some(svm_ir::TypeEntry::Func(ft)) => Ok(ft.clone()),
+                    _ => err(format!(
+                        "import {import} references type {t}, which is not a func entry"
+                    )),
+                }
+            }
+            svm_ir::ImportShape::Interface(t) => self.iface_op_sig(t, op),
+        }
+    }
+
+    /// `{ name: ty, ... }` — an interface's named-op element list (§3.5; names required).
+    fn parse_iface_elems(&mut self) -> Result<Vec<svm_ir::IfaceOp>, ParseError> {
+        self.expect(&Tok::LBrace)?;
+        let mut elems = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RBrace)) {
+            loop {
+                let name = self.parse_ident()?;
+                self.expect(&Tok::Colon)?;
+                let ty = self.parse_u32()?;
+                elems.push(svm_ir::IfaceOp { name, ty });
+                if matches!(self.peek(), Some(Tok::Comma)) {
+                    self.next()?;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(elems)
+    }
+
+    /// An offer's op map `{ op: funcidx, ... }` — keys resolved to positions through the
+    /// declared interface's op names — or bare funcidxs, taken positionally.
+    fn parse_offer_ops(&mut self, interface: u32) -> Result<Vec<u32>, ParseError> {
+        self.expect(&Tok::LBrace)?;
+        let mut named: Vec<(String, u32)> = Vec::new();
+        let mut positional: Vec<u32> = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RBrace)) {
+            loop {
+                match self.peek() {
+                    Some(Tok::Int(_)) => positional.push(self.parse_u32()?),
+                    _ => {
+                        let name = self.parse_ident()?;
+                        self.expect(&Tok::Colon)?;
+                        let f = self.parse_u32()?;
+                        named.push((name, f));
+                    }
+                }
+                if matches!(self.peek(), Some(Tok::Comma)) {
+                    self.next()?;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        if named.is_empty() {
+            return Ok(positional);
+        }
+        if !positional.is_empty() {
+            return err("offer op map mixes named and positional entries");
+        }
+        // Resolve names to positions through the interface declaration.
+        let Some(svm_ir::TypeEntry::Interface(elems)) = self.types.get(interface as usize) else {
+            return err(format!(
+                "offer references type {interface}, which is not a declared interface"
+            ));
+        };
+        let mut ops = vec![u32::MAX; elems.len()];
+        for (name, f) in named {
+            let Some(pos) = elems.iter().position(|e| e.name == name) else {
+                return err(format!(
+                    "offer op `{name}` is not in the declared interface"
+                ));
+            };
+            if ops[pos] != u32::MAX {
+                return err(format!("offer op `{name}` bound twice"));
+            }
+            ops[pos] = f;
+        }
+        if ops.contains(&u32::MAX) {
+            return err("offer op map must bind every op of the declared interface");
+        }
+        Ok(ops)
     }
 
     fn parse_type_list(&mut self) -> Result<Vec<ValType>, ParseError> {
@@ -1894,48 +2311,94 @@ impl<'a> Parser<'a> {
         // The name-inline form lets a streaming frontend (chibicc) emit a capability call per site
         // with no pre-collected import table; the parser interns the name into `imports`.
         if op == "call.import" {
-            let (import, sig) = if matches!(self.peek(), Some(Tok::Str(_))) {
+            let (import, opidx) = if matches!(self.peek(), Some(Tok::Str(_))) {
+                // Name-inline sugar: `call.import "name" (sig) v<h> (args)` interns the
+                // signature as a type entry and the name as a flat func import.
                 let name = String::from_utf8(self.parse_str()?)
                     .map_err(|_| ParseError("call.import name is not valid UTF-8".into()))?;
                 let params = self.parse_type_list()?;
                 self.expect(&Tok::Arrow)?;
                 let results = self.parse_type_list()?;
-                let sig = FuncType { params, results };
-                // Intern: reuse an existing import of the same (name, sig), else append.
+                let t = self.intern_func_type(FuncType { params, results });
+                // Intern: reuse an existing import of the same (name, shape), else append.
                 let idx = self
                     .imports
                     .iter()
-                    .position(|imp| imp.name == name && imp.sig == sig)
+                    .position(|imp| imp.name == name && imp.shape == svm_ir::ImportShape::Func(t))
                     .unwrap_or_else(|| {
                         self.imports.push(Import {
+                            ns: String::new(),
                             name,
-                            sig: sig.clone(),
+                            shape: svm_ir::ImportShape::Func(t),
                             mode: svm_ir::ImportMode::Required, // name-inline interning is required-mode
                         });
                         self.imports.len() - 1
                     });
-                (idx as u32, sig)
+                (idx as u32, 0)
             } else {
-                let n = self.parse_int()?;
-                let import = u32::try_from(n)
-                    .map_err(|_| ParseError(format!("import index out of range: {n}")))?;
-                let sig = self
-                    .imports
-                    .get(import as usize)
-                    .map(|imp| imp.sig.clone())
-                    .ok_or_else(|| {
-                        ParseError(format!("call.import references undeclared import {import}"))
-                    })?;
-                (import, sig)
+                let import = self.parse_u32()?;
+                // Optional op selector: `.name` (resolved through the grouped import's
+                // interface) or `op <n>` (numeric). Absent = op 0 (the flat case).
+                let opidx = if matches!(self.peek(), Some(Tok::Dot)) {
+                    self.next()?;
+                    let opname = self.parse_ident()?;
+                    self.resolve_import_op(import, &opname)?
+                } else if matches!(self.peek(), Some(Tok::Ident(k)) if k == "op") {
+                    self.next()?;
+                    self.parse_u32()?
+                } else {
+                    0
+                };
+                (import, opidx)
             };
+            let sig = self.import_op_sig(import, opidx)?;
             let handle = self.value(names)?;
             let args = self.parse_value_list(names)?;
             return Ok(Inst::CallImport {
                 import,
+                op: opidx,
                 sig,
                 handle,
                 args,
             });
+        }
+        // Dynamic-mode dispatch by type-section reference (§3.5):
+        // `call.import.dyn <ty>[.<opname> | op <n>] v<handle> (args)`.
+        if op == "call.import.dyn" {
+            let ty = self.parse_u32()?;
+            let opidx = if matches!(self.peek(), Some(Tok::Dot)) {
+                self.next()?;
+                let opname = self.parse_ident()?;
+                self.resolve_iface_op(ty, &opname)?
+            } else if matches!(self.peek(), Some(Tok::Ident(k)) if k == "op") {
+                self.next()?;
+                self.parse_u32()?
+            } else {
+                0
+            };
+            let sig = self.iface_op_sig(ty, opidx)?;
+            let handle = self.value(names)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CallImportDyn {
+                ty,
+                op: opidx,
+                sig,
+                handle,
+                args,
+            });
+        }
+        if op == "export.handle" {
+            let export = self.parse_u32()?;
+            return Ok(Inst::ExportHandle { export });
+        }
+        if op == "cap.self.type_id" {
+            let ty = self.parse_u32()?;
+            return Ok(Inst::CapSelfTypeId { ty });
+        }
+        if op == "cap.self.covers" {
+            let handle = self.value(names)?;
+            let ty = self.parse_u32()?;
+            return Ok(Inst::CapSelfCovers { handle, ty });
         }
         if op == "ref.func" {
             let n = self.parse_int()?;
@@ -2720,6 +3183,11 @@ impl<'a> Parser<'a> {
         match self.next()? {
             Tok::Float(v) => Ok(*v),
             Tok::Int(v) => Ok(*v as f64),
+            // Non-finite literals, as the printer's `{:?}` emits them (`inf` / `NaN`; the
+            // lexer handles `-inf`). All NaN text is the canonical quiet NaN — payload bits
+            // do not survive text (binary is the lossless carrier).
+            Tok::Ident(s) if s == "inf" => Ok(f64::INFINITY),
+            Tok::Ident(s) if s == "NaN" => Ok(f64::NAN),
             other => err(format!("expected number, found {other:?}")),
         }
     }
@@ -2795,11 +3263,13 @@ block0(v0: i64):
 
     #[test]
     fn impl_exports_round_trip() {
-        // Interface offers (IMPORTS.md §3.2): `export "<name>" impl <funcidx>...` — one funcidx
-        // per op; op signatures are the named functions' declared types.
+        // Interface offers, §3.5 surface plus the legacy `impl` sugar — the settled form is
+        // `export <idx> interface "<name>" <t> { op: funcidx, ... }` with required op names.
         let src = "\
-export \"main\" 0
-export \"logger\" impl 1 0
+type 0 func (i64) -> (i64)
+type 1 interface { put: 0, get: 0 }
+export 0 func \"main\" 0
+export 0 interface \"logger\" 1 { put: 1, get: 0 }
 
 func (i64) -> (i64) {
 block0(v0: i64):
