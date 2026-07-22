@@ -824,17 +824,25 @@ holder is the domain that implements them:
   all; distrust means separate processes (§1a). The two compose: attest
   tells you which world you are in; `export.handle` keeps offer wiring
   consent-based in the worlds where isolation is real.
-- **The `cap` value type — boundary translation (settled 2026-07-21).** A raw
-  `i32` handle crossing domains is deliberately inert (it would index the
-  *receiver's* table — the forgeability guarantee). Authority crosses only
-  where a signature says so: a parameter or result declared `cap` makes the
-  host translate at the capability-call / entry-result boundary — resolve in
-  the sender's table (must be live), re-grant into the receiver's, substitute
-  the receiver-local packed handle. This is the guest↔guest half of §2.3's
-  "objects are arguments" (today only trusted built-ins like
-  `Instantiator.join` interpret arguments as handles); unmarked integers keep
-  the existing inertness. In guest code `cap` is `i32`-width data; only
-  boundaries treat it specially.
+- **The `cap` value type — boundary translation (settled 2026-07-21; BUILT
+  2026-07-22 for the offer-call boundary).** A raw `i32` handle crossing
+  domains is deliberately inert (it would index the *receiver's* table — the
+  forgeability guarantee). Authority crosses only where a signature says so: a
+  parameter or result declared `cap` makes the host translate at the
+  capability-call / entry-result boundary — resolve in the sender's table
+  (must be live), re-grant into the receiver's, substitute the receiver-local
+  packed handle. This is the guest↔guest half of §2.3's "objects are
+  arguments" (today only trusted built-ins like `Instantiator.join` interpret
+  arguments as handles); unmarked integers keep the existing inertness. In
+  guest code `cap` is `i32`-width data; only boundaries treat it specially. **As
+  built:** the offer-call boundary translates in the one generic dispatch (so
+  all three backends translate uniformly) — `cap` args re-grant caller→provider
+  before the run, `cap` results provider→caller after, reusing the §14 re-grant
+  policy (offers adopt one depth deeper, pipe ends alias, coordinate-free caps
+  copy); a forged/dead cap is a fail-closed `CapFault`. The verifiers make `cap`
+  value-compatible with `i32` wherever operands flow while keeping the marker
+  distinct in signatures. The **entry-result (`Instantiator.join`) boundary**
+  remains a follow-up.
 - **What offer calls run over — as built (v2) vs the end state (§3.6).** As
   built, offers execute over a **passive provider instance**: a second
   window + powerbox distinct from the live run — own lock, provider-pays
@@ -1076,11 +1084,32 @@ with its reason recorded:
   a symbolic call binds by name at whichever binding act comes first. Emitters that
   never link (svm-llvm, svm-wasm, the printer's canonical output) produce the clean
   form only.
-- **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
-  the type is reserved and lowers as `i32` everywhere.
-- **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
-  built-in shapes await their consumers; grouped binding works today through child
-  manifests and host-side wiring.
+- **[BUILT 2026-07-22] `cap` boundary translation.** A parameter or result the offer
+  op signature types `cap` is re-granted at the offer-call boundary: caller→provider
+  before the run (resolve the handle in the *caller's* table, re-grant the capability
+  into the *provider's*, substitute the provider-local handle), provider→caller after
+  it — the guest↔guest half of §2.3's "objects are arguments." A forged/dead/
+  non-re-grantable handle is a fail-closed `CapFault`; unmarked integers keep their
+  inertness (a raw handle would index the *receiver's* table). The re-grant reuses the
+  §14 child policy (offers adopt one depth-hop deeper, pipe ends alias their backing,
+  coordinate-free caps copy). It lives in the one generic dispatch, so all three
+  backends translate uniformly. In guest code `cap` is `i32`-width data — the verifiers
+  treat `cap` and `i32` as value-compatible wherever operands flow (a `cap` is usable as
+  a handle, an `i32` fills a `cap` slot), while keeping them **distinct in signatures**
+  so structural interface matching and the translation itself still key on the marker.
+  The §14 entry-result (`Instantiator.join`) path remains a follow-up.
+- **[BUILT 2026-07-22] Registry-grouped host caps (`HostCap::iface`).** A host-native
+  handle can be offered as a *whole interface* (`Imports::provide("fs",
+  HostCap::iface(&shape, grant))`), its `IfaceShape` listing op names + signatures in
+  the handle's native op order. A consumer's grouped import binds by the coverage walk —
+  name-keyed, signature-equal, **subset allowed** (a consumer needing `{read, len}`
+  binds a four-op provider), extras ignored — validated fail-closed at instantiation and
+  dispatched through the frozen op remap (`call.import slot.op` → native op) on all three
+  backends. The host-side mirror of a guest offer: `impl_service` wires a guest module as
+  the provider, `iface` wires a host-native handle. **Intern pre-seeding** of built-in
+  shapes stays deferred: nothing yet declares a guest interface *meaning* to match a
+  built-in id, so seeding canonical built-in shapes now would be speculative (prime
+  directive) — it lands with its first consumer.
 - **[BUILT 2026-07-22] Legacy text retirement — the dual grammars are gone.** The
   parser now rejects the pre-§3.5 spellings: `blockN(…):` indentation labels (braced
   `block N (…) { … }` only, numeric branch targets), unindexed `export "name" N` and

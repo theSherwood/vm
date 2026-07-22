@@ -183,3 +183,107 @@ fn impl_offer_fails_closed_on_unknown_offer_or_op() {
     assert!(HostCap::impl_offer(&provider, "nope", 0).is_none());
     assert!(HostCap::impl_offer(&provider, "adder", 1).is_none());
 }
+
+// --- §3.5 grouped host-native providers (HostCap::iface) --------------------------------------
+
+/// A consumer that imports a **whole interface** and uses only one op: a grouped import `log`
+/// declaring `interface { write }` (a subset of the host `Stream`'s read/write/close), called
+/// as `call.import 0.write`. `write(buf, len) -> nwritten` writes the 3 data bytes and returns
+/// 3, which the guest passes to `exit` — the cross-backend observable.
+const GROUPED_CONSUMER: &str = "\
+memory 16
+data 0 \"hi\\n\"
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0 }
+type 2 func (i32) -> ()
+import 0 interface \"log\" 1
+import 1 func \"exit\" 2
+func 0 () -> () {
+block 0 () {
+  v0 = i64.const 0
+  v1 = i64.const 3
+  v2 = call.import 0.write (v0, v1)
+  v3 = i32.wrap_i64 v2
+  call.import 1 (v3)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// The provided host interface, in the `Stream` handle's **native op order**: read=0, write=1,
+/// close=2. A consumer needing only `write` covers it (subset); the frozen remap sends the
+/// consumer's op 0 to the handle's native op 1.
+fn stream_shape() -> svm_run::IfaceShape {
+    use svm_ir::{FuncType, ValType};
+    let rw = FuncType {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+    };
+    svm_run::IfaceShape::new()
+        .op("read", rw.clone())
+        .op("write", rw)
+        .op(
+            "close",
+            FuncType {
+                params: vec![],
+                results: vec![],
+            },
+        )
+}
+
+#[test]
+fn a_grouped_host_interface_binds_a_subset_and_dispatches_across_backends() {
+    let consumer = parse_module(GROUPED_CONSUMER).expect("consumer parses");
+    let shape = stream_shape();
+    let registry = Imports::new()
+        .provide(
+            "log",
+            // A host-native `Stream` (stdout) offered as a whole interface; the consumer binds a
+            // subset and the remap routes its `write` to the stream's native op 1.
+            HostCap::iface(&shape, |h, _| h.grant_stream(svm_interp::StreamRole::Out)),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: the grouped write dispatched through the remap and returned nwritten"
+        );
+    }
+}
+
+#[test]
+fn a_grouped_host_interface_that_does_not_cover_fails_instantiation() {
+    // The consumer requires `read`, which the provided shape has — but with a *different*
+    // signature than the consumer declared, so coverage fails closed at instantiation.
+    let consumer = parse_module(
+        "type 0 func (i32) -> (i32)\n\
+         type 1 interface { read: 0 }\n\
+         import 0 interface \"log\" 1\n\
+         func 0 () -> () {\n\
+         block 0 () {\n\
+           return\n\
+           }\n\
+         }\n\
+         export 0 func \"_start\" 0\n",
+    )
+    .expect("consumer parses");
+    let shape = stream_shape(); // read is (i64,i64)->(i64), not (i32)->(i32)
+    let registry = Imports::new().provide(
+        "log",
+        HostCap::iface(&shape, |h, _| h.grant_stream(svm_interp::StreamRole::Out)),
+    );
+    let err = match instantiate_with_imports(consumer, registry) {
+        Err(e) => e,
+        Ok(_) => panic!("a non-covering grouped import must refuse instantiation"),
+    };
+    assert!(
+        err.contains("§3.5") && err.contains("not covered"),
+        "the refusal names the coverage rule: {err}"
+    );
+}

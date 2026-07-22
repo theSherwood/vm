@@ -10145,6 +10145,35 @@ const PROVIDER_FUEL_RESERVE: u64 = 1 << 32;
 /// follow-up alongside exporter-domain state.
 const GUEST_IMPL_FUEL: u64 = 1 << 26;
 
+/// §3.5 `cap` **boundary translation**: for each slot the signature types `ValType::Cap`,
+/// re-grant the capability the slot names from `src`'s handle table into `dst`'s, replacing the
+/// value with the receiver-local packed handle. Non-`cap` slots pass through untouched — a
+/// guest-visible `cap` is `i32`-width data, treated specially *only* at a boundary. A forged /
+/// dead / non-re-grantable handle is a fail-closed [`Trap::CapFault`].
+///
+/// This is the guest↔guest half of §2.3's "objects are arguments": authority crosses an
+/// offer-call boundary exactly where a signature says `cap`, and unmarked integers keep the
+/// forgeability guarantee (a raw handle crossing domains would index the *receiver's* table and
+/// is inert). The re-grant policy is [`Host::regrant_into_child`]'s — an offer is adopted one
+/// domain-hop deeper (§3.1 provenance), a pipe end aliases its shared backing, a coordinate-free
+/// cap copies.
+fn translate_cap_slots(
+    src: &mut Host,
+    dst: &mut Host,
+    types: &[ValType],
+    slots: &mut [i64],
+) -> Result<(), Trap> {
+    for (ty, slot) in types.iter().zip(slots.iter_mut()) {
+        if *ty == ValType::Cap {
+            let translated = src
+                .regrant_into_child(*slot as i32, dst)
+                .ok_or(Trap::CapFault)?;
+            *slot = translated as i64;
+        }
+    }
+    Ok(())
+}
+
 // The `Host` *is* the region minter — the narrow authority a `HostFnRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
@@ -12621,13 +12650,12 @@ impl Host {
                 if args.len() != sig.params.len() {
                     return Err(Trap::CapFault);
                 }
-                let vals: Vec<Value> = sig
-                    .params
-                    .iter()
-                    .zip(args)
-                    .map(|(ty, &s)| slot_to_val(*ty, s))
-                    .collect();
-                let (res, _, _) = match &entry.state {
+                // §3.5 `cap` boundary translation happens per branch, because the receiver host
+                // differs: `cap`-typed args are re-granted caller→provider *before* the run,
+                // `cap`-typed results provider→caller *after* it. Non-`cap` slots are plain i32
+                // data. A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the
+                // caller's call traps, fail-closed, identically on every backend.
+                match &entry.state {
                     // §3.2 v2 **instanced** offer: run over the provider's persistent window +
                     // powerbox (exporter-domain state). The blocking lock is deadlock-free by
                     // construction — providers never hold offers (`grant_impl_cap` refuses
@@ -12647,10 +12675,18 @@ impl Host {
                         if st.fuel == 0 {
                             return Err(Trap::CapFault);
                         }
+                        let mut arg_slots = args.to_vec();
+                        translate_cap_slots(self, &mut st.host, &sig.params, &mut arg_slots)?;
+                        let vals: Vec<Value> = sig
+                            .params
+                            .iter()
+                            .zip(&arg_slots)
+                            .map(|(ty, &s)| slot_to_val(*ty, s))
+                            .collect();
                         let budget = st.fuel.min(GUEST_IMPL_FUEL);
                         let mut impl_fuel = budget;
-                        let out = drive_arc(
-                            entry.funcs,
+                        let (res, _, _) = drive_arc(
+                            entry.funcs.clone(),
                             f,
                             &vals,
                             &mut impl_fuel,
@@ -12658,26 +12694,41 @@ impl Host {
                             &mut st.host,
                         );
                         st.fuel -= budget - impl_fuel; // drain what the call actually used
-                        out
+                        let mut result_slots: Vec<i64> =
+                            res?.iter().map(|v| val_to_slot(*v)).collect();
+                        translate_cap_slots(&mut st.host, self, &sig.results, &mut result_slots)?;
+                        Ok(result_slots)
                     }
                     // v1 **pure** offer: windowless, empty powerbox — arguments in, results out,
                     // capped at the flat per-call budget (there is no provider domain to drain;
-                    // the wirer accepted the bounded per-call price at wiring).
+                    // the wirer accepted the bounded per-call price at wiring). The ephemeral
+                    // host lives just long enough to hold any translated `cap` arg the impl
+                    // forwards or returns (e.g. an identity offer over a `cap`).
                     None => {
+                        let mut ephemeral = Host::new();
+                        let mut arg_slots = args.to_vec();
+                        translate_cap_slots(self, &mut ephemeral, &sig.params, &mut arg_slots)?;
+                        let vals: Vec<Value> = sig
+                            .params
+                            .iter()
+                            .zip(&arg_slots)
+                            .map(|(ty, &s)| slot_to_val(*ty, s))
+                            .collect();
                         let mut impl_fuel = GUEST_IMPL_FUEL;
-                        drive_arc(
-                            entry.funcs,
+                        let (res, _, _) = drive_arc(
+                            entry.funcs.clone(),
                             f,
                             &vals,
                             &mut impl_fuel,
                             &mut None,
-                            &mut Host::new(),
-                        )
+                            &mut ephemeral,
+                        );
+                        let mut result_slots: Vec<i64> =
+                            res?.iter().map(|v| val_to_slot(*v)).collect();
+                        translate_cap_slots(&mut ephemeral, self, &sig.results, &mut result_slots)?;
+                        Ok(result_slots)
                     }
-                };
-                // A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the caller's
-                // call traps, fail-closed, identically on every backend.
-                Ok(res?.iter().map(|v| val_to_slot(*v)).collect())
+                }
             }
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
             // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
