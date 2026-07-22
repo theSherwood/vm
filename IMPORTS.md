@@ -1303,6 +1303,49 @@ unified model there, so nothing regresses; the fiber slice replaces it
 when its consumer (the shell personality, STAGE1) is ready to drive it, and
 the instance concept is deleted rather than kept as a second mode.
 
+**Consumer pinning — jacl (2026-07-22).** The shell personality now has a
+named first consumer: **jacl** (theSherwood/jacl_impl), a shell-like language
+whose core goals are domain orchestration, child-I/O interposition, and
+coordination across domains of varying mutual trust. Its answers settle the
+§3.6 open questions that were "pinned when the slice is built":
+
+- **Waitset: minimal — no select/poll-set primitive.** One fiber per
+  thing-awaited (fiber-level synchrony, already this section's model);
+  `svc.wait`/`svc.poll` exist *solely* for handler admission. A timeout is a
+  fiber parked on `memory.wait` with `timeout_ns` (exists today). jacl adapts
+  to this shape rather than asking for a richer waitset.
+- **Reentrancy: confirmed as designed.** A→B→A runs as a fresh handler fiber
+  A[f2] while A[f1] stays parked — the consumer independently specified
+  exactly the "re-entry is a new fiber" semantics above. Closed.
+- **Cross-trust liveness: racing fibers + revocation-unparks.** No substrate
+  timeouts (the L4 lesson stands). A supervisor fiber races the untrusted
+  wait: it parks on a timer and, on expiry, **revokes the connection** —
+  closing/rebinding the client handle its sibling is parked through, which
+  completes that fiber's parked call with a probeable `CapFault`-style error.
+  The fiber is never killed: it wakes on its own error path and releases what
+  it holds — cancellation as a returned value, not `fiber.cancel`'s
+  killed-while-holding-locks tar pit. This is D37 death-is-revocation turned
+  inward (holder hangs up instead of provider dying; the servicer's late
+  reply lands inert via the existing generation check). Granularity is
+  per-connection; per-call granularity = per-call attenuated handles. **The
+  one new substrate item: a parked cross-domain call must observe revocation
+  of the handle it is parked through** — pinned as part of the fiber slice
+  (PROCESS.md §4).
+- **Registry/attach: personality-level, not substrate.** Rendezvous with an
+  existing domain is someone who holds its `export.handle` granting it —
+  registry semantics (names, discovery) are jacl's to define.
+- **Stages: sequential first, concurrency promptly** — an svm-owned todo
+  (STAGE1.md item 6), not waiting on a further request.
+- **Trust ladder** (with §1a/PROCESS.md §6 honesty): trusted → in-process
+  domains; limited trust → domains + `attest` + attenuated grants; hostile →
+  a separate OS process. A domain distrusting its *spawner* needs
+  `window_exposed = false`, which requires **detached windows** (PROCESS.md
+  §5) — promoted to the consumer critical path; attest itself is built.
+
+Remaining before the slice: build revocation-unparks, build detached
+windows, and the exec-interface contract (EXEC.md) whose guest-served
+backend is the first Endpoint consumer.
+
 ---
 
 ## 4. Interactions with settled decisions
