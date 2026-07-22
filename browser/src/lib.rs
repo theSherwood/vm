@@ -1820,19 +1820,19 @@ const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrs
 /// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
 /// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
 fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
-    use svm_interp::iface;
+    use svm_interp::cap_id;
     let (type_id, op): (u32, u32) = match name {
-        "write" => (iface::STREAM, 1),
-        "read" => (iface::STREAM, 0),
-        "exit" => (iface::EXIT, 0),
-        "vm_map" => (iface::MEMORY, 0),
-        "vm_unmap" => (iface::MEMORY, 1),
-        "vm_protect" => (iface::MEMORY, 2),
-        "vm_page_size" => (iface::MEMORY, 3),
-        "vm_region_create" => (iface::ADDRESS_SPACE, 5),
-        "vm_region_map" => (iface::SHARED_REGION, 0),
-        "vm_region_unmap" => (iface::SHARED_REGION, 1),
-        "vm_region_page_size" => (iface::SHARED_REGION, 3),
+        "write" => (cap_id::STREAM, 1),
+        "read" => (cap_id::STREAM, 0),
+        "exit" => (cap_id::EXIT, 0),
+        "vm_map" => (cap_id::MEMORY, 0),
+        "vm_unmap" => (cap_id::MEMORY, 1),
+        "vm_protect" => (cap_id::MEMORY, 2),
+        "vm_page_size" => (cap_id::MEMORY, 3),
+        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
+        "vm_region_map" => (cap_id::SHARED_REGION, 0),
+        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
+        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })
@@ -1898,7 +1898,7 @@ fn grant_onramp_caps(
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
     // dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
-        use svm_interp::iface;
+        use svm_interp::cap_id;
         let bindings = m
             .imports
             .iter()
@@ -1907,11 +1907,11 @@ fn grant_onramp_caps(
                     return svm_interp::BoundImport::rebindable(0, 0, None);
                 };
                 let handle = match (cap.type_id, cap.op) {
-                    (iface::STREAM, 1) => handles[0],
-                    (iface::STREAM, _) => handles[1],
-                    (iface::EXIT, _) => handles[2],
-                    (iface::MEMORY, _) => handles[3],
-                    (iface::ADDRESS_SPACE, _) => handles[4],
+                    (cap_id::STREAM, 1) => handles[0],
+                    (cap_id::STREAM, _) => handles[1],
+                    (cap_id::EXIT, _) => handles[2],
+                    (cap_id::MEMORY, _) => handles[3],
+                    (cap_id::ADDRESS_SPACE, _) => handles[4],
                     _ => return svm_interp::BoundImport::rebindable(0, 0, None),
                 };
                 svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
@@ -2153,7 +2153,7 @@ fn pg_setup(m: &svm_ir::Module, image: &[u8]) -> Result<(Host, Vec<u8>, svm_fs::
     // granted handles (`Stream` disambiguated by op). A name outside this headless powerbox (e.g.
     // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
-        use svm_interp::iface;
+        use svm_interp::cap_id;
         let bindings = m
             .imports
             .iter()
@@ -2162,10 +2162,10 @@ fn pg_setup(m: &svm_ir::Module, image: &[u8]) -> Result<(Host, Vec<u8>, svm_fs::
                     return svm_interp::BoundImport::rebindable(0, 0, None);
                 };
                 let handle = match (cap.type_id, cap.op) {
-                    (iface::STREAM, 1) => out,
-                    (iface::STREAM, _) => inp,
-                    (iface::EXIT, _) => exit,
-                    (iface::MEMORY, _) => memory,
+                    (cap_id::STREAM, 1) => out,
+                    (cap_id::STREAM, _) => inp,
+                    (cap_id::EXIT, _) => exit,
+                    (cap_id::MEMORY, _) => memory,
                     _ => return svm_interp::BoundImport::rebindable(0, 0, None),
                 };
                 svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
