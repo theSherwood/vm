@@ -1168,10 +1168,11 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     slot as i32
 }
 
-/// `join(child_handle) -> result` — block on the child's completion (it already ran synchronously at
-/// `instantiate` today) and return its `i64` result, propagating a child trap as the parent's
-/// (`*trap_out`). A forged / already-joined handle is inert (a `CapFault`), matching the interpreter's
-/// once-only join.
+/// `join(child_handle) -> result` — block on the child's completion (an async op-0/5 child runs on its
+/// own OS thread; a durable / op-8/11/13 child is already done) and return its `i64` result,
+/// propagating a child trap as the parent's (`*trap_out`). A §5 host kill on the parent's interrupt
+/// cell while parked here unwinds the waiter *as `OutOfFuel`* (see the loop below). A forged /
+/// already-joined handle is inert (a `CapFault`), matching the interpreter's once-only join.
 ///
 /// # Safety
 /// As [`instantiate`]: `rt`/`trap_out` are the baked nursery + run trap cell, valid for the call.
@@ -1200,10 +1201,16 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
         if let Some(outcome) = *st {
             break outcome;
         }
-        // §5 kill-path: the host set the parent's interrupt cell — stop waiting and return; the parent's
-        // guest code traps `OutOfFuel` at its next epoch poll (as `thread.join` does). The child bakes
-        // the same cell, so it unwinds too.
+        // §5 kill-path: the host set the parent's interrupt cell — stop waiting and **propagate
+        // `OutOfFuel` right here** (the child bakes the same cell, so it unwinds too, and is joined at
+        // teardown). We must not return a bare `0` and lean on "the parent traps at its next epoch
+        // poll": unlike a spinning caller, a parent that does `join` then `return` has **no** back-edge
+        // or function-entry between this call and its `return`, so there is no next poll — the `0` would
+        // flow straight out as a clean `Returned`, silently dropping the kill (ISSUES.md I33). Setting
+        // the trap cell makes the outcome `Trapped(OutOfFuel)` regardless of a subsequent poll, matching
+        // the child's own kill and the interpreter's runaway-nesting semantics.
         if epoch_fired(rt.epoch_addr) {
+            *trap_out = TrapKind::OutOfFuel as i64;
             return 0;
         }
         st = done

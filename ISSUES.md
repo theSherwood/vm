@@ -13,7 +13,7 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I33 — `jit_killpath_stops_runaway_child` flaked once under full-workspace parallel load (S4) — local run, 2026-07-20
+### I33 — `jit_killpath_stops_runaway_child` flaked under full-workspace parallel load (S4) — **RESOLVED** (2026-07-22): the kill-path escape in the JIT `join` returned a clean `0` instead of propagating `OutOfFuel`; original report below
 
 **Where:** `crates/svm/tests/jit_killpath.rs::jit_killpath_stops_runaway_child`, during a full
 `cargo test --workspace` on a loaded machine (the phase-3 IMPORTS migration's local gate). 4/5 of
@@ -55,6 +55,39 @@ passed, and a local full `cargo test --workspace` was green). **Next action is n
 the runaway-child kill deadline (or raise the child's fuel headroom so the watchdog reliably wins
 the race on a loaded runner) — a focused, security-reviewed change on its own PR, since it tunes a
 TCB-adjacent fuel/kill assertion.
+
+**ROOT CAUSE FOUND + RESOLVED (2026-07-22).** The four prior sightings all read this as a *timing*
+flake ("the child completed before the interrupt landed / the deadline is too tight"), but that
+model is wrong: the runaway child (`PARENT_WITH_RUNAWAY_CHILD`'s func 1) is a **true infinite loop**
+— it can never "complete", so a widened deadline / more child fuel would not have helped. The real
+mechanism is a **race in the JIT `join`** (`crates/svm-jit/src/instantiator_rt.rs::join`). The
+non-durable child now runs **asynchronously on its own OS thread** (PROCESS.md S1c), so the parent
+*parks* in `join` on the child's completion cell. When the watchdog fires the kill, two paths race:
+(a) the child's own epoch poll trips `OutOfFuel` and fills its completion cell → `join` breaks with
+that trap → `Trapped(OutOfFuel)` ✓; **(b)** the parent's `join` loop observes `epoch_fired` *first*
+and **returned a bare `0` with `*trap_out` unset**, on the assumption the parent "traps `OutOfFuel`
+at its next epoch poll." That assumption holds for a *spinning* caller (a back-edge poll follows),
+but the parent module does `cap.call join` then `return` with **no** intervening back-edge or
+function-entry — so there is no next poll, and the `0` flows straight out as a clean `Returned([0])`.
+Under parallel load the parent-side escape (b) wins the race more often, hence "only under load,
+never in isolation." This was a genuine (if narrow) kill-path correctness gap — a host firing the
+§5 interrupt on a parked-in-`join` parent would silently see `Returned` instead of `OutOfFuel` — not
+merely a test-timing artifact.
+
+**Fix.** `join`'s `epoch_fired` escape now sets `*trap_out = TrapKind::OutOfFuel` before returning
+(one line + the SAFETY/why comment), so the kill surfaces as `Trapped(OutOfFuel)` regardless of
+whether a subsequent guest poll exists — making *both* race outcomes (a) and (b) deterministic. The
+child bakes the same interrupt cell and unwinds on its own; it is joined at run teardown
+(`join_children`), so nothing leaks or hangs. Only the **kill** branch changed — the sibling freeze
+escape (`window_is_unwinding`) in `os_thread_rt::thread_join` still returns `0` deliberately (a
+freeze must reach the guest's safepoint, not trap). Verified: `jit_killpath` 5/5 green, then the
+runaway-child test alone **60/60** serial + **36/36** across 6 parallel rounds under saturated CPU
+load (the condition that used to flake it); `jit_killpath_threads`, `jit_instantiator`,
+`jit_instantiate_{cache,granted,named}`, and `jit_coroutine` all green; clippy clean. The
+`jit_killpath.rs` test serialization from the third sighting is kept (harmless — the other four
+tests there still race their own watchdogs). The `os_thread_rt::thread_join` kill escape has the
+same latent shape but is not exercised by any current test (both thread tests spin after join, so a
+back-edge poll always follows); left as-is, noted here for the next time it matters.
 
 
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
