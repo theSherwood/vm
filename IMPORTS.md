@@ -1044,7 +1044,17 @@ with its reason recorded:
 - **The vestigial `call.import` handle operand is retained**, not retired: it is *live*
   in link-form modules (the §7 loader ABI reads it as the cap-symbol handle and the
   `Slot` patch target), so its retirement rides the future migration of that ABI to
-  manifest/attach — not this bump.
+  manifest/attach — not this bump. **Recorded v8 todo — the migration plan:** link-form
+  cap symbols become ordinary manifest imports resolved at instantiation (today
+  `resolve_imports_with` bakes the resolution into rewritten instructions and then
+  *erases* the import section, costing link-form modules manifest reflection,
+  slot provenance, rebinding, and interposition — they gain all four back); function
+  symbols stay direct calls; the `Slot` (guest-dynlink) case gets its own patch
+  placeholder instead of reusing the handle's defining `ConstI32`. Then the operand
+  drops from the instruction and the encoding, and a manifest call site is just
+  `call.import 0.read (args)`. No functionality is lost: binding moves from link-time
+  baking to per-instance slot state (strictly more capable), and dynamic dispatch on a
+  runtime handle value remains as `call.import.dyn`.
 - **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
   the type is reserved and lowers as `i32` everywhere.
 - **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
