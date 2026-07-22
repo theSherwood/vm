@@ -44,6 +44,18 @@ sibling-test CPU contention distorts exactly what it measures). Leave this issue
 the serialized binary holds green across several full-workspace/CI runs; if it flakes *while
 serialized*, the deadline itself is too tight — widen it next.
 
+**Fourth sighting — flaked *while serialized*, 2026-07-22 (PR #414):** recurred on `build ·
+test (macos-latest)` (run 29937973810, head `3b60cd00`), same test, same captured signature
+(expected `Trapped(OutOfFuel)`, got `Returned([0])` — child completed before the interrupt
+landed). The serialization mitigation is in place, so per the note above this is now the
+"deadline too tight under load" signal, not sibling-test contention. Unrelated diff (the head is
+the capability-model `iface::→cap_id` rename + intern pre-seeding — no JIT-fuel/kill-path code
+touched; that run's Linux main gate, both macOS fiber jobs, and all differential/browser jobs
+passed, and a local full `cargo test --workspace` was green). **Next action is now pinned:** widen
+the runaway-child kill deadline (or raise the child's fuel headroom so the watchdog reliably wins
+the race on a loaded runner) — a focused, security-reviewed change on its own PR, since it tunes a
+TCB-adjacent fuel/kill assertion.
+
 
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
 
