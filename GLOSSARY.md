@@ -86,9 +86,15 @@ The system is four ideas wearing many names:
   instantiation or the spawn fails; immutable for the instance's life (always safe to
   devirtualize). `rebindable`: declared and typed, may start empty, filled at runtime
   by `import.attach`.
-- **`call.import`** — the one capability-call convention. Static mode: slot immediate,
-  types from the manifest, verifier-checked at load. Dynamic mode (designed; today via
-  the `cap.call` wire form): object from a runtime handle value, checked at the use site.
+- **`call.import`** — the one capability-call convention (v8: no handle operand — the
+  slot binding identifies the capability). Static mode: slot immediate, types from the
+  manifest, verifier-checked at load. Dynamic mode: `call.import.dyn` on a runtime
+  handle value, requirement by type-section reference, checked at the use site.
+- **`call.sym`** — the §7/§22 *symbolic* call (v8): flat name reference + self-describing
+  sig + the legacy handle operand only it still carries. Binds by name at whichever
+  binding act comes first — instantiation (executes as ordinary slot dispatch, operand
+  ignored) or the linker (`resolve_imports_with` rewrites it: Cap → `cap.call` on the
+  live operand, Slot → `call_indirect`, Func → direct call).
 - **`import.attach`** — fill (or refill) a `rebindable` slot with a capability the
   domain already holds, type-checked fail-closed. The "reflect, decide, attach once,
   then ordinary calls" pattern.

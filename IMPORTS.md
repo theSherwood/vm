@@ -493,9 +493,10 @@ is checked, not asserted. *Status: **landed**, notes:*
   shims with `Resolved::Cap` (handle-free, link-time symbol resolution) and
   the guests discover their own handles via `cap.self` reflection — §2.3's
   dynamic mode for the `Instantiator` ops, exercised end to end.*
-- *The vestigial `CallImport` handle operand is **kept** until the next
-  wire-format bump, exactly as §2.5 schedules it (frontends emit a dummy,
-  backends ignore it).*
+- *The vestigial `CallImport` handle operand was **kept** until the next
+  wire-format bump, exactly as §2.5 scheduled it — and retired there: at v8
+  `call.import` has no operand, and the symbolic spelling that still carries
+  one is its own instruction, `call.sym` (see the §3.5 as-built notes).*
 
 **The deletion phase is tracked work, not eventual cleanup.** The failure
 mode of this migration is not a wrong design; it is stalling at phase 1 and
@@ -674,8 +675,8 @@ func 0 () -> (i64) {
     v2 = i64.const 64
     v3 = call.import 0.read (v1, v2)   ; by name — resolved to the op index at parse
     v4 = call.import 0.1 (v1)          ; or positional — identical wire form
-    v5 = call.import [v6] interface 2 . read (v1, v2)  ; dynamic: handle from a
-    return v5                          ; value, requirement by type-section ref
+    v5 = call.import.dyn 2.read v6 (v1, v2)  ; dynamic: handle from a value,
+    return v5                          ; requirement by type-section ref
   }
 }
 ```
@@ -1036,7 +1037,7 @@ live run is over but its provider instance keeps serving both C's `log`
 calls and P's `count` calls — the counter they share lives in the instance,
 not in the finished run.
 
-**As built (2026-07-21, wire v7; polish pass 2026-07-22).** Everything above is
+**As built (2026-07-21, wire v7; polish pass + v8 bump 2026-07-22).** Everything above is
 landed — coverage binding with bind-time remaps (child manifests + host wiring;
 name-less legacy wires fall back to first-signature-position matching), the settled
 declaration surface (indices, kinds, required op names, `{ name: idx }` maps, legacy
@@ -1053,24 +1054,28 @@ refreshing the op remap (non-covering or dead handles are a probeable `-EINVAL`;
 requirement-less slots keep the exact-`type_id` check). Remaining deferrals, each
 with its reason recorded:
 
-- **The vestigial `call.import` handle operand is retained**, not retired: it is *live*
-  in link-form modules (the §7 loader ABI reads it as the cap-symbol handle and the
-  `Slot` patch target), so its retirement rides the future migration of that ABI to
-  manifest/attach — not this bump. **Recorded v8 todo — the migration plan:** link-form
-  cap symbols become ordinary manifest imports resolved at instantiation (today
-  `resolve_imports_with` bakes the resolution into rewritten instructions and then
-  *erases* the import section, costing link-form modules manifest reflection,
-  slot provenance, rebinding, and interposition — they gain all four back); function
-  symbols stay direct calls; the `Slot` (guest-dynlink) case gets its own patch
-  placeholder instead of reusing the handle's defining `ConstI32`. Then the operand
-  drops from the instruction and the encoding, and a manifest call site is just
-  `call.import 0.read (args)`. No functionality is lost: binding moves from link-time
-  baking to per-instance slot state (strictly more capable), and dynamic dispatch on a
-  runtime handle value remains as `call.import.dyn`. **Riding the same v8 bump: the
-  `ns` field is deleted** (settled 2026-07-22 — an import name is one string, dotted
-  namespacing by convention; see the text-format rules above). Nothing resolves on
-  `ns` today, so the deletion is wire + surface only: drop the field, drop the second
-  string from the `import` line, migrate corpora names to the dotted form.
+- **[BUILT 2026-07-22, wire v8] The handle operand is retired from `call.import`; the
+  `ns` field is deleted.** A manifest call site is now `call.import 0.read (args)` —
+  no operand; the slot binding identifies the capability — and an import name is one
+  string (dotted namespacing by convention; the two-string text form still parses,
+  joined with `.`). The as-built shape differs from the plan sketched here before the
+  build, in one instructive way. The plan said link-form cap symbols would "become
+  manifest imports"; that is impossible — a link-form cap call passes its *handle per
+  call site* (a C program's `write(fd, …)`: the symbol resolves the `(type_id, op)`,
+  the fd flows at runtime), which is dynamic dispatch and can never be a slot bound
+  once at instantiation. What was built instead is a **split**: `call.import` is the
+  clean manifest call, and the symbolic spelling is its own instruction, **`call.sym
+  <import> v<handle> (args)`** (wire 0x0E) — flat name, self-describing sig, and the
+  handle operand only *it* still carries. `call.sym` has one rule serving both of its
+  historical consumers: it verifies exactly like a flat `call.import` (op 0, plus the
+  i32 handle operand) and **executes as ordinary slot dispatch when the instance binds
+  the name** (operand ignored) — the chibicc emission stream instantiates unchanged —
+  while remaining the **linker's rewrite target** when `resolve_imports_with` runs
+  first (Cap → `cap.call` on the live operand; Slot → `call_indirect` via the
+  operand's patched `ConstI32`; Func → direct call). One spelling, two binding times:
+  a symbolic call binds by name at whichever binding act comes first. Emitters that
+  never link (svm-llvm, svm-wasm, the printer's canonical output) produce the clean
+  form only.
 - **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
   the type is reserved and lowers as `i32` everywhere.
 - **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of

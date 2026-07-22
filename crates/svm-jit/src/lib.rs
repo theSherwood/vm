@@ -4479,6 +4479,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::CapCall { .. }
                 | Inst::CallImport { .. }
                 | Inst::CallImportDyn { .. }
+                | Inst::CallSym { .. }
                 | Inst::ExportHandle { .. }
                 | Inst::CapSelfTypeId { .. }
                 | Inst::CapSelfCovers { .. }
@@ -5282,6 +5283,27 @@ fn lower_block(
                 svm_ir::CAP_IMPORT_TYPE_ID,
                 // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                 *import | (*op << 16),
+                sig,
+                h0,
+                args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §7/§22 symbolic call: a bound `call.sym` is a flat import dispatch (op 0); the
+        // legacy handle operand is not read by the dispatch (constant 0, like `call.import`).
+        if let Inst::CallSym {
+            import, sig, args, ..
+        } = inst
+        {
+            let h0 = b.ins().iconst(I32, 0);
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_IMPORT_TYPE_ID,
+                *import,
                 sig,
                 h0,
                 args,

@@ -422,15 +422,46 @@ fn check_inst(
             check_args(types, args, &sig.params)?;
             sig.results.clone()
         }
+        // §7/§22 symbolic call (v8): verifies exactly like a *flat* manifest import call
+        // (op 0) plus its legacy handle operand (i32; ignored by manifest dispatch, live to
+        // the linker). Executable when bound at instantiation; the linker's rewrite target
+        // when resolved first.
+        Inst::CallSym {
+            import,
+            sig,
+            handle,
+            args,
+        } => {
+            let Some(decl) = imports.get(*import as usize) else {
+                return Err(format!(
+                    "unresolved import {import} (out of manifest range)"
+                ));
+            };
+            let want_sig = match decl.shape {
+                svm_ir::ImportShape::Func(t) => match tsec.get(t as usize) {
+                    Some(svm_ir::TypeEntry::Func(ft)) => Some(ft),
+                    _ => None,
+                },
+                svm_ir::ImportShape::Interface(t) => iface_op_sig(tsec, t, 0),
+            };
+            let Some(want_sig) = want_sig else {
+                return Err(format!("import {import} op 0 out of range for its shape"));
+            };
+            if want_sig != sig {
+                return Err(format!("import {import} signature mismatch with manifest"));
+            }
+            w(*handle, V::I32)?;
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
+        }
         // §7 / IMPORTS.md phase 1: a `call.import` is executable when its index names a declared
         // import and its self-describing sig equals the manifest's (the canonical interface);
         // out-of-range (including the empty-manifest legacy shape) or a sig disagreement is
-        // fail-closed. Operand typing mirrors `cap.call` (handle i32 + args per sig).
+        // fail-closed. Operand typing mirrors `cap.call` (args per sig; no handle since v8).
         Inst::CallImport {
             import,
             op,
             sig,
-            handle,
             args,
         } => {
             let Some(decl) = imports.get(*import as usize) else {
@@ -456,7 +487,6 @@ fn check_inst(
             if want_sig != sig {
                 return Err(format!("import {import} signature mismatch with manifest"));
             }
-            w(*handle, V::I32)?;
             check_args(types, args, &sig.params)?;
             sig.results.clone()
         }

@@ -59,9 +59,11 @@ fn no_rewrite_manifest_and_call_imports_survive_instantiation() {
         "phase-1 instantiation must keep the module byte-identical (no rewrite)"
     );
     let insts: Vec<&Inst> = inst.module().funcs[0].blocks[0].insts.iter().collect();
+    // The name-inline text form is the symbolic spelling (v8: `call.sym`); it survives
+    // instantiation unrewritten exactly as an indexed `call.import` would.
     assert!(
-        insts.iter().any(|i| matches!(i, Inst::CallImport { .. })),
-        "call.import instructions survive"
+        insts.iter().any(|i| matches!(i, Inst::CallSym { .. })),
+        "symbolic call instructions survive"
     );
     assert!(
         !insts.iter().any(|i| matches!(i, Inst::CapCall { .. })),

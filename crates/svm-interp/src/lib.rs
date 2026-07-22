@@ -423,10 +423,12 @@ impl DebugShared {
             // An executable `call.import` (IMPORTS.md phase 1) is a capability boundary too;
             // reported under the reserved import-dispatch type_id with the import index as the op
             // (the concrete binding is instantiation state, not visible at this layer).
-            Inst::CallImport { import, .. } if self.cap_stops => Some(StopReason::CapCall {
-                type_id: svm_ir::CAP_IMPORT_TYPE_ID,
-                op: *import,
-            }),
+            Inst::CallImport { import, .. } | Inst::CallSym { import, .. } if self.cap_stops => {
+                Some(StopReason::CapCall {
+                    type_id: svm_ir::CAP_IMPORT_TYPE_ID,
+                    op: *import,
+                })
+            }
             _ => None,
         }
     }
@@ -7021,6 +7023,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // operand is ignored (the binding carries the real handle).
                 Inst::CallImport {
                     import, sig, args, ..
+                }
+                | Inst::CallSym {
+                    import, sig, args, ..
                 } if matches!(
                     host.lock().unwrap_or_else(|e| e.into_inner()).import_binding(*import),
                     Some(b) if b.type_id == iface::JIT && matches!(b.op, 1 | 3 | 4)
@@ -7055,6 +7060,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *import | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
+                    for (s, ty) in results.iter().zip(&sig.results) {
+                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                    }
+                }
+                // §7/§22 symbolic call: when the instance bound the name, dispatch exactly like
+                // a flat `call.import` (op 0); the legacy handle operand is ignored.
+                Inst::CallSym {
+                    import, sig, args, ..
+                } => {
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args {
+                        argv.push(get(&frames[top].vals, *a)?.i64());
+                    }
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results =
+                        hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7982,8 +8004,10 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::ConstI64(c) => Reg::from_i64(*c),
         // §7 executable named imports (+ phase-2 attach) need the host's import-binding table,
         // so they're serviced in the eval loop (like `cap.call`), never in this pure-op helper.
+        // `CallSym` (the v8 link-form placeholder) never verifies, so it can never execute.
         Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
+        | Inst::CallSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop

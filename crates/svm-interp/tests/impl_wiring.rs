@@ -308,7 +308,7 @@ fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
     let manifest = |specs: &[(&str, Vec<ValType>, ImportMode)]| {
         let mut m = svm_ir::Module::default();
         for (name, params, mode) in specs {
-            m.add_func_import("", *name, sig(params.clone(), vec![ValType::I64]), *mode);
+            m.add_func_import(*name, sig(params.clone(), vec![ValType::I64]), *mode);
         }
         (m.imports, m.types)
     };

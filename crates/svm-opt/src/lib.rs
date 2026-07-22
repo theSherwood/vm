@@ -2385,9 +2385,14 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         }
         Inst::CapSelfCovers { handle, .. } => *handle = f(*handle),
         Inst::CapCall { handle, args, .. }
-        | Inst::CallImport { handle, args, .. }
-        | Inst::CallImportDyn { handle, args, .. } => {
+        | Inst::CallImportDyn { handle, args, .. }
+        | Inst::CallSym { handle, args, .. } => {
             *handle = f(*handle);
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Inst::CallImport { args, .. } => {
             for v in args.iter_mut() {
                 *v = f(*v);
             }

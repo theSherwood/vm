@@ -313,6 +313,25 @@ pub fn struct_rows() -> Vec<StructRow> {
                 import: 0,
                 op: 0,
                 sig: ft_void.clone(),
+                args: vec![],
+            },
+            false,
+            vec![],
+        ),
+    });
+
+    // v8 §7/§22 link-form symbolic call: the loader-ABI placeholder. Never verifies by
+    // design (a surviving `call.sym` is an unresolved symbol) — round-trip + byte pin only.
+    rows.push(StructRow {
+        id: "call_sym".into(),
+        encoding: Enc::Byte(0x0E),
+        verifies: false,
+        is_term: false,
+        module: inst_module(
+            vec![i32t],
+            Inst::CallSym {
+                import: 0,
+                sig: ft_void.clone(),
                 handle: 0,
                 args: vec![],
             },
@@ -681,6 +700,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::CapCall { .. }
         | Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
+        | Inst::CallSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
@@ -713,15 +733,16 @@ mod tests {
     #[test]
     fn structural_row_tally() {
         let rows = struct_rows();
-        assert_eq!(rows.len(), 37, "structural row count (update on new ops)");
+        assert_eq!(rows.len(), 38, "structural row count (update on new ops)");
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), rows.len(), "duplicate structural row id");
-        // Exactly two ops have manifest-less row modules that fail verification
-        // (`call_import` + `import_attach` — both valid only against a declared manifest,
-        // IMPORTS.md; the manifest-bearing accept legs live in `spec_verify`).
-        assert_eq!(rows.iter().filter(|r| !r.verifies).count(), 2);
+        // Exactly three ops have row modules that fail verification: `call_import` +
+        // `import_attach` (valid only against a declared manifest, IMPORTS.md; the
+        // manifest-bearing accept legs live in `spec_verify`) and `call_sym` (the v8
+        // link-form placeholder, which *never* verifies by design).
+        assert_eq!(rows.iter().filter(|r| !r.verifies).count(), 3);
         assert_eq!(rows.iter().filter(|r| r.is_term).count(), 7, "terminators");
     }
 

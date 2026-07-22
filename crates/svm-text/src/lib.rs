@@ -89,9 +89,9 @@ pub fn print_module(m: &Module) -> String {
         }
         s.push('\n');
     }
-    // §7 capability imports (§3.5 surface): `import <idx> func|interface ["ns"] "name"
-    // <typeidx> [rebindable]` — the shape is a type-section reference; the namespace level
-    // is omitted when empty.
+    // §7 capability imports (§3.5 surface, v8 names): `import <idx> func|interface "name"
+    // <typeidx> [rebindable]` — one name string (dotted namespacing by convention); the
+    // shape is a type-section reference.
     if !m.imports.is_empty() {
         for (i, imp) in m.imports.iter().enumerate() {
             // A `rebindable` suffix marks the phase-2 mode; `required` (the default) is implicit.
@@ -103,12 +103,7 @@ pub fn print_module(m: &Module) -> String {
                 svm_ir::ImportShape::Func(t) => ("func", t),
                 svm_ir::ImportShape::Interface(t) => ("interface", t),
             };
-            let ns = if imp.ns.is_empty() {
-                String::new()
-            } else {
-                format!("\"{}\" ", imp.ns)
-            };
-            let _ = writeln!(s, "import {i} {kind} {ns}\"{}\" {t}{mode}", imp.name);
+            let _ = writeln!(s, "import {i} {kind} \"{}\" {t}{mode}", imp.name);
         }
         s.push('\n');
     }
@@ -449,16 +444,12 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
             types(&sig.results),
             arglist(args)
         ),
-        // §7 import call (§3.5): `call.import <idx>[.<opname> | op <n>] v<handle> (args)`.
+        // Manifest capability call (§3.5, v8): `call.import <idx>[.<opname> | op <n>] (args)`.
         // The op signature is recovered from the declaration through the type section on
         // re-parse; the op prints by name when the grouped import's interface resolves,
         // numerically otherwise, and not at all for op 0 of a flat import.
         Inst::CallImport {
-            import,
-            op,
-            handle,
-            args,
-            ..
+            import, op, args, ..
         } => {
             let opsel = if *op == 0
                 && matches!(
@@ -484,8 +475,16 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
                     None => format!(" op {op}"),
                 }
             };
-            format!("call.import {import}{opsel} v{handle}{}", arglist(args))
+            format!("call.import {import}{opsel}{}", arglist(args))
         }
+        // §7/§22 link-form symbolic call: `call.sym <import> v<handle> (args)` — the loader-ABI
+        // placeholder (never verifies; the linker rewrites it).
+        Inst::CallSym {
+            import,
+            handle,
+            args,
+            ..
+        } => format!("call.sym {import} v{handle}{}", arglist(args)),
         // §3.5 dynamic mode: `call.import.dyn <ty>[.<opname> | op <n>] v<handle> (args)`.
         Inst::CallImportDyn {
             ty,
@@ -1274,18 +1273,23 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 if n < 0 || n as usize != p.imports.len() {
                     return err("import indices must be dense and in declaration order");
                 }
-                let (ns, name, shape) = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func" || k == "interface")
+                let (name, shape) = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func" || k == "interface")
                 {
                     let kind = p.parse_ident()?;
                     let first = String::from_utf8(p.parse_str()?)
                         .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
-                    // One string = unnamespaced name; two = ("ns", "name").
-                    let (ns, name) = if matches!(p.peek(), Some(Tok::Str(_))) {
+                    // One string is the v8 name. Two strings are the legacy two-level
+                    // `("ns", "name")` form — joined with `.` per the dotted convention.
+                    let name = if matches!(p.peek(), Some(Tok::Str(_))) {
                         let second = String::from_utf8(p.parse_str()?)
                             .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
-                        (first, second)
+                        if first.is_empty() {
+                            second
+                        } else {
+                            format!("{first}.{second}")
+                        }
                     } else {
-                        (String::new(), first)
+                        first
                     };
                     let t = p.parse_u32()?;
                     let shape = if kind == "func" {
@@ -1293,7 +1297,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     } else {
                         svm_ir::ImportShape::Interface(t)
                     };
-                    (ns, name, shape)
+                    (name, shape)
                 } else {
                     let name = String::from_utf8(p.parse_str()?)
                         .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
@@ -1301,7 +1305,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     p.expect(&Tok::Arrow)?;
                     let results = p.parse_type_list()?;
                     let t = p.intern_func_type(FuncType { params, results });
-                    (String::new(), name, svm_ir::ImportShape::Func(t))
+                    (name, svm_ir::ImportShape::Func(t))
                 };
                 // Optional phase-2 mode suffix; absent = `required` (the default).
                 let mode = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "rebindable") {
@@ -1310,12 +1314,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 } else {
                     svm_ir::ImportMode::Required
                 };
-                p.imports.push(Import {
-                    ns,
-                    name,
-                    shape,
-                    mode,
-                });
+                p.imports.push(Import { name, shape, mode });
             }
             // Module-level `data [ro] <offset> "<bytes>"` segment (§3a / D40).
             Some(Tok::Ident(s)) if s == "data" => {
@@ -2343,21 +2342,27 @@ impl<'a> Parser<'a> {
             let args = self.parse_value_list(names)?;
             return Ok(Inst::Call { func, args });
         }
-        // §7 named import call, two forms:
-        //   indexed:     `call.import <idx> v<handle> (args)`          — sig from the `import` decl
-        //   name-inline: `call.import "name" (params)->(results) v<h> (args)` — interned on the fly
-        // The name-inline form lets a streaming frontend (chibicc) emit a capability call per site
+        // §7 capability / symbolic calls:
+        //   manifest:    `call.import <idx>[.<opname> | op <n>] (args)` — sig from the decl;
+        //                a legacy `v<handle>` operand before the args parses and is discarded
+        //                (the slot binding identifies the capability since v8)
+        //   link-form:   `call.sym <idx> v<handle> (args)` — the §7/§22 placeholder
+        //   name-inline: `call.import "name" (params)->(results) v<h> (args)` — legacy link-form
+        //                sugar; interns the name as a flat func import and yields a `CallSym`
+        // The name-inline form lets a streaming frontend (chibicc) emit a symbolic call per site
         // with no pre-collected import table; the parser interns the name into `imports`.
-        if op == "call.import" {
-            let (import, opidx) = if matches!(self.peek(), Some(Tok::Str(_))) {
-                // Name-inline sugar: `call.import "name" (sig) v<h> (args)` interns the
-                // signature as a type entry and the name as a flat func import.
+        if op == "call.import" || op == "call.sym" {
+            if op == "call.import" && matches!(self.peek(), Some(Tok::Str(_))) {
+                // Name-inline sugar: interns the signature as a type entry and the name as a
+                // flat func import; the call is a link-form `CallSym` (the handle operand is
+                // the cap symbol's runtime handle / `Slot` patch target).
                 let name = String::from_utf8(self.parse_str()?)
                     .map_err(|_| ParseError("call.import name is not valid UTF-8".into()))?;
                 let params = self.parse_type_list()?;
                 self.expect(&Tok::Arrow)?;
                 let results = self.parse_type_list()?;
-                let t = self.intern_func_type(FuncType { params, results });
+                let sig = FuncType { params, results };
+                let t = self.intern_func_type(sig.clone());
                 // Intern: reuse an existing import of the same (name, shape), else append.
                 let idx = self
                     .imports
@@ -2365,38 +2370,56 @@ impl<'a> Parser<'a> {
                     .position(|imp| imp.name == name && imp.shape == svm_ir::ImportShape::Func(t))
                     .unwrap_or_else(|| {
                         self.imports.push(Import {
-                            ns: String::new(),
                             name,
                             shape: svm_ir::ImportShape::Func(t),
                             mode: svm_ir::ImportMode::Required, // name-inline interning is required-mode
                         });
                         self.imports.len() - 1
                     });
-                (idx as u32, 0)
-            } else {
+                let handle = self.value(names)?;
+                let args = self.parse_value_list(names)?;
+                return Ok(Inst::CallSym {
+                    import: idx as u32,
+                    sig,
+                    handle,
+                    args,
+                });
+            }
+            if op == "call.sym" {
                 let import = self.parse_u32()?;
-                // Optional op selector: `.name` (resolved through the grouped import's
-                // interface) or `op <n>` (numeric). Absent = op 0 (the flat case).
-                let opidx = if matches!(self.peek(), Some(Tok::Dot)) {
-                    self.next()?;
-                    let opname = self.parse_ident()?;
-                    self.resolve_import_op(import, &opname)?
-                } else if matches!(self.peek(), Some(Tok::Ident(k)) if k == "op") {
-                    self.next()?;
-                    self.parse_u32()?
-                } else {
-                    0
-                };
-                (import, opidx)
+                let sig = self.import_op_sig(import, 0)?;
+                let handle = self.value(names)?;
+                let args = self.parse_value_list(names)?;
+                return Ok(Inst::CallSym {
+                    import,
+                    sig,
+                    handle,
+                    args,
+                });
+            }
+            let import = self.parse_u32()?;
+            // Optional op selector: `.name` (resolved through the grouped import's
+            // interface) or `op <n>` (numeric). Absent = op 0 (the flat case).
+            let opidx = if matches!(self.peek(), Some(Tok::Dot)) {
+                self.next()?;
+                let opname = self.parse_ident()?;
+                self.resolve_import_op(import, &opname)?
+            } else if matches!(self.peek(), Some(Tok::Ident(k)) if k == "op") {
+                self.next()?;
+                self.parse_u32()?
+            } else {
+                0
             };
             let sig = self.import_op_sig(import, opidx)?;
-            let handle = self.value(names)?;
+            // Legacy sugar: a pre-v8 handle operand before the arg list parses and is dropped.
+            if !matches!(self.peek(), Some(Tok::LParen)) {
+                self.value(names)?;
+            }
             let args = self.parse_value_list(names)?;
             return Ok(Inst::CallImport {
                 import,
                 op: opidx,
                 sig,
-                handle,
                 args,
             });
         }
@@ -3264,16 +3287,17 @@ block0(v0: i32):
         assert_eq!(m.imports.len(), 2);
         assert_eq!(m.imports[0].name, "write");
         assert_eq!(m.imports[1].name, "exit");
-        // The body carries two CallImports, sigs recovered from the import table.
+        // The body carries two CallImports, sigs recovered from the import table (the legacy
+        // handle operands parse and are discarded — v8).
         let insts = &m.funcs[0].blocks[0].insts;
         let imports: Vec<_> = insts
             .iter()
             .filter_map(|i| match i {
-                Inst::CallImport { import, handle, .. } => Some((*import, *handle)),
+                Inst::CallImport { import, .. } => Some(*import),
                 _ => None,
             })
             .collect();
-        assert_eq!(imports, vec![(0, 0), (1, 0)]);
+        assert_eq!(imports, vec![0, 1]);
         // Print → re-parse is identity.
         let printed = print_module(&m);
         let m2 = parse_module(&printed).expect("reparse");
@@ -3384,9 +3408,12 @@ block2(vr: i64):
 
     // The linker's Cap lowering (IMPORTS.md §2.5: `resolve_imports_with` survives in the linker
     // only) over parsed text IR — the parse → link integration, not an instantiation path.
+    // Since v8 the link-form spelling is `call.sym` (indexed `call.import` is the manifest
+    // call, which the linker never touches).
     #[test]
     fn linker_lowers_parsed_imports_to_capcalls() {
-        let m = parse_module(SRC).expect("parse");
+        let src = SRC.replace("call.import", "call.sym");
+        let m = parse_module(&src).expect("parse");
         let r = svm_ir::resolve_imports_with(&m, |n| match n {
             "write" => Some(svm_ir::Resolved::Cap(ResolvedCap { type_id: 0, op: 1 })),
             "exit" => Some(svm_ir::Resolved::Cap(ResolvedCap { type_id: 1, op: 0 })),
@@ -3395,7 +3422,7 @@ block2(vr: i64):
         .expect("resolve");
         assert!(r.imports.is_empty());
         let insts = &r.funcs[0].blocks[0].insts;
-        assert!(!insts.iter().any(|i| matches!(i, Inst::CallImport { .. })));
+        assert!(!insts.iter().any(|i| matches!(i, Inst::CallSym { .. })));
         // write → cap.call 0 1, exit → cap.call 1 0.
         let caps: Vec<_> = insts
             .iter()
@@ -3414,7 +3441,8 @@ mod import_inline_tests {
     use svm_ir::Inst;
 
     // Name-inline `call.import "name" (sig) v<h> (args)` needs no `import` declaration: the
-    // parser interns the name. Two sites with the same name+sig share one import index.
+    // parser interns the name and yields the link-form `CallSym` (v8). Two sites with the same
+    // name+sig share one import index.
     #[test]
     fn name_inline_interns_imports() {
         let src = "\
@@ -3438,12 +3466,12 @@ block0(v0: i32):
             .insts
             .iter()
             .filter_map(|i| match i {
-                Inst::CallImport { import, .. } => Some(*import),
+                Inst::CallSym { import, .. } => Some(*import),
                 _ => None,
             })
             .collect();
         assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
-        // Canonical print → re-parse is identity (printer emits the indexed form + decls).
+        // Canonical print → re-parse is identity (printer emits `call.sym` + decls).
         assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
     }
 

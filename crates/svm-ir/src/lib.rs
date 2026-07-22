@@ -1754,15 +1754,28 @@ pub enum Inst {
     /// the slot's bind-time remap; `args` are the op arguments; `sig` is a self-describing
     /// copy of the op's signature (mirroring `cap.call`/`call_indirect`, so result counting
     /// needs no module context — the verifier checks it equals the type-section resolution).
-    /// `handle` is dummy in manifest (static) modules — backends ignore it — but **live in
-    /// link-form modules**: the §7 loader ABI ([`resolve_imports_with`]) reads it as the cap
-    /// symbol's handle and as the `Slot` patch target, so its retirement is deferred until
-    /// that ABI migrates to manifest/attach (recorded in IMPORTS.md §3.5). It deliberately
-    /// carries **no** `type_id`: bound at instantiation through the domain's import-binding
-    /// table ([`CAP_IMPORT_TYPE_ID`]) — the module bytes are never rewritten.
+    /// It deliberately carries **no** `type_id` and **no** handle operand (retired at v8):
+    /// bound at instantiation through the domain's import-binding table
+    /// ([`CAP_IMPORT_TYPE_ID`]) — the module bytes are never rewritten. Link-form symbolic
+    /// calls are a different instruction ([`Inst::CallSym`]).
     CallImport {
         import: u32,
         op: u32,
+        sig: FuncType,
+        args: Vec<ValIdx>,
+    },
+    /// §7/§22 **link-form symbolic call** — the loader ABI's placeholder, never executable.
+    /// `import` names an entry of the unit's import section (its symbol list);
+    /// [`resolve_imports_with`] rewrites every `CallSym` 1:1 by what the name resolves to —
+    /// [`Resolved::Func`] → a direct [`Inst::Call`] (`handle` unused), [`Resolved::Slot`] →
+    /// [`Inst::CallIndirect`] (the `ConstI32` defining `handle` is patched to the table slot
+    /// and `handle` becomes the index), [`Resolved::Cap`] → [`Inst::CapCall`] (`handle` is the
+    /// live runtime handle value — link-form cap calls are per-call-site-handle *dynamic*
+    /// dispatch; a manifest slot could never carry them). A `CallSym` that survives to
+    /// verification is an unresolved symbol and is rejected unconditionally — resolve is
+    /// source-to-source *before* `verify_module`, so a mis-link fails closed.
+    CallSym {
+        import: u32,
         sig: FuncType,
         handle: ValIdx,
         args: Vec<ValIdx>,
@@ -2436,6 +2449,7 @@ impl Inst {
             | Inst::CallIndirect { .. }
             | Inst::CallImport { .. }
             | Inst::CallImportDyn { .. }
+            | Inst::CallSym { .. }
             | Inst::CapCall { .. } => fx(true, true, true, true),
             // `export.handle` mints/aliases host capability state (a grant into the own table).
             Inst::ExportHandle { .. } => fx(false, false, false, true),
@@ -2508,6 +2522,7 @@ impl Inst {
             Inst::CapCall { sig, .. } => sig.results.len(),
             Inst::CallImport { sig, .. } => sig.results.len(),
             Inst::CallImportDyn { sig, .. } => sig.results.len(),
+            Inst::CallSym { sig, .. } => sig.results.len(),
             _ => 1,
         }
     }
@@ -2915,14 +2930,12 @@ impl Module {
     /// mechanical migration path from the v6 inline-signature shape.
     pub fn add_func_import(
         &mut self,
-        ns: impl Into<String>,
         name: impl Into<String>,
         sig: FuncType,
         mode: ImportMode,
     ) -> u32 {
         let t = self.intern_func_type(sig);
         self.imports.push(Import {
-            ns: ns.into(),
             name: name.into(),
             shape: ImportShape::Func(t),
             mode,
@@ -3129,20 +3142,19 @@ pub struct SsaLoc {
     pub value: u32,
 }
 
-/// A named capability import (§7, reshaped by IMPORTS.md §3.5 / wire v7). The name is
-/// **two-level** — `ns` names the provider binding point, `name` the op (flat) or bundle
-/// (grouped); resolver vocabulary, never identity (`ns` may be empty). The signature lives in
-/// the module's type section: [`ImportShape::Func`] is a flat one-op import referencing a
-/// [`TypeEntry::Func`]; [`ImportShape::Interface`] is a **grouped** import — one slot binding a
-/// whole interface, referencing a [`TypeEntry::Interface`] that states the *requirement set*
-/// the binding must cover (coverage binding: name-keyed, signature-equal, extra provider ops
-/// ignored). Declared in [`Module::imports`] and referenced by index from
-/// [`Inst::CallImport`]. Listing a module's imports is the up-front, fail-closed
+/// A named capability import (§7, reshaped by IMPORTS.md §3.5; single-string names at v8).
+/// The `name` is **one string the core only compares for equality** — namespacing is a dotted
+/// convention inside it (`posix.fs`, `app.log`; `svm.` reserved for platform interfaces), and
+/// prefix-based policy is wirer code, never a core concept. Resolver vocabulary, never
+/// identity. The signature lives in the module's type section: [`ImportShape::Func`] is a flat
+/// one-op import referencing a [`TypeEntry::Func`]; [`ImportShape::Interface`] is a **grouped**
+/// import — one slot binding a whole interface, referencing a [`TypeEntry::Interface`] that
+/// states the *requirement set* the binding must cover (coverage binding: name-keyed,
+/// signature-equal, extra provider ops ignored). Declared in [`Module::imports`] and referenced
+/// by index from [`Inst::CallImport`]. Listing a module's imports is the up-front, fail-closed
 /// "what capabilities does this need?" check (a missing binding never silently no-ops).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Import {
-    /// Namespace level of the two-level name (`("env", "fs")`); empty = unnamespaced.
-    pub ns: String,
     pub name: String,
     /// What this import requires, as a type-section reference.
     pub shape: ImportShape,
@@ -3287,15 +3299,17 @@ pub enum ImportError {
     SlotHandleNotConst,
 }
 
-/// The **link-time** §7 import-lowering pass (IMPORTS.md §2.5: this survives in the linker only —
-/// [`link`], `compile_linked` — which legitimately produces new module bytes; instantiation never
-/// rewrites). A name may bind to a host capability ([`Resolved::Cap`] → `cap.call` on the import's
-/// handle operand), another function in the linked module ([`Resolved::Func`] → a direct `call`),
-/// or a `call_indirect` table slot ([`Resolved::Slot`]). `Func` is the compile-time (static)
-/// linking step the in-window loader builds on. Each `CallImport` rewrites **1:1** (no value
-/// renumbering) — a `Func` binding drops the unused handle operand. Fails closed on an unresolved
-/// name, so a missing symbol surfaces at link, never as a silent miscompile. The result is
-/// import-free (verifier/both backends accept it; the linked module is re-verified).
+/// The **link-time** §7 symbol-resolution pass (IMPORTS.md §2.5: this survives in the linker
+/// only — [`link`], `compile_linked` — which legitimately produces new module bytes;
+/// instantiation never rewrites). A name may bind to a host capability ([`Resolved::Cap`] →
+/// `cap.call` on the placeholder's handle operand — per-call-site-handle *dynamic* dispatch),
+/// another function in the linked module ([`Resolved::Func`] → a direct `call`), or a
+/// `call_indirect` table slot ([`Resolved::Slot`]). `Func` is the compile-time (static)
+/// linking step the in-window loader builds on. Each [`Inst::CallSym`] rewrites **1:1** (no
+/// value renumbering) — a `Func` binding drops the unused handle operand. Fails closed on an
+/// unresolved name, so a missing symbol surfaces at link, never as a silent miscompile. The
+/// result is symbol-free (verifier/both backends accept it; the linked module is re-verified —
+/// and a surviving `CallSym` is itself a verify error, so nothing unresolved slips through).
 pub fn resolve_imports_with(
     module: &Module,
     mut resolve: impl FnMut(&str) -> Option<Resolved>,
@@ -3313,7 +3327,7 @@ pub fn resolve_imports_with(
         for b in &mut f.blocks {
             // Map each value index to its defining instruction (block params → `None`) — a `Slot`
             // import patches the `ConstI32` that defines its handle operand, so we may need to reach
-            // a *different* instruction than the `CallImport` we're rewriting.
+            // a *different* instruction than the `CallSym` we're rewriting.
             let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
             for (p, inst) in b.insts.iter().enumerate() {
                 for _ in 0..inst.result_count(&fn_results) {
@@ -3322,7 +3336,7 @@ pub fn resolve_imports_with(
             }
             for i in 0..b.insts.len() {
                 let (import, handle) = match &b.insts[i] {
-                    Inst::CallImport { import, handle, .. } => (*import, *handle),
+                    Inst::CallSym { import, handle, .. } => (*import, *handle),
                     _ => continue,
                 };
                 let bind = *bound
@@ -3330,7 +3344,7 @@ pub fn resolve_imports_with(
                     .ok_or(ImportError::BadImportIndex(import))?;
                 // Pull the call's pieces out of the placeholder so we can rebuild it.
                 let (sig, args) = match &mut b.insts[i] {
-                    Inst::CallImport { sig, args, .. } => {
+                    Inst::CallSym { sig, args, .. } => {
                         (core::mem::take(sig), core::mem::take(args))
                     }
                     _ => unreachable!(),
@@ -3686,7 +3700,7 @@ pub struct Data {
 mod import_tests {
     use super::*;
 
-    // Build a one-function module whose body issues two CallImports ("write", "exit").
+    // Build a one-function module whose body issues two link-form CallSyms ("write", "exit").
     fn module_with_imports() -> Module {
         let sig_write = FuncType {
             params: vec![ValType::I64, ValType::I64],
@@ -3701,19 +3715,17 @@ mod import_tests {
             insts: vec![
                 Inst::ConstI64(0), // v1 = buf
                 Inst::ConstI64(3), // v2 = len
-                Inst::CallImport {
+                Inst::CallSym {
                     // v3 = write(handle=v0, v1, v2)
                     import: 0,
-                    op: 0,
                     sig: sig_write.clone(),
                     handle: 0,
                     args: vec![1, 2],
                 },
                 Inst::ConstI32(0), // v4 = exit code
-                Inst::CallImport {
+                Inst::CallSym {
                     // exit(handle=v0, v4)
                     import: 1,
-                    op: 0,
                     sig: sig_exit.clone(),
                     handle: 0,
                     args: vec![4],
@@ -3735,8 +3747,8 @@ mod import_tests {
             impl_exports: vec![],
             debug_info: None,
         };
-        m.add_func_import("", "write", sig_write, ImportMode::Required);
-        m.add_func_import("", "exit", sig_exit, ImportMode::Required);
+        m.add_func_import("write", sig_write, ImportMode::Required);
+        m.add_func_import("exit", sig_exit, ImportMode::Required);
         m
     }
 
@@ -3750,16 +3762,16 @@ mod import_tests {
     }
 
     #[test]
-    fn resolves_callimports_to_capcalls() {
+    fn resolves_callsyms_to_capcalls() {
         let m = module_with_imports();
         let r = resolve_imports_with(&m, |n| policy(n).map(Resolved::Cap)).expect("resolve");
         // Import section is gone; the module is now backend-ready.
         assert!(r.imports.is_empty());
         let insts = &r.funcs[0].blocks[0].insts;
-        // No CallImport survives.
+        // No CallSym survives.
         assert!(
-            !insts.iter().any(|i| matches!(i, Inst::CallImport { .. })),
-            "all imports must be lowered"
+            !insts.iter().any(|i| matches!(i, Inst::CallSym { .. })),
+            "all symbols must be lowered"
         );
         // "write" became cap.call 0 1 on handle v0 with args [1,2].
         match &insts[2] {

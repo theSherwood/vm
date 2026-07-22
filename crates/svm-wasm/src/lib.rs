@@ -318,7 +318,6 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                             manifest_types.len() - 1
                         }) as u32;
                     manifest.push(svm_ir::Import {
-                        ns: String::new(),
                         name,
                         shape: svm_ir::ImportShape::Func(t),
                         mode: svm_ir::ImportMode::Required,
@@ -2178,14 +2177,10 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         }
         args.reverse(); // stack top is the last argument
         let results = sig.results.clone();
-        // The handle operand is vestigial in static mode (the slot is the dispatch; retired at the
-        // next format bump) — emit a dummy.
-        let handle = lo.emit(Inst::ConstI32(0));
         let inst = Inst::CallImport {
             import: slot,
             op: 0,
             sig,
-            handle,
             args,
         };
         let res = lo.emit_call(inst, results.len());
