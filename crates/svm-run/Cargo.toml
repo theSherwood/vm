@@ -25,6 +25,7 @@ svm-text.workspace = true
 svm-encode.workspace = true
 svm-verify.workspace = true
 svm-interp.workspace = true
+svm-exec.workspace = true
 svm-fs.workspace = true
 svm-jit.workspace = true
 # The partial-evaluation on-ramp (§20c): the `--specialize` path turns an interpreter + a fixed

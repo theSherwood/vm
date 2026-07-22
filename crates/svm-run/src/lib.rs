@@ -30,6 +30,7 @@ pub use svm_interp::{Quota, Value};
 // Re-export the mem-hook instrumentation stats so [`Instance::mem_hook_stats`] consumers need not
 // also depend on `svm-opt`.
 pub use svm_opt::instrument::MemHookStats;
+pub mod exec;
 pub mod fs;
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 pub use svm_peval::{SpecArg, SpecConfig};

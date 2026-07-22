@@ -14,8 +14,8 @@ interposition-invisibility property the import model already guarantees:
 
 | backend | what a spawn is | status |
 |---|---|---|
-| `host_exec(allowlist)` | a real host OS process, attenuated by an explicit program allowlist (the capability *is* the list, as `host_fs`'s *is* the root) | build now |
-| `scripted_exec(table)` | no process at all: a `(argv-prefix → {stdout, stderr, exit})` table — the `mem_fs` analog; what differential tests and wasm/browser embedders grant | build now |
+| `host_exec(allowlist)` | a real host OS process, attenuated by an explicit program allowlist (the capability *is* the list, as `host_fs`'s *is* the root) | **BUILT 2026-07-22** (`svm-run/src/exec.rs`) |
+| `scripted_exec(table)` | no process at all: a `(argv-prefix → {stdout, stderr, exit})` table — the `mem_fs` analog; what differential tests and wasm/browser embedders grant | **BUILT 2026-07-22** (wasm-safe `svm-exec` crate) |
 | `domain_exec` | a **child svm domain** (host-served: the embedder implements the same ops over the Instantiator machinery it already has) | next |
 | guest-served | a parent domain serves its child's `"exec"` with **its own code** — the none-the-wiser nested shell | §3.6 `Endpoint` (its first consumer) |
 
@@ -111,3 +111,19 @@ cdylib can grant it; the real `host_exec` backend and the `HostCap`
 constructors live in `svm-run` (`exec.rs`, mirroring `fs.rs`).
 `domain_exec` lands beside them when built; the guest-served backend is
 §3.6/Endpoint work and is recorded there.
+
+**As built (2026-07-22).** `svm-exec` holds the protocol (op codes, errno,
+NUL-argv parsing) plus the shared `JobTable` — every backend routes its
+non-`run` ops through the one table, so read/status/close semantics are
+backend-identical by construction — and `scripted_exec_handler` (longest
+argv-prefix wins; a miss is `-EPERM`, the *same* refusal an allowlist miss
+produces, so the failure mode doesn't reveal the backend either).
+`svm-run/src/exec.rs` adds `host_exec(allowlist)` (blocking one-shot spawn,
+stdin fed then closed, both streams captured, POSIX-shell status collapse)
+and the `HostCap` constructors, re-exporting `svm-exec` as one surface.
+Acceptance pinned by `crates/svm-run/tests/exec_cap.rs`: `echo hi` →
+`hi\n` + exit 0, byte-identical host vs scripted, on all three backends;
+un-granted resolve negative with the fallback running; allowlist miss
+probeable, never a trap (the host test is unix-only — Windows has no
+`echo` executable; the protocol is covered everywhere by the scripted
+differential).

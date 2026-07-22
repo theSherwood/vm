@@ -11,6 +11,7 @@ members = [
     "crates/svm-opt",
     "crates/svm-peval",
     "crates/svm-interp",
+    "crates/svm-exec",
     "crates/svm-fs",
     "crates/svm-dap",
     "crates/svm-snapshot",
@@ -52,6 +53,7 @@ svm-verify = { path = "crates/svm-verify" }
 svm-opt = { path = "crates/svm-opt", default-features = false }
 svm-peval = { path = "crates/svm-peval" }
 svm-interp = { path = "crates/svm-interp" }
+svm-exec = { path = "crates/svm-exec" }
 svm-fs = { path = "crates/svm-fs" }
 svm-snapshot = { path = "crates/svm-snapshot" }
 svm-fiber = { path = "crates/svm-fiber" }
