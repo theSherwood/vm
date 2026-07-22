@@ -7,7 +7,7 @@
 //! (`-EINVAL`) without touching a byte the holder doesn't own — confinement of the authority, not
 //! just of the access.
 
-use svm_interp::{iface, run_capture_reserved_with_host, Host, Value};
+use svm_interp::{cap_id, run_capture_reserved_with_host, Host, Value};
 use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -155,7 +155,7 @@ fn sub_rejects_ranges_outside_the_holder() {
 
     // A helper to call `sub(off, size_log2)` on `handle` and get the raw result.
     let sub = |h: &mut Host, handle: i32, off: i64, size_log2: i64| -> i64 {
-        h.cap_dispatch_slots(iface::ADDRESS_SPACE, 4, handle, &[off, size_log2], None)
+        h.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 4, handle, &[off, size_log2], None)
             .expect("dispatch")[0]
     };
 

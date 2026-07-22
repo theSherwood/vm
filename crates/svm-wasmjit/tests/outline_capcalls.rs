@@ -16,7 +16,7 @@ use svm_interp::{bytecode, Host, Value};
 use svm_wasmjit::{compile_module_reactor, outline_cap_calls};
 
 // The entry (`f0`) is otherwise-emittable integer compute, but makes one inline `cap.call` to a
-// host-fn capability (`iface::HOST_FN` = type_id 13, op 0) whose handle arrives as the arg: it computes
+// host-fn capability (`cap_id::HOST_FN` = type_id 13, op 0) whose handle arrives as the arg: it computes
 // `host_fn(10, 20) + 5`. The host-fn adds its two args, so the result is `10 + 20 + 5 = 35`.
 const SRC: &str = r#"
 memory 16

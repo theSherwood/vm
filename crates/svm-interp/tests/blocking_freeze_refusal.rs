@@ -12,7 +12,7 @@
 //! controller against a real OS thread.
 
 use std::time::Duration;
-use svm_interp::{iface, GuestMem, Host, Trap, STATE_NORMAL, STATE_OFF, STATE_UNWINDING};
+use svm_interp::{cap_id, GuestMem, Host, Trap, STATE_NORMAL, STATE_OFF, STATE_UNWINDING};
 
 /// A trivial flat window: the gate only reads the 4-byte freeze word at `STATE_OFF`, and a `Blocking`
 /// op is window-independent, so a `Vec` backing is all the dispatch needs.
@@ -46,7 +46,7 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
 
     // Freeze landed (UNWINDING): entering a new blocking offload would stall the STW, so refuse.
     set_state(&mut mem, STATE_UNWINDING);
-    let refused = host.cap_dispatch_slots(iface::BLOCKING, 0, h, &[7], Some(&mut mem));
+    let refused = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
     assert!(
         matches!(refused, Err(Trap::ThreadFault)),
         "freeze landed → blocking call must fail closed, got {refused:?}",
@@ -54,7 +54,7 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
 
     // No freeze (NORMAL): the same call runs and returns its one deterministic result.
     set_state(&mut mem, STATE_NORMAL);
-    let ran = host.cap_dispatch_slots(iface::BLOCKING, 0, h, &[7], Some(&mut mem));
+    let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
     assert!(
         matches!(&ran, Ok(v) if v.len() == 1),
         "no freeze → blocking call must run, got {ran:?}",
@@ -64,7 +64,8 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
 /// Lay a single 64-byte `Blocking.work` SQE at window offset `at`, matching the `io_ring.submit`
 /// layout: `u32 type_id | u32 op | i32 handle | u32 n_args | i64 args[4] | i64 user_data | i64 pad`.
 fn write_blocking_sqe(mem: &mut VecMem, at: u64, blocking_handle: i32, arg: i64) {
-    mem.write_bytes(at, &iface::BLOCKING.to_le_bytes()).unwrap(); // type_id = Blocking
+    mem.write_bytes(at, &cap_id::BLOCKING.to_le_bytes())
+        .unwrap(); // type_id = Blocking
     mem.write_bytes(at + 4, &0u32.to_le_bytes()).unwrap(); // op 0 = work
     mem.write_bytes(at + 8, &blocking_handle.to_le_bytes())
         .unwrap();
@@ -90,7 +91,7 @@ fn io_ring_blocking_offload_fails_closed_once_a_freeze_has_landed() {
     let submit = [sq as i64, 1, cq as i64];
 
     set_state(&mut mem, STATE_UNWINDING);
-    let refused = host.cap_dispatch_slots(iface::IO_RING, 0, rh, &submit, Some(&mut mem));
+    let refused = host.cap_dispatch_slots(cap_id::IO_RING, 0, rh, &submit, Some(&mut mem));
     assert!(
         matches!(refused, Err(Trap::ThreadFault)),
         "freeze landed → blocking offload batch must fail closed, got {refused:?}",
@@ -104,7 +105,7 @@ fn io_ring_blocking_offload_fails_closed_once_a_freeze_has_landed() {
     );
 
     set_state(&mut mem, STATE_NORMAL);
-    let ran = host.cap_dispatch_slots(iface::IO_RING, 0, rh, &submit, Some(&mut mem));
+    let ran = host.cap_dispatch_slots(cap_id::IO_RING, 0, rh, &submit, Some(&mut mem));
     assert!(
         matches!(&ran, Ok(v) if v.len() == 1 && v[0] == 1),
         "no freeze → submit offloads the one SQE, got {ran:?}",
@@ -120,7 +121,7 @@ fn blocking_call_runs_when_not_durable_even_if_offset_zero_looks_like_unwinding(
     let mut mem = VecMem(vec![0u8; 4096]);
     set_state(&mut mem, STATE_UNWINDING); // a coincidental guest byte pattern, not a freeze word
 
-    let ran = host.cap_dispatch_slots(iface::BLOCKING, 0, h, &[7], Some(&mut mem));
+    let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
     assert!(
         matches!(&ran, Ok(v) if v.len() == 1),
         "non-durable: offset-0 byte is guest data, the blocking call must run, got {ran:?}",

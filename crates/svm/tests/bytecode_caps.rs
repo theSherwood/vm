@@ -3,7 +3,7 @@
 //! seam rewrite — this authors capability-using modules by hand and asserts the bytecode engine
 //! (with a live powerbox) agrees bit-for-bit with the reference tree-walker `run_with_host`.
 //!
-//! It uses a **deterministic** host function (`iface::HOST_FN` = 13) so results are reproducible:
+//! It uses a **deterministic** host function (`cap_id::HOST_FN` = 13) so results are reproducible:
 //! `f(op, args) = op*100 + sum(args)`. Each engine gets its own freshly-granted host with the same
 //! closure, so the granted handle index matches.
 //!

@@ -12,7 +12,7 @@
 //! across a restore ⇒ every guest-held handle stays valid. (The full freeze→serialize→
 //! restore→thaw run lands with the snapshot-codec slice that wires this to the window image.)
 
-use svm_interp::{iface, DurableBinding, DurableHandle, Host, NonDurableKind, StreamRole, Trap};
+use svm_interp::{cap_id, DurableBinding, DurableHandle, Host, NonDurableKind, StreamRole, Trap};
 
 /// Grant a spread of durable bindings, capture, restore into a fresh table, and confirm the
 /// captured set is byte-for-byte identical — slot, generation, type_id, and binding all pinned.
@@ -148,7 +148,7 @@ fn drain_non_durable_kills_stale_handle_values() {
     assert_eq!(drained.len(), 1, "only the io_ring drained");
 
     // The drained handle now faults at the use site (freed slot ⇒ resolve fails before the op runs).
-    let r = a.cap_dispatch_slots(iface::IO_RING, 0, ring, &[], None);
+    let r = a.cap_dispatch_slots(cap_id::IO_RING, 0, ring, &[], None);
     assert!(
         matches!(r, Err(Trap::CapFault)),
         "a drained handle is a dead generation, got {r:?}"

@@ -42,7 +42,7 @@ fn parse_module(ir: &str) -> Result<svm_ir::Module, svm_text::ParseError> {
 /// handle by interface — the same mapping `svm_run::Instance::grant_caps` installs. A name outside
 /// the fixed policy leaves its slot unbound (fail-closed CapFault at dispatch).
 fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
-    use svm_interp::iface;
+    use svm_interp::cap_id;
     if m.imports.is_empty() {
         return;
     }
@@ -58,14 +58,14 @@ fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
                 return svm_interp::BoundImport::rebindable(0, 0, None);
             };
             let handle = match (cap.type_id, cap.op) {
-                (iface::STREAM, 1) => hv(0),
-                (iface::STREAM, _) => hv(1),
-                (iface::EXIT, _) => hv(2),
-                (iface::MEMORY, _) => hv(3),
-                (iface::ADDRESS_SPACE, _) => hv(4),
-                (iface::IO_RING, _) => hv(5),
-                (iface::BLOCKING, _) => hv(6),
-                (iface::JIT, _) => hv(7),
+                (cap_id::STREAM, 1) => hv(0),
+                (cap_id::STREAM, _) => hv(1),
+                (cap_id::EXIT, _) => hv(2),
+                (cap_id::MEMORY, _) => hv(3),
+                (cap_id::ADDRESS_SPACE, _) => hv(4),
+                (cap_id::IO_RING, _) => hv(5),
+                (cap_id::BLOCKING, _) => hv(6),
+                (cap_id::JIT, _) => hv(7),
                 _ => return svm_interp::BoundImport::rebindable(0, 0, None),
             };
             svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
@@ -2592,7 +2592,7 @@ fn reflection_enumerates_granted_capabilities() {
           for (int i = 0; i < n; i++) {
             int t;
             __vm_cap_at(i, &t);
-            if (t == 1) exits++;   /* iface::EXIT == 1 */
+            if (t == 1) exits++;   /* cap_id::EXIT == 1 */
           }
           return n * 100 + exits;  /* 8 capabilities, exactly one Exit -> 801 */
         }

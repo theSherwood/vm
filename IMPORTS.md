@@ -690,8 +690,8 @@ func 0 () -> (i64) {
   references, stable diffs, precise errors). Exactly two kind keywords,
   **`func`** and **`interface`**, used identically in `type`, `import`, and
   `export`; the spellings `iface` and `impl` are retired (Rust follows:
-  `ImplExport.iface` → `interface`; the `iface::` constants module renames in
-  a follow-up).
+  `ImplExport.iface` → `interface`; the `iface::` constants module is now
+  `cap_id`).
 - **One grouping construct:** `{ }` — function bodies, blocks, interface
   declarations, offer maps; indentation is never significant. One map syntax,
   `{ name: idx, … }` (in `type … interface` the values are type indices; in
@@ -771,13 +771,18 @@ index) and freezes it; call sites use the consumer's own numbering.
   rebindable slot — the coverage walk happens once, there — then use static
   calls. `cap.call` stays as the escape hatch for undeclared grants and the
   reserved self namespace.
-- **Intern pre-seeding.** Built-in interfaces publish canonical shapes,
-  pre-seeded into the per-host intern, so a structurally equal guest
+- **Intern pre-seeding.** *(Built 2026-07-22.)* Built-in interfaces publish canonical
+  shapes, pre-seeded into the per-host intern, so a structurally equal guest
   declaration interns *to the built-in id* (D59 extended across the
-  host-native/guest-impl divide). `HOST_FN` is the deliberate exception — its
-  semantics are per-registration embedder code with no canonical shape; it
-  binds by name through the registry, the (trusted) embedder asserting the
-  shape it implements.
+  host-native/guest-impl divide). Only **specific** shapes are seeded: a genuine
+  interface identity like `Stream`'s read/write/close triple, *not* a generic
+  single-op shape (`Clock`'s `(i64) -> (i64)`) an unrelated offer could share.
+  Handle-typed built-ins (unsettled `cap`-vs-`i32` op-signature convention) and
+  `HOST_FN` are the deliberate exceptions — `HOST_FN`'s semantics are per-registration
+  embedder code with no canonical shape; it binds by name through the registry, the
+  (trusted) embedder asserting the shape it implements. Interning to a built-in id
+  confers no authority: a call still needs a real granted handle of the matching
+  binding.
 - **Reflection gains two authority-neutral ops:** `cap.self.type_id k` —
   intern *this module's* `types[k]`, return the runtime id (exact-shape
   discovery: iterate `cap.self.get`, compare ids) — and `cap.self.covers
@@ -1106,10 +1111,31 @@ with its reason recorded:
   binds a four-op provider), extras ignored — validated fail-closed at instantiation and
   dispatched through the frozen op remap (`call.import slot.op` → native op) on all three
   backends. The host-side mirror of a guest offer: `impl_service` wires a guest module as
-  the provider, `iface` wires a host-native handle. **Intern pre-seeding** of built-in
-  shapes stays deferred: nothing yet declares a guest interface *meaning* to match a
-  built-in id, so seeding canonical built-in shapes now would be speculative (prime
-  directive) — it lands with its first consumer.
+  the provider, `iface` wires a host-native handle.
+- **[BUILT 2026-07-22] Intern pre-seeding of built-in interface shapes.** Built-in
+  interfaces publish a canonical op-signature shape (`svm_interp::builtin_iface_shape`),
+  pre-seeded into the per-host intern (`preseeded_iface_shapes`): a guest interface
+  declaration structurally equal to a pre-seeded shape now interns to the **built-in id**
+  rather than a fresh guest id — D59 extended across the host-native/guest-impl divide, so
+  an import slot requiring that shape accepts a real host handle or a guest impl of it
+  interchangeably (the virtualized-interface unlock). It confers **no authority**: only a
+  real granted handle of the matching binding can be called, generation-checked at the use
+  site — pre-seeding only lets a structurally-equal declaration name the same *type*.
+  `IfaceShape::builtin(id)` lets an embedder offer a host handle as a whole interface
+  without re-declaring its shape (the second consumer). **Scope is deliberately narrow:**
+  only *specific* shapes are seeded. `Stream`'s read/write/close triple is a genuine
+  interface identity and is seeded; a generic single-op shape like `Clock`'s `(i64) ->
+  (i64)` is **not** — an unrelated guest offer could share it, so canonicalizing it would
+  over-claim (and `(i64) -> (i64)` is exactly what an ordinary offer uses). Handle-typed
+  built-ins (whose ops pass/return capabilities, where the `cap`-vs-`i32` signature
+  convention for built-ins is unsettled) and `HOST_FN` (per-registration semantics, no
+  canonical shape) are the deliberate exceptions; each additional built-in shape lands when
+  its signature convention is pinned and a consumer needs it.
+- **[BUILT 2026-07-22] The `svm_interp::iface` constants module is now `cap_id`.** The
+  built-in interface type-id constants (`cap_id::STREAM` … `cap_id::BUDGET`,
+  `cap_id::GUEST_IMPL_BASE`) read as capability type identifiers at their use sites
+  (`type_id == cap_id::STREAM`); the `iface` name is retained only for the `HostCap.iface`
+  field and `HostCap::iface`/`IfaceShape` grouped-provider surface.
 - **[BUILT 2026-07-22] Legacy text retirement — the dual grammars are gone.** The
   parser now rejects the pre-§3.5 spellings: `blockN(…):` indentation labels (braced
   `block N (…) { … }` only, numeric branch targets), unindexed `export "name" N` and

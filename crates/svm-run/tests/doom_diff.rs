@@ -11,7 +11,7 @@
 //! via `DOOM_SVMB` / `DOOM_WAD` / `DOOM_NATIVE_FRAMES`; the defaults match the demo scripts' cache.
 //! Run:  `cargo test -p svm-run --test doom_diff -- --ignored --nocapture`
 
-use svm_interp::{bytecode, iface, Host, StreamRole};
+use svm_interp::{bytecode, cap_id, Host, StreamRole};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -21,13 +21,13 @@ fn env_or(key: &str, default: &str) -> String {
 /// `(type_id, op)` each manifest slot binds to at instantiation.
 fn onramp_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     let (type_id, op) = match name {
-        "write" => (iface::STREAM, 1),
-        "read" => (iface::STREAM, 0),
-        "exit" => (iface::EXIT, 0),
-        "vm_map" => (iface::MEMORY, 0),
-        "vm_unmap" => (iface::MEMORY, 1),
-        "vm_protect" => (iface::MEMORY, 2),
-        "vm_page_size" => (iface::MEMORY, 3),
+        "write" => (cap_id::STREAM, 1),
+        "read" => (cap_id::STREAM, 0),
+        "exit" => (cap_id::EXIT, 0),
+        "vm_map" => (cap_id::MEMORY, 0),
+        "vm_unmap" => (cap_id::MEMORY, 1),
+        "vm_protect" => (cap_id::MEMORY, 2),
+        "vm_page_size" => (cap_id::MEMORY, 3),
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })
@@ -80,9 +80,9 @@ fn doom_frame_hashes_match_native() {
         .map(|im| match onramp_resolver(&im.name) {
             Some(cap) => {
                 let handle = match (cap.type_id, cap.op) {
-                    (iface::STREAM, 1) => stdout,
-                    (iface::STREAM, _) => stdin,
-                    (iface::EXIT, _) => exit,
+                    (cap_id::STREAM, 1) => stdout,
+                    (cap_id::STREAM, _) => stdin,
+                    (cap_id::EXIT, _) => exit,
                     _ => memory,
                 };
                 svm_interp::BoundImport::required(cap.type_id, cap.op, handle)

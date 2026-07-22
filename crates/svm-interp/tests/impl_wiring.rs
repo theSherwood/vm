@@ -13,7 +13,7 @@
 //!   drained cleanly.
 
 use std::sync::Arc;
-use svm_interp::{iface, Host, NonDurableKind, Trap, Value};
+use svm_interp::{cap_id, Host, NonDurableKind, Trap, Value};
 use svm_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, LoadOp, Terminator, ValType};
 
 /// A one-block leaf `(params) -> (results)` whose body just returns its first param (or
@@ -88,7 +88,7 @@ fn intern_is_structural_and_allocates_from_the_base() {
     let c = vec![sig(vec![ValType::I32], vec![ValType::I64])];
     let ia = h.intern_interface(&a);
     assert!(
-        ia >= iface::GUEST_IMPL_BASE,
+        ia >= cap_id::GUEST_IMPL_BASE,
         "guest ids allocate above the built-ins"
     );
     assert_eq!(
@@ -106,6 +106,49 @@ fn intern_is_structural_and_allocates_from_the_base() {
 }
 
 #[test]
+fn a_stream_shaped_declaration_interns_to_the_builtin_id() {
+    // IMPORTS.md §3.5 intern pre-seeding: a guest interface declaration structurally equal to a
+    // pre-seeded built-in shape interns to the built-in's fixed id (D59 across the
+    // host-native/guest-impl divide), not a fresh guest id — so a slot requiring that shape
+    // accepts a real host handle or a guest impl of it interchangeably.
+    let mut h = Host::new();
+    let stream = vec![
+        sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // read
+        sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
+        sig(vec![], vec![]),                                       // close
+    ];
+    assert_eq!(
+        h.intern_interface(&stream),
+        cap_id::STREAM,
+        "the exact stream triple canonicalizes to the built-in Stream id"
+    );
+
+    // A subset (write/close only) is a *different* structural shape — not pre-seeded, so it gets a
+    // fresh guest id above the base. Pre-seeding claims the whole shape, never a prefix of it.
+    let subset = vec![
+        sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
+        sig(vec![], vec![]),                                       // close
+    ];
+    assert!(
+        h.intern_interface(&subset) >= cap_id::GUEST_IMPL_BASE,
+        "a non-matching shape stays in the guest id space"
+    );
+
+    // The built-in shape is discoverable for an embedder that offers a host handle as a whole
+    // interface (svm-run's IfaceShape::builtin), and its op order matches the handle's native ops.
+    let names: Vec<&str> = svm_interp::builtin_iface_shape(cap_id::STREAM)
+        .expect("Stream is pre-seeded")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(names, ["read", "write", "close"]);
+    assert!(
+        svm_interp::builtin_iface_shape(cap_id::HOST_FN).is_none(),
+        "HOST_FN is the deliberate non-pre-seeded exception (per-registration semantics)"
+    );
+}
+
+#[test]
 fn wire_impl_derives_sigs_and_mints_a_resolvable_handle() {
     let mut h = Host::new();
     let funcs = offer_funcs();
@@ -120,7 +163,7 @@ fn wire_impl_derives_sigs_and_mints_a_resolvable_handle() {
             sig(vec![ValType::I64], vec![ValType::I64]),
         ]
     );
-    assert!(entry.type_id >= iface::GUEST_IMPL_BASE);
+    assert!(entry.type_id >= cap_id::GUEST_IMPL_BASE);
 
     // Two offers with the same shape share a type_id (structural identity); a different
     // shape gets a fresh one.
@@ -547,7 +590,7 @@ fn a_cap_result_is_translated_back_to_the_caller() {
     );
     // The returned handle resolves as a Clock in the caller's table and is callable.
     assert_eq!(
-        h.cap_dispatch_slots(iface::CLOCK, 0, returned, &[], None),
+        h.cap_dispatch_slots(cap_id::CLOCK, 0, returned, &[], None),
         Ok(vec![0]),
         "the translated-back cap is a live Clock in the caller's own table"
     );

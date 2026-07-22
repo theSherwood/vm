@@ -287,3 +287,31 @@ fn a_grouped_host_interface_that_does_not_cover_fails_instantiation() {
         "the refusal names the coverage rule: {err}"
     );
 }
+
+#[test]
+fn a_grouped_host_interface_from_the_preseeded_builtin_shape_dispatches() {
+    // IMPORTS.md §3.5 intern pre-seeding: the host `Stream` shape is published, so the embedder
+    // offers a host-native stdout stream as a whole interface *without* re-declaring read/write/close
+    // by hand — `IfaceShape::builtin` sources the canonical shape. The consumer's `write` still
+    // routes through the remap to the stream's native op 1, identically on every backend.
+    let consumer = parse_module(GROUPED_CONSUMER).expect("consumer parses");
+    let shape = svm_run::IfaceShape::builtin(svm_interp::cap_id::STREAM)
+        .expect("Stream is a pre-seeded built-in");
+    let registry = Imports::new()
+        .provide(
+            "log",
+            HostCap::iface(&shape, |h, _| h.grant_stream(svm_interp::StreamRole::Out)),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: the canonical built-in shape covers the consumer and dispatched write"
+        );
+    }
+}

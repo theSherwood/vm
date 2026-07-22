@@ -6,7 +6,7 @@
 //! and drives it through the same static-mode `call.import` as any required import — on all
 //! three backends, with no module rewriting anywhere.
 
-use svm_interp::iface;
+use svm_interp::cap_id;
 use svm_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use svm_text::{parse_module, print_module};
 
@@ -58,7 +58,7 @@ export 0 func \"_start\" 0\n";
 
 fn registry() -> Imports {
     Imports::new()
-        .provide("out", HostCap::template(iface::STREAM, 1))
+        .provide("out", HostCap::template(cap_id::STREAM, 1))
         .provide("exit", HostCap::exit())
 }
 
@@ -214,8 +214,8 @@ block 0 () {\n\
     // Required import bound to a template-only cap.
     let m = parse_module(ATTACH_START).expect("parse");
     let bad = Imports::new()
-        .provide("out", HostCap::template(iface::STREAM, 1))
-        .provide("exit", HostCap::template(iface::EXIT, 0)); // required "exit" gets a template
+        .provide("out", HostCap::template(cap_id::STREAM, 1))
+        .provide("exit", HostCap::template(cap_id::EXIT, 0)); // required "exit" gets a template
     let Err(err) = instantiate_with_imports(m, bad) else {
         panic!("required-import-to-template must fail instantiation");
     };

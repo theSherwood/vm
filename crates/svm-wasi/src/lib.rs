@@ -4,7 +4,7 @@
 //! to *real WASI bytes*. svm-wasm transpiles a WASI module, declaring one manifest import
 //! `"wasi_snapshot_preview1.<name>"` per WASI function (IMPORTS.md phase 3 — call sites are
 //! `call.import <slot>`, the module is never rewritten); [`bind`] grants a single
-//! [`svm_interp::iface::HOST_FN`] capability and installs one [`BoundImport`] per manifest slot
+//! [`svm_interp::cap_id::HOST_FN`] capability and installs one [`BoundImport`] per manifest slot
 //! ([`resolve`] maps each name to its op), and [`handler`] implements the WASI ops over the guest
 //! window. The WASI *semantics* (the iovec ABI, errno values, the fd table) live **here** — outside
 //! both svm-wasm and the interp TCB — exactly the boundary DESIGN.md §7 draws: the binding mechanism
@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use svm_interp::{iface, BoundImport, GuestMem, Host, HostFn, Trap};
+use svm_interp::{cap_id, BoundImport, GuestMem, Host, HostFn, Trap};
 use svm_ir::ResolvedCap;
 
 /// Op numbers the [`handler`] dispatches on; [`resolve`] maps WASI names to these.
@@ -37,7 +37,7 @@ pub struct WasiOut {
 }
 
 /// The §7 import-name resolver for this WASI subset: maps the standard preview1 import names (as
-/// svm-wasm declares them, `"<module>.<name>"`) to the [`iface::HOST_FN`] capability + op. [`bind`]
+/// svm-wasm declares them, `"<module>.<name>"`) to the [`cap_id::HOST_FN`] capability + op. [`bind`]
 /// uses it to build the per-slot bindings; compose with your own policy for other imports. Unknown
 /// names return `None`, so binding fails closed.
 pub fn resolve(name: &str) -> Option<ResolvedCap> {
@@ -47,7 +47,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         _ => return None,
     };
     Some(ResolvedCap {
-        type_id: iface::HOST_FN,
+        type_id: cap_id::HOST_FN,
         op,
     })
 }

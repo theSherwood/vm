@@ -2954,12 +2954,12 @@ fn callee_name(c: &crate::ll::ast::Call) -> Option<String> {
 // vestigial dummy handle operand, and the slot binding is the dispatch. This keeps the translator
 // pure mechanism — it never interprets host semantics, just defers the bind (§2a).
 
-/// The `HostFn` interface id (`svm_interp::iface::HOST_FN`) — the **embedder-registered** capability
+/// The `HostFn` interface id (`svm_interp::cap_id::HOST_FN`) — the **embedder-registered** capability
 /// (§7 "host-defined capabilities"), reached from C via `__vm_host_call`. Pinned here numerically
 /// (svm-llvm produces `svm-ir` and does not depend on the interpreter crate); `svm-run`'s
 /// `host_fn_type_id_matches` test locks the two together.
 const HOST_FN_TYPE_ID: u32 = 13;
-/// The `SharedRegion` interface id (`svm_interp::iface::SHARED_REGION`) — the §13 window-aliasing
+/// The `SharedRegion` interface id (`svm_interp::cap_id::SHARED_REGION`) — the §13 window-aliasing
 /// capability, reached from C via `__vm_region_call` (the zero-copy file-mmap bridge, §4b). Pinned
 /// numerically like [`HOST_FN_TYPE_ID`]; `svm-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;

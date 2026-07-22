@@ -523,7 +523,7 @@ impl Nursery {
     }
 }
 
-/// The `Instantiator` interface id (§3e), kept in lockstep with `svm_interp::iface::INSTANTIATOR`.
+/// The `Instantiator` interface id (§3e), kept in lockstep with `svm_interp::cap_id::INSTANTIATOR`.
 /// (`svm-jit` does not depend on `svm-interp`; the host dispatch on the other side checks the same
 /// constant, and the cross-backend tests pin them equal.)
 #[inline]
@@ -1297,7 +1297,7 @@ fn epoch_fired(addr: usize) -> bool {
         && unsafe { (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed) != 0 }
 }
 
-/// The `Yielder` interface id (iface 7), in lockstep with `svm_interp::iface::YIELDER`.
+/// The `Yielder` interface id (iface 7), in lockstep with `svm_interp::cap_id::YIELDER`.
 #[inline]
 fn svm_ir_iface_yielder() -> u32 {
     7
