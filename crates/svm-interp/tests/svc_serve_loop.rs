@@ -126,4 +126,75 @@ fn an_arity_mismatched_dispatch_gets_a_probeable_errno_and_serving_continues() {
 #[test]
 fn the_svc_poll_op_number_is_pinned() {
     assert_eq!(CAP_SELF_SVC_POLL, 9);
+    assert_eq!(svm_interp::CAP_SELF_SVC_WAIT, 10);
+}
+
+/// §3.6 slice 3 — **caller-side parking, end to end**: a parent spawns a serving child
+/// (§14 same-module), mints a live-callee offer over the child's export
+/// (`Instantiator.child_offer`, op 14), and calls through it. The call enqueues on the
+/// child's queue and parks the parent; the child's `svc.wait` (op 10) wakes on the enqueue
+/// (or finds the work already queued — both orders are correct), serves `add(40, 2)` as a
+/// handler, and the reply wakes the parent with 42. The child returns its served count,
+/// which the parent reads back through `join` — proving the whole caller ↔ servicer
+/// round-trip parked and woke rather than deadlocked. The offer's structural type id is
+/// the first guest intern (`GUEST_IMPL_BASE` = 268435456), pinned by D59 determinism.
+const CALLER_PARKING: &str = r#"
+memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 2 }
+
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 0
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vk = i64.const 100
+  vm = i64.mul vj vk
+  vs = i64.add vm vr
+  return vs
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_caller_parks_on_a_live_child_and_wakes_with_the_reply() {
+    let m = Arc::new({
+        let m = svm_text::parse_module(CALLER_PARKING).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        m
+    });
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let h = host.grant_instantiator(0, 1u64 << 17);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(142)],
+        "join(served=1)*100 + add(40,2) — the parked caller woke with the handler's reply"
+    );
 }

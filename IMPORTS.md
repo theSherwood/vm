@@ -1391,10 +1391,32 @@ moved in and back), and a backend tier without the servicing arm answers
 a probeable `-EINVAL`. Pinned by `svc_serve_loop.rs` (one-world
 mutation + ordered serialization + completion cells, bounded/unservable
 refusals, arity-errno-and-continue, the pinned op number). **Deferred to
-the next slices:** `svc.wait`'s park-on-empty (its only real waker — a
-guest caller's enqueue — arrives with caller-side parking), handler
-fibers that may park (fiber admission), text sugar for `svc.*`, and the
-guest-caller enqueue path itself.
+the next slices:** handler fibers that may park (fiber admission), text
+sugar for `svc.*`, slot-parked (`call.import`) live calls + their
+rebind-triggered revocation, and bytecode/JIT parity.
+
+**[BUILT 2026-07-22] §3.6 slice 3 — caller-side parking.** The unified
+model's semantic heart, on the §14 nested-child topology (the one place
+two live domains + separate powerboxes + one shared scheduler already
+exist): a parent mints a **live-callee offer** over a running child's
+impl-export (`Instantiator.child_offer`, op 14 → `Binding::LiveImpl`,
+index-carried; the child inherits the parent's registered self module at
+spawn and its live powerbox Arc is retained parent-side), and a call
+through it **enqueues on the child's inbound queue and parks the calling
+fiber** (`Blocked::CapReply`, ticket-keyed) until the child's serve loop
+completes the dispatch — the reply riding the same `Pending::CapResult`
+vehicle as a revocation (it carries any i64). **`svc.wait` (op 10) is
+live**: an empty queue parks the serving fiber keyed by its domain
+identity (the powerbox Arc pointer), and a caller's enqueue wakes it —
+the frame is rewound so the wake re-executes the wait, which then finds
+the work. Both park races are closed under the scheduler lock (an early
+reply is taken from the completion cell instead of stranding the caller;
+an enqueue-during-park re-runs the server); a full callee queue is
+probeable `-EAGAIN` backpressure at the caller, never a trap; both new
+parks fail closed on the exhaustive explorer, and a `LiveImpl` is
+non-durable (a live run is not a snapshot artifact). Pinned by
+`svc_serve_loop.rs`: the full caller ↔ servicer round-trip — spawn,
+mint, call-and-park, `svc.wait`-serve, reply-wake, join.
 
 ---
 
