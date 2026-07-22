@@ -3,7 +3,7 @@
 //! The "host provides libc as a capability; the §7 named-import mechanism carries it" story — the
 //! same shape as [`svm-wasi`](../svm_wasi), generalized from a WASI subset to the POSIX/libc surface a
 //! fork-less shell (BusyBox `ash` → Bash) links against. [`resolve`] binds libc symbol names to a
-//! single [`svm_interp::iface::HOST_FN`] capability; [`handler`] implements the ops over the guest
+//! single [`svm_interp::cap_id::HOST_FN`] capability; [`handler`] implements the ops over the guest
 //! window. All libc *semantics* live **here** — outside the interp escape-TCB — reached only through a
 //! granted, masked, type-checked handle (DESIGN.md §7).
 //!
@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use svm_interp::{iface, GuestMem, Host, HostFn, Trap};
+use svm_interp::{cap_id, GuestMem, Host, HostFn, Trap};
 use svm_ir::ResolvedCap;
 
 /// Op numbers on the shared `HOST_FN` handle; [`resolve`] maps libc names to these.
@@ -285,7 +285,7 @@ impl Posix {
 }
 
 /// The §7 import-name policy for the POSIX subset: maps libc symbol names to the
-/// [`iface::HOST_FN`] capability + op — the name vocabulary [`bind`] installs as slot bindings.
+/// [`cap_id::HOST_FN`] capability + op — the name vocabulary [`bind`] installs as slot bindings.
 /// Unknown names return `None`, so binding fails closed. Both bare (`"write"`) and `"posix."`-
 /// prefixed names resolve, so it works whether the frontend emits raw libc symbols or namespaced ones.
 pub fn resolve(name: &str) -> Option<ResolvedCap> {
@@ -319,7 +319,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         _ => return None,
     };
     Some(ResolvedCap {
-        type_id: iface::HOST_FN,
+        type_id: cap_id::HOST_FN,
         op,
     })
 }

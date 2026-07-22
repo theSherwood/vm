@@ -1713,7 +1713,17 @@ impl Cx<'_> {
     /// An operand must be defined earlier in this block and have exactly `want`'s type.
     fn expect(&self, v: ValIdx, want: ValType) -> Result<(), VerifyError> {
         let found = self.type_of(v)?;
-        if found != want {
+        // `cap` is `i32`-width data in guest code (IMPORTS.md §3.5): the two are value-compatible
+        // everywhere operands flow — a `cap` is usable as a handle (`i32`), and an `i32` fills a
+        // `cap` slot. They stay *distinct* in signatures, so structural interface matching and the
+        // boundary `cap` translation both still key on the marker; those compare `FuncType`s
+        // directly, never through `expect`.
+        let ok = found == want
+            || matches!(
+                (found, want),
+                (ValType::I32 | ValType::Cap, ValType::I32 | ValType::Cap)
+            );
+        if !ok {
             return Err(VerifyError::TypeMismatch {
                 func: self.fi,
                 block: self.bi,

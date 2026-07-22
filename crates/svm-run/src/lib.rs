@@ -15,14 +15,14 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
-    iface, run_capture_reserved_with_host, run_with_host, run_with_host_fast, AsyncCounter,
+    cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, AsyncCounter,
     CapPageMap, GuestMem, Host, HostFn, RegionBacking, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use svm_interp::SharedBacking;
-use svm_ir::{FuncIdx, Module, Resolved, ValType};
+use svm_ir::{FuncIdx, FuncType, Module, Resolved, ValType};
 
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
@@ -246,7 +246,7 @@ pub unsafe extern "C" fn cap_thunk(
     // neither of which `svm-interp` can (or should) reach. The interpreter backend services the
     // same iface in its eval loop; both share the Host-side state and validator, so they stay in
     // differential lockstep.
-    if type_id == iface::JIT {
+    if type_id == cap_id::JIT {
         jit_native_op(
             host, op, handle, arg_slots, results, n_results, trap_out, gm, mem_base,
         );
@@ -315,7 +315,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         (type_id, op, handle)
     };
     // `Jit.invoke` (iface 11 op 1) re-enters guest code → never hold the lock across it.
-    if type_id == iface::JIT && op == 1 {
+    if type_id == cap_id::JIT && op == 1 {
         let arg_slots = if n_args == 0 {
             &[][..]
         } else {
@@ -1265,10 +1265,10 @@ pub unsafe extern "C" fn fast_cap_resolver(
     n_args: u32,
     n_res: u32,
 ) -> *const c_void {
-    use svm_interp::iface;
+    use svm_interp::cap_id;
     match (type_id, op, n_args, n_res) {
-        (iface::CLOCK, 0, 0, 1) => fast_clock_now as *const c_void,
-        (iface::BLOCKING, 0, 1, 1) => fast_blocking_work as *const c_void,
+        (cap_id::CLOCK, 0, 0, 1) => fast_clock_now as *const c_void,
+        (cap_id::BLOCKING, 0, 1, 1) => fast_blocking_work as *const c_void,
         _ => std::ptr::null(),
     }
 }
@@ -1300,7 +1300,7 @@ unsafe extern "C" fn fast_clock_now(
             0
         }
         // A W1 tape is active — take the full path so the input is recorded/replayed.
-        None => fast_dispatch(ctx, svm_interp::iface::CLOCK, 0, handle, &[], trap_out),
+        None => fast_dispatch(ctx, svm_interp::cap_id::CLOCK, 0, handle, &[], trap_out),
     }
 }
 
@@ -1316,7 +1316,14 @@ unsafe extern "C" fn fast_blocking_work(
     trap_out: *mut i64,
     a0: i64,
 ) -> i64 {
-    fast_dispatch(ctx, svm_interp::iface::BLOCKING, 0, handle, &[a0], trap_out)
+    fast_dispatch(
+        ctx,
+        svm_interp::cap_id::BLOCKING,
+        0,
+        handle,
+        &[a0],
+        trap_out,
+    )
 }
 
 /// Shared body for the fast-path fns: drive the **same** [`Host::cap_dispatch_slots`] the generic
@@ -2581,33 +2588,33 @@ pub fn is_named_powerbox_entry(module: &Module) -> bool {
 /// interface and differ only by which handle their slots bind (e.g. `write`/`read` are both
 /// `Stream`, bound to stdout vs stdin).
 pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
-    use svm_interp::iface;
+    use svm_interp::cap_id;
     let (type_id, op): (u32, u32) = match name {
         // Stream — the *handle* (stdout/stdin) selects the endpoint, not the name.
-        "write" => (iface::STREAM, 1),
-        "read" => (iface::STREAM, 0),
+        "write" => (cap_id::STREAM, 1),
+        "read" => (cap_id::STREAM, 0),
         // Exit (noreturn).
-        "exit" => (iface::EXIT, 0),
+        "exit" => (cap_id::EXIT, 0),
         // Memory management (§3e/§4).
-        "vm_map" => (iface::MEMORY, 0),
-        "vm_unmap" => (iface::MEMORY, 1),
-        "vm_protect" => (iface::MEMORY, 2),
-        "vm_page_size" => (iface::MEMORY, 3),
+        "vm_map" => (cap_id::MEMORY, 0),
+        "vm_unmap" => (cap_id::MEMORY, 1),
+        "vm_protect" => (cap_id::MEMORY, 2),
+        "vm_page_size" => (cap_id::MEMORY, 3),
         // AddressSpace / SharedRegion aliasing (§13/§14).
-        "vm_region_create" => (iface::ADDRESS_SPACE, 5),
-        "vm_region_map" => (iface::SHARED_REGION, 0),
-        "vm_region_unmap" => (iface::SHARED_REGION, 1),
-        "vm_region_page_size" => (iface::SHARED_REGION, 3),
+        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
+        "vm_region_map" => (cap_id::SHARED_REGION, 0),
+        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
+        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
         // IoRing submit/complete (§9/§12).
-        "vm_io_submit_async" => (iface::IO_RING, 1),
-        "vm_io_reap" => (iface::IO_RING, 2),
+        "vm_io_submit_async" => (cap_id::IO_RING, 1),
+        "vm_io_reap" => (cap_id::IO_RING, 2),
         // Guest-driven JIT (§22).
-        "vm_jit_compile" => (iface::JIT, 0),
-        "vm_jit_compile_linked" => (iface::JIT, 5),
-        "vm_jit_invoke2" => (iface::JIT, 1),
-        "vm_jit_release" => (iface::JIT, 2),
-        "vm_jit_install" => (iface::JIT, 3),
-        "vm_jit_uninstall" => (iface::JIT, 4),
+        "vm_jit_compile" => (cap_id::JIT, 0),
+        "vm_jit_compile_linked" => (cap_id::JIT, 5),
+        "vm_jit_invoke2" => (cap_id::JIT, 1),
+        "vm_jit_release" => (cap_id::JIT, 2),
+        "vm_jit_install" => (cap_id::JIT, 3),
+        "vm_jit_uninstall" => (cap_id::JIT, 4),
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })
@@ -3296,6 +3303,10 @@ fn run_interp(
 /// `HostCap` is cheap to clone and the differential wrapper can grant it on either backend's host.
 type GrantFn = Arc<dyn Fn(&mut Host, u64) -> i32 + Send + Sync>;
 
+/// One grouped host-cap slot's post-binding fixups (`grant_caps`): its import index, the frozen
+/// consumer→native op remap, and the requirement set (names + sigs) retained for `import.attach`.
+type GroupedSlot = (usize, Arc<[u32]>, Vec<String>, Vec<FuncType>);
+
 #[derive(Clone)]
 pub struct HostCap {
     type_id: u32,
@@ -3311,6 +3322,42 @@ pub struct HostCap {
     /// [`HostCap::impl_offer`]; signature-checked structurally, fail-closed, at
     /// [`instantiate_with_imports`].
     offer: Option<OfferBinding>,
+    /// §3.5 (IMPORTS.md): a **grouped host-native provider** — the slot binds a *whole
+    /// interface* served by one host handle, its ops in the handle's native op order. When set,
+    /// `grant` mints the handle and this shape (op names + signatures) is coverage-matched
+    /// against the consumer's grouped requirement at instantiation. Built by [`HostCap::iface`].
+    iface: Option<Arc<Vec<(String, svm_ir::FuncType)>>>,
+}
+
+/// A host-native interface's **canonical shape**: op names and signatures in the providing
+/// handle's native op order (position `i` is the handle's op `i`). What [`HostCap::iface`]
+/// coverage-matches a consumer's grouped requirement against — the (trusted) embedder asserting
+/// the interface a handle implements, mirroring the text `interface { name: sig, … }` form.
+#[derive(Clone, Default)]
+pub struct IfaceShape {
+    ops: Vec<(String, svm_ir::FuncType)>,
+}
+
+impl IfaceShape {
+    /// An empty shape; build it up with [`IfaceShape::op`] in the handle's op order.
+    pub fn new() -> IfaceShape {
+        IfaceShape::default()
+    }
+    /// Append op `name` with signature `sig` at the next native op index.
+    pub fn op(mut self, name: impl Into<String>, sig: svm_ir::FuncType) -> IfaceShape {
+        self.ops.push((name.into(), sig));
+        self
+    }
+    /// The canonical shape of a **pre-seeded built-in interface** (IMPORTS.md §3.5), so an
+    /// embedder can offer a host-native handle as a whole interface without re-declaring its op
+    /// names and signatures by hand — e.g. `IfaceShape::builtin(svm_interp::cap_id::STREAM)` for a
+    /// host stream. Returns `None` for a built-in that is not pre-seeded (handle-typed built-ins,
+    /// `HOST_FN`) or an unknown id.
+    pub fn builtin(id: u32) -> Option<IfaceShape> {
+        svm_interp::builtin_iface_shape(id).map(|ops| IfaceShape {
+            ops: ops.into_iter().map(|(n, s)| (n.to_string(), s)).collect(),
+        })
+    }
 }
 
 /// The state a [`HostCap::impl_offer`] carries: the offering module's function table and the
@@ -3333,61 +3380,66 @@ impl HostCap {
     /// A `Stream` write endpoint (stdout): `write(buf, len)` is op 1.
     pub fn stdout() -> HostCap {
         HostCap {
-            type_id: iface::STREAM,
+            type_id: cap_id::STREAM,
             op: 1,
             grant: Arc::new(|h, _| h.grant_stream(StreamRole::Out)),
             unbound: false,
             offer: None,
+            iface: None,
         }
     }
     /// A `Stream` read endpoint (stdin): `read(buf, len)` is op 0.
     pub fn stdin() -> HostCap {
         HostCap {
-            type_id: iface::STREAM,
+            type_id: cap_id::STREAM,
             op: 0,
             grant: Arc::new(|h, _| h.grant_stream(StreamRole::In)),
             unbound: false,
             offer: None,
+            iface: None,
         }
     }
     /// The `Exit` lifecycle capability: `exit(code)` (op 0, noreturn).
     pub fn exit() -> HostCap {
         HostCap {
-            type_id: iface::EXIT,
+            type_id: cap_id::EXIT,
             op: 0,
             grant: Arc::new(|h, _| h.grant_exit()),
             unbound: false,
             offer: None,
+            iface: None,
         }
     }
     /// The `Clock` capability: `now(clock_id) -> i64` (op 0).
     pub fn clock() -> HostCap {
         HostCap {
-            type_id: iface::CLOCK,
+            type_id: cap_id::CLOCK,
             op: 0,
             grant: Arc::new(|h, _| h.grant_clock()),
             unbound: false,
             offer: None,
+            iface: None,
         }
     }
-    /// A **host-defined** capability (iface [`iface::HOST_FN`]) — arbitrary semantics behind a named
+    /// A **host-defined** capability (iface [`cap_id::HOST_FN`]) — arbitrary semantics behind a named
     /// import, the wasm-like escape hatch. `op` is the operation this name selects; `make` builds a
     /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
     /// `(op, args, guest_mem) -> result slots | Trap`.
     pub fn host_fn(op: u32, make: impl Fn() -> HostFn + Send + Sync + 'static) -> HostCap {
         let make = Arc::new(make);
         HostCap {
-            type_id: iface::HOST_FN,
+            type_id: cap_id::HOST_FN,
             op,
             grant: Arc::new(move |h, _| h.grant_host_fn(make())),
             unbound: false,
             offer: None,
+            iface: None,
         }
     }
     /// An **mmap-capable** host-defined capability (§4b): like [`host_fn`](HostCap::host_fn) but the
     /// handler is registered via [`Host::grant_host_fn_region`], so it is also handed a
     /// [`svm_interp::RegionMinter`] and can mint a file-backed `SharedRegion` to hand the guest for
-    /// zero-copy aliasing. Resolves under the same [`iface::HOST_FN`], so the guest reaches it exactly
+    /// zero-copy aliasing. Resolves under the same [`cap_id::HOST_FN`], so the guest reaches it exactly
     /// like a plain `host_fn`.
     pub fn host_fn_region(
         op: u32,
@@ -3395,11 +3447,12 @@ impl HostCap {
     ) -> HostCap {
         let make = Arc::new(make);
         HostCap {
-            type_id: iface::HOST_FN,
+            type_id: cap_id::HOST_FN,
             op,
             grant: Arc::new(move |h, _| h.grant_host_fn_region(make())),
             unbound: false,
             offer: None,
+            iface: None,
         }
     }
     /// A fully custom binding: an explicit `(type_id, op)` and a re-grantable grant action. The escape
@@ -3415,6 +3468,7 @@ impl HostCap {
             grant: Arc::new(grant),
             unbound: false,
             offer: None,
+            iface: None,
         }
     }
 
@@ -3446,6 +3500,7 @@ impl HostCap {
                 op,
                 provider: None,
             }),
+            iface: None,
         })
     }
 
@@ -3472,7 +3527,31 @@ impl HostCap {
                 op,
                 provider: Some(Arc::new(provider.clone())),
             }),
+            iface: None,
         })
+    }
+
+    /// §3.5 (IMPORTS.md): a **grouped host-native provider** — bind a consumer's whole-interface
+    /// import to one host handle implementing `shape` (op names + signatures in the handle's
+    /// native op order). `grant` mints the handle each run (its runtime `type_id` is read back
+    /// for the binding); at instantiation the consumer's grouped requirement is coverage-matched
+    /// against `shape` — name-keyed, signature-equal, **subset allowed** (a consumer needing only
+    /// `{read, len}` binds a four-op provider), extra provider ops ignored — and the frozen op
+    /// remap makes `call.import slot.op` dispatch the right native op. This is the host-side
+    /// mirror of a guest offer: `HostCap::impl_service` wires a guest module as the provider,
+    /// `HostCap::iface` wires a host-native handle.
+    pub fn iface(
+        shape: &IfaceShape,
+        grant: impl Fn(&mut Host, u64) -> i32 + Send + Sync + 'static,
+    ) -> HostCap {
+        HostCap {
+            type_id: 0, // the real interface id is the granted handle's, read back at wiring
+            op: 0,
+            grant: Arc::new(grant),
+            unbound: false,
+            offer: None,
+            iface: Some(Arc::new(shape.ops.clone())),
+        }
     }
 
     /// Phase-2 (IMPORTS.md): a **template-only** binding for a `rebindable` import — the slot's
@@ -3486,6 +3565,7 @@ impl HostCap {
             grant: Arc::new(|_, _| -1),
             unbound: true,
             offer: None,
+            iface: None,
         }
     }
 }
@@ -3531,6 +3611,7 @@ impl Imports {
                     op,
                     unbound: false,
                     offer: None,
+                    iface: None,
                     grant: Arc::new(move |h, win| match h.resolve_cap_name(&module_name) {
                         Some(handle) => handle,
                         None => {
@@ -3654,7 +3735,7 @@ fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
 /// dynamic-only interface (e.g. `SharedRegion`, whose objects are runtime-minted), refuses to
 /// start the module — the `ImportError::Unresolved` semantics IMPORTS.md §2.1 keeps.
 fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
-    use svm_interp::iface;
+    use svm_interp::cap_id;
     for im in &module.imports {
         if im.mode != svm_ir::ImportMode::Required {
             continue; // a rebindable slot may legitimately start empty
@@ -3667,13 +3748,13 @@ fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
         };
         let bindable = matches!(
             cap.type_id,
-            iface::STREAM
-                | iface::EXIT
-                | iface::MEMORY
-                | iface::ADDRESS_SPACE
-                | iface::IO_RING
-                | iface::BLOCKING
-                | iface::JIT
+            cap_id::STREAM
+                | cap_id::EXIT
+                | cap_id::MEMORY
+                | cap_id::ADDRESS_SPACE
+                | cap_id::IO_RING
+                | cap_id::BLOCKING
+                | cap_id::JIT
         );
         if !bindable {
             return Err(format!(
@@ -3755,12 +3836,36 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
     // served by the generic dispatch under its per-host interned id.
     if let Some(name) = order.iter().find(|n| {
         let cap = &imports.map[n.as_str()];
-        cap.offer.is_none() && !generic_dispatch_iface(cap.type_id)
+        cap.offer.is_none() && cap.iface.is_none() && !generic_dispatch_iface(cap.type_id)
     }) {
         return Err(format!(
             "capability import `{name}` names an interface the slot dispatch cannot serve — use \
              dynamic mode (`cap.call` on a live handle, IMPORTS.md §2.2)"
         ));
+    }
+    // §3.5 grouped host-native providers: the consumer's grouped requirement must be **covered**
+    // by the provided shape — name-keyed, signature-equal, subset allowed (extra provider ops
+    // ignored). Checked here (host-independently, fail-closed) so `grant_caps` wires under a
+    // validated invariant; the actual op remap is recomputed there once the handle is granted.
+    for (i, name) in order.iter().enumerate() {
+        let Some(shape) = &imports.map[name.as_str()].iface else {
+            continue;
+        };
+        let req = module.import_named_ops(i as u32).ok_or_else(|| {
+            format!("grouped import `{name}` has a malformed type-section reference")
+        })?;
+        let (rn, rs): (Vec<String>, Vec<FuncType>) = req
+            .into_iter()
+            .map(|(n, s)| (n.to_string(), s.clone()))
+            .unzip();
+        let sn: Vec<String> = shape.iter().map(|(n, _)| n.clone()).collect();
+        let ss: Vec<FuncType> = shape.iter().map(|(_, s)| s.clone()).collect();
+        if svm_interp::coverage_remap(&rn, &rs, &sn, &ss).is_none() {
+            return Err(format!(
+                "grouped import `{name}` is not covered by the provided host interface \
+                 (IMPORTS.md §3.5: every required op present by name with an equal signature)"
+            ));
+        }
     }
     // §3.2 offer bindings: the wiring-time signature check, structural and fail-closed — the
     // import's declared op signature must equal the offered function's declared type exactly.
@@ -3801,7 +3906,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
 fn generic_dispatch_iface(type_id: u32) -> bool {
     matches!(
         type_id,
-        iface::STREAM | iface::EXIT | iface::CLOCK | iface::MEMORY | iface::HOST_FN
+        cap_id::STREAM | cap_id::EXIT | cap_id::CLOCK | cap_id::MEMORY | cap_id::HOST_FN
     )
 }
 
@@ -3850,7 +3955,7 @@ impl Instance {
             scratch.grant_host_fn(Box::new(|_, _, _| Ok(vec![])))
         };
         let spec = svm_opt::instrument::MemHookSpec {
-            type_id: iface::HOST_FN,
+            type_id: cap_id::HOST_FN,
             handle,
         };
         let (m, stats) = svm_opt::instrument::instrument_mem_hooks(&self.module, spec);
@@ -4075,6 +4180,10 @@ impl Instance {
                 // Grant in import order, and register each grant under the guest's own import name
                 // in the §7 capability-name directory (F7).
                 let mut bindings = Vec::with_capacity(b.order.len());
+                // §3.5 grouped-slot remaps + requirement sets to freeze *after* the bindings are
+                // installed (`set_import_bindings` sizes the remap/req tables): per slot, its
+                // `(index, op remap, requirement names, requirement sigs)`.
+                let mut grouped: Vec<GroupedSlot> = Vec::new();
                 for (i, name) in b.order.iter().enumerate() {
                     let cap = &b.imports.map[name];
                     // The declared mode of import `i` (order was captured from `module.imports`,
@@ -4093,6 +4202,37 @@ impl Instance {
                             cap.op,
                             None,
                         ));
+                        continue;
+                    }
+                    // §3.5 grouped host-native provider: grant the handle, coverage-match the
+                    // consumer's grouped requirement against the provided shape (validated at
+                    // instantiation, so it cannot fail here), and bind the slot to the handle's
+                    // real interned/native `type_id` with the op remap frozen below.
+                    if let Some(shape) = &cap.iface {
+                        let handle = (cap.grant)(h, win);
+                        h.register_cap_name(name, handle);
+                        let tid = h
+                            .type_id_of(handle)
+                            .expect("granted grouped host cap is live");
+                        let req = self
+                            .module
+                            .import_named_ops(i as u32)
+                            .expect("grouped import shape validated at instantiation");
+                        let (rn, rs): (Vec<String>, Vec<FuncType>) = req
+                            .into_iter()
+                            .map(|(n, s)| (n.to_string(), s.clone()))
+                            .unzip();
+                        let sn: Vec<String> = shape.iter().map(|(n, _)| n.clone()).collect();
+                        let ss: Vec<FuncType> = shape.iter().map(|(_, s)| s.clone()).collect();
+                        let remap = svm_interp::coverage_remap(&rn, &rs, &sn, &ss)
+                            .expect("iface coverage validated at instantiation");
+                        let base = remap[0];
+                        bindings.push(if rebindable {
+                            svm_interp::BoundImport::rebindable(tid, base, Some(handle))
+                        } else {
+                            svm_interp::BoundImport::required(tid, base, handle)
+                        });
+                        grouped.push((i, remap, rn, rs));
                         continue;
                     }
                     // §3.2 offer binding: wire the offer into this host's table (interning its
@@ -4131,6 +4271,13 @@ impl Instance {
                 // `(type_id, op)` + granted handle.
                 if !self.module.imports.is_empty() {
                     h.set_import_bindings(bindings);
+                    // Freeze each grouped host-cap slot's op remap + requirement set now that the
+                    // remap/req tables are sized (`call.import slot.op` → remap → native op; a
+                    // later `import.attach` coverage-checks against the requirement).
+                    for (slot, remap, rn, rs) in grouped {
+                        h.set_import_remap(slot, remap);
+                        h.set_import_req(slot, rn, rs);
+                    }
                 }
             }
             None => {
@@ -4144,7 +4291,7 @@ impl Instance {
                 let [stdout, stdin, exit, memory, addrspace, ioring, blocking, jit] =
                     grant_powerbox_prefix(h, win);
                 if !self.module.imports.is_empty() {
-                    use svm_interp::iface;
+                    use svm_interp::cap_id;
                     let bindings = self
                         .module
                         .imports
@@ -4155,14 +4302,14 @@ impl Instance {
                                 return svm_interp::BoundImport::rebindable(0, 0, None);
                             };
                             let handle = match (cap.type_id, cap.op) {
-                                (iface::STREAM, 1) => stdout, // write
-                                (iface::STREAM, _) => stdin,  // read
-                                (iface::EXIT, _) => exit,
-                                (iface::MEMORY, _) => memory,
-                                (iface::ADDRESS_SPACE, _) => addrspace,
-                                (iface::IO_RING, _) => ioring,
-                                (iface::BLOCKING, _) => blocking,
-                                (iface::JIT, _) => jit,
+                                (cap_id::STREAM, 1) => stdout, // write
+                                (cap_id::STREAM, _) => stdin,  // read
+                                (cap_id::EXIT, _) => exit,
+                                (cap_id::MEMORY, _) => memory,
+                                (cap_id::ADDRESS_SPACE, _) => addrspace,
+                                (cap_id::IO_RING, _) => ioring,
+                                (cap_id::BLOCKING, _) => blocking,
+                                (cap_id::JIT, _) => jit,
                                 // e.g. SharedRegion: dynamic-mode only — never a manifest slot.
                                 _ => return svm_interp::BoundImport::rebindable(0, 0, None),
                             };

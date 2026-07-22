@@ -13,7 +13,7 @@
 //!   drained cleanly.
 
 use std::sync::Arc;
-use svm_interp::{iface, Host, NonDurableKind, Trap, Value};
+use svm_interp::{cap_id, Host, NonDurableKind, Trap, Value};
 use svm_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, LoadOp, Terminator, ValType};
 
 /// A one-block leaf `(params) -> (results)` whose body just returns its first param (or
@@ -88,7 +88,7 @@ fn intern_is_structural_and_allocates_from_the_base() {
     let c = vec![sig(vec![ValType::I32], vec![ValType::I64])];
     let ia = h.intern_interface(&a);
     assert!(
-        ia >= iface::GUEST_IMPL_BASE,
+        ia >= cap_id::GUEST_IMPL_BASE,
         "guest ids allocate above the built-ins"
     );
     assert_eq!(
@@ -106,6 +106,49 @@ fn intern_is_structural_and_allocates_from_the_base() {
 }
 
 #[test]
+fn a_stream_shaped_declaration_interns_to_the_builtin_id() {
+    // IMPORTS.md §3.5 intern pre-seeding: a guest interface declaration structurally equal to a
+    // pre-seeded built-in shape interns to the built-in's fixed id (D59 across the
+    // host-native/guest-impl divide), not a fresh guest id — so a slot requiring that shape
+    // accepts a real host handle or a guest impl of it interchangeably.
+    let mut h = Host::new();
+    let stream = vec![
+        sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // read
+        sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
+        sig(vec![], vec![]),                                       // close
+    ];
+    assert_eq!(
+        h.intern_interface(&stream),
+        cap_id::STREAM,
+        "the exact stream triple canonicalizes to the built-in Stream id"
+    );
+
+    // A subset (write/close only) is a *different* structural shape — not pre-seeded, so it gets a
+    // fresh guest id above the base. Pre-seeding claims the whole shape, never a prefix of it.
+    let subset = vec![
+        sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
+        sig(vec![], vec![]),                                       // close
+    ];
+    assert!(
+        h.intern_interface(&subset) >= cap_id::GUEST_IMPL_BASE,
+        "a non-matching shape stays in the guest id space"
+    );
+
+    // The built-in shape is discoverable for an embedder that offers a host handle as a whole
+    // interface (svm-run's IfaceShape::builtin), and its op order matches the handle's native ops.
+    let names: Vec<&str> = svm_interp::builtin_iface_shape(cap_id::STREAM)
+        .expect("Stream is pre-seeded")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(names, ["read", "write", "close"]);
+    assert!(
+        svm_interp::builtin_iface_shape(cap_id::HOST_FN).is_none(),
+        "HOST_FN is the deliberate non-pre-seeded exception (per-registration semantics)"
+    );
+}
+
+#[test]
 fn wire_impl_derives_sigs_and_mints_a_resolvable_handle() {
     let mut h = Host::new();
     let funcs = offer_funcs();
@@ -120,7 +163,7 @@ fn wire_impl_derives_sigs_and_mints_a_resolvable_handle() {
             sig(vec![ValType::I64], vec![ValType::I64]),
         ]
     );
-    assert!(entry.type_id >= iface::GUEST_IMPL_BASE);
+    assert!(entry.type_id >= cap_id::GUEST_IMPL_BASE);
 
     // Two offers with the same shape share a type_id (structural identity); a different
     // shape gets a fresh one.
@@ -453,6 +496,103 @@ fn a_regranted_instanced_offer_shares_one_service_instance() {
         parent.cap_dispatch_slots(ptid, 0, offer, &[], None),
         Ok(vec![3]),
         "and the parent sees the child's bump"
+    );
+}
+
+/// A provider whose op takes a `cap` (expected to be a `Clock`) and calls **through** it —
+/// `cap.call CLOCK.now`. The `cap` param is used as an `i32` handle in the body (cap is
+/// i32-width data in guest code, §3.5); the offer's declared `cap` param is what fires the
+/// boundary translation at dispatch.
+fn clock_forward_provider() -> svm_ir::Module {
+    svm_text::parse_module(
+        "memory 16\n\
+         func (cap) -> (i64) {\n\
+         block 0 (v0: cap) {\n\
+           v1 = cap.call 2 0 () -> (i64) v0 ()\n\
+           return v1\n\
+           }\n\
+         }\n",
+    )
+    .expect("clock-forward provider parses")
+}
+
+#[test]
+fn a_cap_argument_is_translated_across_the_offer_boundary() {
+    // §3.5 `cap` boundary translation: the caller passes a handle to a capability it holds as a
+    // `cap`-typed argument; the host re-grants that capability into the provider's own table and
+    // substitutes the provider-local handle, so the provider can call **through** it. Without
+    // translation the provider's `cap.call` would resolve a caller-table handle in its own table
+    // and fail closed.
+    let provider = clock_forward_provider();
+    svm_verify::verify_module(&provider).expect("provider verifies");
+    let mut h = Host::new();
+    let offer = h
+        .wire_impl_instance(&provider, &[0])
+        .expect("instanced offer");
+    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let clock = h.grant_clock();
+    // The provider reads *its* Clock (a fresh, independent instance in the provider's table,
+    // deterministic from 0), proving it resolved the translated cap and called through it.
+    assert_eq!(
+        h.cap_dispatch_slots(tid, 0, offer, &[clock as i64], None),
+        Ok(vec![0]),
+        "the provider called Clock.now through the translated cap"
+    );
+    assert_eq!(
+        h.cap_dispatch_slots(tid, 0, offer, &[clock as i64], None),
+        Ok(vec![1]),
+        "and the provider's own clock advances across calls"
+    );
+}
+
+#[test]
+fn a_forged_cap_argument_fails_closed() {
+    // A `cap` argument that names nothing live in the *caller's* table cannot be re-granted, so
+    // the boundary translation faults before the provider runs — the forgeability guarantee.
+    let provider = clock_forward_provider();
+    svm_verify::verify_module(&provider).expect("verifies");
+    let mut h = Host::new();
+    let offer = h.wire_impl_instance(&provider, &[0]).expect("offer");
+    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    assert_eq!(
+        h.cap_dispatch_slots(tid, 0, offer, &[0xDEAD_BEEFu32 as i32 as i64], None),
+        Err(Trap::CapFault),
+        "a forged cap argument is inert — CapFault before dispatch"
+    );
+}
+
+#[test]
+fn a_cap_result_is_translated_back_to_the_caller() {
+    // The symmetric direction: an offer that returns a `cap` (here an identity forward) hands
+    // the caller a fresh *caller-local* handle to the same capability — the provider→caller
+    // re-grant. The caller can then call through the returned handle in its own table.
+    let provider = svm_text::parse_module(
+        "memory 16\n\
+         func (cap) -> (cap) {\n\
+         block 0 (v0: cap) {\n\
+           return v0\n\
+           }\n\
+         }\n",
+    )
+    .expect("identity-cap provider parses");
+    svm_verify::verify_module(&provider).expect("verifies");
+    let mut h = Host::new();
+    let offer = h.wire_impl_instance(&provider, &[0]).expect("offer");
+    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let clock = h.grant_clock();
+    let out = h
+        .cap_dispatch_slots(tid, 0, offer, &[clock as i64], None)
+        .expect("dispatch");
+    let returned = out[0] as i32;
+    assert_ne!(
+        returned, clock,
+        "a fresh caller-local handle, not the original"
+    );
+    // The returned handle resolves as a Clock in the caller's table and is callable.
+    assert_eq!(
+        h.cap_dispatch_slots(cap_id::CLOCK, 0, returned, &[], None),
+        Ok(vec![0]),
+        "the translated-back cap is a live Clock in the caller's own table"
     );
 }
 

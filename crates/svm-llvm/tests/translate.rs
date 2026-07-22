@@ -7198,7 +7198,7 @@ fn grant_powerbox(
 /// the granted handle by interface — the same mapping `svm_run`'s `grant_caps` installs. Call after
 /// `grant_powerbox` for any harness that drives `run_with_host` directly.
 fn bind_powerbox_imports(h: &mut svm_interp::Host, m: &svm_ir::Module, granted: &[Value]) {
-    use svm_interp::iface;
+    use svm_interp::cap_id;
     if m.imports.is_empty() {
         return;
     }
@@ -7214,14 +7214,14 @@ fn bind_powerbox_imports(h: &mut svm_interp::Host, m: &svm_ir::Module, granted: 
                 return svm_interp::BoundImport::rebindable(0, 0, None);
             };
             let handle = match (cap.type_id, cap.op) {
-                (iface::STREAM, 1) => hv(0),
-                (iface::STREAM, _) => hv(1),
-                (iface::EXIT, _) => hv(2),
-                (iface::MEMORY, _) => hv(3),
-                (iface::ADDRESS_SPACE, _) => hv(4),
-                (iface::IO_RING, _) => hv(5),
-                (iface::BLOCKING, _) => hv(6),
-                (iface::JIT, _) => hv(7),
+                (cap_id::STREAM, 1) => hv(0),
+                (cap_id::STREAM, _) => hv(1),
+                (cap_id::EXIT, _) => hv(2),
+                (cap_id::MEMORY, _) => hv(3),
+                (cap_id::ADDRESS_SPACE, _) => hv(4),
+                (cap_id::IO_RING, _) => hv(5),
+                (cap_id::BLOCKING, _) => hv(6),
+                (cap_id::JIT, _) => hv(7),
                 _ => return svm_interp::BoundImport::rebindable(0, 0, None),
             };
             svm_interp::BoundImport::required(cap.type_id, cap.op, handle)

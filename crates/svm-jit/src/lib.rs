@@ -5115,7 +5115,7 @@ fn module_uses_setjmp(m: &IrModule) -> bool {
     })
 }
 
-/// Whether `m` holds a §14 `Instantiator` — a `cap.call` to iface 6 (`svm_interp::iface::INSTANTIATOR`)
+/// Whether `m` holds a §14 `Instantiator` — a `cap.call` to iface 6 (`svm_interp::cap_id::INSTANTIATOR`)
 /// — so `run_inner` knows to stand up the nesting [`instantiator_rt::Nursery`].
 #[cfg(fiber_rt)]
 fn module_uses_instantiator(m: &IrModule) -> bool {

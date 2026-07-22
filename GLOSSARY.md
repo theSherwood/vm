@@ -47,6 +47,13 @@ The system is four ideas wearing many names:
 - **handle** — the guest-visible name of a capability: a packed `(generation, slot)`
   `i32`. Forgeable as data, inert if forged — every use re-checks slot, generation, and
   type_id (the §3c use-site check).
+- **`cap` (value type) / boundary translation** — (landed: §3.5) a signature marker that a
+  value is a capability handle, not a plain integer. In guest code it is `i32`-width data
+  (the verifiers treat `cap`≡`i32` for value flow); only at an *offer-call boundary* is it
+  special — a `cap` arg is re-granted caller→provider and a `cap` result provider→caller,
+  minting a receiver-local handle. Distinct from `i32` in *signatures* so structural
+  matching and translation key on it. The guest↔guest half of "objects are arguments"; an
+  unmarked integer crossing a boundary stays inert.
 - **slot** (handle table) — one entry position in the host-owned handle table. Also used
   for *import* slots (below); context disambiguates.
 - **generation** — a per-slot counter bumped on each (re)grant, packed into the handle.
@@ -55,14 +62,22 @@ The system is four ideas wearing many names:
   (`grant_stream`, `grant_module`, `regrant_into_child`, …). Authority moves only by
   grants.
 - **type_id** — the runtime identity of an interface: a `u32` stored in each table entry
-  and re-checked at every use. Small constants for the built-ins (`iface::STREAM = 0` …);
+  and re-checked at every use. Small constants for the built-ins (`cap_id::STREAM = 0` …);
   interned per-host for guest-implemented interfaces.
-- **`iface`** — two related uses: (1) the `svm_interp::iface` module of built-in type_id
-  constants; (2) the `ImplExport::iface` field — an index into the module's type section
-  naming the interface entry the export implements.
+- **`cap_id`** — the `svm_interp::cap_id` module of built-in interface type_id constants
+  (`cap_id::STREAM` … `cap_id::BUDGET`, `cap_id::GUEST_IMPL_BASE`), read as capability type
+  identifiers at their use sites (`type_id == cap_id::STREAM`). Renamed from `iface`; the
+  `iface` name now belongs only to the `HostCap.iface` field and the `HostCap::iface` /
+  `IfaceShape` grouped-provider surface. (`ImplExport.iface` became `interface` in v6.)
 - **intern (structural)** — the map from an interface's *shape* (its op-signature list)
   to its runtime `type_id`, maintained per-host: structurally identical shapes get the
   same id (D59: id-equality ≡ structural equality). Why interfaces need no names.
+- **intern pre-seeding** — (landed: §3.5) built-in interfaces publish a canonical shape
+  (`builtin_iface_shape`), pre-seeded into the intern so a structurally-equal guest
+  declaration interns *to the built-in id* — an import slot requiring that shape accepts a
+  real host handle or a guest impl of it interchangeably. Confers no authority (still needs
+  a real granted handle). Only *specific* shapes are seeded (`Stream`, not a generic
+  single-op shape); handle-typed built-ins and `HOST_FN` are the exceptions.
 - **dispatch (generic)** — the one host entry (`cap_dispatch_slots`) every capability
   call funnels through, on all three backends. Where the use-site check and the per-
   interface behavior live.
@@ -109,6 +124,11 @@ The system is four ideas wearing many names:
   the provider covers it (every required op present, same name, equal signature —
   extra provider ops ignored), with a per-slot op remap frozen at bind time. Names
   are the binding contract; `type_id` identity stays shape-only.
+- **`HostCap::iface` / `IfaceShape`** — (landed: §3.5) a **grouped host-native provider**:
+  one host handle offered as a whole interface (`IfaceShape` = op names + sigs in the
+  handle's native op order), which a consumer's grouped import binds against by the same
+  coverage walk (subset allowed, remap-dispatched). The host-side mirror of a guest offer
+  — `impl_service` wires a guest module as provider, `iface` wires a host handle.
 - **`cap.call`** — the wire form of dynamic-mode dispatch: `(type_id, op, sig)`
   immediates plus a runtime handle. Retired as a *concept* (it's just dynamic mode);
   kept as the encoding and the escape hatch for undeclared grants.

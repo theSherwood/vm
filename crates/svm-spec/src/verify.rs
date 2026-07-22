@@ -181,12 +181,22 @@ fn iface_well_formed(tsec: &[svm_ir::TypeEntry], t: u32) -> bool {
 
 /// §3b rule 3: operand `v` is defined strictly earlier and has exactly type `want`.
 fn want(types: &[ValType], v: ValIdx, want: ValType) -> R {
+    // `cap` is `i32`-width data in guest code (IMPORTS.md §3.5): value-compatible with `i32`
+    // wherever operands flow, while staying distinct in signatures (structural matching and the
+    // boundary `cap` translation key on the marker, comparing `FuncType`s directly).
+    let compat = |t: ValType| {
+        t == want
+            || matches!(
+                (t, want),
+                (ValType::I32 | ValType::Cap, ValType::I32 | ValType::Cap)
+            )
+    };
     match types.get(v as usize) {
         None => Err(format!(
             "value v{v} not defined yet ({} defined)",
             types.len()
         )),
-        Some(t) if *t == want => Ok(()),
+        Some(t) if compat(*t) => Ok(()),
         Some(t) => Err(format!("v{v}: expected {want:?}, found {t:?}")),
     }
 }

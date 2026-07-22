@@ -741,12 +741,12 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
                     // ops 0/1 = instantiate/join, op 5 = instantiate_module (executor children);
                     // everything else on INSTANTIATOR/YIELDER is the inline coroutine round-trip.
                     Inst::CapCall {
-                        type_id: super::iface::INSTANTIATOR,
+                        type_id: super::cap_id::INSTANTIATOR,
                         op: 0 | 1 | 5,
                         ..
                     } => has_instantiate = true,
                     Inst::CapCall {
-                        type_id: super::iface::INSTANTIATOR | super::iface::YIELDER,
+                        type_id: super::cap_id::INSTANTIATOR | super::cap_id::YIELDER,
                         ..
                     } => has_coro = true,
                     Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
@@ -1131,14 +1131,14 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             handle,
             args,
         } => {
-            use super::iface;
+            use super::cap_id;
             match (*type_id, *op) {
                 // §14 executor children — instantiate (op 0) spawns a confined child on the scheduler;
                 // join (op 1) parks until it finishes, reusing the §12 thread join machinery (children
                 // share the `threads` handle namespace). The separate-module / demand variants (5/6/7
                 // and op 4) and the JIT / SharedRegion-grant variants need seams this slice doesn't
                 // drive: reject (fall back).
-                (iface::INSTANTIATOR, 0) if args.len() >= 4 => Op::Instantiate {
+                (cap_id::INSTANTIATOR, 0) if args.len() >= 4 => Op::Instantiate {
                     handle: g(*handle),
                     entry: g(args[0]),
                     off: g(args[1]),
@@ -1146,14 +1146,14 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     quota: g(args[3]),
                     dst,
                 },
-                (iface::INSTANTIATOR, 1) if !args.is_empty() => Op::InstJoin {
+                (cap_id::INSTANTIATOR, 1) if !args.is_empty() => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
                     dst,
                 },
                 // op 5 = instantiate_module: the first arg is the granted `Module` handle; the carve
                 // args (entry/off/size_log2/quota) follow. (join, op 1, serves both kinds.)
-                (iface::INSTANTIATOR, 5) if args.len() >= 5 => Op::InstantiateModule {
+                (cap_id::INSTANTIATOR, 5) if args.len() >= 5 => Op::InstantiateModule {
                     handle: g(*handle),
                     module: g(args[0]),
                     entry: g(args[1]),
@@ -1165,7 +1165,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 // op 6/7 = spawn_coroutine_module / spawn_demand_coroutine_module: a coroutine child
                 // running a granted `Module` (the first arg); the carve args (entry/off/size_log2/fuel)
                 // follow. op 7 demand-pages the child's window (data segments supplied lazily).
-                (iface::INSTANTIATOR, op @ (6 | 7)) if args.len() >= 4 => {
+                (cap_id::INSTANTIATOR, op @ (6 | 7)) if args.len() >= 4 => {
                     Op::SpawnCoroutineModule {
                         handle: g(*handle),
                         module: g(args[0]),
@@ -1178,7 +1178,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 }
                 // §14 cooperative coroutine round-trip — spawn_coroutine (op 2) / spawn_demand_coroutine
                 // (op 4, window starts unmapped) / resume / yield.
-                (iface::INSTANTIATOR, op @ (2 | 4)) if args.len() >= 3 => Op::SpawnCoroutine {
+                (cap_id::INSTANTIATOR, op @ (2 | 4)) if args.len() >= 3 => Op::SpawnCoroutine {
                     handle: g(*handle),
                     entry: g(args[0]),
                     off: g(args[1]),
@@ -1186,13 +1186,13 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     dst,
                     demand: op == 4,
                 },
-                (iface::INSTANTIATOR, 3) if args.len() >= 2 => Op::CoResume {
+                (cap_id::INSTANTIATOR, 3) if args.len() >= 2 => Op::CoResume {
                     handle: g(*handle),
                     ch: g(args[0]),
                     value: g(args[1]),
                     dst,
                 },
-                (iface::YIELDER, 0) if !args.is_empty() => Op::CoYield {
+                (cap_id::YIELDER, 0) if !args.is_empty() => Op::CoYield {
                     handle: g(*handle),
                     value: g(args[0]),
                     dst,
@@ -1200,17 +1200,17 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
                 // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
                 // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
-                (iface::JIT, 3) if !args.is_empty() => Op::JitInstall {
+                (cap_id::JIT, 3) if !args.is_empty() => Op::JitInstall {
                     handle: g(*handle),
                     code: g(args[0]),
                     dst,
                 },
-                (iface::JIT, 4) if !args.is_empty() => Op::JitUninstall {
+                (cap_id::JIT, 4) if !args.is_empty() => Op::JitUninstall {
                     handle: g(*handle),
                     slot: g(args[0]),
                     dst,
                 },
-                (iface::JIT, 1) if !args.is_empty() => Op::JitInvoke {
+                (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
                     handle: g(*handle),
                     code: g(args[0]),
                     args: args[1..].iter().map(|a| g(*a)).collect(),
@@ -1220,8 +1220,8 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     params: sig.params.get(1..).unwrap_or(&[]).to_vec().into(),
                     results: sig.results.clone().into(),
                 },
-                (iface::INSTANTIATOR, _) | (iface::YIELDER, _) => return None,
-                (iface::SHARED_REGION, 4) => return None,
+                (cap_id::INSTANTIATOR, _) | (cap_id::YIELDER, _) => return None,
+                (cap_id::SHARED_REGION, 4) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
                     type_id: *type_id,
@@ -3086,7 +3086,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
         b.insts.iter().any(|i| {
             matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::iface::INSTANTIATOR)
+                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
         })
     });
     if outside {
@@ -7976,7 +7976,7 @@ impl Vm {
                     } else {
                         (*type_id, *op)
                     };
-                    if eff_tid == super::iface::STREAM
+                    if eff_tid == super::cap_id::STREAM
                         && eff_op == 0
                         && host.with(|p| p.take_stdin_parked())
                     {

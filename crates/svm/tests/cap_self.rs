@@ -81,7 +81,7 @@ fn count_reflects_the_granted_powerbox() {
 }
 
 /// `cap.self.get(i)` yields the i-th held capability's `(handle, type_id)`. Entry 2 (the 3rd grant)
-/// is Exit, so its `type_id` is `iface::EXIT == 1`.
+/// is Exit, so its `type_id` is `cap_id::EXIT == 1`.
 #[test]
 fn get_reports_the_interface_type_id() {
     let src = "func (i32, i32, i32) -> (i32) {\n\

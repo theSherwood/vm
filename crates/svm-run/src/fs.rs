@@ -672,14 +672,14 @@ mod tests {
     /// on the interpreter crate); this locks the pin to the real constant.
     #[test]
     fn host_fn_type_id_matches() {
-        assert_eq!(svm_interp::iface::HOST_FN, 13);
+        assert_eq!(svm_interp::cap_id::HOST_FN, 13);
     }
 
     /// `svm-llvm` pins `SharedRegion`'s interface id numerically (`SHARED_REGION_TYPE_ID`, for the
     /// `__vm_region_call` the zero-copy bridge lowers to); this locks that pin to the real constant.
     #[test]
     fn shared_region_type_id_matches() {
-        assert_eq!(svm_interp::iface::SHARED_REGION, 4);
+        assert_eq!(svm_interp::cap_id::SHARED_REGION, 4);
     }
 
     /// The §4b zero-copy op end to end at the capability boundary: `host_fs_mmap`'s `FS_MAP_REGION`
@@ -692,7 +692,7 @@ mod tests {
     fn map_region_op_mints_a_file_backed_region_only_on_the_mmap_grant() {
         use super::*;
         use std::io::Write;
-        use svm_interp::{iface, Host, WindowMem};
+        use svm_interp::{cap_id, Host, WindowMem};
 
         let dir = std::env::temp_dir().join(format!("svm_fs_mapregion_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -715,12 +715,12 @@ mod tests {
             let fs_h = (cap.grant)(&mut host, 0);
             let mut wm = WindowMem::new(&mut win, 4096);
             let fd = host
-                .cap_dispatch_slots(iface::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .cap_dispatch_slots(cap_id::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
                 .unwrap()[0];
             assert!(fd >= 0, "open failed: {fd}");
             let region = host
                 .cap_dispatch_slots(
-                    iface::HOST_FN,
+                    cap_id::HOST_FN,
                     FS_MAP_REGION,
                     fs_h,
                     &[fd, 0, 8192],
@@ -733,7 +733,7 @@ mod tests {
             );
             // The returned handle is a live SharedRegion; op 2 `len()` reports the mapped size.
             let len = host
-                .cap_dispatch_slots(iface::SHARED_REGION, 2, region as i32, &[], Some(&mut wm))
+                .cap_dispatch_slots(cap_id::SHARED_REGION, 2, region as i32, &[], Some(&mut wm))
                 .unwrap()[0];
             assert_eq!(len, 8192, "the minted region maps the whole file");
         }
@@ -745,11 +745,11 @@ mod tests {
             let fs_h = (cap.grant)(&mut host, 0);
             let mut wm = WindowMem::new(&mut win, 4096);
             let fd = host
-                .cap_dispatch_slots(iface::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .cap_dispatch_slots(cap_id::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
                 .unwrap()[0];
             let region = host
                 .cap_dispatch_slots(
-                    iface::HOST_FN,
+                    cap_id::HOST_FN,
                     FS_MAP_REGION,
                     fs_h,
                     &[fd, 0, 8192],
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn os_metadata_ops_parity_mem_vs_host() {
         use super::*;
-        use svm_interp::{iface, Host, WindowMem};
+        use svm_interp::{cap_id, Host, WindowMem};
 
         // Window layout: [0..64) path A, [64..128) path B, [256..328) statbuf, [512..576) name buf.
         const PA: usize = 0;
@@ -782,7 +782,7 @@ mod tests {
         fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
             let n = win.len();
             let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(iface::HOST_FN, op, h, args, Some(&mut wm))
+            host.cap_dispatch_slots(cap_id::HOST_FN, op, h, args, Some(&mut wm))
                 .unwrap()[0]
         }
         fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn data_image_roundtrip_and_mount() {
         use super::*;
-        use svm_interp::{iface, Host, WindowMem};
+        use svm_interp::{cap_id, Host, WindowMem};
 
         let files = vec![
             ("PG_VERSION".to_string(), b"17\n".to_vec()),
@@ -933,7 +933,7 @@ mod tests {
         let mut wm = WindowMem::new(&mut win, 4096);
         let fd = host
             .cap_dispatch_slots(
-                iface::HOST_FN,
+                cap_id::HOST_FN,
                 FS_OPEN,
                 h,
                 &[0, 10, O_READ, 0],
@@ -942,7 +942,7 @@ mod tests {
             .unwrap()[0];
         assert!(fd >= 0, "open a file from the mounted image");
         let n = host
-            .cap_dispatch_slots(iface::HOST_FN, FS_READ, h, &[fd, 512, 8, 0], Some(&mut wm))
+            .cap_dispatch_slots(cap_id::HOST_FN, FS_READ, h, &[fd, 512, 8, 0], Some(&mut wm))
             .unwrap()[0];
         assert_eq!(n, 3);
         assert_eq!(&win[512..515], b"17\n", "file contents from the image");
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn seeded_mem_fs_open_norm_and_dir_fsync() {
         use super::*;
-        use svm_interp::{iface, Host, WindowMem};
+        use svm_interp::{cap_id, Host, WindowMem};
 
         const PA: usize = 0;
         const SB: usize = 256;
@@ -963,7 +963,7 @@ mod tests {
         fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
             let n = win.len();
             let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(iface::HOST_FN, op, h, args, Some(&mut wm))
+            host.cap_dispatch_slots(cap_id::HOST_FN, op, h, args, Some(&mut wm))
                 .unwrap()[0]
         }
         fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
@@ -1050,12 +1050,12 @@ mod tests {
     #[test]
     fn readdir_is_sorted_and_bounded() {
         use super::*;
-        use svm_interp::{iface, Host, WindowMem};
+        use svm_interp::{cap_id, Host, WindowMem};
 
         fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
             let n = win.len();
             let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(iface::HOST_FN, op, h, args, Some(&mut wm))
+            host.cap_dispatch_slots(cap_id::HOST_FN, op, h, args, Some(&mut wm))
                 .unwrap()[0]
         }
         fn names(host: &mut Host, h: i32, win: &mut [u8]) -> Vec<String> {

@@ -757,11 +757,11 @@ pub struct CapTape {
 /// Whether a capability is a **nondeterministic input** whose result a re-execution must replay
 /// (rather than re-derive). Deterministic / structural caps (window `Memory` ops, `SharedRegion`,
 /// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Inputs: `Clock`
-/// (op 0 `now`), `Stream` op 0 (stdin `read`), and **any host-fn** (`iface::HOST_FN`) — the
+/// (op 0 `now`), `Stream` op 0 (stdin `read`), and **any host-fn** (`cap_id::HOST_FN`) — the
 /// embedder's escape hatch (RNG, a real clock, external I/O), whose closure is *gone* on the fresh
 /// replay powerbox, so only the tape can reproduce it.
 fn is_recorded_input(type_id: u32, op: u32) -> bool {
-    type_id == iface::CLOCK || (type_id == iface::STREAM && op == 0) || type_id == iface::HOST_FN
+    type_id == cap_id::CLOCK || (type_id == cap_id::STREAM && op == 0) || type_id == cap_id::HOST_FN
 }
 
 /// A [`GuestMem`] wrapper that records every `write_bytes` a capability makes into the guest window
@@ -6217,7 +6217,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // value) is delivered on the next `resume` via `Pending::CoResume`; the inst pointer is
                 // already advanced, so we return `CoYield` without pushing a result.
                 Inst::CapCall {
-                    type_id: iface::YIELDER,
+                    type_id: cap_id::YIELDER,
                     op,
                     handle,
                     args,
@@ -6243,7 +6243,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // children and the JIT parent are follow-ups; a forged region handle or an
                 // unknown/finished child is an inert `CapFault`.
                 Inst::CapCall {
-                    type_id: iface::SHARED_REGION,
+                    type_id: cap_id::SHARED_REGION,
                     op: 4,
                     handle,
                     args,
@@ -6270,7 +6270,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .push(Reg::from_i64(child_handle.map_or(EMFILE, |h| h as i64)));
                 }
                 Inst::CapCall {
-                    type_id: iface::INSTANTIATOR,
+                    type_id: cap_id::INSTANTIATOR,
                     op,
                     handle,
                     args,
@@ -6950,7 +6950,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // mirrors it by writing the unit's natural entry + `type_id` into the same padding
                 // slot (`CompiledModule::install`), so the returned index agrees.
                 Inst::CapCall {
-                    type_id: iface::JIT,
+                    type_id: cap_id::JIT,
                     op: 3,
                     handle,
                     args,
@@ -6965,7 +6965,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // only clear slots it installed (`≥ funcs.len()`, the module-0 function count);
                 // `0` on success, `-EINVAL` for a real-function/out-of-range/already-empty slot.
                 Inst::CapCall {
-                    type_id: iface::JIT,
+                    type_id: cap_id::JIT,
                     op: 4,
                     handle,
                     args,
@@ -6975,7 +6975,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     jit_uninstall_body!(h, args)
                 }
                 Inst::CapCall {
-                    type_id: iface::JIT,
+                    type_id: cap_id::JIT,
                     op: 1,
                     handle,
                     args,
@@ -7028,7 +7028,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     import, sig, args, ..
                 } if matches!(
                     host.lock().unwrap_or_else(|e| e.into_inner()).import_binding(*import),
-                    Some(b) if b.type_id == iface::JIT && matches!(b.op, 1 | 3 | 4)
+                    Some(b) if b.type_id == cap_id::JIT && matches!(b.op, 1 | 3 | 4)
                 ) =>
                 {
                     let b = host
@@ -9228,7 +9228,7 @@ fn cast(op: CastOp, a: Reg) -> Reg {
 /// MVP interface type-ids (§3e). Phase-1: a `type_id` is just a small constant a
 /// handle-table entry carries and `cap.call` re-checks. (A module-level interface
 /// section that globalizes ids across linked modules is deferred to §13.)
-pub mod iface {
+pub mod cap_id {
     /// `Stream` — byte stream: op 0 `read`, op 1 `write`, op 2 `close` (§3e D43).
     pub const STREAM: u32 = 0;
     /// `Exit` — lifecycle: op 0 `exit(code)` (noreturn).
@@ -9336,6 +9336,59 @@ pub mod iface {
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
     /// the fixed built-ins and far below the reserved `u32::MAX`-family dispatch sentinels.
     pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
+}
+
+/// Canonical op-signature shapes for the built-in interfaces that are **pre-seeded** into the
+/// per-`Host` intern (IMPORTS.md §3.5 "intern pre-seeding"). A guest interface declaration whose
+/// op-signature list is structurally equal to a pre-seeded shape interns to the built-in id
+/// ([`Host::intern_interface`]) — D59 extended across the host-native/guest-impl divide — so an
+/// import slot requiring that shape accepts a real host handle or a guest impl of it
+/// interchangeably (the virtualized-interface unlock: a guest can interpose a whole built-in
+/// interface). Interning to a built-in id confers **no authority**: a call still needs a real
+/// granted handle of the matching [`Binding`], generation- and type-checked at the use site
+/// ([`Host::resolve_op`]) — pre-seeding only lets a structurally-equal declaration name the same
+/// type, never mint the capability.
+///
+/// Only **specific** shapes are pre-seeded. `Stream`'s read/write/close triple is a genuine
+/// interface identity. A generic single-op shape — `Clock`'s `(i64) -> (i64)`, say — is *not*: an
+/// unrelated capability could share it by accident, so canonicalizing it would over-claim (and
+/// `(i64) -> (i64)` is exactly the shape an ordinary guest offer uses). Handle-typed built-ins,
+/// whose ops pass or return capabilities where the `cap`-vs-`i32` signature convention for
+/// built-ins is unsettled, and `HOST_FN`, whose semantics are per-registration with no canonical
+/// shape, are the deliberate exceptions — see IMPORTS.md §3.5.
+fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 1] {
+    let rw = FuncType {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+    };
+    let unit = FuncType {
+        params: vec![],
+        results: vec![],
+    };
+    [(
+        cap_id::STREAM,
+        vec![("read", rw.clone()), ("write", rw), ("close", unit)],
+    )]
+}
+
+/// The pre-seeded built-in id whose canonical shape structurally equals `sigs`, if any
+/// ([`preseeded_iface_shapes`]). Consulted before allocating a guest id in
+/// [`Host::intern_interface`], so a matching declaration resolves to the built-in.
+fn preseeded_iface_id(sigs: &[FuncType]) -> Option<u32> {
+    preseeded_iface_shapes().into_iter().find_map(|(id, ops)| {
+        (ops.len() == sigs.len() && ops.iter().zip(sigs).all(|((_, s), t)| s == t)).then_some(id)
+    })
+}
+
+/// The canonical op names + signatures of a pre-seeded built-in interface
+/// ([`preseeded_iface_shapes`]) — for an embedder offering a host-native handle as a **whole
+/// interface** (e.g. `svm-run`'s `IfaceShape::builtin`) without re-declaring its shape by hand.
+/// Returns `None` for a built-in that is not pre-seeded (handle-typed built-ins, `HOST_FN`) or an
+/// unknown id.
+pub fn builtin_iface_shape(id: u32) -> Option<Vec<(&'static str, FuncType)>> {
+    preseeded_iface_shapes()
+        .into_iter()
+        .find_map(|(bid, ops)| (bid == id).then_some(ops))
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -9812,7 +9865,7 @@ const GEN_MASK: u32 = (1u32 << GEN_BITS) - 1;
 /// on the one `submit` while the pool absorbs the blocking) — the "0 blocked vCPU threads" win.
 pub const OFFLOAD_POOL_THREADS: usize = 4;
 
-/// Shared, thread-safe state behind a [`iface::BLOCKING`] capability — a *mock* synchronous-only host
+/// Shared, thread-safe state behind a [`cap_id::BLOCKING`] capability — a *mock* synchronous-only host
 /// op used to exercise the offload pool. Its `run` is **window-independent and `&mut Host`-free** (a
 /// pure function of its argument plus this `Send + Sync` state), which is exactly the property that
 /// lets a `submit` batch run it on the pool instead of the guest's vCPU thread. The result is
@@ -10014,7 +10067,7 @@ impl AsyncCounter for RegionCounter {
     }
 }
 
-/// An **embedder-registered host-capability handler** (iface [`iface::HOST_FN`]): given the `op`,
+/// An **embedder-registered host-capability handler** (iface [`cap_id::HOST_FN`]): given the `op`,
 /// the slot-encoded `i64` args, and the guest window (`None` if the module has no memory), it runs
 /// the operation and returns its result slots — or a [`Trap`] (e.g. `Trap::Exit`). This is how a
 /// host adds a capability (e.g. an `svm-wasi` shim) **without** touching this crate: the semantics
@@ -10036,7 +10089,7 @@ pub trait RegionMinter {
 /// Like [`HostFn`] but the handler is also handed a [`RegionMinter`] — the escape hatch for the
 /// zero-copy file-mmap bridge (§4b): an mmap-capable fs handler opens a file, mints a file-backed
 /// `SharedRegion` over it, and returns the handle so the guest aliases the real file into its window.
-/// Registered with [`Host::grant_host_fn_region`]; resolves under the same [`iface::HOST_FN`] as a
+/// Registered with [`Host::grant_host_fn_region`]; resolves under the same [`cap_id::HOST_FN`] as a
 /// plain `HostFn`, so a guest reaches it identically.
 pub type HostFnRegion = Box<
     dyn FnMut(
@@ -10144,6 +10197,35 @@ const PROVIDER_FUEL_RESERVE: u64 = 1 << 32;
 /// fail-closed and identically on every backend. Caller-fuel threading is the designed
 /// follow-up alongside exporter-domain state.
 const GUEST_IMPL_FUEL: u64 = 1 << 26;
+
+/// §3.5 `cap` **boundary translation**: for each slot the signature types `ValType::Cap`,
+/// re-grant the capability the slot names from `src`'s handle table into `dst`'s, replacing the
+/// value with the receiver-local packed handle. Non-`cap` slots pass through untouched — a
+/// guest-visible `cap` is `i32`-width data, treated specially *only* at a boundary. A forged /
+/// dead / non-re-grantable handle is a fail-closed [`Trap::CapFault`].
+///
+/// This is the guest↔guest half of §2.3's "objects are arguments": authority crosses an
+/// offer-call boundary exactly where a signature says `cap`, and unmarked integers keep the
+/// forgeability guarantee (a raw handle crossing domains would index the *receiver's* table and
+/// is inert). The re-grant policy is [`Host::regrant_into_child`]'s — an offer is adopted one
+/// domain-hop deeper (§3.1 provenance), a pipe end aliases its shared backing, a coordinate-free
+/// cap copies.
+fn translate_cap_slots(
+    src: &mut Host,
+    dst: &mut Host,
+    types: &[ValType],
+    slots: &mut [i64],
+) -> Result<(), Trap> {
+    for (ty, slot) in types.iter().zip(slots.iter_mut()) {
+        if *ty == ValType::Cap {
+            let translated = src
+                .regrant_into_child(*slot as i32, dst)
+                .ok_or(Trap::CapFault)?;
+            *slot = translated as i64;
+        }
+    }
+    Ok(())
+}
 
 // The `Host` *is* the region minter — the narrow authority a `HostFnRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
@@ -10594,9 +10676,9 @@ impl Host {
             return Ok(());
         }
         let policy = |name: &str| match name {
-            "write" => Some((iface::STREAM, 1u32)),
-            "read" => Some((iface::STREAM, 0u32)),
-            "exit" => Some((iface::EXIT, 0u32)),
+            "write" => Some((cap_id::STREAM, 1u32)),
+            "read" => Some((cap_id::STREAM, 0u32)),
+            "exit" => Some((cap_id::EXIT, 0u32)),
             _ => None,
         };
         let first_of = |h: &Host, tid: u32| -> Option<i32> {
@@ -11257,7 +11339,7 @@ impl Host {
 
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
     pub fn grant_stream(&mut self, role: StreamRole) -> i32 {
-        self.grant(iface::STREAM, Binding::Stream(role))
+        self.grant(cap_id::STREAM, Binding::Stream(role))
     }
 
     /// §4 / S4 — mint a **host-served pipe** and grant both ends, returning `(write_handle,
@@ -11270,8 +11352,8 @@ impl Host {
     pub fn grant_pipe(&mut self) -> (i32, i32) {
         let pipe = self.pipes.len() as u32;
         self.pipes.push(Arc::new(Mutex::new(VecDeque::new())));
-        let w = self.grant(iface::STREAM, Binding::PipeEnd { pipe, write: true });
-        let r = self.grant(iface::STREAM, Binding::PipeEnd { pipe, write: false });
+        let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
+        let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (w, r)
     }
 
@@ -11280,7 +11362,7 @@ impl Host {
     /// index-carrying cap a §14 child can be handed: it returns the shared backing (not the parent-local
     /// index) so [`Self::install_pipe_end`] can alias it into a child `Host`.
     fn resolve_pipe_end(&self, handle: i32) -> Option<(bool, PipeBacking)> {
-        match self.resolve(handle, iface::STREAM) {
+        match self.resolve(handle, cap_id::STREAM) {
             Ok(Binding::PipeEnd { pipe, write }) => {
                 Some((write, Arc::clone(self.pipes.get(pipe as usize)?)))
             }
@@ -11294,7 +11376,7 @@ impl Host {
     fn install_pipe_end(&mut self, write: bool, backing: PipeBacking) -> i32 {
         let pipe = self.pipes.len() as u32;
         self.pipes.push(backing);
-        self.grant(iface::STREAM, Binding::PipeEnd { pipe, write })
+        self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write })
     }
 
     /// PROCESS.md S2 — promote `stdout` to a **shared** sink and return a handle to it, so a child
@@ -11336,20 +11418,20 @@ impl Host {
         }
     }
     pub fn grant_exit(&mut self) -> i32 {
-        self.grant(iface::EXIT, Binding::Exit)
+        self.grant(cap_id::EXIT, Binding::Exit)
     }
     pub fn grant_clock(&mut self) -> i32 {
-        self.grant(iface::CLOCK, Binding::Clock)
+        self.grant(cap_id::CLOCK, Binding::Clock)
     }
     pub fn grant_memory(&mut self) -> i32 {
-        self.grant(iface::MEMORY, Binding::Memory)
+        self.grant(cap_id::MEMORY, Binding::Memory)
     }
     /// Grant a §9/§12 `IoRing` capability — authority to `submit` batched/deferred `cap.call`s
     /// (synchronously via op 0, or asynchronously via op 1 `submit_async` + op 2 `reap`).
     pub fn grant_io_ring(&mut self) -> i32 {
         let idx = self.rings.len() as u32;
         self.rings.push(Arc::new(RingState::default()));
-        self.grant(iface::IO_RING, Binding::IoRing(idx))
+        self.grant(cap_id::IO_RING, Binding::IoRing(idx))
     }
     /// Grant a §12 `Blocking` capability — a mock synchronous/blocking host op the offload pool can
     /// overlap. `block_for` is how long each op blocks (`Duration::ZERO` for a pure compute);
@@ -11364,30 +11446,30 @@ impl Host {
         });
         let idx = self.blockings.len() as u32;
         self.blockings.push(state);
-        self.grant(iface::BLOCKING, Binding::Blocking(idx))
+        self.grant(cap_id::BLOCKING, Binding::Blocking(idx))
     }
     /// Read back the [`AsyncState`] behind a granted `Blocking` handle (a test inspects `max_active`
     /// to confirm a batched `submit` overlapped on the pool). `None` if the handle isn't a `Blocking`.
     pub fn blocking_state(&self, handle: i32) -> Option<Arc<AsyncState>> {
-        match self.resolve(handle, iface::BLOCKING) {
+        match self.resolve(handle, cap_id::BLOCKING) {
             Ok(Binding::Blocking(idx)) => self.blockings.get(idx as usize).cloned(),
             _ => None,
         }
     }
 
     /// §7 Register an **embedder host-capability** handler and grant a handle to it (iface
-    /// [`iface::HOST_FN`]). The guest reaches it with `cap.call HOST_FN <op> <handle> (args)`; the
+    /// [`cap_id::HOST_FN`]). The guest reaches it with `cap.call HOST_FN <op> <handle> (args)`; the
     /// closure supplies the semantics, so a host adds a capability (e.g. an `svm-wasi` shim) without
     /// changing the VM. The handler is host code in the **authority** TCB — it sees the guest window
     /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
     pub fn grant_host_fn(&mut self, f: HostFn) -> i32 {
         let idx = self.host_fns.len() as u32;
         self.host_fns.push(f);
-        self.grant(iface::HOST_FN, Binding::HostFn(idx))
+        self.grant(cap_id::HOST_FN, Binding::HostFn(idx))
     }
 
     /// §4b Register an **mmap-capable** embedder host-capability handler and grant a handle to it
-    /// (also iface [`iface::HOST_FN`], so a guest resolves it exactly like a plain [`grant_host_fn`]).
+    /// (also iface [`cap_id::HOST_FN`], so a guest resolves it exactly like a plain [`grant_host_fn`]).
     /// Identical to `grant_host_fn` except the handler is additionally handed a [`RegionMinter`] on
     /// each call, so it can mint a file-backed `SharedRegion` and return the handle — the delivery
     /// mechanism for the zero-copy file-mmap bridge. The extra authority is exactly region-minting
@@ -11395,20 +11477,28 @@ impl Host {
     pub fn grant_host_fn_region(&mut self, f: HostFnRegion) -> i32 {
         let idx = self.host_fns_region.len() as u32;
         self.host_fns_region.push(f);
-        self.grant(iface::HOST_FN, Binding::HostFnRegion(idx))
+        self.grant(cap_id::HOST_FN, Binding::HostFnRegion(idx))
     }
 
     /// Intern an interface's op-signature list and return its id (IMPORTS.md §3.2): structurally
     /// identical lists collide to the same id, so **id-equality ≡ structural equality** within
     /// this `Host` (D59 applied to capability interfaces — a parent-implemented interface is
     /// typewise indistinguishable from any other structurally-equal one; provenance, not typing,
-    /// is the honest bit, §3.1). Ids allocate from [`iface::GUEST_IMPL_BASE`] upward.
+    /// is the honest bit, §3.1). Guest ids allocate from [`cap_id::GUEST_IMPL_BASE`] upward — but a
+    /// declaration structurally equal to a **pre-seeded built-in shape** ([`preseeded_iface_shapes`],
+    /// IMPORTS.md §3.5) interns to that built-in's fixed id instead, so a guest that declares (e.g.)
+    /// the `Stream` interface is typewise the same as a real host stream and an import slot requiring
+    /// that shape accepts either. This grants no authority — only a real handle of the matching
+    /// [`Binding`] can be called.
     pub fn intern_interface(&mut self, sigs: &[FuncType]) -> u32 {
+        if let Some(id) = preseeded_iface_id(sigs) {
+            return id;
+        }
         if let Some(i) = self.iface_intern.iter().position(|s| **s == *sigs) {
-            return iface::GUEST_IMPL_BASE + i as u32;
+            return cap_id::GUEST_IMPL_BASE + i as u32;
         }
         self.iface_intern.push(sigs.into());
-        iface::GUEST_IMPL_BASE + (self.iface_intern.len() - 1) as u32
+        cap_id::GUEST_IMPL_BASE + (self.iface_intern.len() - 1) as u32
     }
 
     /// **Wire an interface offer into this domain's table** (IMPORTS.md §3.2) and return the
@@ -11694,21 +11784,21 @@ impl Host {
     /// it (so the range and every sub-range are power-of-two aligned, §4/D19) — the caller's
     /// contract, mirroring how the host lays out windows.
     pub fn grant_address_space(&mut self, base: u64, size: u64) -> i32 {
-        self.grant(iface::ADDRESS_SPACE, Binding::AddressSpace { base, size })
+        self.grant(cap_id::ADDRESS_SPACE, Binding::AddressSpace { base, size })
     }
 
     /// Grant a §14 `Instantiator` capability over the window sub-range `[base, base+size)` — the
     /// authority to spawn children (`instantiate`/`join`) confined to power-of-two sub-windows of it
     /// (§14). Like `grant_address_space`, `size` must be a power of two and `base` a multiple of it.
     pub fn grant_instantiator(&mut self, base: u64, size: u64) -> i32 {
-        self.grant(iface::INSTANTIATOR, Binding::Instantiator { base, size })
+        self.grant(cap_id::INSTANTIATOR, Binding::Instantiator { base, size })
     }
 
     /// Resolve a handle as an `Instantiator` (§14) and return its `(base, size)` sub-range, or a
     /// `CapFault` for a forged / closed / wrong-type handle. Used by the eval loop, which services
     /// `instantiate`/`join` itself (the generic dispatch can't reach the executor).
     fn resolve_instantiator(&self, handle: i32) -> Result<(u64, u64), Trap> {
-        match self.resolve(handle, iface::INSTANTIATOR)? {
+        match self.resolve(handle, cap_id::INSTANTIATOR)? {
             Binding::Instantiator { base, size } => Ok((base, size)),
             _ => Err(Trap::CapFault),
         }
@@ -11717,13 +11807,13 @@ impl Host {
     /// Grant a §14 `Yielder` capability (the co-fiber child's handle back to its parent). Used by the
     /// eval loop when standing up a coroutine child; not a powerbox-level grant.
     fn grant_yielder(&mut self) -> i32 {
-        self.grant(iface::YIELDER, Binding::Yielder)
+        self.grant(cap_id::YIELDER, Binding::Yielder)
     }
 
     /// Confirm a handle resolves to *this* domain's `Yielder` (§14 co-fiber); a forged/wrong handle is
     /// a `CapFault`. The eval loop calls this before yielding the running coroutine's continuation.
     fn resolve_yielder(&self, handle: i32) -> Result<(), Trap> {
-        match self.resolve(handle, iface::YIELDER)? {
+        match self.resolve(handle, cap_id::YIELDER)? {
             Binding::Yielder => Ok(()),
             _ => Err(Trap::CapFault),
         }
@@ -11759,7 +11849,7 @@ impl Host {
             durable,
             digest: module_digest(m),
         });
-        self.grant(iface::MODULE, Binding::Module(id))
+        self.grant(cap_id::MODULE, Binding::Module(id))
     }
 
     /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore
@@ -11776,7 +11866,7 @@ impl Host {
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
     /// module ops. A forged / closed / wrong-type handle is a `CapFault`.
     fn resolve_module(&self, handle: i32) -> Result<&ModuleGrant, Trap> {
-        match self.resolve(handle, iface::MODULE)? {
+        match self.resolve(handle, cap_id::MODULE)? {
             Binding::Module(id) => self.modules.get(id as usize).ok_or(Trap::CapFault),
             _ => Err(Trap::CapFault),
         }
@@ -11819,7 +11909,7 @@ impl Host {
     pub fn grant_shared_region_backed(&mut self, backing: RegionBacking) -> i32 {
         let id = self.regions.len() as u32;
         self.regions.push(backing);
-        self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
+        self.grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
 
     /// PROCESS.md S1b/S1c — install (or clear, with `None`) the **canonical-key futex** region hook.
@@ -11849,7 +11939,7 @@ impl Host {
     pub fn grant_budget(&mut self, fuel: i64, mem: i64, spawn: i64) -> i32 {
         let id = self.budgets.len() as u32;
         self.budgets.push(BudgetState { fuel, mem, spawn });
-        self.grant(iface::BUDGET, Binding::Budget(id))
+        self.grant(cap_id::BUDGET, Binding::Budget(id))
     }
 
     /// Set this domain's §6 [`Attestation`] — what `cap.self.attest` reports. The embedder calls it on
@@ -11905,7 +11995,7 @@ impl Host {
             bytes_left: JIT_DEFAULT_MAX_BLOB_BYTES,
         });
         self.jit_table_log2 = self.jit_table_log2.max(table_log2);
-        self.grant(iface::JIT, Binding::JitDomain(id))
+        self.grant(cap_id::JIT, Binding::JitDomain(id))
     }
 
     /// The `call_indirect` table reservation (`log2`) the run's root vCPU should build for B2
@@ -12003,7 +12093,7 @@ impl Host {
         });
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
         // stored unit stays (append-only storage; harmless without a handle).
-        match self.try_grant(iface::JIT_CODE, Binding::JitCode { domain, unit }) {
+        match self.try_grant(cap_id::JIT_CODE, Binding::JitCode { domain, unit }) {
             Some(h) => Ok(Ok(JitCompiled {
                 handle: h,
                 domain,
@@ -12048,7 +12138,7 @@ impl Host {
 
     /// Resolve a handle as a `Jit` domain (a forged/closed/wrong-type handle is a `CapFault`).
     pub fn resolve_jit_domain(&self, handle: i32) -> Result<u32, Trap> {
-        match self.resolve(handle, iface::JIT)? {
+        match self.resolve(handle, cap_id::JIT)? {
             Binding::JitDomain(d) => Ok(d),
             _ => Err(Trap::CapFault),
         }
@@ -12056,7 +12146,7 @@ impl Host {
 
     /// Resolve a handle as a `CompiledCode` unit → `(domain, unit)`.
     pub fn resolve_jit_code(&self, handle: i32) -> Result<(u32, u32), Trap> {
-        match self.resolve(handle, iface::JIT_CODE)? {
+        match self.resolve(handle, cap_id::JIT_CODE)? {
             Binding::JitCode { domain, unit } => Ok((domain, unit)),
             _ => Err(Trap::CapFault),
         }
@@ -12127,7 +12217,7 @@ impl Host {
         }
         let id = self.regions.len() as u32;
         self.regions.push(backing);
-        self.try_grant(iface::SHARED_REGION, Binding::SharedRegion(id))
+        self.try_grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
 
     /// Install the backing factory for **guest-minted** regions (`AddressSpace.create_region`,
@@ -12142,7 +12232,7 @@ impl Host {
     /// shared object). Used by the eval loop's cross-domain `grant` (SharedRegion op 4); a forged /
     /// closed / wrong-type handle is a `CapFault`.
     fn resolve_region(&self, handle: i32) -> Result<RegionBacking, Trap> {
-        match self.resolve(handle, iface::SHARED_REGION)? {
+        match self.resolve(handle, cap_id::SHARED_REGION)? {
             Binding::SharedRegion(id) => {
                 self.regions.get(id as usize).cloned().ok_or(Trap::CapFault)
             }
@@ -12326,7 +12416,7 @@ impl Host {
         if self.cap_record.is_some() || self.cap_replay.is_some() {
             return None; // a tape is active — fall back so the input is recorded/replayed
         }
-        Some(match self.resolve(handle, iface::CLOCK) {
+        Some(match self.resolve(handle, cap_id::CLOCK) {
             Ok(Binding::Clock) => {
                 let now = self.clock_ns;
                 self.clock_ns = self.clock_ns.wrapping_add(1);
@@ -12621,13 +12711,12 @@ impl Host {
                 if args.len() != sig.params.len() {
                     return Err(Trap::CapFault);
                 }
-                let vals: Vec<Value> = sig
-                    .params
-                    .iter()
-                    .zip(args)
-                    .map(|(ty, &s)| slot_to_val(*ty, s))
-                    .collect();
-                let (res, _, _) = match &entry.state {
+                // §3.5 `cap` boundary translation happens per branch, because the receiver host
+                // differs: `cap`-typed args are re-granted caller→provider *before* the run,
+                // `cap`-typed results provider→caller *after* it. Non-`cap` slots are plain i32
+                // data. A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the
+                // caller's call traps, fail-closed, identically on every backend.
+                match &entry.state {
                     // §3.2 v2 **instanced** offer: run over the provider's persistent window +
                     // powerbox (exporter-domain state). The blocking lock is deadlock-free by
                     // construction — providers never hold offers (`grant_impl_cap` refuses
@@ -12647,10 +12736,18 @@ impl Host {
                         if st.fuel == 0 {
                             return Err(Trap::CapFault);
                         }
+                        let mut arg_slots = args.to_vec();
+                        translate_cap_slots(self, &mut st.host, &sig.params, &mut arg_slots)?;
+                        let vals: Vec<Value> = sig
+                            .params
+                            .iter()
+                            .zip(&arg_slots)
+                            .map(|(ty, &s)| slot_to_val(*ty, s))
+                            .collect();
                         let budget = st.fuel.min(GUEST_IMPL_FUEL);
                         let mut impl_fuel = budget;
-                        let out = drive_arc(
-                            entry.funcs,
+                        let (res, _, _) = drive_arc(
+                            entry.funcs.clone(),
                             f,
                             &vals,
                             &mut impl_fuel,
@@ -12658,26 +12755,41 @@ impl Host {
                             &mut st.host,
                         );
                         st.fuel -= budget - impl_fuel; // drain what the call actually used
-                        out
+                        let mut result_slots: Vec<i64> =
+                            res?.iter().map(|v| val_to_slot(*v)).collect();
+                        translate_cap_slots(&mut st.host, self, &sig.results, &mut result_slots)?;
+                        Ok(result_slots)
                     }
                     // v1 **pure** offer: windowless, empty powerbox — arguments in, results out,
                     // capped at the flat per-call budget (there is no provider domain to drain;
-                    // the wirer accepted the bounded per-call price at wiring).
+                    // the wirer accepted the bounded per-call price at wiring). The ephemeral
+                    // host lives just long enough to hold any translated `cap` arg the impl
+                    // forwards or returns (e.g. an identity offer over a `cap`).
                     None => {
+                        let mut ephemeral = Host::new();
+                        let mut arg_slots = args.to_vec();
+                        translate_cap_slots(self, &mut ephemeral, &sig.params, &mut arg_slots)?;
+                        let vals: Vec<Value> = sig
+                            .params
+                            .iter()
+                            .zip(&arg_slots)
+                            .map(|(ty, &s)| slot_to_val(*ty, s))
+                            .collect();
                         let mut impl_fuel = GUEST_IMPL_FUEL;
-                        drive_arc(
-                            entry.funcs,
+                        let (res, _, _) = drive_arc(
+                            entry.funcs.clone(),
                             f,
                             &vals,
                             &mut impl_fuel,
                             &mut None,
-                            &mut Host::new(),
-                        )
+                            &mut ephemeral,
+                        );
+                        let mut result_slots: Vec<i64> =
+                            res?.iter().map(|v| val_to_slot(*v)).collect();
+                        translate_cap_slots(&mut ephemeral, self, &sig.results, &mut result_slots)?;
+                        Ok(result_slots)
                     }
-                };
-                // A trap inside the impl (fault, fuel, CapFault) propagates verbatim — the caller's
-                // call traps, fail-closed, identically on every backend.
-                Ok(res?.iter().map(|v| val_to_slot(*v)).collect())
+                }
             }
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
             // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
@@ -12824,7 +12936,7 @@ impl Host {
                             spawn: cs,
                         });
                         Ok(vec![
-                            match self.try_grant(iface::BUDGET, Binding::Budget(child)) {
+                            match self.try_grant(cap_id::BUDGET, Binding::Budget(child)) {
                                 Some(h) => {
                                     let b = &mut self.budgets[idx];
                                     b.fuel = pf;
@@ -12874,7 +12986,7 @@ impl Host {
                     }
                     // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit #1).
                     return Ok(vec![match self.try_grant(
-                        iface::ADDRESS_SPACE,
+                        cap_id::ADDRESS_SPACE,
                         Binding::AddressSpace {
                             base: base + off,
                             size: child,
@@ -13150,7 +13262,7 @@ impl Host {
             }
             let user_data = i64::from_le_bytes(raw[48..56].try_into().unwrap());
 
-            if type_id == iface::IO_RING {
+            if type_id == cap_id::IO_RING {
                 // A ring submitting to a ring would recurse without bound — inert CapFault.
                 pending.push(Pending {
                     at,
@@ -13158,10 +13270,10 @@ impl Host {
                     result: 0,
                     status: trap_status(&Trap::CapFault),
                 });
-            } else if type_id == iface::BLOCKING && op == 0 {
+            } else if type_id == cap_id::BLOCKING && op == 0 {
                 // Offloadable iff the handle actually resolves to a `Blocking` binding; a forged /
                 // wrong-type handle is an inert CapFault (the I2 check), never queued.
-                match self.resolve(handle, iface::BLOCKING) {
+                match self.resolve(handle, cap_id::BLOCKING) {
                     Ok(Binding::Blocking(idx)) => {
                         let slot = pending.len();
                         pending.push(Pending {
@@ -13305,8 +13417,8 @@ impl Host {
             }
             let user_data = i64::from_le_bytes(raw[48..56].try_into().unwrap());
 
-            if type_id == iface::BLOCKING && op == 0 {
-                if let Ok(Binding::Blocking(bidx)) = self.resolve(handle, iface::BLOCKING) {
+            if type_id == cap_id::BLOCKING && op == 0 {
+                if let Ok(Binding::Blocking(bidx)) = self.resolve(handle, cap_id::BLOCKING) {
                     // Offload: compute on a pool thread, post the completion, then bump+notify so a
                     // parked vCPU wakes (the counter write happens-before the notify, so the futex
                     // compare-under-lock can't lose the wakeup).
@@ -13330,7 +13442,7 @@ impl Host {
                     trap_status(&Trap::CapFault),
                 ));
                 inline_done += 1;
-            } else if type_id == iface::IO_RING {
+            } else if type_id == cap_id::IO_RING {
                 // A ring submitting to a ring would recurse without bound — inert CapFault.
                 ring.completed.lock().unwrap().push_back((
                     user_data,
@@ -15384,7 +15496,7 @@ mod region_minter_tests {
 
         // Dispatch op 0 → the handler mints via the `RegionMinter` and returns the region handle.
         let out = host
-            .cap_dispatch_slots(iface::HOST_FN, 0, h, &[], None)
+            .cap_dispatch_slots(cap_id::HOST_FN, 0, h, &[], None)
             .expect("host_fn_region dispatch");
         let region_h = out[0];
         assert!(
@@ -15394,7 +15506,7 @@ mod region_minter_tests {
 
         // The returned handle really is a live `SharedRegion` (resolves under iface 4), and its
         // backing is the 64-byte object the handler minted.
-        match host.resolve(region_h as i32, iface::SHARED_REGION) {
+        match host.resolve(region_h as i32, cap_id::SHARED_REGION) {
             Ok(Binding::SharedRegion(id)) => {
                 assert_eq!(host.regions[id as usize].size(), 64, "minted region size");
             }
@@ -15423,16 +15535,16 @@ mod gen_recycle_tests {
     fn handle_slot_recycles_across_generation_wrap() {
         let mut h = Host::new();
         // Grant once (slot 0, generation 1) and confirm it resolves.
-        let handle0 = h.try_grant(iface::EXIT, Binding::Exit).expect("grant");
+        let handle0 = h.try_grant(cap_id::EXIT, Binding::Exit).expect("grant");
         let slot = (handle0 as u32 as usize) & (CAP - 1);
-        assert!(h.resolve(handle0, iface::EXIT).is_ok());
+        assert!(h.resolve(handle0, cap_id::EXIT).is_ok());
 
         // Force the counter to the last value before wrap, then close + regrant: the new handle is
         // issued at generation `2^GEN_BITS`, whose low `GEN_BITS` are 0 — exactly the case the old
         // `s.generation == gen` compare got wrong (the slot would have died forever).
         h.table[slot].generation = (1u32 << GEN_BITS) - 1;
         h.close(handle0);
-        let handle_wrap = h.try_grant(iface::EXIT, Binding::Exit).expect("regrant");
+        let handle_wrap = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
         assert_eq!(
             (handle_wrap as u32 as usize) & (CAP - 1),
             slot,
@@ -15444,14 +15556,14 @@ mod gen_recycle_tests {
             "counter wrapped past GEN_BITS"
         );
         assert!(
-            h.resolve(handle_wrap, iface::EXIT).is_ok(),
+            h.resolve(handle_wrap, cap_id::EXIT).is_ok(),
             "slot must recycle cleanly when the generation counter wraps"
         );
 
         // The stale pre-wrap handle is still inert (a forged/stale index re-checks the generation and
         // faults), so recycling did not reopen a use-after-close hole.
         assert!(matches!(
-            h.resolve(handle0, iface::EXIT),
+            h.resolve(handle0, cap_id::EXIT),
             Err(Trap::CapFault)
         ));
     }
