@@ -69,9 +69,14 @@ The system is four ideas wearing many names:
 
 ## Imports (the consumer side)
 
-- **import** — a named capability requirement a module declares: `import 0 "write"
-  (i64, i64) -> (i64)`. Says "bind me something implementing this signature under this
-  name"; confers nothing by itself.
+- **import** — a named capability requirement a module declares: `import 0 func
+  "posix.write" 1`. Says "bind me something implementing this shape under this name";
+  confers nothing by itself.
+- **import name** — one string, compared only for equality by the core. Namespacing is
+  a convention inside the string (dotted segments, most-significant first: `posix.fs`,
+  `app.log`; `svm.` reserved for platform interfaces) — wirer policy may match by
+  prefix, the mechanism never parses names. (The v7 wire's vestigial `ns` field is
+  deleted at v8.)
 - **manifest** — a module's import list as a whole: the up-front, fail-closed statement
   of what it needs. Bounds *requirements*, not *reach* (reach is bounded by grants).
 - **import slot** — the per-instance binding position behind import `i`: filled at
@@ -87,11 +92,13 @@ The system is four ideas wearing many names:
 - **`import.attach`** — fill (or refill) a `rebindable` slot with a capability the
   domain already holds, type-checked fail-closed. The "reflect, decide, attach once,
   then ordinary calls" pattern.
-- **grouped import** — (designed: IMPORTS.md §3.5) an import slot binding a *whole
-  interface* rather than one op: `import 0 interface "env" "fs" 2`, called as
-  `call.import 0.read` (by op name) or `call.import 0.1` (positional). Today's
-  flat named import is the singleton case of the same mechanism.
-- **coverage binding** — (designed: §3.5) the binding relation for grouped imports:
+- **grouped import** — (landed: IMPORTS.md §3.5, wire v7) an import slot binding a
+  *whole interface* rather than one op: `import 0 interface "posix.fs" 2`, called as
+  `call.import 0.read` (by op name) or `call.import 0 op 1` (positional). The flat
+  named import is the singleton case of the same mechanism — and the group is the
+  extra assertion that its ops are facets of *one object*: same provider state,
+  atomically bound and revoked, holdable as one handle.
+- **coverage binding** — (landed: §3.5) the binding relation for grouped imports:
   a consumer's interface declaration is a *requirement set*; binding succeeds iff
   the provider covers it (every required op present, same name, equal signature —
   extra provider ops ignored), with a per-slot op remap frozen at bind time. Names

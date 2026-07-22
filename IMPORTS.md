@@ -665,8 +665,8 @@ type 0 func (i64, i64) -> (i64)
 type 1 func (i64) -> (i64)
 type 2 interface { read: 0, len: 1 }   ; op names required
 
-import 0 interface "env" "fs" 2 required   ; grouped: one slot, the whole requirement
-import 1 func "env" "log" 1 rebindable     ; flat: a singleton requirement
+import 0 interface "posix.fs" 2 required   ; grouped: one slot, the whole requirement
+import 1 func "app.log" 1 rebindable       ; flat: a singleton requirement
 
 func 0 () -> (i64) {
   block 0 {
@@ -697,9 +697,21 @@ func 0 () -> (i64) {
   `export … interface` they are func indices — the kind keyword up front says
   which). One signature syntax, `(params) -> (results)`, appearing only in
   `type … func` entries; everything else references a type index.
-- **Import names are two-level**: `("env", "fs")` — the first level names the
-  provider binding point, the second the bundle (grouped) or op (flat).
-  Resolver vocabulary.
+- **An import name is one string; the core only compares it for equality**
+  (settled 2026-07-22, replacing the earlier two-level `("env", "fs")` form).
+  Namespacing is a *convention inside the string*, never a wire field: dotted
+  segments, most-significant first — `posix.fs`, `app.log` — with the `svm.`
+  prefix reserved for platform-defined interfaces. Wirer policy (forward
+  everything under `posix.`, grant by prefix) is prefix matching in binder
+  code, exactly where policy belongs; the mechanism stays name-blind. This is
+  the same discipline as D59 (names never enter type identity): structure in
+  names is for wirers, humans, and tooling — the core sees an atom. Precedent:
+  the component model's own IDs (`wasi:filesystem/types@0.2.0`) pack
+  namespace, package, and version into one structured string; wasm's separate
+  module level is an accident of the JS `importObject` embedding, not a
+  design principle. The v7 wire's vestigial `ns` field (nothing ever resolved
+  on it) is deleted at v8. The name pairs naturally with the op level:
+  `("posix.fs", "read")` — level 1 picks the object, level 2 the op.
 - **Index spaces stay per-section** (types / imports / funcs / exports).
   Import index = handle-table slot is ABI (plus the reserved child prefix);
   folding types into the import numbering would put a "subtract the
@@ -1054,7 +1066,11 @@ with its reason recorded:
   drops from the instruction and the encoding, and a manifest call site is just
   `call.import 0.read (args)`. No functionality is lost: binding moves from link-time
   baking to per-instance slot state (strictly more capable), and dynamic dispatch on a
-  runtime handle value remains as `call.import.dyn`.
+  runtime handle value remains as `call.import.dyn`. **Riding the same v8 bump: the
+  `ns` field is deleted** (settled 2026-07-22 — an import name is one string, dotted
+  namespacing by convention; see the text-format rules above). Nothing resolves on
+  `ns` today, so the deletion is wire + surface only: drop the field, drop the second
+  string from the `import` line, migrate corpora names to the dotted form.
 - **`cap` boundary translation** (the triangle's `join` path) is the recorded follow-up;
   the type is reserved and lowers as `i32` everywhere.
 - **Registry-grouped host caps** (`HostCap::iface`) and **intern pre-seeding** of
