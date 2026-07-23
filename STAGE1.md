@@ -218,6 +218,27 @@ keystone of self-similarity. It is **not built**. Until it lands:
    step 2 of the revised plan (OS-thread children in own guarded windows; the
    canonical-key futex, step 1, landed as S1b) — sequential-first, concurrency
    promptly after.
+
+   **[BUILT 2026-07-23 — the substrate composition, reference interpreter.]**
+   Two changes closed the gap, then the pipeline just composed: (1) the
+   **cross-domain canonical futex key** — the interp's `FutexKey::Region` first
+   field was the *per-window* region id (the S1b caveat), so two domains
+   mapping one granted backing produced different keys and every wake missed;
+   it now keys on the **backing allocation's identity**, closing the S1c
+   residue. (2) **`SharedRegion` re-grants into spawned children** —
+   `can_regrant`/`regrant_into_child` alias the same backing into the child's
+   powerbox (the pipe-end pattern), so op-8/11/13 named grants (and detached
+   spawns) carry the data plane; previously only coroutine children could
+   receive a region. Pinned by `svm-interp/tests/concurrent_stages.rs`: a
+   parent mints a region, spawns a producer and a consumer as separate carves
+   (own windows, own address spaces), and the two move four items through a
+   **one-slot bounded ring** (flag + datum in the region), parking on the flag
+   and waking each other — the shape sequential spawn/wait deadlocks on
+   outright. Regressions surface loudly (30 s wait timeouts fold into the
+   result ×1000), and the run completes in well under a second — real wakes.
+   **Remaining for this item:** the JIT pipeline (aliasing a `SharedRegion`
+   into a *separate child window* is the S1c deferred deep-PAL piece) and the
+   `c_shell` personality `|` wiring over rings — both in TODO.md.
 7. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
    piece for shells that fork *themselves*.
 

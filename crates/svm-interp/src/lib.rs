@@ -3530,10 +3530,15 @@ enum FutexKey {
     /// A normal (anonymous) window page — keyed by confined absolute address. Anonymous pages are never
     /// aliased across domains, so the address is a sound identity.
     Anon(u64),
-    /// A §13 `SharedRegion`-aliased page — keyed by `(region id, byte offset within the region)`, so
-    /// every alias of the same region byte maps to the same key regardless of which window (or offset)
-    /// names it. This is what lets a sibling/parent↔child pipe ring on shared memory wake its peer.
-    Region(u32, u64),
+    /// A §13 `SharedRegion`-aliased page — keyed by `(backing identity, byte offset within the
+    /// region)`, so every alias of the same region byte maps to the same key regardless of which
+    /// window, window offset, **or domain** names it (the S1c residue: a per-window region id was
+    /// canonical within one domain only — two domains granted the same backing got different
+    /// keys, and a pipe ring between concurrently-running children never woke). The identity is
+    /// the backing allocation's address (stable while any grant holds it — a mapped waiter's
+    /// window keeps it alive; a wake against a freed-and-reused address is a futex-legal spurious
+    /// wake). This is what lets a sibling/parent↔child pipe ring on shared memory wake its peer.
+    Region(u64, u64),
 }
 
 /// Why a vCPU yielded its worker (returned by [`VCpu::run`]).
@@ -13680,6 +13685,7 @@ impl Host {
     fn can_regrant(&self, handle: i32) -> bool {
         self.resolve_pipe_end(handle).is_some()
             || self.resolve_live_impl(handle).is_some()
+            || self.resolve_region(handle).is_ok()
             || self.resolve_guest_impl(handle).is_ok()
             || self.resolve_copyable(handle).is_ok()
     }
@@ -13702,6 +13708,14 @@ impl Host {
         if let Some(e) = self.resolve_live_impl(handle) {
             let (callee, export, sigs) = (Arc::clone(&e.callee), e.export, Arc::clone(&e.sigs));
             return Some(child.install_live_impl(callee, export, sigs));
+        }
+        // Concurrent stages (STAGE1.md item 6): re-granting a §13 `SharedRegion` aliases the
+        // SAME backing into the child's powerbox — the explicit parent↔child / sibling↔sibling
+        // data plane (PROCESS.md §4: never implicit carve addresses). Each grantee maps it into
+        // its own window; the canonical futex key (backing identity) makes wait/notify
+        // rendezvous across the domains — the concurrent-pipeline substrate.
+        if let Ok(backing) = self.resolve_region(handle) {
+            return Some(child.grant_shared_region_backed(backing));
         }
         // A **wired interface offer** (IMPORTS.md §3.2/§3.3): re-granting it is how a parent
         // forwards, wraps, or overrides a capability for a child — the entry (shared function
@@ -15737,11 +15751,21 @@ impl Mem {
     fn futex_key(&self, base: u64) -> FutexKey {
         if self.has_regions.load(Ordering::Relaxed) {
             let rel = base.wrapping_sub(self.window.base());
+            let space = self.space_read();
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = self.space_read().prot.get(&(rel / self.page))
+            }) = space.prot.get(&(rel / self.page))
             {
-                return FutexKey::Region(*region, region_off + rel % self.page);
+                // Cross-domain canonical identity (S1c residue): key on the backing
+                // *allocation*, not the per-window region id — two domains that map the same
+                // granted backing must produce the same key, or a concurrent pipe ring's
+                // notify misses its peer. The fat `dyn` pointer's data address is the identity.
+                let ident = space
+                    .regions
+                    .get(region)
+                    .map(|b| Arc::as_ptr(b) as *const u8 as u64)
+                    .unwrap_or(*region as u64);
+                return FutexKey::Region(ident, region_off + rel % self.page);
             }
         }
         FutexKey::Anon(base)
