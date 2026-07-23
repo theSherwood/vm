@@ -13,6 +13,94 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+> **I36–I40 (2026-07-23):** the §3.6 serving-substrate review, recorded at the owner's request
+> after a design walkthrough. Two further items from the same review were **already tracked** and
+> are not duplicated here: fiber-level `svc.wait`/`Join` parks (TODO.md §3.6 residue,
+> "Join-in-fiber parks") and durability × serving (TODO.md "Durable event-parks" + PROCESS.md O10).
+> Verdict from the review: none of these needs a different design — the model is the actor model
+> (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
+> and I37/I38 need their idioms documented so they're chosen, not stumbled into.
+
+### I36 — a serving module runs its ENTIRE program on the tree-walk oracle: `module_serves` folds the fast backends away (S3, **promoted 2026-07-23 — owner: the cliff is not acceptable**)
+
+**Where:** the §3.6 parity decision (IMPORTS.md): the serve loop (`svc.wait`/`svc.poll` + handler
+admission) exists only in the tree-walk eval loop; the bytecode and JIT entries detect a serving
+module (`module_serves`) and fall back to the oracle **for the whole module** — compute included.
+One impl-export handler costs a personality its fast backend everywhere.
+
+**Why it's a gap, not a design flaw:** nothing in the model precludes native serve loops — the
+JIT already has the pieces (fiber runtime, futex thunks, call trampolines, host-side queue). The
+fold was the correct differential-first baseline; it was parked "awaiting benchmark evidence,"
+and the owner's verdict supersedes that: a parent-as-kernel personality (jacl) is exactly a
+serving domain that needs its compute fast.
+
+**Fix sketch (staged):** (1) bytecode serve loop — the same rewind-driven state machine
+(`serve_run`/`handler_parks`/`serve_count`) in the bytecode dispatch loop, sharing the Host queue
+and Sched wake paths; differential vs the tree-walk. (2) JIT serve loop — `svc.wait` as a thunk
+parking on the domain queue (condvar keyed like the futex table), handlers launched as fibers via
+the existing call trampoline, handler parks riding the S1c shared-futex machinery. The oracle
+fold stays as the differential baseline, not the shipped path.
+
+### I37 — a handler trap kills the whole serving domain: total blast radius per bad request (S3)
+
+**Where:** §3.6 handlers run over the domain's **one world** (same window/powerbox/fuel), so a
+trap in any handler is terminal for the domain and every in-flight dispatch — any client that
+finds a crashing input in any handler takes the service down for everyone. Death-is-revocation
+keeps the failure *clean* (parked callers wake with a probeable errno; nothing hangs), but the
+blast radius is the domain.
+
+**Why "continue after trap" is not the fix:** the world may be half-mutated at the trap point;
+resuming the serve loop over corrupted state would be unsound. Trap-is-terminal is forced by
+one-world semantics, which is also what makes handlers race-free without locks.
+
+**Fix (idioms, not substrate):** the actor-model answers, both already expressible —
+(1) **supervision**: the parent `join`/`poll`s its serving child and respawns it on death (all
+primitives exist; a documented pattern, optionally a personality-level respawn helper);
+(2) **isolation granularity is domain granularity**: put risky handlers in worker child domains
+the server spawns (pay-for-what-you-isolate). Action: document both as THE pattern in
+IMPORTS.md/PROCESS.md so personalities choose their blast radius deliberately.
+
+### I38 — the servicer cannot shed or shape load: no per-client fairness, no admission control beyond one global quota (S3)
+
+**Where:** the svc queue is one bounded FIFO per domain; the only backpressure is queue-full and
+the fiber quota at admission (`EAGAIN`). A single chatty client with a live offer can keep the
+queue full and starve every sibling into `EAGAIN`; the servicer cannot cancel a stuck parked
+handler, deadline a dispatch, or distinguish callers. Caller-side timeouts (racing fibers +
+revocation-unparks, O1) protect *callers* — nothing protects the *servicer* beyond provider-pays
+fuel caps.
+
+**Boundary:** mid-flight handler cancellation is unsound for the same one-world reason as I37 —
+load control must live at **admission**, where nothing has mutated yet.
+
+**Fix sketch:** per-caller (or per-offer) bounded sub-queues with round-robin admission — the
+enqueue path already knows the caller's identity (ticket/domain); plus an optional timed
+`svc.wait` so an idle-but-scheduled servicer can run its own housekeeping. Parked-handler
+discipline stays guest-side (handlers use timed waits). Small, additive, no model change.
+
+### I39 — handler execution is serialized: one domain's dispatches never use more than one core (S3, latent hazard — a constraint to keep documented, not a bug)
+
+**Where:** concurrency in the serve loop comes only from handler *parks*; a CPU-bound handler
+blocks every other dispatch until it finishes or parks. This is the flip side of the race-freedom
+guarantee (one world, no locks) and matches F6's scoping of guest-served calls to
+**shell-frequency control traffic**. The hazard is latent: someone routes a hot path or a data
+plane through handlers and discovers the ceiling in production.
+
+**Fix (pattern, not substrate):** shard state across worker domains (the parent introduces
+clients to N workers — the grant graph is the load balancer), and keep bulk data on the
+`SharedRegion` ring plane, never in handler args. Action: state the ceiling and both patterns
+explicitly next to F6 so the constraint is designed around, not tripped over.
+
+### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4)
+
+**Where:** a completed dispatch whose caller didn't (or can't) claim the reply parks the value in
+`Host::svc_results` keyed by ticket. If the caller died between enqueue and claim, nothing sweeps
+the entry — a long-lived serving domain accumulates orphaned tickets. Bounded by call volume, not
+by live state.
+
+**Fix sketch:** sweep a caller's outstanding tickets on its death/revocation (the
+death-is-revocation path already visits the waiter structures), or bound the map with an LRU/TTL.
+Small; suitable as a rider on any §3.6 residue slice.
+
 ### I35 — chibicc miscompile (unreduced): an indexed array store through a post-incremented counter inside a capability-enumeration loop read back zeros (S3) — seen 2026-07-23, building the c_shell `__stage` ring runner
 
 **Where:** guest C compiled by the chibicc frontend (`--child-entry`). The `__stage` filter
