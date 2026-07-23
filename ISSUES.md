@@ -33,6 +33,15 @@ any future rendezvous regression fails loudly in seconds instead of hanging a ru
 pre-built container) or add a step-level `timeout-minutes` so the job fails fast and
 re-runs instead of burning the runner budget.
 
+**Same-day sibling (2026-07-23, run 30032025837):** the `real-browser` job's "Install
+Playwright + Chromium" step stalled >30 min (24 s – 3 min on every prior run) — an
+npm/CDN download hang, before any tree code runs. Third distinct infra fetch-stall of
+the day (apt mingw, runner-loss mid-link, npm). The pattern generalizes the mitigation:
+**every network-fetch step in CI should carry a `timeout-minutes`** so a wedged mirror
+fails-fast into a re-run instead of pinning a runner for the 6-hour default; caching
+(Playwright browser cache keyed on the package version, like the Postgres inputs the
+same job already caches) removes the fetch entirely from the steady state.
+
 ### I33 — `jit_killpath_stops_runaway_child` flaked under full-workspace parallel load (S4) — **RESOLVED** (2026-07-22): the kill-path escape in the JIT `join` returned a clean `0` instead of propagating `OutOfFuel`; original report below
 
 **Where:** `crates/svm/tests/jit_killpath.rs::jit_killpath_stops_runaway_child`, during a full
