@@ -437,6 +437,19 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
             types(&ty.results),
             arglist(args)
         ),
+        // §3.6 sugar: the service points print as `svc.poll`/`svc.wait` (greppable, per the
+        // design) — pure spelling over `cap.call CAP_SELF_TYPE_ID 9|10`; the ignored handle
+        // operand rides along so the round-trip is exact.
+        Inst::CapCall {
+            type_id: svm_ir::CAP_SELF_TYPE_ID,
+            op: op @ (9 | 10),
+            sig,
+            handle,
+            args,
+        } if sig.params.is_empty() && *sig.results == [ValType::I64] && args.is_empty() => {
+            let name = if *op == 9 { "svc.poll" } else { "svc.wait" };
+            format!("{name} v{handle}")
+        }
         Inst::CapCall {
             type_id,
             op,
@@ -2483,6 +2496,21 @@ impl<'a> Parser<'a> {
                 ty: FuncType { params, results },
                 idx,
                 args,
+            });
+        }
+        if op == "svc.poll" || op == "svc.wait" {
+            // §3.6 sugar over `cap.call CAP_SELF_TYPE_ID 9|10 () -> (i64) v<h> ()` — the
+            // service points, spelled greppably. The handle operand is carried but ignored.
+            let handle = self.value(names)?;
+            return Ok(Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op: if op == "svc.poll" { 9 } else { 10 },
+                sig: svm_ir::FuncType {
+                    params: vec![],
+                    results: vec![ValType::I64],
+                },
+                handle,
+                args: vec![],
             });
         }
         if op == "cap.call" {

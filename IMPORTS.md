@@ -1418,6 +1418,27 @@ non-durable (a live run is not a snapshot artifact). Pinned by
 `svc_serve_loop.rs`: the full caller ↔ servicer round-trip — spawn,
 mint, call-and-park, `svc.wait`-serve, reply-wake, join.
 
+**[BUILT 2026-07-22] §3.6 slice 4 — sugar, the slot route, rebind
+revocation.** (1) **`svc.poll`/`svc.wait` text sugar** — pure spelling
+over the reserved dispatch (print+parse only; wire unchanged; greppable,
+as the design demands). (2) **The slot route**: an import slot attached
+(`import.attach`) to a live-callee cap routes `call.import` like the
+direct form — enqueue, park, reply — the discovery-then-attach pattern
+over a live domain (flat/identity op mapping this slice; coverage-remapped
+grouped bindings later). (3) **Rebind revokes the outgoing connection**:
+`import.attach` wakes fibers parked in calls through the slot's old
+binding handle with the revocation errno (the pinned "closing/rebinding"
+trigger); **in-flight live dispatches deliberately still complete** —
+program order is call → results; rebind governs future calls. **Recorded
+finding — handler-fiber parking is gated on fiber-level park routing:**
+today a park (`memory.wait`, a blocking read) parks the whole *vCPU*, so
+a handler that parked would wedge the very serve loop that must keep
+running to unblock it; §3.6's "the vCPU idles only if it has no other
+runnable fiber" presumes the §12 fiber-level-park substrate, which does
+not exist yet. Handlers therefore stay run-to-completion (a parking
+handler is a fail-closed `CapFault`), and handler-fiber admission lands
+with that substrate, not before.
+
 ---
 
 ## 4. Interactions with settled decisions
