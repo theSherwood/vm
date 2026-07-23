@@ -216,3 +216,35 @@ fn jit_instantiator_child_trap_propagates() {
     );
     assert!(matches!(jo, JitOutcome::Trapped(_)), "jit: {jo:?}");
 }
+
+/// §3.6 parity — `child_offer` (op 14) on the JIT is a **probeable refusal, never a trap**:
+/// the op is eval-loop-serviced (it mints from the tree-walk scheduler's live-child registry,
+/// which the JIT runtime does not have), so the JIT lowers it to a `-EINVAL` result — the
+/// same refusal the interpreter gives a bad child handle. Differential: both backends agree.
+#[test]
+fn jit_child_offer_refuses_probeably_and_matches_interp() {
+    if !svm_jit::fiber_supported() {
+        return;
+    }
+    let src = "memory 16\n\
+         func (i32) -> (i64) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 vbad = i32.const 99\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vc = cap.call 6 14 (i32, i64) -> (i32) v0 (vbad, vz)\n\
+         \x20 vr = i64.extend_i32_s vc\n\
+         \x20 return vr\n\
+           }\n\
+         }\n";
+    let (ir, _imem, jo, _jmem) = both(src, 16);
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(-22)]),
+        "interp: a bad child handle refuses -EINVAL"
+    );
+    assert_eq!(
+        jo,
+        JitOutcome::Returned(vec![-22]),
+        "jit: op 14 refuses probeably with the same value — no trap, no wrong answer"
+    );
+}

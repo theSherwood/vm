@@ -1439,6 +1439,24 @@ not exist yet. Handlers therefore stay run-to-completion (a parking
 handler is a fail-closed `CapFault`), and handler-fiber admission lands
 with that substrate, not before.
 
+**[BUILT 2026-07-22] §3.6 backend parity — oracle-first, no wrong
+answers.** The serve loop stays a **single implementation on the
+reference interpreter** (the oracle), per the repo's philosophy; the fast
+backends decline cleanly rather than triplicate the scheduler. As built:
+**bytecode** declines the svc ops at compile (like the Instantiator ops)
+and the whole module falls back to the tree-walker — `Backend::Bytecode`
+**serves identically via the oracle** (pinned by a fallback-equality
+test). **JIT** answers probeable refusals — the svc ops `-EINVAL` from
+the one shared dispatch (fixing a routing bug the parity test caught:
+packed self-ops ≥ 6 had trapped instead), `child_offer` (op 14) lowered
+to a `-EINVAL` result instead of a `CapFault` trap, differential-pinned
+against the interpreter's own bad-input refusal. `LiveImpl` calls on
+non-serving tiers were already probeable `-EINVAL`. The parity contract:
+every backend either **serves** (tree-walk; bytecode via fallback) or
+**refuses probeably** — never a trap, never a wrong answer. Native
+fast-backend serving is deferred indefinitely (a cold, embedder-driven
+path; duplicating the scheduler cuts against the single-oracle design).
+
 ---
 
 ## 4. Interactions with settled decisions

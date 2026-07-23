@@ -11663,11 +11663,6 @@ impl Host {
             // §6 `cap.self.attest`: the domain's platform-vouched provenance, packed as
             // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
             4 => Ok(vec![self.attestation.packed() as i64]),
-            // §3.6 `svc.poll` reaching host-side dispatch means this backend tier has no
-            // eval-loop servicing arm (only the eval loop can run guest handler code): answer
-            // a probeable `-EINVAL` rather than trap — the guest's serve loop can fall back.
-            // The tree-walk eval loop intercepts the op before dispatch and serves it.
-            CAP_SELF_SVC_POLL => Ok(vec![EINVAL]),
             // §3.1 `cap.self.provenance(handle) -> i32` (IMPORTS.md): the binding's provenance
             // class — `0` = **platform-terminated** (host-native vtable), `d ≥ 1` =
             // **ancestor-terminated** (a wired guest impl terminating `d` domain boundaries up:
@@ -13130,6 +13125,12 @@ impl Host {
                     Ok(vec![self.self_covers(h, idx)?])
                 }
                 8 => Ok(vec![self.reify_export(idx)? as i64]),
+                // §3.6 svc.poll/svc.wait reaching host-side dispatch = a backend tier without
+                // the eval-loop servicing arm (only the eval loop can run guest handler code):
+                // a probeable `-EINVAL`, never a trap — the guest's serve loop can fall back.
+                // (The tree-walk eval loop intercepts these before dispatch; the bytecode
+                // engine declines them at compile and falls back to the tree-walker.)
+                CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT if op >> 8 == 0 => Ok(vec![EINVAL]),
                 _ => Err(Trap::CapFault),
             };
         }

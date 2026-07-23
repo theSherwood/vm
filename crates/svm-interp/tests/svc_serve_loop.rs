@@ -129,6 +129,38 @@ fn the_svc_poll_op_number_is_pinned() {
     assert_eq!(svm_interp::CAP_SELF_SVC_WAIT, 10);
 }
 
+/// §3.6 parity — **the bytecode entry serves via the oracle fallback**: `run_with_host_fast`
+/// (the `Backend::Bytecode` entry) declines to compile the svc ops and runs the whole module
+/// on the tree-walker, so a serving domain behaves **identically** through either entry.
+/// Fallback is the same free-correctness path the Instantiator ops already ride.
+#[test]
+fn the_bytecode_entry_serves_identically_via_the_oracle_fallback() {
+    let m = server_module();
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let t1 = host.svc_enqueue(0, 0, vec![5]).expect("enqueue 1");
+    let t2 = host.svc_enqueue(0, 0, vec![30]).expect("enqueue 2");
+    let mut fuel = u64::MAX;
+    let r = svm_interp::run_with_host_fast(&m, 0, &[], &mut fuel, &mut host).expect("run");
+    assert_eq!(r, vec![Value::I64(2042)], "identical to the tree-walk run");
+    assert_eq!(host.svc_result(t1), Some(7));
+    assert_eq!(host.svc_result(t2), Some(12));
+}
+
+/// §3.6 parity — a backend tier **without** eval-loop servicing answers both svc ops with a
+/// probeable `-EINVAL` from the one shared host dispatch (the JIT's route): refusal, never a
+/// trap, never a wrong answer — pinned directly at the shared entry.
+#[test]
+fn a_non_serving_tier_refuses_both_svc_ops_probeably() {
+    let mut host = Host::new();
+    for op in [CAP_SELF_SVC_POLL, svm_interp::CAP_SELF_SVC_WAIT] {
+        let r = host
+            .cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, op, 0, &[], None)
+            .expect("refusal, not a trap");
+        assert_eq!(r, vec![-22], "probeable -EINVAL for svc op {op}");
+    }
+}
+
 /// §3.6 slice 3 — **caller-side parking, end to end**: a parent spawns a serving child
 /// (§14 same-module), mints a live-callee offer over the child's export
 /// (`Instantiator.child_offer`, op 14), and calls through it. The call enqueues on the

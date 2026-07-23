@@ -1222,6 +1222,12 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 },
                 (cap_id::INSTANTIATOR, _) | (cap_id::YIELDER, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
+                // §3.6 service points (svc.poll/svc.wait) are eval-loop-serviced — they run
+                // guest handler code, which the bytecode engine cannot. Decline the compile so
+                // the whole module falls back to the tree-walk oracle and SERVES (the same
+                // free-correctness path as the Instantiator ops above), instead of answering
+                // a refusal from host-side dispatch.
+                (svm_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
                     type_id: *type_id,
