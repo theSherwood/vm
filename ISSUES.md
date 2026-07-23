@@ -154,6 +154,19 @@ commit 19 minutes earlier with only a test-fixture resize + docs in between. Sec
 if a third lands, take the durable mitigation (cap link parallelism / split `svm-jit` test bins)
 rather than re-running.
 
+**Third sighting (2026-07-23, run 30034429088) — durable mitigation prepared, blocked on token
+scope.** Identical death 51 s into the same step on the immediate retry (code-identical tree; the
+interleaved run between the two deaths passed in 8 min — an alternating pass/die pattern consistent
+with OOM raciness under runner neighbor pressure). UI note: the job *name* contains "fmt", so the
+PR checks list reads as a fmt failure — the fmt/clippy/build steps were green; the death is in the
+test step's link phase. Per the rule above the fix is capping the gating job's test-build
+parallelism — change ci.yml line `- run: cargo test --workspace` (the `check` job) to
+`- run: cargo test --workspace -j 2` — bounding concurrent heavy links (the memory peak; the step
+is warm-cache dominated, so the wall-clock cost is small). **The CI token cannot push workflow
+files** (`refusing to allow an OAuth App to ... without workflow scope`), so this one-line change
+needs the repo owner. If a fourth death lands *with* the cap, the next escalation is splitting the
+heaviest `svm-jit` test binaries.
+
 ### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — **RESOLVED** (2026-07-18) — found by the QuickJS breadth harness (2026-07-17)
 
 **Where:** the LLVM on-ramp on Bellard's QuickJS 2024-01-13, the `libbf` bignum path (BigInt).
