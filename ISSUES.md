@@ -40,7 +40,9 @@ the day (apt mingw, runner-loss mid-link, npm). The pattern generalizes the miti
 **every network-fetch step in CI should carry a `timeout-minutes`** so a wedged mirror
 fails-fast into a re-run instead of pinning a runner for the 6-hour default; caching
 (Playwright browser cache keyed on the package version, like the Postgres inputs the
-same job already caches) removes the fetch entirely from the steady state.
+same job already caches) removes the fetch entirely from the steady state. **Timeouts
+applied** in `.github/workflows_src/ci.yml` (the editable mirror — owner copies over):
+apt mingw ×2 (15 min) + Playwright install (10 min); the cache half remains open.
 
 ### I33 — `jit_killpath_stops_runaway_child` flaked under full-workspace parallel load (S4) — **RESOLVED** (2026-07-22): the kill-path escape in the JIT `join` returned a clean `0` instead of propagating `OutOfFuel`; original report below
 
@@ -163,9 +165,10 @@ test step's link phase. Per the rule above the fix is capping the gating job's t
 parallelism — change ci.yml line `- run: cargo test --workspace` (the `check` job) to
 `- run: cargo test --workspace -j 2` — bounding concurrent heavy links (the memory peak; the step
 is warm-cache dominated, so the wall-clock cost is small). **The CI token cannot push workflow
-files** (`refusing to allow an OAuth App to ... without workflow scope`), so this one-line change
-needs the repo owner. If a fourth death lands *with* the cap, the next escalation is splitting the
-heaviest `svm-jit` test binaries.
+files** (`refusing to allow an OAuth App to ... without workflow scope`), so the edit lives in
+**`.github/workflows_src/ci.yml`** (the editable mirror — see its README; the owner copies the
+directory over `.github/workflows/`). If a fourth death lands *with* the cap, the next escalation
+is splitting the heaviest `svm-jit` test binaries.
 
 ### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — **RESOLVED** (2026-07-18) — found by the QuickJS breadth harness (2026-07-17)
 

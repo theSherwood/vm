@@ -1,0 +1,543 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 7 * * *" # daily extended fuzz
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # Ride out transient crates.io connection resets instead of failing the job (ISSUES.md I18:
+  # a cold `cargo build`'s registry download died `curl [56] Connection reset by peer` and cost a
+  # manual re-run). Cargo's default is 3 quick retries; 10 with the longer timeout spans a
+  # multi-second registry blip.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_TIMEOUT: "60"
+  # Pin stable so a channel roll can't silently introduce new clippy/rustc lints
+  # under -D warnings (bump deliberately, same posture as the nightly-pinned fuzz job).
+  RUST_STABLE: "1.97.0"
+  # The Postgres the playground ships. One source of truth on purpose: it keys the build-input cache
+  # *and* is read by build-pg-assets.mjs. If those two ever disagree, a bump would hit the old
+  # version's cached bitcode + cluster, skip the rebuild, and ship the old Postgres — silently.
+  SVM_PG_VER: "17.5"
+
+jobs:
+
+  check:
+    name: build · test · fmt · clippy
+    runs-on: ubuntu-latest
+    # Backstop for an unforeseen liveness hang (e.g. ISSUES.md I7): bound the job to minutes, not
+    # GitHub's 6 h default, so a wedged `cargo test --workspace` fails the run instead of sitting
+    # stuck for hours. The named work-stealing demos already fail-fast in-test (run.rs); this covers
+    # anything else. Generous vs. a healthy cold-cache run (fmt + clippy + build + test + windows
+    # cross-check), tight vs. a hang.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      # ISSUES.md I30 durable mitigation (three sightings: a rust-lld SIGBUS, then two runner
+      # losses ~50 s into this step on 2026-07-23): the test build's parallel LINK phase is the
+      # memory peak — several svm-jit test binaries (each pulling the large Cranelift + Wasmtime
+      # rlibs) linking concurrently can OOM a 16 GB runner under neighbor pressure, which kills
+      # the runner agent (no logs, step frozen "in_progress"). Cap build parallelism to bound
+      # concurrent links; the step is warm-cache dominated, so the wall-clock cost is small.
+      - run: cargo test --workspace -j 2
+      - run: rustup target add x86_64-pc-windows-gnu
+      # The §5 W3 trap-capture C shim (trap_capture.c) is compiled for windows targets too, so the
+      # windows-gnu cross-check needs the mingw cross-compiler. (The MSVC build runs on windows-latest.)
+      # ISSUES.md I34: fetch steps carry their own timeout so a wedged mirror fails fast into a
+      # re-run instead of eating the whole job budget (a 29 min apt stall burned one 2026-07-23).
+      - name: install mingw cross toolchain
+        timeout-minutes: 15
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+      - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+
+  cross-os:
+    name: build · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Same I7 backstop as `check` (windows/macOS runners are slower, so a wider bound).
+    timeout-minutes: 45
+    # continue-on-error: true # TODO: drop once green to make parity gating (the windows guard is unverified)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  fuzz:
+    name: cargo-fuzz (escape-TCB targets)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_verify, diff, mask, wasm_transpile, spec_ops, spec_verify]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Pinned to a dated nightly, unlike the other nightly lanes (ISSUES.md I18): this job's first
+      # step *builds cargo-fuzz from source*, so its health depends on `latest nightly × cargo-fuzz's
+      # locked dep tree` compiling at 07:00 UTC — which broke for 5 straight nights (Jun 4-9, rustix
+      # vs a new reserved attribute) and silently produced zero fuzz coverage. The fuzz *targets*
+      # need nightly features, not the newest nightly. Bump the date deliberately (with the
+      # cargo-fuzz version) rather than riding the channel.
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { toolchain: nightly-2026-07-01 }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: fuzz }
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+
+  bench:
+    # Non-gating perf signal (DESIGN §1a). Wall-clock on shared runners is noisy and the
+    # committed `bench/baseline.txt` records *another* machine's ratios, so this never blocks a
+    # merge (`continue-on-error`) and runs only nightly / on demand. A wide `--tol` (40%) means
+    # only a gross regression — e.g. SSA promotion or mask-elision silently dropping, which is
+    # multiples, not percent — trips it; small cross-machine drift is ignored. (The *exact*
+    # promotion guard is the deterministic `c_frontend` memory-op test in the gating job.)
+    name: bench regression check (non-gating)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: bench }
+      # `cargo run` builds the chibicc fork itself (for the `alu_c` kernel); make + cc are
+      # preinstalled on ubuntu-latest. If the frontend can't build, that kernel is skipped.
+      - name: bench --check vs committed baseline
+        working-directory: bench
+        run: cargo run --release -- --check baseline.txt --tol 0.4
+
+  loom:
+    name: loom (parallel scheduler model check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: loom model check
+        run: cargo test -p svm-jit --lib loom
+        env:
+          RUSTFLAGS: "--cfg loom"
+
+  svm-llvm:
+    name: svm-llvm (LLVM→IR on-ramp · Linux-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: crates/svm-llvm }
+      - name: install LLVM/clang 18 (out-of-process build tools, no dev headers)
+        # The on-ramp now reads **textual `.ll`** via an in-house parser — it no longer links
+        # libLLVM, so the `-dev` headers/lib are gone. The test harness still shells out to two
+        # ordinary build-time tools: `clang` (compile the C/C++ corpus to bitcode) and `llvm-dis`
+        # (disassemble it to `.ll` for the reader). Both ship in the base `llvm-18`/`clang-18`
+        # packages, as do the `llvm-link-18`/`opt-18` the peval probe uses.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install Rust 1.81 (LLVM 18) for the peval Futamura probe only
+        # NOT for the Rust breadth lane anymore — that runs on the default stable `rustc` (its LLVM
+        # flows through the textual reader; the version-tolerance proof). This pin remains solely for
+        # the multi-crate `peval_*` probe (`tests/common/mod.rs`): it links the whole fixture closure
+        # with `llvm-link-18` and DCEs it with `opt-18`, and those LLVM-18 CLI tools can only ingest
+        # LLVM-18 IR — so the fixture must be built by a version-matched `rustc` (1.81 = LLVM 18.1).
+        # Without it the `peval_futamura`/`peval_jit`/`peval_in_sandbox` tests auto-skip (don't fail).
+        run: rustup toolchain install 1.81.0 --profile minimal
+      - name: fmt · clippy · test
+        working-directory: crates/svm-llvm
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+  miri:
+    # Run the unsafe memory substrate under Miri's UB/provenance + data-race checkers. svm-mem is
+    # Miri-aware (a heap-backed fallback replaces the mmap FFI under `cfg(miri)`), so its raw-pointer
+    # atomics and the Mapped-vs-Paged differential get provenance/race-checked — complementing loom
+    # (which models the protocol atomics) and TSan.
+    name: miri (svm-mem unsafe substrate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: miri }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo +nightly miri test -p svm-mem
+        env:
+          # Miri's weak-memory emulation ICEs on the differential test's mixed-size atomic accesses
+          # ("partially overlapping store buffer when previous write was atomic" — a Miri bug, not ours).
+          # Disabling it keeps full UB / provenance / data-race / alignment checking.
+          MIRIFLAGS: "-Zmiri-disable-weak-memory-emulation"
+
+  supply-chain:
+    # Scan the dependency tree against the RustSec advisory DB. Gated off pull_request so a
+    # newly-published advisory on a transitive dep surfaces on main / nightly without blocking
+    # unrelated feature PRs (same posture as the fuzz/bench jobs).
+    name: cargo-audit (advisory scan)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  asan:
+    # AddressSanitizer over the fiber stack-switch paths. svm-fiber's `asan` feature emits the
+    # __sanitizer_{start,finish}_switch_fiber annotations so ASan can follow manual stack switches.
+    name: ASan (svm-fiber switches)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo test -p svm-fiber (ASan + asan feature)
+        run: cargo test -p svm-fiber --features asan -Z build-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          # The scheduler intentionally leaks values live on a dropped-suspended fiber's stack
+          # (documented), so leak detection would false-positive — keep it to UB/races here.
+          ASAN_OPTIONS: "detect_leaks=0"
+
+  tsan:
+    # ThreadSanitizer over the shared-region hardware atomics (svm-mem's parallel vCPU substrate).
+    name: TSan (svm-mem concurrency)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo test -p svm-mem (TSan)
+        run: cargo test -p svm-mem --tests -Z build-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+
+  wasm32-differential:
+    name: wasm32 differential (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      - run: rustup target add wasm32-unknown-unknown
+      # gencorpus (native) writes corpus.json + corpus/*.svmbc; build the wasm32 lib; diff in Node
+      # (Node is preinstalled on ubuntu-latest — corpus.mjs needs only WebAssembly + BigInt).
+      - name: wasm32 corpus differential (119/119 vs native)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          cargo build --release --lib --target wasm32-unknown-unknown
+          node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
+
+  wasm64-differential:
+    name: wasm64 differential (Wasmtime embedding)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "" # override the global -D warnings: -Z build-std recompiles std from source
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            browser
+            browser/wt
+      - name: wasm64 corpus differential (119/119 vs native)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          cargo build -Z build-std=std,panic_abort --release --lib \
+            --target wasm64-unknown-unknown
+          cargo run --manifest-path wt/Cargo.toml --release -- \
+            target/wasm64-unknown-unknown/release/svm_browser.wasm
+
+  asan-jit-setjmp:
+    # AddressSanitizer over the JIT setjmp/longjmp path (Option B: libc _setjmp/_longjmp called
+    # inline from JITted code — memory-unsafe native-stack manipulation, so it gets svm-fiber-grade
+    # rigor, LLVM.md §"JIT longjmp"). Runs the on-ramp setjmp differential (all engines incl. the
+    # live JIT == native) under ASan. The baked _setjmp/_longjmp addresses resolve to ASan's
+    # interceptors, which unpoison the stack on the non-local jump — so a returns-twice mishandle
+    # surfaces here as a red-zone/use-after-return report rather than silent corruption.
+    name: ASan (JIT setjmp/longjmp)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: crates/svm-llvm }
+      - name: install LLVM/clang 18 (build tools for the svm-llvm test harness)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: cargo test -p svm-llvm setjmp (ASan, JIT path live)
+        run: cargo test --manifest-path crates/svm-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
+        env:
+          # -Zsanitizer=address replaces the workflow-global `-D warnings`: -Z build-std recompiles
+          # std from source, which would trip warnings-as-errors (same reason the wasm64 lane clears it).
+          RUSTFLAGS: "-Zsanitizer=address"
+          # The fiber scheduler intentionally leaks values on a dropped-suspended fiber's stack, so
+          # keep leak detection off and check UB/use-after-return/red-zones only (matches the asan lane).
+          ASAN_OPTIONS: "detect_leaks=0"
+
+  browser-real:
+    name: real-browser (Chromium via Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      # Three workspaces: `browser` (the wasm engine), the root (svm-run's `prep_svmb`/`build_image`),
+      # and the workspace-excluded `crates/svm-llvm` (`svm-llvm-translate`). The latter two build the
+      # Postgres regenerate half below; caching them is what keeps a warm run's re-translate at ~30s
+      # instead of a release rebuild of the translator on every run.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            browser
+            .
+            crates/svm-llvm
+      # Playwright + Chromium aren't preinstalled on the runner (unlike Node); install both.
+      # ISSUES.md I34: an npm/CDN stall wedged this step >30 min on 2026-07-23 (24 s – 3 min
+      # healthy) — bound it so a stall fails fast into a re-run instead of pinning the runner.
+      - name: Install Playwright + Chromium
+        timeout-minutes: 10
+        working-directory: browser
+        run: |
+          npm install playwright@1.56.1
+          npx playwright install --with-deps chromium
+
+      # LLVM is needed on EVERY run, not just a cold one: build-pg-assets.mjs hands the translator
+      # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (svm-llvm links no
+      # libLLVM). clang/flex/bison are Postgres's own build deps — used only on a cold input cache.
+      - name: install LLVM/clang 18 (+ Postgres build deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18 flex bison
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+
+      # Regenerate the Postgres artifacts from current code and stage them into web/assets/, so the
+      # `browser-test.mjs` Postgres check BOOTS instead of SKIPping (it skips when unstaged). That boot
+      # is the drift guard: a translator/encoder change that breaks the database fails the PR that
+      # introduces it rather than the next deploy. The cached inputs (whole-program bitcode + initdb'd
+      # cluster) are code-independent, so keying them on the Postgres version + shim sources is sound.
+      - name: cache Postgres build inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/svm_pg_cache/postgres_shimmed.bc
+            /tmp/svm_pg_cache/pgdata
+          key: pg-inputs-v1-${{ env.SVM_PG_VER }}-${{ hashFiles('crates/svm-run/demos/postgres/**') }}
+      # SVM_PG_VER comes from the workflow env above — the same value that keyed the cache.
+      - name: build + stage Postgres artifacts
+        working-directory: browser
+        env:
+          SVM_PG_CACHE: /tmp/svm_pg_cache
+        run: node build-pg-assets.mjs
+      # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
+      # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
+      - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
+            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
+            -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
+            -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
+            -Clink-arg=--export=__wasm_init_tls" \
+            cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+          node browser-test.mjs
+          # wasm-JIT reactor differential: each committed reactor guest (bounce/life/mandelzoom) must
+          # render byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining).
+          # Reuses the threads module built above + the committed `.svmb` assets — no extra toolchain.
+          node browser-jit-reactor-test.mjs
+          node browser-play-editor-test.mjs
+          node pg-reload-test.mjs
+          # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
+          # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
+          node browser-dap-test.mjs
+
+  embench-differential:
+    # Whole-stack differential on the real Embench-IoT suite — every engine's `verify` must equal
+    # native's (1). EMBENCH_STRICT makes a MISCOMPILE or an on-ramp build/translate failure fail the
+    # job. This is the net that caught the qrduino soundness bug, so it gates every PR.
+    name: embench differential (all engines · wasm32/wasm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            crates/svm-llvm
+            bench/cross-engine/wasmtime-rs
+      - name: install LLVM/clang 18 (clang for the kernels & wasm, llvm-dis for the on-ramp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
+        run: |
+          curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
+          echo "EMBENCH=/tmp/embench-iot-master" >> "$GITHUB_ENV"
+      - name: build the in-process Wasmtime runner (populates the wt/* columns)
+        run: cargo build --release --bin embench_one --manifest-path bench/cross-engine/wasmtime-rs/Cargo.toml
+      - name: embench differential (strict — MISCOMPILE or on-ramp failure ⇒ red)
+        env:
+          EMBENCH_STRICT: "1"
+        run: cargo run --release --example embench --manifest-path crates/svm-llvm/Cargo.toml
+
+  cross-engine-differential:
+    # Soundness gate for the cross-engine bench harness (crates/svm-llvm/examples/cross_engine.rs).
+    # It runs each kernel's LLVM-frontend IR on the bytecode engine *compiled to wasm* (the
+    # `svm-bytecode-wasm` row, via browser/bench.mjs on Node) and cross-checks every result against
+    # native bytecode. The harness prints `MISCOMPILE` on a mismatch but doesn't itself exit non-zero,
+    # so this step greps for it — and asserts the row actually ran, so a missing cdylib/node can't pass
+    # silently. Linux-only, like `svm-llvm` (the on-ramp shells out to clang/llvm-dis). The perf
+    # numbers it also prints are informational — the perf signal is the separate non-gating `bench` job.
+    name: cross-engine differential (svm-bytecode-wasm vs native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            crates/svm-llvm
+            browser
+      - name: install LLVM/clang 18 (clang for the kernels, llvm-dis for the on-ramp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - run: rustup target add wasm32-unknown-unknown
+      - name: build the svm-browser wasm32 cdylib (so the svm-bytecode-wasm row runs)
+        run: cargo build --release --lib --target wasm32-unknown-unknown --manifest-path browser/Cargo.toml
+      - name: cross-engine differential (MISCOMPILE ⇒ red)
+        run: |
+          set -o pipefail
+          cargo run --release --example cross_engine --manifest-path crates/svm-llvm/Cargo.toml 2>&1 | tee xe.log
+          if grep -q MISCOMPILE xe.log; then
+            echo "::error::cross-engine differential found a MISCOMPILE"; exit 1
+          fi
+          if ! grep -q '^svm-bytecode-wasm,' xe.log; then
+            echo "::error::svm-bytecode-wasm row did not run (node or svm-browser cdylib missing?)"; exit 1
+          fi
+
+  stack-guard:
+    # The fiber-scaling PROTOTYPE features, both OFF by default: the arena stack allocator
+    # (`arena-stacks`) and the JIT software stack-overflow guard (`stack-check`). The gating `check`
+    # job builds with neither, so this is the ONLY lane that compiles + runs the feature-gated code —
+    # incl. the `svm-jit` guard tests (single- and multi-vCPU fiber recursion must trap StackOverflow).
+    # Linux runtime + a windows-gnu cross-check for compile parity (the arena's VirtualAlloc path and
+    # the ABI-param threading) without needing a Windows runtime runner.
+    name: fiber-scaling features (stack-check + arena-stacks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}", components: clippy }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets -- -D warnings
+      - run: cargo test -p svm-jit --features stack-check,arena-stacks
+      # The stack-guard soundness fuzz's hole-oracle is the PROT_NONE guard page, present only on the
+      # default (non-arena) backend. The line above runs the check on the arena backend it ships with;
+      # this runs the fuzz on the guard-page backend so a frame that slips past the check faults
+      # (MemoryFault/crash) instead of silently corrupting a neighbour slot. (STACK_GUARD_FLIP.md #1.)
+      - run: cargo test -p svm-jit --features stack-check --test stack_guard_fuzz
+      - run: cargo test -p svm-fiber --features arena-stacks
+      # Compile parity for the feature-gated code on Windows. mingw is needed for the §5 trap-capture
+      # C shim (as in the `check` job's cross-check).
+      - run: rustup target add x86_64-pc-windows-gnu
+      # ISSUES.md I34: this exact step stalled 29 min on 2026-07-23 until the run was cancelled —
+      # bound it so an apt-mirror wedge fails fast into a re-run.
+      - name: install mingw cross toolchain
+        timeout-minutes: 15
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+
+  stack-guard-cross-os:
+    # Runtime coverage of the feature-gated code on aarch64 (macOS) + x86-64 Windows — the arena's
+    # VirtualAlloc path and the software guard have not run there yet. NON-GATING (continue-on-error)
+    # until proven green, mirroring the `cross-os` posture for the unverified windows guard; drop
+    # continue-on-error to make it gating once it passes.
+    name: fiber-scaling features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test -p svm-jit --features stack-check,arena-stacks
+      - run: cargo test -p svm-fiber --features arena-stacks
+
+  rustbench:
+    name: rustbench (real-program perf · svm-jit vs Wasmtime-w64)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - name: install workload toolchains
+        run: |
+          rustup toolchain install 1.81.0 --profile minimal
+          rustup +1.81.0 target add wasm32-unknown-unknown
+          rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: bench }
+      - name: rustbench
+        working-directory: bench
+        run: cargo run --release --bin rustbench
+
