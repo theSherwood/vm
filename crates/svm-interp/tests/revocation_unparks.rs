@@ -93,6 +93,69 @@ fn a_fresh_call_on_a_closed_stream_is_the_d37_use_after_close_fault() {
     );
 }
 
+/// §3.6 slice 4 — **rebind revokes the outgoing connection** (the pinned trigger: "closing/
+/// REBINDING the client handle"): fiber A parks reading through the handle that import slot 0
+/// is bound to; fiber B `import.attach`es a different stream into the slot; A's parked call
+/// completes with the revocation errno. Same wake as a close — rebind is a hang-up.
+const REBIND_RACERS: &str = r#"
+memory 16
+import 0 "in" (i64, i64) -> (i64) rebindable
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vh64 = i64.extend_i32_u v1
+  vt = thread.spawn 1 vh64 vh64
+  vbuf = i64.const 8
+  vcap = i64.const 4
+  vr = cap.call 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
+  vj = thread.join vt
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vharg: i64) {
+  vaddr = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const 100000000
+  vw = i32.atomic.wait vaddr vexp vto
+  vh = i32.wrap_i64 vharg
+  vst = import.attach 0 vh
+  vz64 = i64.extend_i32_u vst
+  return vz64
+  }
+}
+"#;
+
+#[test]
+fn a_rebind_of_the_slot_wakes_the_fiber_parked_through_its_old_binding() {
+    let m = svm_text::parse_module(REBIND_RACERS).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let stdin_h = host.grant_stream(StreamRole::In);
+    let other_h = host.grant_stream(StreamRole::Out);
+    host.set_stdin_blocking(true);
+    host.set_import_bindings(vec![svm_interp::BoundImport {
+        type_id: 0, // STREAM
+        op: 0,
+        handle: stdin_h,
+        bound: true,
+        rebindable: true,
+    }]);
+    let mut fuel = u64::MAX;
+    let r = run_with_host(
+        &m,
+        0,
+        &[Value::I32(stdin_h), Value::I32(other_h)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("no trap");
+    assert_eq!(
+        r,
+        vec![Value::I64(CAP_REVOKED)],
+        "the rebind hung up the old connection; the parked read completed with the errno"
+    );
+}
+
 /// Close is idempotent-shaped at the op level: closing an already-closed handle is itself the
 /// D37 fault (the handle no longer resolves) — nothing dangles, nothing double-frees.
 #[test]

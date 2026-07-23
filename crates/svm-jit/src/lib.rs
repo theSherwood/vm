@@ -7214,6 +7214,17 @@ fn lower_instantiator(
     // introduces no ABI mismatch. A non-scalar (or too-few args, or an unknown op) still lowers to an
     // unconditional runtime CapFault — never a compile-time rejection of a verified module.
     let is_scalar_int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
+    // §3.6 op 14 (`child_offer`) is eval-loop-serviced — it mints a live-callee offer from the
+    // tree-walk scheduler's child registry, which the JIT runtime does not have. Answer a
+    // probeable `-EINVAL` result instead of trapping (the oracle's own bad-input refusal
+    // shape), so a guest probes and falls back — parity is refusal, never a wrong answer.
+    if op == 14 && sig.results.iter().all(is_scalar_int) {
+        for t in &sig.results {
+            let v = b.ins().iconst(clif_ty(*t), -22);
+            vals.push(v);
+        }
+        return Ok(());
+    }
     let shape_ok = contract.is_some_and(|(need, res)| {
         sig.params.len() >= need.len()
             && sig.params[..need.len()].iter().all(is_scalar_int)

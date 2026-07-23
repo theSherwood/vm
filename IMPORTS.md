@@ -1418,6 +1418,55 @@ non-durable (a live run is not a snapshot artifact). Pinned by
 `svc_serve_loop.rs`: the full caller ↔ servicer round-trip — spawn,
 mint, call-and-park, `svc.wait`-serve, reply-wake, join.
 
+**[BUILT 2026-07-22] §3.6 slice 4 — sugar, the slot route, rebind
+revocation.** (1) **`svc.poll`/`svc.wait` text sugar** — pure spelling
+over the reserved dispatch (print+parse only; wire unchanged; greppable,
+as the design demands). (2) **The slot route**: an import slot attached
+(`import.attach`) to a live-callee cap routes `call.import` like the
+direct form — enqueue, park, reply — the discovery-then-attach pattern
+over a live domain (flat/identity op mapping this slice; coverage-remapped
+grouped bindings later). (3) **Rebind revokes the outgoing connection**:
+`import.attach` wakes fibers parked in calls through the slot's old
+binding handle with the revocation errno (the pinned "closing/rebinding"
+trigger); **in-flight live dispatches deliberately still complete** —
+program order is call → results; rebind governs future calls. **Recorded
+finding — handler-fiber parking is gated on fiber-level park routing:**
+today a park (`memory.wait`, a blocking read) parks the whole *vCPU*, so
+a handler that parked would wedge the very serve loop that must keep
+running to unblock it; §3.6's "the vCPU idles only if it has no other
+runnable fiber" presumes the §12 fiber-level-park substrate, which does
+not exist yet. Handlers therefore stay run-to-completion (a parking
+handler is a fail-closed `CapFault`), and handler-fiber admission lands
+with that substrate, not before.
+
+**[BUILT 2026-07-22] §3.6 backend parity — one oracle, identical
+behavior on all three backends.** The serve loop stays a **single
+implementation on the reference interpreter** (the oracle); a **serving
+module routes to it on every backend**, so behavior is identical, not
+merely safe. As built: **bytecode** declines the svc ops at compile
+(the engine's standing contract, like the Instantiator ops) and falls
+back to the tree-walker on its own; the **JIT** gets the same fold in
+`svm-run` (`module_serves`: a module containing `svc.poll`/`svc.wait`
+or `child_offer` runs on the oracle under `Backend::Jit` too — the
+run-once and reactor paths both). Pinned by a 3-backend equality test
+(`svc_parity.rs`: the full spawn → offer → park → serve → reply → join
+program exits 42 identically on TreeWalk, Bytecode, and Jit). Beneath
+the fold, the defense-in-depth refusals also hold — and building them
+caught a real routing bug (packed self-ops ≥ 6 trapped `CapFault`
+instead of refusing; fixed at the shared dispatch): svc ops and
+`child_offer` on a tier without servicing answer probeable `-EINVAL`
+(the JIT op-14 lowering is differential-pinned), covering the one
+residual asymmetry — a live cap *runtime-granted* by an embedder into
+an already-JIT-compiled module (embedder-controlled, statically
+invisible). **Native fast-backend serving is an open optimization, not
+a decision**: the serving domain is a cold, park-dominated event loop
+(its hot functions can tier via the §22 guest JIT), the §3.6 semantics
+are still moving (handler-fiber parking is substrate-gated), and
+duplicating scheduler machinery is the highest-divergence-risk class —
+so it waits for benchmark evidence (jacl workloads) or settled
+semantics, whichever demands it first; the oracle fold is the baseline
+any native port will be differential-tested against.
+
 ---
 
 ## 4. Interactions with settled decisions

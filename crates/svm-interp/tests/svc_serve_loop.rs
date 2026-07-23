@@ -129,6 +129,38 @@ fn the_svc_poll_op_number_is_pinned() {
     assert_eq!(svm_interp::CAP_SELF_SVC_WAIT, 10);
 }
 
+/// §3.6 parity — **the bytecode entry serves via the oracle fallback**: `run_with_host_fast`
+/// (the `Backend::Bytecode` entry) declines to compile the svc ops and runs the whole module
+/// on the tree-walker, so a serving domain behaves **identically** through either entry.
+/// Fallback is the same free-correctness path the Instantiator ops already ride.
+#[test]
+fn the_bytecode_entry_serves_identically_via_the_oracle_fallback() {
+    let m = server_module();
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let t1 = host.svc_enqueue(0, 0, vec![5]).expect("enqueue 1");
+    let t2 = host.svc_enqueue(0, 0, vec![30]).expect("enqueue 2");
+    let mut fuel = u64::MAX;
+    let r = svm_interp::run_with_host_fast(&m, 0, &[], &mut fuel, &mut host).expect("run");
+    assert_eq!(r, vec![Value::I64(2042)], "identical to the tree-walk run");
+    assert_eq!(host.svc_result(t1), Some(7));
+    assert_eq!(host.svc_result(t2), Some(12));
+}
+
+/// §3.6 parity — a backend tier **without** eval-loop servicing answers both svc ops with a
+/// probeable `-EINVAL` from the one shared host dispatch (the JIT's route): refusal, never a
+/// trap, never a wrong answer — pinned directly at the shared entry.
+#[test]
+fn a_non_serving_tier_refuses_both_svc_ops_probeably() {
+    let mut host = Host::new();
+    for op in [CAP_SELF_SVC_POLL, svm_interp::CAP_SELF_SVC_WAIT] {
+        let r = host
+            .cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, op, 0, &[], None)
+            .expect("refusal, not a trap");
+        assert_eq!(r, vec![-22], "probeable -EINVAL for svc op {op}");
+    }
+}
+
 /// §3.6 slice 3 — **caller-side parking, end to end**: a parent spawns a serving child
 /// (§14 same-module), mints a live-callee offer over the child's export
 /// (`Instantiator.child_offer`, op 14), and calls through it. The call enqueues on the
@@ -179,6 +211,99 @@ block 0 (va: i64, vb: i64) {
   }
 }
 "#;
+
+/// §3.6 slice 4 — the **slot route**: the same round-trip as the direct form, but the caller
+/// attaches the live-callee cap into a rebindable import slot and calls `call.import 0` — the
+/// discovery-then-attach pattern over a live domain. Same enqueue/park/reply machinery.
+const SLOT_CALLER: &str = r#"
+memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 2 }
+import 0 "svc.add" (i64, i64) -> (i64) rebindable
+
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 0
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  vst = import.attach 0 v7
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.import 0 (va, vb)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vk = i64.const 100
+  vm = i64.mul vj vk
+  vs = i64.add vm vr
+  return vs
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_slot_attached_live_call_parks_and_wakes_like_the_direct_form() {
+    let m = Arc::new({
+        let m = svm_text::parse_module(SLOT_CALLER).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        m
+    });
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    // The rebindable slot's template: typed to the (first-interned) offer interface, unbound.
+    host.set_import_bindings(vec![svm_interp::BoundImport {
+        type_id: 268435456, // GUEST_IMPL_BASE — the offer's structural intern (D59-deterministic)
+        op: 0,
+        handle: 0,
+        bound: false,
+        rebindable: true,
+    }]);
+    let h = host.grant_instantiator(0, 1u64 << 17);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(142)],
+        "attach → call.import through a live callee: park, serve (svc.wait sugar), reply, join"
+    );
+}
+
+/// §3.6 slice 4 — the `svc.*` sugar round-trips: `svc.wait v0` in SLOT_CALLER above already
+/// proves parse; this pins print→parse stability and the desugared identity.
+#[test]
+fn svc_sugar_round_trips_and_desugars_to_the_reserved_dispatch() {
+    let m = svm_text::parse_module(SLOT_CALLER).expect("parse");
+    let printed = svm_text::print_module(&m);
+    assert!(
+        printed.contains("svc.wait v"),
+        "the printer emits the greppable sugar"
+    );
+    let m2 = svm_text::parse_module(&printed).expect("reparse");
+    assert_eq!(m, m2, "text round-trip");
+    let m3 = svm_encode::decode_module(&svm_encode::encode_module(&m)).expect("decode");
+    assert_eq!(
+        m, m3,
+        "wire round-trip (sugar is pure spelling — no wire change)"
+    );
+}
 
 #[test]
 fn a_caller_parks_on_a_live_child_and_wakes_with_the_reply() {

@@ -7450,6 +7450,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     for a in args {
                         argv.push(get(&frames[top].vals, *a)?.i64());
                     }
+                    // §3.6 slice 4 — a slot bound (e.g. by `import.attach`) to a live-callee
+                    // offer routes like the direct form: enqueue on the callee, park this
+                    // fiber until the reply. Same backpressure and race story as slice 3.
+                    let live = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.import_live_target(*import)
+                    };
+                    if let Some((callee, export, base_op)) = live {
+                        let ticket = {
+                            let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
+                            cg.svc_enqueue(export, base_op + *op, argv)
+                        };
+                        match ticket {
+                            Some(t) => {
+                                sched.svc_wake(Arc::as_ptr(&callee) as usize);
+                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
+                            }
+                            None => {
+                                if !sig.results.is_empty() {
+                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
@@ -7553,6 +7578,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::ImportAttach { import, handle } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    // §3.6 slice 4 — rebind revokes the outgoing *connection*: fibers parked in
+                    // a call through the slot's old binding handle wake with the revocation
+                    // errno (the pinned racing-fibers trigger: "closing/REBINDING the client
+                    // handle"). In-flight live-callee dispatches (ticket-parked) deliberately
+                    // still complete — program order is call → results; rebind governs *future*
+                    // calls through the slot.
+                    let old = hg
+                        .import_binding(*import)
+                        .filter(|b| b.bound)
+                        .map(|b| b.handle);
                     let results = hg.cap_dispatch_slots(
                         svm_ir::CAP_IMPORT_ATTACH_TYPE_ID,
                         *import,
@@ -7561,6 +7596,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         None,
                     )?;
                     let status = *results.first().ok_or(Trap::Malformed)?;
+                    drop(hg);
+                    if status == 0 {
+                        if let Some(old) = old {
+                            if old != h {
+                                sched.cap_revoke(old, CAP_REVOKED);
+                            }
+                        }
+                    }
                     frames[top].vals.push(Reg::from_i32(status as i32));
                 }
                 // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
@@ -11620,11 +11663,6 @@ impl Host {
             // §6 `cap.self.attest`: the domain's platform-vouched provenance, packed as
             // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
             4 => Ok(vec![self.attestation.packed() as i64]),
-            // §3.6 `svc.poll` reaching host-side dispatch means this backend tier has no
-            // eval-loop servicing arm (only the eval loop can run guest handler code): answer
-            // a probeable `-EINVAL` rather than trap — the guest's serve loop can fall back.
-            // The tree-walk eval loop intercepts the op before dispatch and serves it.
-            CAP_SELF_SVC_POLL => Ok(vec![EINVAL]),
             // §3.1 `cap.self.provenance(handle) -> i32` (IMPORTS.md): the binding's provenance
             // class — `0` = **platform-terminated** (host-native vtable), `d ≥ 1` =
             // **ancestor-terminated** (a wired guest impl terminating `d` domain boundaries up:
@@ -12115,6 +12153,25 @@ impl Host {
             export,
         });
         Ok(self.grant(type_id, Binding::LiveImpl(idx)))
+    }
+
+    /// §3.6 slice 4 — the live-callee target behind import slot `i`, iff the slot is bound to a
+    /// [`Binding::LiveImpl`] handle: `(callee, export, base_op)`. The `call.import` route's
+    /// pre-dispatch probe (an ordinarily-bound slot answers `None` and flows to the ordinary
+    /// dispatch); the consumer's op offsets from `base_op` (flat/identity mapping this slice —
+    /// coverage-remapped grouped bindings ride a later slice).
+    fn import_live_target(&self, i: u32) -> Option<(Arc<Mutex<Host>>, u32, u32)> {
+        let b = self.import_binding(i)?;
+        if !b.bound {
+            return None;
+        }
+        match self.resolve(b.handle, b.type_id) {
+            Ok(Binding::LiveImpl(idx)) => self
+                .live_impls
+                .get(idx as usize)
+                .map(|e| (Arc::clone(&e.callee), e.export, b.op)),
+            _ => None,
+        }
     }
 
     /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
@@ -13068,6 +13125,12 @@ impl Host {
                     Ok(vec![self.self_covers(h, idx)?])
                 }
                 8 => Ok(vec![self.reify_export(idx)? as i64]),
+                // §3.6 svc.poll/svc.wait reaching host-side dispatch = a backend tier without
+                // the eval-loop servicing arm (only the eval loop can run guest handler code):
+                // a probeable `-EINVAL`, never a trap — the guest's serve loop can fall back.
+                // (The tree-walk eval loop intercepts these before dispatch; the bytecode
+                // engine declines them at compile and falls back to the tree-walker.)
+                CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT if op >> 8 == 0 => Ok(vec![EINVAL]),
                 _ => Err(Trap::CapFault),
             };
         }

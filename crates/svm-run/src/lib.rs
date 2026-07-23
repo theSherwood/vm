@@ -2989,6 +2989,36 @@ fn diff_outcome(
     }
 }
 
+/// §3.6 — whether a module **statically serves**: it contains a service point (`svc.poll`/
+/// `svc.wait`, the reserved self ops 9/10) or mints a live-callee offer
+/// (`Instantiator.child_offer`, op 14). Serving is eval-loop machinery — a single
+/// implementation on the reference interpreter (the oracle) — so a serving module routes to
+/// the tree-walker on every backend: bytecode declines at compile and falls back on its own;
+/// the JIT is folded here, giving **behavioral parity** (identical serving on all three
+/// backends), not just a probeable refusal. Runtime-granted live caps on a JIT run (an
+/// embedder wiring `wire_live_impl` into a compiled module) remain the embedder's choice and
+/// still answer `-EINVAL` — the static scan covers everything a guest can express in its bytes.
+fn module_serves(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    svm_ir::Inst::CapCall {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: 9 | 10,
+                        ..
+                    } | svm_ir::Inst::CapCall {
+                        type_id: 6,
+                        op: 14,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
 /// Fold an interpreter result (`TreeWalk`/`Bytecode`) into an [`Outcome`]: a clean return, an
 /// `Exit(code)`, or a trap (detect-and-kill, surfaced as `Err`). The interpreter already returns typed
 /// [`Value`]s, so no result-type table is needed (unlike [`outcome_from_jit`]).
@@ -4074,6 +4104,14 @@ impl Instance {
             host.register_cap_name(name, handle);
         }
 
+        // §3.6 behavioral parity: a serving module runs on the oracle regardless of the
+        // requested backend (see `module_serves`) — the same fold the bytecode engine already
+        // performs via its compile-decline fallback, applied to the JIT here.
+        let backend = if matches!(backend, Backend::Jit) && module_serves(m) {
+            Backend::TreeWalk
+        } else {
+            backend
+        };
         let folded = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
                 let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
@@ -4372,6 +4410,13 @@ fn run_capture_on(
     host: &mut Host,
     limits: &Limits,
 ) -> Result<(Outcome, Vec<u8>), String> {
+    // §3.6 behavioral parity (reactor path): serving modules run on the oracle on every
+    // backend — the same fold as `Instance::run_with_caps`.
+    let backend = if matches!(backend, Backend::Jit) && module_serves(m) {
+        Backend::TreeWalk
+    } else {
+        backend
+    };
     let treewalk = |host: &mut Host| {
         let mut fuel = limits.fuel.unwrap_or(DEFAULT_FUEL);
         run_capture_reserved_with_host(
