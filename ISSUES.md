@@ -137,6 +137,14 @@ linked fine on the same commit. Distinct from the macOS-launch SIGBUS entry belo
 recurs, reduce link-time memory: cap the linker's parallelism or split the heaviest test binaries. Log
 recurrences here to judge whether it needs a durable mitigation vs. staying a re-run-and-move-on flake.
 
+**Recurrence (2026-07-23, PR #422 run 30030308082):** same job, harder death — the runner was lost
+48 s into `cargo test --workspace` (step stuck "in_progress", job concluded `failure`, **no logs ever
+uploaded**, likely the OOM-killer taking the runner agent during the parallel link phase). Same
+commit's windows/macOS/miri/llvm jobs all green, and the identical job was fully green on the parent
+commit 19 minutes earlier with only a test-fixture resize + docs in between. Second sighting —
+if a third lands, take the durable mitigation (cap link parallelism / split `svm-jit` test bins)
+rather than re-running.
+
 ### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — **RESOLVED** (2026-07-18) — found by the QuickJS breadth harness (2026-07-17)
 
 **Where:** the LLVM on-ramp on Bellard's QuickJS 2024-01-13, the `libbf` bignum path (BigInt).
