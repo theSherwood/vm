@@ -1521,6 +1521,50 @@ nested-serve refusal, and the suspend fault. With this, the §3.6 core
 loop is semantically complete on the oracle: callers park, servers
 serve, handlers park, and nothing blocks a domain but its own choice.
 
+**[BUILT 2026-07-23] §3.6 — separate-module serving children.** The
+serve loop now covers the real shell shape: a child spawned from its
+**own** granted module (`instantiate_module` ops 5/6/7/13) serves its
+own offers, wired by the same `child_offer` (op 14). Two changes, both
+where the design said they belonged: (1) a `ModuleGrant` retains the
+whole granted `Arc<Module>`, and the spawn registers it as the child's
+**self module** — enqueue admission, handler resolution, and reflection
+all resolve against the child's own program, exactly as a same-module
+child resolves against the shared one; (2) the live-offer shape now
+comes from the **callee's** export (`offer_shape` on the child's
+powerbox — fetched before the wirer's lock, so the two powerbox locks
+are never held together), interned structurally into the wirer's table
+— D59 makes this a no-op for same-module children (the id ≡ the shape)
+and means **the wirer needs no self module at all** (pinned: the
+separate-module test registers none on the parent). The eval loop's
+7-tuple module-grant threading became a named `ChildMod` struct in
+passing. Pinned by `svc_serve_loop.rs`: the full round-trip against a
+foreign program (spawn its module, wire its offer, park, its
+`svc.wait` serves, reply, join — 142, same composite as the
+same-module form), and a bad export refusing probeable `-EINVAL`
+resolved against the *child's* module. Known residual, same class as
+the runtime-granted-cap asymmetry recorded with the parity fold: the
+`module_serves` oracle fold scans the module it runs, so a JIT parent
+that spawns a serving child module but never wires it (no `svc.*`, no
+op 14 of its own) keeps the JIT — where the child's `svc.*` answers
+the probeable refusal instead of serving. Any parent that actually
+*talks* to the child contains op 14 and folds to the oracle.
+
+**[BUILT 2026-07-23] §3.6 — sibling-as-service (live-offer re-grant).**
+A live-callee offer is now **re-grantable into a spawned child**
+(`can_regrant`/`regrant_into_child` cover `Binding::LiveImpl`): the
+parent takes `child_offer` over serving child A and hands the cap to
+child B at spawn (op 8/11/13 named grants), where it is installed
+against B's own powerbox — the shape rides the `LiveImplEntry`
+(captured at wire time), so the child-side intern never touches the
+callee's lock. B resolves it by name and calls: enqueue on A, park B,
+A serves, reply wakes B — **two siblings coordinating through a live
+peer their parent introduced**, no shared memory, no parent relay.
+This closes the S9 sibling-as-service topology through the grant
+graph (PROCESS.md §4 rescope); guest-side *self*-mint (a domain
+minting its own live offer, the distrust-parent variant) remains the
+recorded residue. Pinned by `svc_serve_loop.rs`
+(`a_sibling_calls_a_sibling_through_a_regranted_live_offer`, 142).
+
 ---
 
 ## 4. Interactions with settled decisions

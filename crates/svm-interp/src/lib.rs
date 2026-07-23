@@ -5593,17 +5593,22 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 /// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
 ///
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
-/// A resolved §14 `Module` grant's pieces, as the eval loop carries them: the child module's
-/// functions, declared window size, and data segments (`Arc`s — spawning shares, never copies).
-type ModArc = (
-    Arc<[Func]>,
-    Option<u8>,
-    Arc<[Data]>,
-    bool,
-    [u8; 32],
-    Arc<[svm_ir::Import]>,
-    Arc<[svm_ir::TypeEntry]>,
-);
+/// A resolved §14 `Module` grant's pieces, as the eval loop carries them from the op decode
+/// into the shared spawn logic (`Arc`s — spawning shares, never copies). `None` = a
+/// same-module child (runs the parent's own program).
+struct ChildMod {
+    funcs: Arc<[Func]>,
+    memory_log2: Option<u8>,
+    data: Arc<[Data]>,
+    durable: bool,
+    digest: [u8; 32],
+    imports: Arc<[svm_ir::Import]>,
+    types: Arc<[svm_ir::TypeEntry]>,
+    /// §3.6 — the whole granted module, registered as the child's **self module** at spawn so
+    /// a separate-module child serves its *own* offers (enqueue admission and handler
+    /// resolution go through it), exactly as a same-module child serves the parent's.
+    module: Arc<Module>,
+}
 
 /// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
 /// **awaiting a resume value** — i.e. parked at a `yield` (so the next `resume` delivers its argument
@@ -6736,7 +6741,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // resolution happens at child construction via `regrant_into_child`. Validated here.
                     let (op, child_mod, askip, grant, named): (
                         u32,
-                        Option<ModArc>,
+                        Option<ChildMod>,
                         usize,
                         Option<i32>,
                         Vec<(String, i32)>,
@@ -6749,15 +6754,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let g = {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 let g = hg.resolve_module(mh)?;
-                                (
-                                    g.funcs.clone(),
-                                    g.memory_log2,
-                                    g.data.clone(),
-                                    g.durable,
-                                    g.digest,
-                                    g.imports.clone(),
-                                    g.types.clone(),
-                                )
+                                ChildMod {
+                                    funcs: g.funcs.clone(),
+                                    memory_log2: g.memory_log2,
+                                    data: g.data.clone(),
+                                    durable: g.durable,
+                                    digest: g.digest,
+                                    imports: g.imports.clone(),
+                                    types: g.types.clone(),
+                                    module: Arc::clone(&g.module),
+                                }
                             };
                             (
                                 match mop {
@@ -6842,15 +6848,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let g = {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 let g = hg.resolve_module(mh)?;
-                                (
-                                    g.funcs.clone(),
-                                    g.memory_log2,
-                                    g.data.clone(),
-                                    g.durable,
-                                    g.digest,
-                                    g.imports.clone(),
-                                    g.types.clone(),
-                                )
+                                ChildMod {
+                                    funcs: g.funcs.clone(),
+                                    memory_log2: g.memory_log2,
+                                    data: g.data.clone(),
+                                    durable: g.durable,
+                                    digest: g.digest,
+                                    imports: g.imports.clone(),
+                                    types: g.types.clone(),
+                                    module: Arc::clone(&g.module),
+                                }
                             };
                             let grants_ptr =
                                 get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
@@ -6881,7 +6888,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => (o, None, 0, None, Vec::new()),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _, _, _)| f);
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |cm| &cm.funcs);
                     match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
@@ -6927,7 +6934,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _, _, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|cm| cm.memory_log2 == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -6938,8 +6945,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // drain-then-unwind, so admitting it would stop the subtree being
                             // snapshottable as a unit. A same-module child (`None`) runs the
                             // parent's own (already instrumented) funcs — always admissible.
-                            let mod_durable_ok = !durable
-                                || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _, _)| *d);
+                            let mod_durable_ok =
+                                !durable || child_mod.as_ref().is_none_or(|cm| cm.durable);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6956,10 +6963,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // bounded them to its declared window == the carve). RO protection of
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
-                                if let (Some((_, _, data, _, _, _, _)), Some(m)) =
-                                    (&child_mod, mem.as_ref())
-                                {
-                                    for d in data.iter() {
+                                if let (Some(cm), Some(m)) = (&child_mod, mem.as_ref()) {
+                                    for d in cm.data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
                                             <= child_size
                                         {
@@ -7022,25 +7027,27 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // slot with nothing to bind fails the spawn closed — probeable
                                 // `-EINVAL`, before any child code runs.
                                 let manifest_ok = match &child_mod {
-                                    Some((_, _, _, _, _, cimports, ctypes)) => {
-                                        ch.bind_child_manifest(cimports, ctypes).is_ok()
+                                    Some(cm) => {
+                                        ch.bind_child_manifest(&cm.imports, &cm.types).is_ok()
                                     }
                                     None => true,
                                 };
                                 if !manifest_ok {
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                                 } else {
-                                    // §3.6 slice 3: a same-module child serves its own offers
-                                    // over the shared program, so it inherits the parent's
-                                    // registered self module (a separate-module child would
-                                    // need its own — recorded with the serve-loop docs).
-                                    if child_mod.is_none() {
-                                        ch.self_module = host
+                                    // §3.6: the child's **self module** — what its serve loop
+                                    // resolves enqueue admission and handlers against. A
+                                    // separate-module child serves its *own* offers; a
+                                    // same-module child serves over the shared program (the
+                                    // parent's registered module).
+                                    ch.self_module = match &child_mod {
+                                        Some(cm) => Some(Arc::clone(&cm.module)),
+                                        None => host
                                             .lock()
                                             .unwrap_or_else(|e| e.into_inner())
                                             .self_module
-                                            .clone();
-                                    }
+                                            .clone(),
+                                    };
                                     let child_host = Arc::new(Mutex::new(ch));
                                     // §3.6 slice 3: keep a live reference past the move into
                                     // the child vCPU, for `child_offer` (op 14).
@@ -7060,7 +7067,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     };
                                     let cfuncs = child_mod.as_ref().map_or_else(
                                         || Arc::clone(&funcs),
-                                        |(f, _, _, _, _, _, _)| Arc::clone(f),
+                                        |cm| Arc::clone(&cm.funcs),
                                     );
                                     let csched = sched.clone();
                                     // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
@@ -7146,7 +7153,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 entry: entry as u32,
                                                 module_digest: child_mod
                                                     .as_ref()
-                                                    .map(|(_, _, _, _, d, _, _)| *d),
+                                                    .map(|cm| cm.digest),
                                             });
                                             frames[top]
                                                 .vals
@@ -7200,15 +7207,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // transparency), exactly as for `instantiate_module`.
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _, _, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|cm| cm.memory_log2 == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
                             // §4 enforcement, exactly as for `instantiate`: a durable domain
                             // admits only freezable (durable-attested) separate-module children.
-                            let mod_durable_ok = !durable
-                                || child_mod.as_ref().is_none_or(|(_, _, _, d, _, _, _)| *d);
+                            let mod_durable_ok =
+                                !durable || child_mod.as_ref().is_none_or(|cm| cm.durable);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -7229,10 +7236,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // in the parent's backing while the child's pages start unmapped — so
                                 // a plugin's data segments are *supplied lazily*, page by page, as it
                                 // first touches them (the §14 parent-as-pager model, for free).
-                                if let (Some((_, _, data, _, _, _, _)), Some(m)) =
-                                    (&child_mod, mem.as_ref())
-                                {
-                                    for d in data.iter() {
+                                if let (Some(cm), Some(m)) = (&child_mod, mem.as_ref()) {
+                                    for d in cm.data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
                                             <= child_size
                                         {
@@ -7254,10 +7259,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ch.set_attestation(catt);
                                 let cy = ch.grant_yielder(); // the child's handle to suspend back to us
                                 let child_host = Arc::new(Mutex::new(ch));
-                                let cfuncs = child_mod.as_ref().map_or_else(
-                                    || Arc::clone(&funcs),
-                                    |(f, _, _, _, _, _, _)| Arc::clone(f),
-                                );
+                                let cfuncs = child_mod
+                                    .as_ref()
+                                    .map_or_else(|| Arc::clone(&funcs), |cm| Arc::clone(&cm.funcs));
                                 // A co-fiber child is its own domain → its own dispatch table.
                                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                                 let mut child = VCpu::new(
@@ -7398,8 +7402,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // and parks this (the caller's) fiber until the child's serve loop
                         // replies — the caller-parking half of the unified model. Probeable
                         // `-EINVAL` for a bad child handle, a finished/joined child, or a
-                        // malformed export; the type is the export's structural interface
-                        // (D59 intern — a same-module child shares this module's shapes).
+                        // malformed export. The offer's shape is the CHILD's export (its own
+                        // registered module — a separate-module child's differs from ours),
+                        // fetched first so the two powerbox locks are never held together,
+                        // then interned structurally into our table (D59: the id ≡ the shape).
                         14 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
@@ -7410,8 +7416,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 .ok()
                                 .and_then(|slot| child_hosts.get(&slot).cloned())
                                 .and_then(|callee| {
+                                    let sigs = callee
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .offer_shape(export)?;
                                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.wire_live_impl(&callee, export).ok()
+                                    hg.wire_live_impl(&callee, export, &sigs).ok()
                                 });
                             frames[top]
                                 .vals
@@ -11102,10 +11112,13 @@ pub const CAP_SELF_SVC_POLL: u32 = 9;
 pub const CAP_SELF_SVC_WAIT: u32 = 10;
 
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
-/// + the target impl-export. Index-carried so `Binding` stays `Copy`.
+/// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's
+/// **shape** (fetched from the callee's module at wire time) so a re-grant into another
+/// powerbox can intern it there without touching the callee's lock.
 struct LiveImplEntry {
     callee: Arc<Mutex<Host>>,
     export: u32,
+    sigs: Arc<[FuncType]>,
 }
 
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
@@ -11502,6 +11515,10 @@ struct ModuleGrant {
     /// against the restore host's re-granted modules (host-supplied at restore, D-scope — the module
     /// bytes never ride the artifact). Computed by [`module_digest`], shared with the codec's R5 gate.
     digest: [u8; 32],
+    /// §3.6 — the whole granted module, registered as a spawned child's **self module** so a
+    /// separate-module child can serve its own offers (impl-export admission, handler
+    /// resolution, reflection) exactly as the top-level program serves via `set_self_module`.
+    module: Arc<Module>,
 }
 
 /// The §4 nested-child module-identity digest: a content hash of a grant's **semantic image**
@@ -12570,25 +12587,63 @@ impl Host {
         self.svc_results.remove(&ticket)
     }
 
+    /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op
+    /// order), for a wirer minting a live offer over it: the offer *is* the callee's export,
+    /// so its shape resolves against the callee's own registered module — which, for a
+    /// separate-module child, differs from the wirer's. `None` fails the wire closed (no
+    /// registered module / malformed export).
+    fn offer_shape(&self, export: u32) -> Option<Vec<FuncType>> {
+        let m = self.self_module.as_ref()?;
+        let e = m.impl_exports.get(export as usize)?;
+        let named = m.interface_named_ops(e.interface)?;
+        Some(named.iter().map(|&(_, ft)| ft.clone()).collect())
+    }
+
     /// §3.6 slice 3 — mint a **live-callee offer** into this (the wirer's) table: a capability
     /// whose provider is the *running* domain behind `callee` (a §14 child's live powerbox),
-    /// targeting its impl-export `export`. The type_id is the structural intern of the export's
-    /// op signatures **in this domain's own module** (same-module children share it — D59: the
-    /// id ≡ the shape). A call through the handle enqueues on the callee and parks the caller
-    /// (the eval loop's caller-parking arm); `Err` fail-closed when this domain has no self
-    /// module or the export is malformed.
-    pub fn wire_live_impl(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Result<i32, Trap> {
-        let m = self.self_module.clone().ok_or(Trap::CapFault)?;
-        let e = m.impl_exports.get(export as usize).ok_or(Trap::CapFault)?;
-        let named = m.interface_named_ops(e.interface).ok_or(Trap::CapFault)?;
-        let sigs: Vec<FuncType> = named.iter().map(|&(_, ft)| ft.clone()).collect();
+    /// targeting its impl-export `export`. `sigs` is the export's shape — the **callee's**
+    /// ([`Host::offer_shape`] on it; the caller fetches it first so the two powerbox locks are
+    /// never held together) — interned structurally into the wirer's table (D59: the id ≡ the
+    /// shape, so a same-module child lands on the identical id the wirer's own module would).
+    /// A call through the handle enqueues on the callee and parks the caller (the eval loop's
+    /// caller-parking arm).
+    pub fn wire_live_impl(
+        &mut self,
+        callee: &Arc<Mutex<Host>>,
+        export: u32,
+        sigs: &[FuncType],
+    ) -> Result<i32, Trap> {
+        Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into()))
+    }
+
+    /// Install a live-callee offer entry + grant its handle — shared by the wire
+    /// ([`Host::wire_live_impl`]) and the child re-grant ([`Host::regrant_into_child`]), so
+    /// the two mint identical bindings.
+    fn install_live_impl(
+        &mut self,
+        callee: Arc<Mutex<Host>>,
+        export: u32,
+        sigs: Arc<[FuncType]>,
+    ) -> i32 {
         let type_id = self.intern_interface(&sigs);
         let idx = self.live_impls.len() as u32;
         self.live_impls.push(LiveImplEntry {
-            callee: Arc::clone(callee),
+            callee,
             export,
+            sigs,
         });
-        Ok(self.grant(type_id, Binding::LiveImpl(idx)))
+        self.grant(type_id, Binding::LiveImpl(idx))
+    }
+
+    /// Resolve `handle` as a live-callee offer, whatever its interface type — the re-grant
+    /// path's lookup (which has only the handle, not the interned id). `None` for anything
+    /// else, including forged handles.
+    fn resolve_live_impl(&self, handle: i32) -> Option<&LiveImplEntry> {
+        let tid = self.type_id_of(handle)?;
+        match self.resolve(handle, tid).ok()? {
+            Binding::LiveImpl(i) => self.live_impls.get(i as usize),
+            _ => None,
+        }
     }
 
     /// §3.6 slice 4 — the live-callee target behind import slot `i`, iff the slot is bound to a
@@ -12894,6 +12949,7 @@ impl Host {
             types: m.types.clone().into(),
             durable,
             digest: module_digest(m),
+            module: Arc::new(m.clone()),
         });
         self.grant(cap_id::MODULE, Binding::Module(id))
     }
@@ -13386,6 +13442,7 @@ impl Host {
     /// closed *before* any child state is built.
     fn can_regrant(&self, handle: i32) -> bool {
         self.resolve_pipe_end(handle).is_some()
+            || self.resolve_live_impl(handle).is_some()
             || self.resolve_guest_impl(handle).is_ok()
             || self.resolve_copyable(handle).is_ok()
     }
@@ -13399,6 +13456,15 @@ impl Host {
     fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
         if let Some((write, backing)) = self.resolve_pipe_end(handle) {
             return Some(child.install_pipe_end(write, backing));
+        }
+        // §3.6 sibling-as-service: re-granting a **live-callee offer** wires the SAME running
+        // domain into the child — the child's calls enqueue on the original callee (park,
+        // serve, reply, all as-built), so two siblings coordinate through a live peer their
+        // parent introduced. The shape rides the entry (captured at wire), so the child-side
+        // intern never touches the callee's lock.
+        if let Some(e) = self.resolve_live_impl(handle) {
+            let (callee, export, sigs) = (Arc::clone(&e.callee), e.export, Arc::clone(&e.sigs));
+            return Some(child.install_live_impl(callee, export, sigs));
         }
         // A **wired interface offer** (IMPORTS.md §3.2/§3.3): re-granting it is how a parent
         // forwards, wraps, or overrides a capability for a child — the entry (shared function

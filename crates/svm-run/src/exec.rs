@@ -13,11 +13,11 @@
 
 pub use svm_exec::*;
 
-use crate::HostCap;
+use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use svm_interp::{GuestMem, HostFn};
+use svm_interp::{GuestMem, HostFn, Value};
 
 /// The deterministic **scripted** backend as a [`HostCap`]: a `(argv-prefix → {stdout, stderr,
 /// exit})` table, no host processes. What differential tests and wasm/browser embedders grant.
@@ -34,6 +34,87 @@ pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
 pub fn host_exec(allowlist: &[&str]) -> HostCap {
     let allow: Arc<Vec<String>> = Arc::new(allowlist.iter().map(|s| s.to_string()).collect());
     HostCap::host_fn(0, host_exec_handler(allow))
+}
+
+/// One program in a [`domain_exec`] registry: the name a `run`'s `argv[0]` selects (exact
+/// match — the registry *is* the attenuation, like `host_exec`'s allowlist), the instantiated
+/// module to run, and the per-run [`Limits`] (a fuel bound is what makes a domain run
+/// deterministic — EXEC.md).
+#[derive(Clone)]
+pub struct DomainProgram {
+    pub name: String,
+    pub instance: Arc<Instance>,
+    pub limits: Limits,
+}
+
+/// The **child-domain** backend (EXEC.md's third row): a spawn is a fresh svm domain — its own
+/// window, powerbox, and fuel — run to completion with the wire `stdin` seeded and both output
+/// streams captured, no OS process anywhere. `argv[0]` resolves through the program registry
+/// (a miss is `-EPERM`, the same refusal shape as an allowlist or table miss); the full argv
+/// rides the §3e args buffer, so a `main(int, char**)` program reads it exactly as it would
+/// standalone. The exit code is the child's entry result **verbatim** (`Exit(code)` or the
+/// first returned value; nothing collapsed) per the contract's exit-code table; a child that
+/// **traps** is a failed `run` (`-EINVAL`, probeable) — v1 does not invent an exit code for a
+/// crash. Runs on the reference interpreter (deterministic under fuel; a serving module would
+/// fold there anyway). Blocking profile: v1 `run` executes the child inline, exactly as
+/// `host_exec` blocks on the process — one synchronous op either way.
+pub fn domain_exec(programs: Vec<DomainProgram>) -> HostCap {
+    let programs = Arc::new(programs);
+    HostCap::host_fn(0, move || {
+        let programs = Arc::clone(&programs);
+        let mut jobs = JobTable::default();
+        Box::new(
+            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+                Ok(vec![domain_dispatch(&programs, &mut jobs, op, args, mem)])
+            },
+        ) as HostFn
+    })
+}
+
+fn domain_dispatch(
+    programs: &[DomainProgram],
+    jobs: &mut JobTable,
+    op: u32,
+    args: &[i64],
+    mem: Option<&mut dyn GuestMem>,
+) -> i64 {
+    if op != EXEC_RUN {
+        return jobs.handle(op, args, mem);
+    }
+    let (argv, stdin) = match run_args(args, mem.as_deref()) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let Some(p) = programs.iter().find(|p| p.name == argv[0]) else {
+        return -EPERM; // outside the registry: refused, not a trap
+    };
+    let config = RunConfig {
+        limits: p.limits.clone(),
+        stdin,
+        memory_size_log2: None,
+        args: argv.into_iter().map(String::into_bytes).collect(),
+        env: Vec::new(),
+    };
+    match p.instance.run(Backend::TreeWalk, &config) {
+        Ok(run) => {
+            let exit = match run.outcome {
+                Outcome::Exited(c) => c as i64,
+                Outcome::Returned(vals) => vals.first().map_or(0, |v| match v {
+                    Value::I64(x) => *x,
+                    Value::I32(x) => *x as i64,
+                    _ => 0,
+                }),
+            };
+            jobs.push(Job {
+                stdout: run.stdout,
+                stderr: run.stderr,
+                out_pos: 0,
+                err_pos: 0,
+                exit,
+            })
+        }
+        Err(_) => -EINVAL, // the child trapped / ran out of fuel: a failed run, probeable
+    }
 }
 
 fn host_exec_handler(allow: Arc<Vec<String>>) -> impl Fn() -> HostFn + Send + Sync + 'static {

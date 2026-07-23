@@ -305,6 +305,263 @@ fn svc_sugar_round_trips_and_desugars_to_the_reserved_dispatch() {
     );
 }
 
+/// §3.6 — **separate-module serving children**: the child domain runs its OWN module
+/// (`instantiate_module`, op 5) with its own offers, and the parent wires a live offer over
+/// the child's export via the same `child_offer` (op 14). The offer's shape is the CHILD
+/// module's export — the parent registers no self module at all, pinning that the wirer's
+/// own program is irrelevant to the wire — interned structurally into the parent's table
+/// (D59: first guest intern = `GUEST_IMPL_BASE`, same as the same-module form). Same
+/// enqueue/park/`svc.wait`-serve/reply/join round-trip: join(served=1)*100 + add(40,2) = 142.
+const SEPARATE_MODULE_CALLER: &str = r#"
+memory 17
+
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vmh = i64.extend_i32_u v1
+  ventry = i64.const 0
+  voff = i64.const 65536
+  vlog = i64.const 12
+  vq = i64.const 0
+  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v6 = i64.const 0
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vk = i64.const 100
+  vm = i64.mul vj vk
+  vs = i64.add vm vr
+  return vs
+  }
+}
+"#;
+
+/// The child's own program: its own memory declaration (the carve must equal it — §14
+/// transparency), its own offer, its own serve loop. Entry = func 0 (`svc.wait`, return the
+/// served count to the joiner); `add` = func 1.
+const SEPARATE_MODULE_SERVER: &str = r#"
+memory 12
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 1 }
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_separate_module_child_serves_its_own_offers() {
+    let a = Arc::new({
+        let m = svm_text::parse_module(SEPARATE_MODULE_CALLER).expect("parse caller");
+        svm_verify::verify_module(&m).expect("verify caller");
+        m
+    });
+    let b = svm_text::parse_module(SEPARATE_MODULE_SERVER).expect("parse server");
+    svm_verify::verify_module(&b).expect("verify server");
+    let mut host = Host::new();
+    // Deliberately NO set_self_module on the parent: the offer's shape is the child's.
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(142)],
+        "join(served=1)*100 + add(40,2) — a foreign program served the parent's live call"
+    );
+    let _ = a;
+}
+
+/// A `child_offer` naming an export the child's module doesn't have refuses with a probeable
+/// `-EINVAL` — resolved against the CHILD's module (which has export 0 only), never the
+/// wirer's. The child here polls-and-returns (nothing to serve), so the parent's `join`
+/// completes the run cleanly after the refused wire.
+const SEPARATE_MODULE_BAD_EXPORT: &str = r#"
+memory 17
+
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vmh = i64.extend_i32_u v1
+  ventry = i64.const 0
+  voff = i64.const 65536
+  vlog = i64.const 12
+  vq = i64.const 0
+  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v6 = i64.const 9
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vr = i64.extend_i32_s v7
+  vs = i64.add vr vj
+  return vs
+  }
+}
+"#;
+
+/// The bad-export test's child: same offer surface, but the entry `svc.poll`s (serving the
+/// nothing that's queued) and returns 0 — so it completes without a caller.
+const SEPARATE_MODULE_POLL_SERVER: &str = r#"
+memory 12
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 1 }
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.poll vz
+  return vn
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
+    let a = svm_text::parse_module(SEPARATE_MODULE_BAD_EXPORT).expect("parse");
+    svm_verify::verify_module(&a).expect("verify");
+    let b = svm_text::parse_module(SEPARATE_MODULE_POLL_SERVER).expect("parse server");
+    svm_verify::verify_module(&b).expect("verify server");
+    let mut host = Host::new();
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(-22)],
+        "-EINVAL (plus join(0)), probeable — the wire refused, the run completed"
+    );
+}
+
+/// §3.6 — **sibling-as-service**: the parent spawns serving child A, takes a live offer over
+/// it (`child_offer`), and re-grants that cap into child B at spawn (`instantiate_named`,
+/// op 11 — the grant record's handle field is stored at runtime). B discovers it by
+/// `cap.self.resolve("adder")` in its OWN powerbox (the re-grant interned the shape there —
+/// B's first guest intern, `GUEST_IMPL_BASE`) and calls through it: the call enqueues on A,
+/// parks B's vCPU, A's `svc.wait` serves `add(40, 2)`, and the reply wakes B — two siblings
+/// coordinating through a live peer their parent introduced, no shared memory, no parent
+/// relay. Composite: join(A=1)*100 + join(B=42) = 142.
+const SIBLING_AS_SERVICE: &str = r#"
+memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 3 }
+data 200 "adder"
+
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ve1 = i64.const 1
+  voffA = i64.const 65536
+  vlog = i64.const 12
+  vq = i64.const 0
+  vA = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve1, voffA, vlog, vq)
+  vz = i64.const 0
+  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vA, vz)
+  va1 = i64.const 256
+  vv1 = i32.const 200
+  i32.store va1 vv1
+  va2 = i64.const 260
+  vv2 = i32.const 5
+  i32.store va2 vv2
+  va3 = i64.const 264
+  i32.store va3 vcap
+  vgp = i64.const 256
+  vgn = i64.const 1
+  ve2 = i64.const 2
+  voffB = i64.const 69632
+  vB = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve2, voffB, vlog, vq)
+  vjB = cap.call 6 1 (i32) -> (i64) v0 (vB)
+  vjA = cap.call 6 1 (i32) -> (i64) v0 (vA)
+  vk = i64.const 100
+  vm = i64.mul vjA vk
+  vs = i64.add vm vjB
+  return vs
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnm = i64.const 491327349857
+  vza = i64.const 0
+  i64.store vza vnm
+  vp = i64.const 0
+  vl = i64.const 5
+  vh = cap.self.resolve vp vl
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) vh (va, vb)
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_sibling_calls_a_sibling_through_a_regranted_live_offer() {
+    let m = Arc::new({
+        let m = svm_text::parse_module(SIBLING_AS_SERVICE).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        m
+    });
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let h = host.grant_instantiator(0, 1u64 << 17);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(142)],
+        "B's call parked, A served, the reply woke B — through a parent-regranted live offer"
+    );
+}
+
 #[test]
 fn a_caller_parks_on_a_live_child_and_wakes_with_the_reply() {
     let m = Arc::new({
