@@ -16,13 +16,6 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
-- **ci.yml** (2026-07-23):
-  - `check` job: `cargo test --workspace -j 2` — the ISSUES.md **I30** durable
-    mitigation (three sightings; bounds the parallel-link memory peak that OOMs
-    the runner agent).
-  - `check`, `real-browser`, and `fiber-scaling (stack-check + arena-stacks)`
-    jobs: `timeout-minutes` on the network-fetch steps (apt mingw ×2, Playwright
-    install) — the **I34** hardening (a wedged mirror fails fast into a re-run
-    instead of pinning a runner; both stall modes were observed 2026-07-23).
+_(none — `workflows_src` and `.github/workflows/` are in sync.)_
 
 Remove entries from this list when they land in `.github/workflows/`.

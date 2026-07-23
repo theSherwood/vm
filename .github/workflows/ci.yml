@@ -47,11 +47,21 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
-      - run: cargo test --workspace
+      # ISSUES.md I30 durable mitigation (three sightings: a rust-lld SIGBUS, then two runner
+      # losses ~50 s into this step on 2026-07-23): the test build's parallel LINK phase is the
+      # memory peak — several svm-jit test binaries (each pulling the large Cranelift + Wasmtime
+      # rlibs) linking concurrently can OOM a 16 GB runner under neighbor pressure, which kills
+      # the runner agent (no logs, step frozen "in_progress"). Cap build parallelism to bound
+      # concurrent links; the step is warm-cache dominated, so the wall-clock cost is small.
+      - run: cargo test --workspace -j 2
       - run: rustup target add x86_64-pc-windows-gnu
       # The §5 W3 trap-capture C shim (trap_capture.c) is compiled for windows targets too, so the
       # windows-gnu cross-check needs the mingw cross-compiler. (The MSVC build runs on windows-latest.)
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      # ISSUES.md I34: fetch steps carry their own timeout so a wedged mirror fails fast into a
+      # re-run instead of eating the whole job budget (a 29 min apt stall burned one 2026-07-23).
+      - name: install mingw cross toolchain
+        timeout-minutes: 15
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
@@ -327,7 +337,10 @@ jobs:
             .
             crates/svm-llvm
       # Playwright + Chromium aren't preinstalled on the runner (unlike Node); install both.
+      # ISSUES.md I34: an npm/CDN stall wedged this step >30 min on 2026-07-23 (24 s – 3 min
+      # healthy) — bound it so a stall fails fast into a re-run instead of pinning the runner.
       - name: Install Playwright + Chromium
+        timeout-minutes: 10
         working-directory: browser
         run: |
           npm install playwright@1.56.1
@@ -480,7 +493,11 @@ jobs:
       # Compile parity for the feature-gated code on Windows. mingw is needed for the §5 trap-capture
       # C shim (as in the `check` job's cross-check).
       - run: rustup target add x86_64-pc-windows-gnu
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      # ISSUES.md I34: this exact step stalled 29 min on 2026-07-23 until the run was cancelled —
+      # bound it so an apt-mirror wedge fails fast into a re-run.
+      - name: install mingw cross toolchain
+        timeout-minutes: 15
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
   stack-guard-cross-os:
