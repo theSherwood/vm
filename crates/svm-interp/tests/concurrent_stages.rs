@@ -11,27 +11,31 @@
 //! child maps the region in its OWN window (its own address space, its own per-window region
 //! id), so wait/notify only rendezvous if the key is the **backing identity** — with
 //! per-domain keys every wake misses. A regression surfaces loudly, not as a hang: waits
-//! carry a 30 s timeout and each child folds its TIMED_OUT count into its result ×1000, so
-//! missed wakes turn 410 into a big wrong number.
+//! carry a 5 s timeout, each child folds its TIMED_OUT count into its result ×1000, and a
+//! child that times out more than 6 times **bails** with that poisoned composite — so missed
+//! wakes turn 410 into a big wrong number within seconds. (Windows sizing note: the §13 map
+//! granule is the 64 KiB allocation granularity there, so child windows are 128 KiB —
+//! `memory 17` — and the region is 64 KiB; the children map `len = granule` they query at
+//! run time, portable across the 4 KiB/16 KiB/64 KiB granule platforms.)
 
 use std::sync::Arc;
 use svm_interp::{run_with_host, Host, Value};
 
 /// func 0 — the parent: mint a region (AddressSpace op 5), build one named-grant record
 /// (`"ring"` → the region handle, stored at runtime), spawn producer (entry 1) and consumer
-/// (entry 2) as 32 KiB carves, join both. Composite: join(producer=4)*100 + join(consumer=10)
-/// = 410.
+/// (entry 2) as 128 KiB carves, join both. Composite: join(producer=4)*100 +
+/// join(consumer=10) = 410.
 ///
 /// funcs 1/2 — the stages: resolve `"ring"`, query the map granule, map the region at window
 /// offset 0, then run the ring protocol. Producer publishes 1..=4 (park while full);
 /// consumer sums them (park while empty) → 10.
 const PIPELINE: &str = r#"
-memory 17
+memory 19
 data 200 "ring"
 
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  vlen = i64.const 32768
+  vlen = i64.const 65536
   vrh64 = cap.call 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
   va1 = i64.const 256
@@ -45,12 +49,12 @@ block 0 (v0: i32, v1: i32) {
   vgp = i64.const 256
   vgn = i64.const 1
   ve1 = i64.const 1
-  voffp = i64.const 65536
-  vlog = i64.const 15
+  voffp = i64.const 131072
+  vlog = i64.const 17
   vq = i64.const 0
   vp = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve1, voffp, vlog, vq)
   ve2 = i64.const 2
-  voffc = i64.const 98304
+  voffc = i64.const 262144
   vc = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve2, voffc, vlog, vq)
   vjp = cap.call 6 1 (i32) -> (i64) v0 (vp)
   vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
@@ -89,13 +93,15 @@ block 2 (vi: i64, vtos: i64) {
 block 3 (vi: i64, vtos: i64) {
   vfa = i64.const 0
   vexp = i32.const 1
-  vto = i64.const 30000000000
+  vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
   vtwo = i32.const 2
   vis = i32.eq vst vtwo
   vis64 = i64.extend_i32_u vis
   vtos2 = i64.add vtos vis64
-  br 2(vi, vtos2)
+  vsix = i64.const 6
+  vbail = i64.lt_s vsix vtos2
+  br_if vbail 5(vtos2) 2(vi, vtos2)
   }
 block 4 (vi: i64, vtos: i64) {
   vda = i64.const 8
@@ -146,13 +152,15 @@ block 2 (vn: i64, vsum: i64, vtos: i64) {
 block 3 (vn: i64, vsum: i64, vtos: i64) {
   vfa = i64.const 0
   vexp = i32.const 0
-  vto = i64.const 30000000000
+  vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
   vtwo = i32.const 2
   vis = i32.eq vst vtwo
   vis64 = i64.extend_i32_u vis
   vtos2 = i64.add vtos vis64
-  br 2(vn, vsum, vtos2)
+  vsix = i64.const 6
+  vbail = i64.lt_s vsix vtos2
+  br_if vbail 5(vsum, vtos2) 2(vn, vsum, vtos2)
   }
 block 4 (vn: i64, vsum: i64, vtos: i64) {
   vda = i64.const 8
@@ -183,7 +191,7 @@ block 5 (vsum: i64, vtos: i64) {
 /// segment carries the `"ring"` name into each private window. Private memory and an
 /// explicit shared channel compose — exactly the separate-process discipline, in-process.
 const DETACHED_STAGES: &str = r#"
-memory 15
+memory 17
 data 0 "ring"
 
 func (i64) -> (i64) {
@@ -211,13 +219,15 @@ block 2 (vi: i64, vtos: i64) {
 block 3 (vi: i64, vtos: i64) {
   vfa = i64.const 0
   vexp = i32.const 1
-  vto = i64.const 30000000000
+  vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
   vtwo = i32.const 2
   vis = i32.eq vst vtwo
   vis64 = i64.extend_i32_u vis
   vtos2 = i64.add vtos vis64
-  br 2(vi, vtos2)
+  vsix = i64.const 6
+  vbail = i64.lt_s vsix vtos2
+  br_if vbail 5(vtos2) 2(vi, vtos2)
   }
 block 4 (vi: i64, vtos: i64) {
   vda = i64.const 8
@@ -265,13 +275,15 @@ block 2 (vn: i64, vsum: i64, vtos: i64) {
 block 3 (vn: i64, vsum: i64, vtos: i64) {
   vfa = i64.const 0
   vexp = i32.const 0
-  vto = i64.const 30000000000
+  vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
   vtwo = i32.const 2
   vis = i32.eq vst vtwo
   vis64 = i64.extend_i32_u vis
   vtos2 = i64.add vtos vis64
-  br 2(vn, vsum, vtos2)
+  vsix = i64.const 6
+  vbail = i64.lt_s vsix vtos2
+  br_if vbail 5(vsum, vtos2) 2(vn, vsum, vtos2)
   }
 block 4 (vn: i64, vsum: i64, vtos: i64) {
   vda = i64.const 8
@@ -303,7 +315,7 @@ data 200 "ring"
 
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
-  vlen = i64.const 32768
+  vlen = i64.const 65536
   vrh64 = cap.call 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
   va1 = i64.const 256
@@ -320,7 +332,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   vgn = i64.const 1
   ve0 = i64.const 0
   ve1 = i64.const 1
-  vlog = i64.const 15
+  vlog = i64.const 17
   vq = i64.const 0
   vp = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve0, vlog, vq)
   vc = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve1, vlog, vq)
@@ -344,7 +356,7 @@ fn two_detached_stages_pipe_through_a_shared_region_ring() {
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let ha = host.grant_address_space(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(2 << 15); // exactly two 2^15 windows
+    let hw = host.grant_window_minter(2 << 17); // exactly two 2^17 windows
     let mut fuel = 50_000_000u64;
     let r = run_with_host(
         &a,
@@ -376,8 +388,8 @@ fn the_bytecode_entry_runs_the_pipeline_identically() {
     let m = Arc::new(m);
     let mut host = Host::new();
     host.set_self_module(&m);
-    let hi = host.grant_instantiator(0, 1u64 << 17);
-    let ha = host.grant_address_space(0, 1u64 << 17);
+    let hi = host.grant_instantiator(0, 1u64 << 19);
+    let ha = host.grant_address_space(0, 1u64 << 19);
     let mut fuel = 50_000_000u64;
     let r = svm_interp::run_with_host_fast(
         &m,
@@ -397,8 +409,8 @@ fn two_concurrent_children_pipe_through_a_shared_region_ring() {
     let m = Arc::new(m);
     let mut host = Host::new();
     host.set_self_module(&m);
-    let hi = host.grant_instantiator(0, 1u64 << 17);
-    let ha = host.grant_address_space(0, 1u64 << 17);
+    let hi = host.grant_instantiator(0, 1u64 << 19);
+    let ha = host.grant_address_space(0, 1u64 << 19);
     let mut fuel = 50_000_000u64;
     let r = run_with_host(
         &m,

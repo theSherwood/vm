@@ -13,6 +13,26 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I34 — CI flake: `apt-get install gcc-mingw-w64-x86-64` stalled ~29 min on the `fiber-scaling (stack-check + arena-stacks)` job until the run was cancelled (S4) — seen 2026-07-23, PR #422 run 30027500683
+
+**Where:** the ubuntu-latest job's mingw cross-toolchain install step (for the
+`x86_64-pc-windows-gnu` cross-clippy). The sibling `build · test · fmt · clippy` job ran the
+**same step in the same run** in ~12.5 min (also slow, but completing) — so this is an apt
+mirror/runner stall, not a tree change (the job's compile+test steps had all passed).
+
+**Also observed on the same PR (separate root cause, fixed in-tree):** the windows-latest
+`cargo test --workspace` hung >30 min because the new `concurrent_stages.rs` fixtures gave
+children 32 KiB windows while the Windows §13 map granule is the 64 KiB allocation
+granularity — the region map refused probeably, the ring landed in each child's private
+anonymous pages, and the consumer's futex loop polled forever (no iteration cap). Fixed by
+sizing child windows to 128 KiB (map `len = granule` queried at run time, portable across
+4 K/16 K/64 K granule platforms) and adding a timeout-count **bail** to every wait loop so
+any future rendezvous regression fails loudly in seconds instead of hanging a runner.
+
+**Action if the apt stall recurs:** cache the mingw toolchain (Swatinem-style or a
+pre-built container) or add a step-level `timeout-minutes` so the job fails fast and
+re-runs instead of burning the runner budget.
+
 ### I33 — `jit_killpath_stops_runaway_child` flaked under full-workspace parallel load (S4) — **RESOLVED** (2026-07-22): the kill-path escape in the JIT `join` returned a clean `0` instead of propagating `OutOfFuel`; original report below
 
 **Where:** `crates/svm/tests/jit_killpath.rs::jit_killpath_stops_runaway_child`, during a full
