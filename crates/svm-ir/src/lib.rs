@@ -2617,6 +2617,37 @@ impl Func {
         })
     }
 
+    /// Whether this function contains a fiber or thread **scheduling** op (`cont.*`, `suspend`,
+    /// `thread.spawn`/`join`) — [`uses_concurrency`](Func::uses_concurrency) minus the futex ops
+    /// (`atomic.wait`/`notify`). A §14 JIT child gets no per-child fiber/thread runtime (rejected),
+    /// but *can* wait/notify against its parent domain's shared futex — the granted-children
+    /// pipeline rendezvous — so the child compile distinguishes the two.
+    pub fn uses_fibers_or_threads(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::ContNew { .. }
+                        | Inst::ContResume { .. }
+                        | Inst::Suspend { .. }
+                        | Inst::ThreadSpawn { .. }
+                        | Inst::ThreadJoin { .. }
+                )
+            })
+        })
+    }
+
+    /// Whether this function contains a futex op (`atomic.wait`/`notify`). Split out of
+    /// [`uses_concurrency`](Func::uses_concurrency) for the §14 JIT child compile: waits/notifies
+    /// are allowed when the child shares its parent domain's futex, rejected otherwise.
+    pub fn uses_futex(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::MemoryWait { .. } | Inst::MemoryNotify { .. }))
+        })
+    }
+
     /// Whether this function contains any `setjmp`/`longjmp` op ([`Inst::SetJmp`]/[`Inst::LongJmp`]).
     /// Used to reject a §14 JIT child that uses `setjmp` (no per-child `setjmp` runtime yet — like
     /// `uses_concurrency` for fibers/threads).

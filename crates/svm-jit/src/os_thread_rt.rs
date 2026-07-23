@@ -100,7 +100,10 @@ struct Env {
     mem_base: u64,
     fn_table_base: u64,
     trap_out: *mut i64,
-    call_tramp: FiberCallTramp,
+    /// The guest call-trampoline vCPU entries run through. `None` on a **futex-only** domain (stood
+    /// up so §14 children can `atomic.wait`/`notify` against the parent's shared futex, in a module
+    /// with no `thread.*`/`cont.*` ops of its own): no spawn site exists, so it is never read there.
+    call_tramp: Option<FiberCallTramp>,
     fault_lo: usize,
     fault_hi: usize,
     /// `(fiber_type_id, fn_table_mask)` when the module mixes fibers + threads — each vCPU then gets
@@ -371,7 +374,7 @@ impl Domain {
         mem_base: u64,
         fn_table_base: u64,
         trap_out: *mut i64,
-        call_tramp: FiberCallTramp,
+        call_tramp: Option<FiberCallTramp>,
         fault: (usize, usize),
         fiber_cfg: Option<(u32, u64)>,
         fiber_table: Option<std::sync::Arc<SharedFiberTable>>,
@@ -395,6 +398,22 @@ impl Domain {
     /// The domain-shared fiber table (for a spawned vCPU to build its `FiberRuntime` over).
     fn fiber_table(&self) -> Option<std::sync::Arc<SharedFiberTable>> {
         lock(&self.fiber_table).clone()
+    }
+
+    /// A §14 **child** (its own OS thread, sharing this domain's futex) started: count it live so the
+    /// wait/join deadlock detection (`live > parked`) sees it as a possible notifier — without this, a
+    /// parked child would push `parked` past `live` and fail a *parent* vCPU's infinite wait closed.
+    /// Called on the spawning thread before `instantiate` returns (so a subsequent wait already counts
+    /// the child); paired with [`Self::child_finished`] on the child's own thread.
+    pub(crate) fn child_started(&self) {
+        lock(&self.threads).live += 1;
+    }
+
+    /// The §14 child finished — drop it from the live count (see [`Self::child_started`]). A parked
+    /// infinite waiter re-evaluates `peers_live` within `KILL_RECHECK`, exactly as it does when a
+    /// spawned vCPU exits (`run_child`'s decrement).
+    pub(crate) fn child_finished(&self) {
+        lock(&self.threads).live -= 1;
     }
 
     fn env(&self) -> Env {
@@ -551,7 +570,12 @@ extern "C" fn child_entry(
         // §2b path B: a spawned vCPU's top-level entry runs on its own OS thread stack (OS-guarded),
         // so its stack-limit is 0 ⇒ the prologue check is inert for it; fibers it resumes get a real
         // limit at their own entry.
-        let v = (env.call_tramp)(
+        // A domain with a spawn site always has the trampoline; only a futex-only domain lacks it,
+        // and nothing can reach a vCPU entry there.
+        let tramp = env
+            .call_tramp
+            .expect("call-trampoline set for a vCPU entry");
+        let v = tramp(
             (*c).code,
             env.mem_base,
             env.fn_table_base,
@@ -690,7 +714,7 @@ fn run_child(a: SpawnArgs) {
         let table = unsafe { (*a.dom).fiber_table() }
             .expect("fiber_cfg set ⇒ the domain fiber table is set");
         let mut rt = FiberRuntime::new(table, tid, mask);
-        rt.set_call_tramp(env.call_tramp);
+        rt.set_call_tramp(env.call_tramp.expect("fiber_cfg set ⇒ call-trampoline set"));
         // §12.8 4A.5 follow-up B: a **concurrent durable** child that owns fibers needs `mem_base` +
         // the `durable` flag on its own runtime, so its `cont.resume` swap repoints the active
         // shadow-SP at the fiber's region and the freeze driver records flattened fibers as residue
@@ -1071,7 +1095,7 @@ impl Domain {
                 .fiber_table()
                 .expect("fiber_cfg set ⇒ the domain fiber table is set");
             let mut rt = FiberRuntime::new(table, tid, mask);
-            rt.set_call_tramp(env.call_tramp);
+            rt.set_call_tramp(env.call_tramp.expect("fiber_cfg set ⇒ call-trampoline set"));
             // Arm the durable fiber-switch swap for this child (slice 3.4): a child that owns fibers
             // needs `mem_base` + the `durable` flag on its own runtime so its `cont.resume` swap points
             // the active shadow-SP at the fiber's region, and so the freeze driver's `Complete` arm

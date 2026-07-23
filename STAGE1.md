@@ -239,10 +239,30 @@ keystone of self-similarity. It is **not built**. Until it lands:
    Also pinned: the same ring between two **detached** stages (op-15 spawns —
    private windows + the explicit shared channel compose, the §5 model
    sentence as a test) and bytecode-entry equality via the standing oracle
-   fallback. **Remaining for this item:** the JIT pipeline (aliasing a
-   `SharedRegion` into a *separate child window* is the S1c deferred deep-PAL
-   piece) and the `c_shell` personality `|` wiring over rings — both in
-   TODO.md.
+   fallback.
+
+   **[BUILT 2026-07-23 — the JIT pipeline.]** The fast backend runs the same
+   ring pin (`svm/tests/jit_concurrent_stages.rs`, byte-identical module,
+   differential vs the interp) — and the deep PAL turned out to be *already
+   built*: `MprotectWindow::map_region` does real aliasing (memfd
+   `mmap(MAP_SHARED|MAP_FIXED)` on unix, placeholder + `MapViewOfFile3` on
+   windows) against any `GuestWindow`, the child powerbox host is already the
+   child's baked `cap.call` ctx (so `map` reaches its regranted region), and
+   the region-canon hook self-installs per child window at the child's first
+   thunk call. What was actually missing: (1) **granted children ran
+   synchronously** — ops 8/11/13 now take the S1c OS-thread path (uncached
+   per-spawn code; the powerbox host is released from the child's thread via
+   `run_child_code_then`'s teardown hook, *before* the child window's VA is
+   freed, so the host's region-canon purge can never erase a reused address's
+   fresh entries); and (2) **children had no futex** — a nesting module's run
+   now always stands up the thread `Domain` (futex-only when the module has no
+   `thread.*` ops: `Env.call_tramp` became optional), the nursery carries its
+   address, and child compiles get a wait/notify-only `ThreadEnv` over the
+   **parent's shared futex table** (spawn/join/fibers stay rejected;
+   `Func::uses_fibers_or_threads`/`uses_futex` split `uses_concurrency`).
+   Spawned children register in the domain's live count so wait/join deadlock
+   detection stays sound. **Remaining for this item:** the `c_shell`
+   personality `|` wiring over rings — in TODO.md.
 7. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
    piece for shells that fork *themselves*.
 
