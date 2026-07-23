@@ -1342,9 +1342,81 @@ coordination across domains of varying mutual trust. Its answers settle the
   `window_exposed = false`, which requires **detached windows** (PROCESS.md
   §5) — promoted to the consumer critical path; attest itself is built.
 
-Remaining before the slice: build revocation-unparks, build detached
-windows, and the exec-interface contract (EXEC.md) whose guest-served
-backend is the first Endpoint consumer.
+Remaining before the slice: ~~build revocation-unparks~~ **[BUILT
+2026-07-22 — §3.6 slice 1]**, build detached windows, and ~~the
+exec-interface contract~~ **[EXEC.md landed; host/scripted backends
+built]** — its guest-served backend is the first Endpoint consumer.
+
+**[BUILT 2026-07-22] §3.6 slice 1 — revocation-unparks.** The substrate
+primitive is live on the reference interpreter's M:N scheduler:
+`Stream.close` is now **real** (slot entry cleared in the one shared
+dispatch — uniform across backends; a fresh call on the closed handle is
+the D37 use-after-close `CapFault` the docs always promised), a blocking
+stream read with no data **parks the fiber keyed by the handle it is
+parked through** (`Blocked::CapRead` + the scheduler's handle→waiters
+index, the futex `wait_waiters`/`notify` pair as template), and a sibling
+fiber's close **wakes every fiber parked through the handle with `-EBADF`**
+(`Scheduler::cap_revoke` → `Pending::CapResult`) — delivered as the call's
+return value on the fiber's own error path, never a trap, never a kill.
+The park-vs-revoke race is closed by a liveness re-check under the
+scheduler lock (a revoked-while-parking fiber wakes itself with the same
+errno). Pinned by `revocation_unparks.rs`: the racing-fibers test (parked
+read + sibling close + timer via `atomic.wait` timeout) and the D37
+close-then-use faults. **Scope, honestly:** the park and wake live on the
+tree-walk scheduler this slice; import-routed (`call.import`) blocking
+reads keep their historical non-blocking 0-EOF (the flag is discarded, so
+it cannot leak into a later direct call's park decision) — slot-parked
+calls and their rebind-triggered revocation are the §3.6 caller-parking
+slice; the exhaustive explorer fails a `CapRead` park closed (nothing can
+feed stdin inside an exploration); bytecode's interactive `Vcpu` stdin
+park is unchanged.
+
+**[BUILT 2026-07-22] §3.6 slice 2 — the serve-loop core (`svc.poll` +
+the bounded dispatch queue + one-world handlers).** A domain's offers now
+serve over its **one world**: dispatches queue on the domain's bounded
+inbound queue (`SVC_QUEUE_CAP`; a full queue refuses the enqueue
+fail-closed — backpressure at the enqueuer, never buffering, and the
+queue only ever holds servable dispatches) and are admitted at the
+guest's **`svc.poll`** service point, each running as a handler over the
+same live window, powerbox, and fuel as `main` — what `main` writes,
+handlers read, and vice versa; a handler trap is terminal for the domain
+(one world, no second state to shield). Handlers run **to completion**
+this slice — exactly the passive instance's serialized observable
+behavior, which is the oracle. Encoding rides the **reserved
+self-namespace dispatch** (`cap.call CAP_SELF_TYPE_ID 9`, the
+`cap.self.provenance` precedent): no wire bump, no new opcode, generic
+verify already covers it; the op is serviced by the eval loop (only it
+can run guest code — the `Jit.invoke` nested-drive pattern, same window
+moved in and back), and a backend tier without the servicing arm answers
+a probeable `-EINVAL`. Pinned by `svc_serve_loop.rs` (one-world
+mutation + ordered serialization + completion cells, bounded/unservable
+refusals, arity-errno-and-continue, the pinned op number). **Deferred to
+the next slices:** handler fibers that may park (fiber admission), text
+sugar for `svc.*`, slot-parked (`call.import`) live calls + their
+rebind-triggered revocation, and bytecode/JIT parity.
+
+**[BUILT 2026-07-22] §3.6 slice 3 — caller-side parking.** The unified
+model's semantic heart, on the §14 nested-child topology (the one place
+two live domains + separate powerboxes + one shared scheduler already
+exist): a parent mints a **live-callee offer** over a running child's
+impl-export (`Instantiator.child_offer`, op 14 → `Binding::LiveImpl`,
+index-carried; the child inherits the parent's registered self module at
+spawn and its live powerbox Arc is retained parent-side), and a call
+through it **enqueues on the child's inbound queue and parks the calling
+fiber** (`Blocked::CapReply`, ticket-keyed) until the child's serve loop
+completes the dispatch — the reply riding the same `Pending::CapResult`
+vehicle as a revocation (it carries any i64). **`svc.wait` (op 10) is
+live**: an empty queue parks the serving fiber keyed by its domain
+identity (the powerbox Arc pointer), and a caller's enqueue wakes it —
+the frame is rewound so the wake re-executes the wait, which then finds
+the work. Both park races are closed under the scheduler lock (an early
+reply is taken from the completion cell instead of stranding the caller;
+an enqueue-during-park re-runs the server); a full callee queue is
+probeable `-EAGAIN` backpressure at the caller, never a trap; both new
+parks fail closed on the exhaustive explorer, and a `LiveImpl` is
+non-durable (a live run is not a snapshot artifact). Pinned by
+`svc_serve_loop.rs`: the full caller ↔ servicer round-trip — spawn,
+mint, call-and-park, `svc.wait`-serve, reply-wake, join.
 
 ---
 

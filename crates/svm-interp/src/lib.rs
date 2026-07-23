@@ -3548,6 +3548,27 @@ enum Blocked {
         width: u32,
         timeout_ns: u64,
     },
+    /// Blocked inside a capability call **through `handle`** (§3.6 slice 1: a blocking stream
+    /// read with no data). Parked in the scheduler's handle-keyed waiter index, so a
+    /// **revocation** of that handle (another fiber's `Stream.close`, D37 turned inward) can
+    /// find and wake it with a probeable negative errno — the racing-fibers escape hatch
+    /// (IMPORTS.md §3.6 consumer pinning / PROCESS.md §4 revocation-unparks). Nothing else
+    /// wakes it today: a scheduler-run blocking read with no closer blocks forever, which is
+    /// what blocking means.
+    CapRead { handle: i32 },
+    /// §3.6 slice 3 — parked inside a call to a **live callee** awaiting its reply, keyed by
+    /// the dispatch ticket. `callee` is carried for the park-vs-reply race check: the park
+    /// handler probes the callee's completion cell under the scheduler lock, so a reply that
+    /// landed before the park wakes the caller immediately instead of stranding it.
+    CapReply {
+        ticket: u64,
+        callee: Arc<Mutex<Host>>,
+    },
+    /// §3.6 slice 3 — a serving fiber parked in `svc.wait` on an empty queue, keyed by its
+    /// domain identity. The frame was rewound before parking, so the wake re-executes the
+    /// `svc.wait` (which then finds work). The park handler re-checks the queue under the
+    /// scheduler lock (the park-vs-enqueue race).
+    SvcWait { key: usize },
 }
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
@@ -3559,6 +3580,10 @@ enum Pending {
     /// Finish a §14 co-fiber `yield`: push the value the parent's `resume` delivered (the result of
     /// the child's `Yielder` cap.call). Only ever set on a *coroutine* child the parent drives inline.
     CoResume(i64),
+    /// Finish a revoked capability call ([`Blocked::CapRead`]): push this as the call's i64
+    /// result — a negative errno the parked fiber probes on its own error path. The fiber is
+    /// never killed and never traps; cancellation is a returned value (§3.6 revocation-unparks).
+    CapResult(i64),
 }
 
 /// One run of a vCPU until it finishes or yields.
@@ -3621,6 +3646,20 @@ struct Sched {
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
     wait_waiters: BTreeMap<FutexKey, Vec<(u64, Box<VCpu>)>>,
+    /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
+    /// (§3.6 slice 1 — the handle → parked-fibers index revocation-unparks needs). Woken only by
+    /// [`Scheduler::cap_revoke`] with a negative errno; the wait_waiters/notify pair is the template.
+    /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
+    /// between this map and `runnable` as a pointer, never by value.)
+    #[allow(clippy::vec_box)]
+    cap_waiters: BTreeMap<i32, Vec<Box<VCpu>>>,
+    /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by the dispatch
+    /// ticket (exactly one caller per ticket; woken by [`Scheduler::cap_reply`] with the result).
+    ticket_waiters: BTreeMap<u64, Box<VCpu>>,
+    /// §3.6 slice 3 — serving fibers parked in `svc.wait` on an empty queue, keyed by their
+    /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
+    /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
+    svc_waiters: BTreeMap<usize, Box<VCpu>>,
     /// Min-heap of `(deadline, waiter id, futex key)` for timing out `wait`s.
     timers: BinaryHeap<Reverse<(Instant, u64, FutexKey)>>,
     /// OS-thread handles of spawned workers (joined by `drive` at the end).
@@ -3704,6 +3743,58 @@ impl Scheduler {
             self.work.notify_all();
         }
         n
+    }
+
+    /// §3.6 revocation-unparks: wake **every** fiber parked in a capability call through
+    /// `handle`, completing each one's call with the negative errno `status` (probeable on the
+    /// fiber's own error path — never a trap, never a kill). Called at the revocation act
+    /// (`Stream.close` from a sibling fiber); returns how many were woken. Granularity is
+    /// per-connection by design: all fibers parked through the handle wake together.
+    fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
+        let mut s = self.lock();
+        let woken = s.cap_waiters.remove(&handle).unwrap_or_default();
+        let n = woken.len() as u32;
+        for mut v in woken {
+            v.pending = Some(Pending::CapResult(status));
+            s.runnable.push_back(v);
+        }
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
+    /// §3.6 slice 3 — deliver a live-callee **reply**: wake the one caller parked on `ticket`
+    /// with the handler's result (the same `Pending::CapResult` vehicle as a revocation — it
+    /// carries any i64). `false` when no caller is parked (an embedder-enqueued dispatch, or
+    /// the caller hasn't parked yet — the result then rides the completion cell and the park
+    /// handler's race check finds it).
+    fn cap_reply(&self, ticket: u64, result: i64) -> bool {
+        let mut s = self.lock();
+        match s.ticket_waiters.remove(&ticket) {
+            Some(mut v) => {
+                v.pending = Some(Pending::CapResult(result));
+                s.runnable.push_back(v);
+                self.work.notify_all();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// §3.6 slice 3 — a caller's enqueue landed on domain `key`'s queue: wake its fiber parked
+    /// in `svc.wait`, if any. Resume re-executes the `svc.wait` (the frame was rewound at the
+    /// park), which now finds the queue non-empty and serves.
+    fn svc_wake(&self, key: usize) -> bool {
+        let mut s = self.lock();
+        match s.svc_waiters.remove(&key) {
+            Some(v) => {
+                s.runnable.push_back(v);
+                self.work.notify_all();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -4044,6 +4135,67 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 sched.work.notify_all(); // let idle workers recompute their timer deadline
             }
         }
+        Step::Park(Blocked::CapRead { handle }) => {
+            // §3.6 slice 1: park inside a capability call, keyed by the handle. The
+            // park-vs-revoke race mirrors the futex compare-and-park: enqueue under the
+            // scheduler lock, then re-check the handle's liveness — a `cap_revoke` that ran
+            // between the empty-read decision and this insertion found no waiter, so if the
+            // handle is now dead we wake ourselves with the same errno instead of parking
+            // forever. (Lock order sched → host; the revoke path holds neither.)
+            let mut s = sched.lock();
+            let live = v
+                .host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .handle_live(handle);
+            if live {
+                s.cap_waiters.entry(handle).or_default().push(v);
+            } else {
+                v.pending = Some(Pending::CapResult(CAP_REVOKED));
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+            }
+        }
+        Step::Park(Blocked::CapReply { ticket, callee }) => {
+            // §3.6 slice 3: park awaiting a live-callee reply. Park-vs-reply race check under
+            // the scheduler lock: a reply that landed before this park sits in the callee's
+            // completion cell — take it and wake ourselves instead of stranding the caller.
+            let mut s = sched.lock();
+            let early = callee
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .svc_results
+                .remove(&ticket);
+            match early {
+                Some(r) => {
+                    v.pending = Some(Pending::CapResult(r));
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                }
+                None => {
+                    s.ticket_waiters.insert(ticket, v);
+                }
+            }
+        }
+        Step::Park(Blocked::SvcWait { key }) => {
+            // §3.6 slice 3: park the serving fiber on its empty queue. Park-vs-enqueue race
+            // check under the scheduler lock: an enqueue that landed since the empty check
+            // found no waiter, so re-run ourselves (the frame was rewound — the re-executed
+            // `svc.wait` finds the work).
+            let mut s = sched.lock();
+            let empty = v
+                .host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .svc_queue
+                .is_empty();
+            if empty {
+                s.svc_waiters.insert(key, v);
+            } else {
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+            }
+        }
         Step::Yield => {
             // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
             let mut s = sched.lock();
@@ -4074,6 +4226,29 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.notify(key, count),
             SchedRef::Det(d) => d.notify(key, count),
+        }
+    }
+    /// §3.6 revocation-unparks: wake every fiber parked in a capability call through `handle`
+    /// with the negative errno `status` ([`Scheduler::cap_revoke`]). The explorer has no
+    /// cap-call parks (a `Blocked::CapRead` there fails closed at the park), so it is a no-op.
+    fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
+        match self {
+            SchedRef::Real(s) => s.cap_revoke(handle, status),
+            SchedRef::Det(_) => 0,
+        }
+    }
+    /// §3.6 slice 3 reply-wake ([`Scheduler::cap_reply`]); the explorer has no caller parks.
+    fn cap_reply(&self, ticket: u64, result: i64) -> bool {
+        match self {
+            SchedRef::Real(s) => s.cap_reply(ticket, result),
+            SchedRef::Det(_) => false,
+        }
+    }
+    /// §3.6 slice 3 serve-wake ([`Scheduler::svc_wake`]); the explorer has no svc parks.
+    fn svc_wake(&self, key: usize) -> bool {
+        match self {
+            SchedRef::Real(s) => s.svc_wake(key),
+            SchedRef::Det(_) => false,
         }
     }
     /// Take a finished child's outcome (for a resuming `thread.join`).
@@ -4498,6 +4673,30 @@ impl SchedDriver {
                             vcpu: v,
                         });
                     }
+                }
+                // Blocking stream reads, live-callee calls, and svc.wait are not part of the
+                // explored model (the same restriction as the other non-resumable drivers).
+                // Fail closed rather than wedge.
+                Step::Park(
+                    Blocked::CapRead { .. } | Blocked::CapReply { .. } | Blocked::SvcWait { .. },
+                ) => {
+                    let id = v.id;
+                    drop(v);
+                    let mut s = det.lock();
+                    if let Some(parent) = s.join_waiters.remove(&id) {
+                        s.runnable.push(parent);
+                    }
+                    s.results.insert(
+                        id,
+                        Outcome {
+                            result: Err(Trap::CapFault),
+                            mem: None,
+                            fuel: 0,
+                            trap_bt: Vec::new(),
+                            trap_fiber: None,
+                        },
+                    );
+                    s.live -= 1;
                 }
                 Step::Yield => {
                     // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU
@@ -5359,6 +5558,12 @@ struct VCpu {
     /// [`FrozenNested`] residue; the un-covered shapes (separate-module child, completed-but-unjoined
     /// child, nested-in-nested) still fail closed (DURABILITY.md §4).
     nested_children: Vec<NestedChildInfo>,
+    /// §3.6 slice 3 — live powerboxes of this vCPU's §14 children, keyed by their `threads`
+    /// slot. Retained so the parent can mint a [`Binding::LiveImpl`] over a child's offer
+    /// (`Instantiator.child_offer`, op 14) — the caller-parking linkage. Live-only (never
+    /// frozen: a LiveImpl is non-durable), kept out of `NestedChildInfo` so the freeze
+    /// records stay `Copy`.
+    child_hosts: BTreeMap<usize, Arc<Mutex<Host>>>,
     /// This vCPU **is** a §14 instantiated child (depth-1). Its freeze-unwind is self-describing —
     /// its extent lives in its carve's shadow-SP word, inside the parent's window image — so its
     /// freeze completion records no host-side residue (and must not clobber the root's).
@@ -5479,6 +5684,7 @@ impl VCpu {
             fuel,
             threads: Vec::new(),
             nested_children: Vec::new(),
+            child_hosts: BTreeMap::new(),
             nested_child: false,
             coroutines: Vec::new(),
             fault_yields: false,
@@ -5549,6 +5755,7 @@ impl VCpu {
             fuel,
             threads: Vec::new(),
             nested_children: Vec::new(),
+            child_hosts: BTreeMap::new(),
             nested_child: false,
             coroutines: Vec::new(),
             fault_yields: false,
@@ -5866,6 +6073,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let top = v.frames.len() - 1;
             v.frames[top].vals.push(Reg::from_i64(value));
         }
+        Some(Pending::CapResult(status)) => {
+            // §3.6 revocation-unparks: the handle this fiber's capability call was parked
+            // through was revoked. The call completes with the negative errno — the fiber
+            // resumes on its own error path (no trap, no kill; cancellation is a value).
+            let top = v.frames.len() - 1;
+            v.frames[top].vals.push(Reg::from_i64(status));
+        }
         None => {}
     }
 
@@ -5895,6 +6109,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         fuel,
         threads,
         nested_children,
+        child_hosts,
         nested_child: _,
         coroutines,
         fault_yields,
@@ -6588,7 +6803,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if !manifest_ok {
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                                 } else {
+                                    // §3.6 slice 3: a same-module child serves its own offers
+                                    // over the shared program, so it inherits the parent's
+                                    // registered self module (a separate-module child would
+                                    // need its own — recorded with the serve-loop docs).
+                                    if child_mod.is_none() {
+                                        ch.self_module = host
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .self_module
+                                            .clone();
+                                    }
                                     let child_host = Arc::new(Mutex::new(ch));
+                                    // §3.6 slice 3: keep a live reference past the move into
+                                    // the child vCPU, for `child_offer` (op 14).
+                                    let child_host_keep = Arc::clone(&child_host);
                                     let mut child_args = vec![Value::I64(cinst as i64)];
                                     if want_as {
                                         child_args.push(Value::I64(cas as i64));
@@ -6680,6 +6909,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                                                          // broadcasts into a live child's carve and records it
                                                                                          // as residue — or fails closed on the un-covered
                                                                                          // shapes (see `VCpu::nested_children`).
+                                                                                         // §3.6 slice 3: retain the child's live powerbox
+                                                                                         // so `child_offer` (op 14) can mint a LiveImpl.
+                                            child_hosts.insert(threads.len() - 1, child_host_keep);
                                             nested_children.push(NestedChildInfo {
                                                 slot: threads.len() - 1,
                                                 carve_off: ibase + off,
@@ -6933,6 +7165,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                             frames[top].vals.push(Reg::from_i32(0));
                         }
+                        // §3.6 slice 3 — `child_offer(child_handle, export) -> cap | -EINVAL`:
+                        // mint a **live-callee offer** over a running child's impl-export. A
+                        // call through the returned cap enqueues on the child's inbound queue
+                        // and parks this (the caller's) fiber until the child's serve loop
+                        // replies — the caller-parking half of the unified model. Probeable
+                        // `-EINVAL` for a bad child handle, a finished/joined child, or a
+                        // malformed export; the type is the export's structural interface
+                        // (D59 intern — a same-module child shares this module's shapes).
+                        14 => {
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
+                            let export =
+                                get_i32(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
+                                    as u32;
+                            let cap = resolve_thread(threads, ch)
+                                .ok()
+                                .and_then(|slot| child_hosts.get(&slot).cloned())
+                                .and_then(|callee| {
+                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.wire_live_impl(&callee, export).ok()
+                                });
+                            frames[top]
+                                .vals
+                                .push(Reg::from_i32(cap.unwrap_or(EINVAL as i32)));
+                        }
                         _ => return Err(Trap::CapFault),
                     }
                 }
@@ -6984,6 +7241,103 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     jit_invoke_body!(h, args, sig)
                 }
+                // §3.6 slices 2+3 — the service points. `svc.poll` (op 9) drains and serves
+                // everything queued, returning the count; `svc.wait` (op 10) parks on an empty
+                // queue until a caller's enqueue wakes it (frame rewound, so the wake
+                // re-executes the wait, which then serves). Each dispatch runs as a handler
+                // over the domain's **one world** — same functions, live window, powerbox,
+                // fuel; a handler trap is terminal (one world, no second state to shield).
+                // A completed dispatch's result wakes its parked caller (`cap_reply`) or,
+                // for an embedder-enqueued dispatch with no parked caller, rides the
+                // completion cell. Serviced here because only the eval loop can run guest
+                // code; other tiers answer a probeable `-EINVAL` from host-side dispatch.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: op @ (CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT),
+                    sig,
+                    ..
+                } => {
+                    if *op == CAP_SELF_SVC_WAIT {
+                        let empty = {
+                            let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            hg.svc_queue.is_empty()
+                        };
+                        if empty {
+                            // Rewind so the wake re-executes this `svc.wait`; park keyed by
+                            // this domain's powerbox identity (the enqueuer computes the same
+                            // key from the callee Arc it holds).
+                            frames[top].inst -= 1;
+                            let key = Arc::as_ptr(host) as usize;
+                            return Ok(Inner::Park(Blocked::SvcWait { key }));
+                        }
+                    }
+                    let mut served: i64 = 0;
+                    loop {
+                        let d = {
+                            let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            hg.svc_queue.pop_front()
+                        };
+                        let Some(d) = d else { break };
+                        // The queue only holds servable dispatches (checked at enqueue), so a
+                        // missing handler here is host-state corruption: fail closed.
+                        let fidx = {
+                            let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            hg.svc_handler_func(d.export, d.op).ok_or(Trap::CapFault)?
+                        };
+                        let params = funcs[fidx as usize].params.clone();
+                        if d.args.len() != params.len() {
+                            // Arity mismatch is the *dispatch's* fault, not the domain's:
+                            // probeable errno to the caller/cell, domain keeps serving.
+                            if !sched.cap_reply(d.ticket, EINVAL) {
+                                let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                hg.svc_results.insert(d.ticket, EINVAL);
+                            }
+                            continue;
+                        }
+                        let child_args: Vec<Value> = d
+                            .args
+                            .iter()
+                            .zip(params)
+                            .map(|(s, ty)| slot_to_val(ty, *s))
+                            .collect();
+                        // The handler's nested run over the SAME world (the jit_invoke pattern):
+                        // window/fuel move into the child and back whatever the outcome.
+                        let child_mem = mem.take();
+                        let mut child = VCpu::new(
+                            Arc::clone(&funcs),
+                            fidx,
+                            &child_args,
+                            child_mem,
+                            Arc::clone(host),
+                            *fuel,
+                            depth + frames.len() as u32 + 1,
+                            0, // transient: never scheduler-posted (driven inline to completion)
+                            sched.clone(),
+                            spawn_quota,
+                            Arc::clone(dt),
+                        );
+                        child.memop = memop;
+                        let out = run_inner(&mut child, u64::MAX);
+                        *mem = child.mem.take();
+                        *fuel = child.fuel;
+                        match out {
+                            Ok(Inner::Done(results)) => {
+                                let r = results.first().copied().map_or(0, val_to_slot);
+                                // Reply-wake the parked caller; an unclaimed result rides the cell.
+                                if !sched.cap_reply(d.ticket, r) {
+                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.svc_results.insert(d.ticket, r);
+                                }
+                                served += 1;
+                            }
+                            Ok(_) => return Err(Trap::CapFault), // no handler parking this slice
+                            Err(t) => return Err(t),
+                        }
+                    }
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(served));
+                    }
+                }
                 Inst::CapCall {
                     type_id,
                     op,
@@ -7000,11 +7354,53 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     for a in args {
                         argv.push(get(&frames[top].vals, *a)?.i64());
                     }
+                    // §3.6 slice 3 — caller-side parking: a call through a live-callee offer
+                    // does not dispatch here. It enqueues on the callee's inbound queue, wakes
+                    // the callee's `svc.wait` (if parked), and parks THIS fiber until the
+                    // handler's reply (`Blocked::CapReply`). A full callee queue is probeable
+                    // backpressure (`-EAGAIN` as the call's result), never a trap.
+                    let live = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.live_impl_of(h, *type_id)
+                    };
+                    if let Some((callee, export)) = live {
+                        let ticket = {
+                            let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
+                            cg.svc_enqueue(export, *op, argv)
+                        };
+                        match ticket {
+                            Some(t) => {
+                                sched.svc_wake(Arc::as_ptr(&callee) as usize);
+                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
+                            }
+                            None => {
+                                if !sig.results.is_empty() {
+                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results = hg.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    // §3.6 slice 1 — the two revocation-unparks hooks, direct-call route:
+                    // (a) a blocking stream read with no data parks THIS fiber, keyed by the
+                    //     handle it is parked through (the dispatch's placeholder result is
+                    //     discarded; the wake delivers the real one via `Pending::CapResult`);
+                    if hg.take_stdin_parked() {
+                        drop(hg);
+                        return Ok(Inner::Park(Blocked::CapRead { handle: h }));
+                    }
+                    // (b) a `Stream.close` that just revoked `h` wakes every sibling fiber
+                    //     parked in a call through it, each completing with a probeable errno.
+                    let closed = *type_id == cap_id::STREAM && *op == 2;
+                    drop(hg);
+                    if closed {
+                        sched.cap_revoke(h, CAP_REVOKED);
+                    }
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7060,6 +7456,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *import | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
+                    // Import-routed blocking reads don't park this slice (slot-parked calls are
+                    // the §3.6 caller-parking slice); discard the flag so it can't leak into a
+                    // later direct call's park decision — the read keeps its historical 0-EOF.
+                    let _ = hg.take_stdin_parked();
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7077,6 +7477,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                    let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -7100,6 +7501,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *ty | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
+                    let _ = hg.take_stdin_parked(); // no dyn-parking this slice (see call.import)
                     for (s, tyv) in results.iter().zip(&sig.results) {
                         frames[top]
                             .vals
@@ -9394,6 +9796,13 @@ pub fn builtin_iface_shape(id: u32) -> Option<Vec<(&'static str, FuncType)>> {
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal.
 const ENOMEM: i64 = -12; // resource quota exhausted (e.g. the Jit compile budget)
+/// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
+/// call returns when the handle it was parked through is revoked out from under it. Probeable
+/// on the fiber's own error path — never a trap (D42: errors return, traps stay for escape).
+const CAP_REVOKED: i64 = -9;
+/// A live-callee's dispatch queue was full at the enqueue (`-EAGAIN`): backpressure surfaces
+/// as a probeable errno at the caller, per the §3.6 bounded fail-closed queue design.
+const EAGAIN: i64 = -11;
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
@@ -9637,6 +10046,16 @@ pub enum StreamRole {
 #[derive(Clone, Copy, Debug)]
 enum Binding {
     Stream(StreamRole),
+    /// §3.6 slice 3 — a **live-callee offer**: a capability whose provider is another *running*
+    /// domain (a §14 child), carried as an index into [`Host::live_impls`] (the entry holds the
+    /// callee's live powerbox Arc + target impl-export — index-carried to keep `Binding: Copy`,
+    /// like [`Binding::GuestImpl`]/[`Binding::PipeEnd`]). A call through it does not run a
+    /// passive `drive_arc` sub-run — it **enqueues** onto the callee's inbound dispatch queue
+    /// and **parks the calling fiber** until the callee's serve loop completes the dispatch
+    /// (the caller-parking half of the unified model; serviced in the eval loop, which alone
+    /// can park). Acyclic by construction: the parent's table points at the child's Host, never
+    /// the reverse. Non-durable (a live run is not a snapshot artifact).
+    LiveImpl(u32),
     /// A **host-served pipe** end (§4/S4, the personality's byte IPC): resolves under iface `STREAM`
     /// (a pipe end *is* a stream — the personality treats it as an fd), carrying the index of its FIFO
     /// in [`Host::pipes`] and which half it is. `write = true` appends to the FIFO (op 1), `false`
@@ -9829,6 +10248,9 @@ pub enum NonDurableKind {
     /// A wired interface offer (IMPORTS.md §3.2) — carries an out-of-line reference to the
     /// offering domain's functions, so it must be re-wired after restore, not snapshotted.
     GuestImpl,
+    /// §3.6 a live-callee offer — points at a *running* domain's powerbox, which no snapshot
+    /// can carry; re-wired after restore like a GuestImpl.
+    LiveImpl,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -10171,6 +10593,42 @@ pub struct GuestImplEntry {
     pub state: Option<Arc<Mutex<ProviderState>>>,
 }
 
+/// §3.6 slice 2 — one queued inbound dispatch (the serve-loop core): a call targeting this
+/// domain's impl-export `export`, op `op`, args in the i64-slot ABI, completion posted under
+/// `ticket`. Admitted as a handler over the domain's **one world** at a `svc.poll` service
+/// point — run-to-completion this slice (handler parking rides the fiber-admission slice),
+/// which is exactly the passive instance's serialized observable behavior (the oracle).
+pub struct SvcDispatch {
+    pub export: u32,
+    pub op: u32,
+    pub args: Vec<i64>,
+    pub ticket: u64,
+}
+
+/// §3.6 bounded dispatch-queue depth. Small and fixed: a full queue refuses the enqueue
+/// fail-closed (probeable at the enqueuer) — backpressure, not buffering (the pinned design).
+pub const SVC_QUEUE_CAP: usize = 64;
+
+/// The reserved self-namespace op number for `svc.poll` (§3.6 slice 2): drain-and-serve all
+/// queued dispatches, return the count. Rides `cap.call CAP_SELF_TYPE_ID` like
+/// `cap.self.provenance` — no wire change, no new opcode; serviced by the eval loop (it runs
+/// guest code, which host-side dispatch cannot), so a backend tier without the eval-loop arm
+/// answers `-EINVAL`, probeable. `svc.wait` (park-until-dispatch) takes the next number when
+/// the caller-parking slice gives it a real waker.
+pub const CAP_SELF_SVC_POLL: u32 = 9;
+
+/// The reserved self-namespace op for `svc.wait` (§3.6 slice 3): like `svc.poll`, but an empty
+/// queue **parks the serving fiber** until a caller's enqueue wakes it — the classic serve loop.
+/// Same encoding path and backend story as `svc.poll`.
+pub const CAP_SELF_SVC_WAIT: u32 = 10;
+
+/// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
+/// + the target impl-export. Index-carried so `Binding` stays `Copy`.
+struct LiveImplEntry {
+    callee: Arc<Mutex<Host>>,
+    export: u32,
+}
+
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
 /// once from the provider module's memory declaration + data segments at wiring) and powerbox
 /// its ops execute over. The powerbox starts empty; the wirer may re-grant its own capabilities
@@ -10340,6 +10798,18 @@ pub struct Host {
     /// Memoized reified-offer handles by impl-export index (re-reifying returns the same
     /// backing).
     self_reified: BTreeMap<u32, i32>,
+    /// §3.6 slice 2 — the domain's **bounded inbound dispatch queue** (the serve-loop core):
+    /// dispatches targeting this domain's offers queue here and are admitted as handlers over
+    /// the domain's **one world** (live window + powerbox) at the guest's `svc.poll` service
+    /// points. Bounded, fail-closed: a full queue refuses the enqueue (probeable at the
+    /// enqueuer), per the pinned §3.6 design. Enqueued embedder-side this slice
+    /// ([`Host::svc_enqueue`]); the cross-domain caller side is the §3.6 caller-parking slice.
+    svc_queue: VecDeque<SvcDispatch>,
+    /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
+    svc_results: BTreeMap<u64, i64>,
+    svc_next_ticket: u64,
+    /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
+    live_impls: Vec<LiveImplEntry>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -10612,6 +11082,10 @@ impl Host {
             self_module: None,
             self_instance: None,
             self_reified: BTreeMap::new(),
+            svc_queue: VecDeque::new(),
+            svc_results: BTreeMap::new(),
+            svc_next_ticket: 0,
+            live_impls: Vec::new(),
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -11146,6 +11620,11 @@ impl Host {
             // §6 `cap.self.attest`: the domain's platform-vouched provenance, packed as
             // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
             4 => Ok(vec![self.attestation.packed() as i64]),
+            // §3.6 `svc.poll` reaching host-side dispatch means this backend tier has no
+            // eval-loop servicing arm (only the eval loop can run guest handler code): answer
+            // a probeable `-EINVAL` rather than trap — the guest's serve loop can fall back.
+            // The tree-walk eval loop intercepts the op before dispatch and serves it.
+            CAP_SELF_SVC_POLL => Ok(vec![EINVAL]),
             // §3.1 `cap.self.provenance(handle) -> i32` (IMPORTS.md): the binding's provenance
             // class — `0` = **platform-terminated** (host-native vtable), `d ≥ 1` =
             // **ancestor-terminated** (a wired guest impl terminating `d` domain boundaries up:
@@ -11224,6 +11703,9 @@ impl Host {
                 Binding::GuestImpl(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::GuestImpl))
                 }
+                Binding::LiveImpl(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::LiveImpl))
+                }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
                 Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
             };
@@ -11278,6 +11760,7 @@ impl Host {
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
                 Binding::GuestImpl(_) => NonDurableKind::GuestImpl,
+                Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
                 Binding::Budget(_) => NonDurableKind::Budget,
                 Binding::PipeEnd { .. } => NonDurableKind::Pipe,
             };
@@ -11585,6 +12068,76 @@ impl Host {
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
         self.self_module = Some(Arc::clone(m));
+    }
+
+    /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served
+    /// at the guest's next `svc.poll` service point. Returns the completion ticket, or `None`
+    /// **fail-closed** when the queue is full (backpressure is the enqueuer's problem, probeable)
+    /// or the target isn't a well-formed offer op of the registered self module. Embedder-side
+    /// this slice; a cross-domain caller's enqueue is the §3.6 caller-parking slice.
+    pub fn svc_enqueue(&mut self, export: u32, op: u32, args: Vec<i64>) -> Option<u64> {
+        if self.svc_queue.len() >= SVC_QUEUE_CAP || self.svc_handler_func(export, op).is_none() {
+            return None;
+        }
+        let ticket = self.svc_next_ticket;
+        self.svc_next_ticket += 1;
+        self.svc_queue.push_back(SvcDispatch {
+            export,
+            op,
+            args,
+            ticket,
+        });
+        Some(ticket)
+    }
+
+    /// Take a served dispatch's result (first result slot; `0` for a no-result handler).
+    /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
+    pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
+        self.svc_results.remove(&ticket)
+    }
+
+    /// §3.6 slice 3 — mint a **live-callee offer** into this (the wirer's) table: a capability
+    /// whose provider is the *running* domain behind `callee` (a §14 child's live powerbox),
+    /// targeting its impl-export `export`. The type_id is the structural intern of the export's
+    /// op signatures **in this domain's own module** (same-module children share it — D59: the
+    /// id ≡ the shape). A call through the handle enqueues on the callee and parks the caller
+    /// (the eval loop's caller-parking arm); `Err` fail-closed when this domain has no self
+    /// module or the export is malformed.
+    pub fn wire_live_impl(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Result<i32, Trap> {
+        let m = self.self_module.clone().ok_or(Trap::CapFault)?;
+        let e = m.impl_exports.get(export as usize).ok_or(Trap::CapFault)?;
+        let named = m.interface_named_ops(e.interface).ok_or(Trap::CapFault)?;
+        let sigs: Vec<FuncType> = named.iter().map(|&(_, ft)| ft.clone()).collect();
+        let type_id = self.intern_interface(&sigs);
+        let idx = self.live_impls.len() as u32;
+        self.live_impls.push(LiveImplEntry {
+            callee: Arc::clone(callee),
+            export,
+        });
+        Ok(self.grant(type_id, Binding::LiveImpl(idx)))
+    }
+
+    /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
+    /// right `type_id` — the eval loop's pre-dispatch probe (a non-LiveImpl handle answers
+    /// `None` and flows to the ordinary dispatch).
+    fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<(Arc<Mutex<Host>>, u32)> {
+        match self.resolve(handle, type_id) {
+            Ok(Binding::LiveImpl(i)) => self
+                .live_impls
+                .get(i as usize)
+                .map(|e| (Arc::clone(&e.callee), e.export)),
+            _ => None,
+        }
+    }
+
+    /// The function a queued `(export, op)` dispatch runs: the registered self module's
+    /// impl-export op table entry, checked in-range against its function table. `None` fails
+    /// the enqueue closed — the queue only ever holds servable dispatches.
+    fn svc_handler_func(&self, export: u32, op: u32) -> Option<FuncIdx> {
+        let m = self.self_module.as_ref()?;
+        let e = m.impl_exports.get(export as usize)?;
+        let f = *e.ops.get(op as usize)?;
+        ((f as usize) < m.funcs.len()).then_some(f)
     }
 
     /// The named-op view of self interface `ty`: `(names, sigs)`, or `None` when no self module
@@ -12247,6 +12800,18 @@ impl Host {
         self.table[slot].entry = None;
     }
 
+    /// Whether `handle` still names a live table entry (its slot has an entry and the packed
+    /// generation matches). The §3.6 revocation-unparks park-vs-revoke race check: a fiber about
+    /// to park through a handle confirms it wasn't revoked in the window since its empty read —
+    /// authority-neutral (a `bool`, no binding escapes), and deliberately type-blind (liveness,
+    /// not typing, is the question).
+    pub fn handle_live(&self, handle: i32) -> bool {
+        let slot = (handle as u32 as usize) & (CAP - 1);
+        let gen = (handle as u32) >> CAP_LOG2;
+        let s = &self.table[slot];
+        s.entry.is_some() && (s.generation & GEN_MASK) == gen
+    }
+
     /// Resolve a handle at a `cap.call` use site (§3c) — **the security hinge**: mask
     /// the index into the host-owned table (never branch), then re-check the entry's
     /// interface `type_id` and `generation`. A forged / closed / wrong-type index is
@@ -12688,6 +13253,22 @@ impl Host {
             return self.self_dispatch(op, args);
         }
         match self.resolve(handle, type_id)? {
+            // §3.6 slice 3: a live-callee offer is serviced by the eval loop (enqueue + park —
+            // host-side dispatch cannot park). Reaching it here means a backend tier without
+            // the servicing arm: answer probeable, never trap.
+            Binding::LiveImpl(_) => Ok(vec![EINVAL]),
+            // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
+            // turned inward: the holder hangs up). Null the slot entry so every later use of the
+            // handle is the clean D37 use-after-close fault the docs always promised, and so a
+            // sibling fiber parked in a read through this handle can be woken by the caller
+            // (the eval loop calls `Scheduler::cap_revoke` after this dispatch returns).
+            // Handled here rather than in `stream_op` because closing needs the *handle*,
+            // which the per-role op body deliberately never sees. Uniform across backends —
+            // every backend routes through this one dispatch.
+            Binding::Stream(_) if op == 2 => {
+                self.close(handle);
+                Ok(vec![0])
+            }
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
             Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
             // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
