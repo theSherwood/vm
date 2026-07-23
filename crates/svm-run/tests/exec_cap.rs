@@ -5,8 +5,11 @@
 //! served it). Un-granted, resolve stays negative and the guest's fallback runs; an allowlist
 //! miss is a refused op (negative return), never a trap.
 
-use svm_run::exec::{host_exec, scripted_exec, ScriptedEntry};
-use svm_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
+use std::sync::Arc;
+use svm_run::exec::{domain_exec, host_exec, scripted_exec, DomainProgram, ScriptedEntry};
+use svm_run::{
+    instantiate, instantiate_with_imports, Backend, HostCap, Imports, Limits, Outcome, RunConfig,
+};
 use svm_text::parse_module;
 
 /// The consumer: resolves `"exec"`, runs `echo hi` (argv `"echo\0hi"` — the separator byte at
@@ -100,6 +103,207 @@ fn host_exec_matches_scripted_byte_for_byte() {
             r.outcome,
             Outcome::Exited(3),
             "{backend:?}: real exit 0, 3 bytes"
+        );
+    }
+}
+
+/// The domain program registered under `"echo"`: a fresh svm domain that writes `hi\n` to its
+/// own stdout and returns — no OS process anywhere. Its captured output becomes the job's.
+const ECHO_DOMAIN: &str = "\
+memory 16
+data 0 \"hi\\n\"
+import 0 \"write\" (i64, i64) -> (i64)
+func 0 () -> () {
+block 0 () {
+  vp = i64.const 0
+  vl = i64.const 3
+  vw = call.import 0 (vp, vl)
+  return
+  }
+}
+export 0 func \"_start\" 0
+";
+
+fn echo_domain_registry() -> Vec<DomainProgram> {
+    let m = parse_module(ECHO_DOMAIN).expect("parse echo domain");
+    vec![DomainProgram {
+        name: "echo".into(),
+        instance: Arc::new(instantiate(m).expect("instantiate echo domain")),
+        limits: Limits::default(),
+    }]
+}
+
+/// The **child-domain** backend (EXEC.md's third row), against the *same consumer*: `run` spawns
+/// a fresh svm domain whose captured stdout becomes the job's output — **byte-identical** to the
+/// scripted table and the real `echo`, on all three backends. Three kinds of spawn, one guest,
+/// no way to tell them apart: the one-interface decision, pinned end to end.
+#[test]
+fn domain_exec_matches_scripted_byte_for_byte() {
+    let m = parse_module(EXEC_CONSUMER).expect("parse");
+    let inst = instantiate_with_imports(m, registry()).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec(echo_domain_registry()))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.stdout, b"hi\n",
+            "{backend:?}: the domain's captured output"
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: exit 0, 3 bytes"
+        );
+    }
+}
+
+/// The wire `stdin` seeds the child domain's `Stream{In}`: a cat-like domain program reads its
+/// stdin and echoes it to its stdout, which the consumer drains and re-emits — `yo` in, `yo`
+/// out, through two domains.
+const CAT_DOMAIN: &str = "\
+memory 16
+import 0 \"read\" (i64, i64) -> (i64)
+import 1 \"write\" (i64, i64) -> (i64)
+func 0 () -> () {
+block 0 () {
+  vp = i64.const 64
+  vc = i64.const 32
+  vn = call.import 0 (vp, vc)
+  vw = call.import 1 (vp, vn)
+  return
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// The consumer for the cat test: runs `cat` with stdin `yo` (argv at 8, the payload at 16),
+/// reads the job's output, and echoes it to the granted `out` stream; exits status*100 + n.
+const CAT_CONSUMER: &str = "\
+memory 16
+data 0 \"exec\"
+data 8 \"cat\"
+data 16 \"yo\"
+import 0 \"out\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+func 0 () -> () {
+block 0 () {
+  vp = i64.const 0
+  vl = i64.const 4
+  vh = cap.self.resolve vp vl
+  vap = i64.const 8
+  val = i64.const 3
+  vsp = i64.const 16
+  vsl = i64.const 2
+  vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vsp, vsl)
+  vbuf = i64.const 32
+  vcap = i64.const 16
+  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
+  vs = cap.call 13 3 (i64) -> (i64) vh (vjob)
+  vw = call.import 0 (vbuf, vn)
+  vhund = i64.const 100
+  vmul = i64.mul vs vhund
+  vsum = i64.add vmul vn
+  vcode = i32.wrap_i64 vsum
+  call.import 1 (vcode)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn stdin_flows_into_the_child_domain() {
+    let cat = parse_module(CAT_DOMAIN).expect("parse cat domain");
+    let programs = vec![DomainProgram {
+        name: "cat".into(),
+        instance: Arc::new(instantiate(cat).expect("instantiate cat domain")),
+        limits: Limits::default(),
+    }];
+    let m = parse_module(CAT_CONSUMER).expect("parse");
+    let inst = instantiate_with_imports(m, registry()).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec(programs.clone()))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.stdout, b"yo",
+            "{backend:?}: stdin round-tripped the domain"
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(2),
+            "{backend:?}: exit 0, 2 bytes"
+        );
+    }
+}
+
+/// A child domain that **traps** is a failed `run` — a probeable negative return, never a trap
+/// in the caller and never an invented exit code (v1, per EXEC.md). Same probe shape as the
+/// registry-miss refusal.
+#[test]
+fn a_trapping_domain_program_is_a_failed_run_not_a_trap() {
+    let boom = parse_module(
+        "memory 16\n\
+         func 0 () -> () {\n\
+         block 0 () {\n\
+           unreachable\n\
+           }\n\
+         }\n\
+         export 0 func \"_start\" 0\n",
+    )
+    .expect("parse boom");
+    let programs = vec![DomainProgram {
+        name: "boom".into(),
+        instance: Arc::new(instantiate(boom).expect("instantiate boom")),
+        limits: Limits::default(),
+    }];
+    // The allowlist-miss consumer runs `cat hi`, which this registry doesn't have — reuse it
+    // with a `boom` entry instead: probe that running `boom`'s trap comes back negative.
+    let m = parse_module(
+        "memory 16\n\
+         data 0 \"exec\"\n\
+         data 8 \"boom\"\n\
+         import 0 \"exit\" (i32) -> ()\n\
+         func 0 () -> () {\n\
+         block 0 () {\n\
+           vp = i64.const 0\n\
+           vl = i64.const 4\n\
+           vh = cap.self.resolve vp vl\n\
+           vap = i64.const 8\n\
+           val = i64.const 4\n\
+           vz = i64.const 0\n\
+           vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
+           vzero = i64.const 0\n\
+           vfailed = i64.lt_s vjob vzero\n\
+           call.import 0 (vfailed)\n\
+           unreachable\n\
+           }\n\
+         }\n\
+         export 0 func \"_start\" 0\n",
+    )
+    .expect("parse");
+    let inst =
+        instantiate_with_imports(m, Imports::new().provide("exit", HostCap::exit())).expect("inst");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec(programs.clone()))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(1),
+            "{backend:?}: the child's trap surfaced as a probeable negative"
         );
     }
 }

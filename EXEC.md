@@ -16,7 +16,7 @@ interposition-invisibility property the import model already guarantees:
 |---|---|---|
 | `host_exec(allowlist)` | a real host OS process, attenuated by an explicit program allowlist (the capability *is* the list, as `host_fs`'s *is* the root) | **BUILT 2026-07-22** (`svm-run/src/exec.rs`) |
 | `scripted_exec(table)` | no process at all: a `(argv-prefix → {stdout, stderr, exit})` table — the `mem_fs` analog; what differential tests and wasm/browser embedders grant | **BUILT 2026-07-22** (wasm-safe `svm-exec` crate) |
-| `domain_exec` | a **child svm domain** (host-served: the embedder implements the same ops over the Instantiator machinery it already has) | next |
+| `domain_exec` | a **child svm domain** (host-served: the embedder implements the same ops over the Instantiator machinery it already has) | **BUILT 2026-07-23** (`svm-run/src/exec.rs`) |
 | guest-served | a parent domain serves its child's `"exec"` with **its own code** — the none-the-wiser nested shell | §3.6 `Endpoint` (its first consumer) |
 
 This is how "a shell that manages real host processes" and "the same
@@ -127,3 +127,27 @@ un-granted resolve negative with the fallback running; allowlist miss
 probeable, never a trap (the host test is unix-only — Windows has no
 `echo` executable; the protocol is covered everywhere by the scripted
 differential).
+
+**As built (2026-07-23): `domain_exec`.** The third row lands beside
+`host_exec` in `svm-run/src/exec.rs`: `domain_exec(Vec<DomainProgram>)`
+— each entry a `{name, Arc<Instance>, Limits}` — where a `run` is a
+**fresh svm domain** (its own window, powerbox, fuel; no OS process
+anywhere): `argv[0]` resolves by exact name through the registry (the
+registry *is* the attenuation; a miss is the same `-EPERM` as an
+allowlist/table miss), the wire `stdin` seeds the child's `Stream{In}`,
+the full argv rides the §3e args buffer (a `main(int, char**)` program
+reads it exactly as standalone), both output streams are captured into
+the shared `JobTable`, and the exit code is the child's entry result
+**verbatim** (`Exit(code)` or the first returned value). A child that
+**traps** (or exhausts its fuel) is a *failed `run`* — probeable
+`-EINVAL`, never a trap in the caller and never an invented exit code
+(v1; a trap→exit-code mapping is a reserved refinement). Runs on the
+reference interpreter — deterministic under the per-program fuel bound,
+as the contract claims — and blocking one-shot, exactly `host_exec`'s
+profile (the §3.6 fiber-parking refinement is the Endpoint/guest-served
+row's business). Acceptance extends `exec_cap.rs`: the **same consumer**
+that ran real and scripted `echo` runs a domain `echo` **byte-identical**
+on all three backends (three kinds of spawn, one guest, no way to tell);
+stdin round-trips a cat-like domain program; a trapping program probes
+negative. The guest-served backend (a parent domain serving its child's
+`"exec"` with its own code) remains the §3.6 Endpoint consumer.
