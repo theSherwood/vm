@@ -438,6 +438,30 @@ object, and *who holds authority over its backing* is the whole visibility story
   jacl's trust model (a domain that distrusts its spawner and attests
   `window_exposed = false`) requires this built — promoted onto the §3.6 consumer
   critical path (IMPORTS.md §3.6 consumer pinning); `attest` itself is landed.
+
+  **[BUILT 2026-07-23 — reference interpreter.]** Decisions taken (each reversible,
+  none reshapes what's underneath): the surface is a **new Instantiator op**, not the
+  §3 substrate `create(window)` refactor — `instantiate_detached(minter, module,
+  grants_ptr, grants_n, entry, size_log2, quota)` (op 15), with `WindowMinter` a new
+  capability (`cap_id` 15, `Binding::WindowMinter` → a remaining-byte-quota side
+  table; inert under generic dispatch — the minter is spawn *evidence*). The minter is
+  **embedder-granted only** (`HostCap::window_minter(quota)` — like `exec`/`fs`,
+  nothing ambient). The spawner **keeps kill/join/fuel authority** — detachment severs
+  *read*, not lifecycle: the child's guarantee is "my memory is private and `attest`
+  proves it", not "I outlive my parent". As built: the child gets a **fresh
+  reservation + guard exactly like a root run's** (no D38 contact — the hinge is
+  untouched), its own module as self module, data segments materialized into the
+  private window, op-11-format named grants, and a `window_exposed = false` /
+  `freeze_exposed = false` attestation (tier inherited — in-process is never a Spectre
+  boundary; real distrust stays `host_exec`). A quota miss / forged minter / bad
+  entry/size refuses probeably (a refused spawn charges nothing); a **durable** domain
+  refuses outright (a detached window is outside the subtree snapshot — fail closed;
+  multi-window freeze stays O6). **Live offers work detached** — `child_offer` +
+  caller parking link through the powerbox Arc, not the window — so private memory and
+  live coordination compose. JIT/bytecode answer the probeable `-EINVAL` refusal (the
+  op-14 precedent). Pinned by `svm-interp/tests/detached_windows.rs`: detached
+  serve/park/reply round-trip (142), the side-by-side attest report (nested 257 vs
+  detached 1), quota exhaustion, forged-minter refusal.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.
