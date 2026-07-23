@@ -305,6 +305,167 @@ fn svc_sugar_round_trips_and_desugars_to_the_reserved_dispatch() {
     );
 }
 
+/// §3.6 — **separate-module serving children**: the child domain runs its OWN module
+/// (`instantiate_module`, op 5) with its own offers, and the parent wires a live offer over
+/// the child's export via the same `child_offer` (op 14). The offer's shape is the CHILD
+/// module's export — the parent registers no self module at all, pinning that the wirer's
+/// own program is irrelevant to the wire — interned structurally into the parent's table
+/// (D59: first guest intern = `GUEST_IMPL_BASE`, same as the same-module form). Same
+/// enqueue/park/`svc.wait`-serve/reply/join round-trip: join(served=1)*100 + add(40,2) = 142.
+const SEPARATE_MODULE_CALLER: &str = r#"
+memory 17
+
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vmh = i64.extend_i32_u v1
+  ventry = i64.const 0
+  voff = i64.const 65536
+  vlog = i64.const 12
+  vq = i64.const 0
+  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v6 = i64.const 0
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vk = i64.const 100
+  vm = i64.mul vj vk
+  vs = i64.add vm vr
+  return vs
+  }
+}
+"#;
+
+/// The child's own program: its own memory declaration (the carve must equal it — §14
+/// transparency), its own offer, its own serve loop. Entry = func 0 (`svc.wait`, return the
+/// served count to the joiner); `add` = func 1.
+const SEPARATE_MODULE_SERVER: &str = r#"
+memory 12
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 1 }
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_separate_module_child_serves_its_own_offers() {
+    let a = Arc::new({
+        let m = svm_text::parse_module(SEPARATE_MODULE_CALLER).expect("parse caller");
+        svm_verify::verify_module(&m).expect("verify caller");
+        m
+    });
+    let b = svm_text::parse_module(SEPARATE_MODULE_SERVER).expect("parse server");
+    svm_verify::verify_module(&b).expect("verify server");
+    let mut host = Host::new();
+    // Deliberately NO set_self_module on the parent: the offer's shape is the child's.
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(142)],
+        "join(served=1)*100 + add(40,2) — a foreign program served the parent's live call"
+    );
+    let _ = a;
+}
+
+/// A `child_offer` naming an export the child's module doesn't have refuses with a probeable
+/// `-EINVAL` — resolved against the CHILD's module (which has export 0 only), never the
+/// wirer's. The child here polls-and-returns (nothing to serve), so the parent's `join`
+/// completes the run cleanly after the refused wire.
+const SEPARATE_MODULE_BAD_EXPORT: &str = r#"
+memory 17
+
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vmh = i64.extend_i32_u v1
+  ventry = i64.const 0
+  voff = i64.const 65536
+  vlog = i64.const 12
+  vq = i64.const 0
+  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v6 = i64.const 9
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vr = i64.extend_i32_s v7
+  vs = i64.add vr vj
+  return vs
+  }
+}
+"#;
+
+/// The bad-export test's child: same offer surface, but the entry `svc.poll`s (serving the
+/// nothing that's queued) and returns 0 — so it completes without a caller.
+const SEPARATE_MODULE_POLL_SERVER: &str = r#"
+memory 12
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 1 }
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.poll vz
+  return vn
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
+    let a = svm_text::parse_module(SEPARATE_MODULE_BAD_EXPORT).expect("parse");
+    svm_verify::verify_module(&a).expect("verify");
+    let b = svm_text::parse_module(SEPARATE_MODULE_POLL_SERVER).expect("parse server");
+    svm_verify::verify_module(&b).expect("verify server");
+    let mut host = Host::new();
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(-22)],
+        "-EINVAL (plus join(0)), probeable — the wire refused, the run completed"
+    );
+}
+
 #[test]
 fn a_caller_parks_on_a_live_child_and_wakes_with_the_reply() {
     let m = Arc::new({
