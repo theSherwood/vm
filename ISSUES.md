@@ -13,6 +13,35 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I34 — CI flake: `apt-get install gcc-mingw-w64-x86-64` stalled ~29 min on the `fiber-scaling (stack-check + arena-stacks)` job until the run was cancelled (S4) — seen 2026-07-23, PR #422 run 30027500683
+
+**Where:** the ubuntu-latest job's mingw cross-toolchain install step (for the
+`x86_64-pc-windows-gnu` cross-clippy). The sibling `build · test · fmt · clippy` job ran the
+**same step in the same run** in ~12.5 min (also slow, but completing) — so this is an apt
+mirror/runner stall, not a tree change (the job's compile+test steps had all passed).
+
+**Also observed on the same PR (separate root cause, fixed in-tree):** the windows-latest
+`cargo test --workspace` hung >30 min because the new `concurrent_stages.rs` fixtures gave
+children 32 KiB windows while the Windows §13 map granule is the 64 KiB allocation
+granularity — the region map refused probeably, the ring landed in each child's private
+anonymous pages, and the consumer's futex loop polled forever (no iteration cap). Fixed by
+sizing child windows to 128 KiB (map `len = granule` queried at run time, portable across
+4 K/16 K/64 K granule platforms) and adding a timeout-count **bail** to every wait loop so
+any future rendezvous regression fails loudly in seconds instead of hanging a runner.
+
+**Action if the apt stall recurs:** cache the mingw toolchain (Swatinem-style or a
+pre-built container) or add a step-level `timeout-minutes` so the job fails fast and
+re-runs instead of burning the runner budget.
+
+**Same-day sibling (2026-07-23, run 30032025837):** the `real-browser` job's "Install
+Playwright + Chromium" step stalled >30 min (24 s – 3 min on every prior run) — an
+npm/CDN download hang, before any tree code runs. Third distinct infra fetch-stall of
+the day (apt mingw, runner-loss mid-link, npm). The pattern generalizes the mitigation:
+**every network-fetch step in CI should carry a `timeout-minutes`** so a wedged mirror
+fails-fast into a re-run instead of pinning a runner for the 6-hour default; caching
+(Playwright browser cache keyed on the package version, like the Postgres inputs the
+same job already caches) removes the fetch entirely from the steady state.
+
 ### I33 — `jit_killpath_stops_runaway_child` flaked under full-workspace parallel load (S4) — **RESOLVED** (2026-07-22): the kill-path escape in the JIT `join` returned a clean `0` instead of propagating `OutOfFuel`; original report below
 
 **Where:** `crates/svm/tests/jit_killpath.rs::jit_killpath_stops_runaway_child`, during a full
@@ -116,6 +145,27 @@ linked fine on the same commit. Distinct from the macOS-launch SIGBUS entry belo
 **Fix sketch.** Transient — re-run the job (a fresh commit / "Re-run failed jobs" clears it). If it
 recurs, reduce link-time memory: cap the linker's parallelism or split the heaviest test binaries. Log
 recurrences here to judge whether it needs a durable mitigation vs. staying a re-run-and-move-on flake.
+
+**Recurrence (2026-07-23, PR #422 run 30030308082):** same job, harder death — the runner was lost
+48 s into `cargo test --workspace` (step stuck "in_progress", job concluded `failure`, **no logs ever
+uploaded**, likely the OOM-killer taking the runner agent during the parallel link phase). Same
+commit's windows/macOS/miri/llvm jobs all green, and the identical job was fully green on the parent
+commit 19 minutes earlier with only a test-fixture resize + docs in between. Second sighting —
+if a third lands, take the durable mitigation (cap link parallelism / split `svm-jit` test bins)
+rather than re-running.
+
+**Third sighting (2026-07-23, run 30034429088) — durable mitigation prepared, blocked on token
+scope.** Identical death 51 s into the same step on the immediate retry (code-identical tree; the
+interleaved run between the two deaths passed in 8 min — an alternating pass/die pattern consistent
+with OOM raciness under runner neighbor pressure). UI note: the job *name* contains "fmt", so the
+PR checks list reads as a fmt failure — the fmt/clippy/build steps were green; the death is in the
+test step's link phase. Per the rule above the fix is capping the gating job's test-build
+parallelism — change ci.yml line `- run: cargo test --workspace` (the `check` job) to
+`- run: cargo test --workspace -j 2` — bounding concurrent heavy links (the memory peak; the step
+is warm-cache dominated, so the wall-clock cost is small). **The CI token cannot push workflow
+files** (`refusing to allow an OAuth App to ... without workflow scope`), so this one-line change
+needs the repo owner. If a fourth death lands *with* the cap, the next escalation is splitting the
+heaviest `svm-jit` test binaries.
 
 ### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — **RESOLVED** (2026-07-18) — found by the QuickJS breadth harness (2026-07-17)
 
