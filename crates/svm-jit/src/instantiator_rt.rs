@@ -58,11 +58,10 @@ const YIELDER_HANDLE: i32 = 256;
 const CORO_STACK: usize = 1 << 18;
 
 /// One spawned child's **completion cell** (S1c): `(result, trap)` once the child has finished (`trap`
-/// `0` = clean), or `None` while it is still running. A child runs **synchronously** at `instantiate`
-/// **today**, so the cell is `Some` before `instantiate` returns and `join`/`poll` never observe `None`;
-/// this is the shape the OS-thread child spawn fills from the child's *own* thread, at which point
-/// `join` parks on `cv` and `poll` reports *running* (`0`). `Arc` so `join` can clone it and drop the
-/// `children` lock before parking (no lock held across a wait).
+/// `0` = clean), or `None` while it is still running. An async child's OS thread fills it from the
+/// child's *own* thread — until then `join` parks on `cv` and `poll` reports *running* (`0`); a
+/// synchronous (durable) child's cell is `Some` before `instantiate` returns. `Arc` so `join` can
+/// clone it and drop the `children` lock before parking (no lock held across a wait).
 struct ChildDone {
     state: Mutex<Option<(i64, i64)>>,
     cv: Condvar,
@@ -104,6 +103,7 @@ impl Child {
 /// and publishes `(result, trap)` into `done`. Returns the `JoinHandle` the nursery joins at teardown so
 /// no child thread outlives the parent window. This is the concurrency primitive: `instantiate` returns
 /// immediately, so a parent can spawn a second child (or its own work) while this one runs.
+#[allow(clippy::too_many_arguments)] // a child spawn threads its full carve/completion/futex context
 fn spawn_child_on_thread(
     code: std::sync::Arc<crate::ChildCode>,
     sub_base: u64,
@@ -112,6 +112,7 @@ fn spawn_child_on_thread(
     args: Vec<i64>,
     n_results: usize,
     done: std::sync::Arc<ChildDone>,
+    futex_sched: usize,
 ) -> std::thread::JoinHandle<()> {
     struct SendPtr(*mut u8);
     // SAFETY: `parent_mem_base` is the parent window, which outlives every child (`join_children` runs
@@ -121,6 +122,13 @@ fn spawn_child_on_thread(
     // guest owns, exactly like sibling `thread.spawn` accesses to one window).
     unsafe impl Send for SendPtr {}
     let base = SendPtr(parent_mem_base);
+    // Count the child live in the parent domain's futex accounting for the wait/join deadlock
+    // detection — before the spawn returns, so a wait issued right after already sees it. SAFETY:
+    // a nonzero `futex_sched` is the run's live `Domain`, which outlives every child (children are
+    // joined at run teardown, before the domain drops).
+    if futex_sched != 0 {
+        unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_started() };
+    }
     std::thread::Builder::new()
         .name("svm-child".into())
         .spawn(move || {
@@ -134,15 +142,105 @@ fn spawn_child_on_thread(
             let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
             *st = Some((r, t));
             done.cv.notify_all();
+            // SAFETY: as `child_started` above — the domain outlives this (joined) thread.
+            if futex_sched != 0 {
+                unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
+            }
         })
         .expect("spawn a §14 child OS thread")
+}
+
+/// S1c for **granted** children (Instantiator ops 8/11/13) — spawn the per-spawn-compiled child on
+/// its own OS thread and register it as a pending join-table entry, returning its slot. Like
+/// [`spawn_child_on_thread`], but the child owns a powerbox `Host` (`gc_ctx`) that must be freed
+/// when it finishes: the thread releases it via [`run_child_code_then`]'s teardown hook — **after**
+/// the copy-back but **while the child window is still alive** — so the host's region-canon purge
+/// guard (which covers the child window's VA range) can never erase entries a later window at a
+/// reused address just recorded. This is what lets two granted children run **concurrently** — a
+/// pipeline over a granted `SharedRegion` ring — where the synchronous path serialized them.
+///
+/// # Safety
+/// `code` is compiled against `gc_ctx` (the live child powerbox `Host`, exclusively owned by the
+/// spawned thread from here until `release` frees it — `Host` is `Send`; state it shares with the
+/// parent host rides `Sync` internals). The carve `[parent_mem_base + sub_base, +2^child_size_log2)`
+/// is committed parent-window memory the Instantiator bounded; `args` matches the entry arity.
+#[allow(clippy::too_many_arguments)]
+unsafe fn spawn_granted_child(
+    rt: &Nursery,
+    code: crate::ChildCode,
+    sub_base: u64,
+    child_size_log2: u8,
+    parent_mem_base: *mut u8,
+    args: Vec<i64>,
+    n_results: usize,
+    release: crate::GrantChildReleaser,
+    gc_ctx: *mut core::ffi::c_void,
+) -> i32 {
+    struct SendRaw<T>(T);
+    // SAFETY: `parent_mem_base` outlives every child (`join_children` runs before it frees) and the
+    // child thread touches only its own carve (the §14 disjointness the guest owns, as in
+    // `spawn_child_on_thread`); `gc_ctx` is a heap `Host` handed over wholesale to the child thread
+    // (`Host: Send` — checked where svm-run builds it), untouched by the parent after this call.
+    unsafe impl<T> Send for SendRaw<T> {}
+    let base = SendRaw(parent_mem_base);
+    let ctx = SendRaw(gc_ctx);
+    let code = std::sync::Arc::new(code);
+    let done = std::sync::Arc::new(ChildDone {
+        state: Mutex::new(None),
+        cv: Condvar::new(),
+    });
+    let done2 = std::sync::Arc::clone(&done);
+    let futex_sched = rt.futex_sched;
+    // Count the child live for the parent domain's wait/join deadlock detection (see
+    // [`spawn_child_on_thread`]). SAFETY: a nonzero `futex_sched` is the run's live `Domain`,
+    // outliving every (teardown-joined) child.
+    if futex_sched != 0 {
+        unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_started() };
+    }
+    let handle = std::thread::Builder::new()
+        .name("svm-child".into())
+        .spawn(move || {
+            let (base, ctx) = (base, ctx);
+            mem::install_guard();
+            // SAFETY: per this function's contract; the teardown frees the child powerbox exactly
+            // once, from the only thread still holding it.
+            let (r, t) = unsafe {
+                crate::run_child_code_then(
+                    &code,
+                    sub_base,
+                    child_size_log2,
+                    base.0,
+                    &args,
+                    n_results,
+                    || release(ctx.0),
+                )
+            };
+            let mut st = done2.state.lock().unwrap_or_else(|e| e.into_inner());
+            *st = Some((r, t));
+            done2.cv.notify_all();
+            // SAFETY: as `child_started` above — the domain outlives this (joined) thread.
+            if futex_sched != 0 {
+                unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
+            }
+        })
+        .expect("spawn a §14 granted-child OS thread");
+    let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = children.len();
+    children.push(Child::pending(done));
+    drop(children);
+    rt.child_threads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(handle);
+    slot as i32
 }
 
 /// The per-run §14 nesting runtime, baked into the module's `Instantiator` `cap.call` sites. Holds
 /// what compiling + running a child needs: the module's functions, the run's `cap.call` thunk/ctx
 /// (to resolve an `Instantiator` handle's authority), and — supplied post-finalize via [`set_env`] —
-/// the live window's detect-and-kill fault range. Children run synchronously at `instantiate` and
-/// their outcomes are stashed for `join`.
+/// the live window's detect-and-kill fault range. Non-durable children (plain and granted) run
+/// **asynchronously** on their own OS threads; outcomes land in per-child completion cells `join`
+/// parks on. Only durable children still run synchronously at `instantiate`.
 pub(crate) struct Nursery {
     funcs: std::sync::Arc<[Func]>,
     cap_thunk: CapThunk,
@@ -156,6 +254,11 @@ pub(crate) struct Nursery {
     /// every child it spawned (a runaway child would otherwise hang the parent inside `instantiate` /
     /// `resume`, where the parent's own epoch checks can't fire).
     epoch_addr: usize,
+    /// Address of the parent run's thread [`crate::os_thread_rt::Domain`] (`0` ⇒ none — the durable
+    /// nested nursery). Children compile their `atomic.wait`/`notify` against this **shared** futex
+    /// table, so concurrent children (and the parent's own vCPUs) rendezvous — the pipeline
+    /// primitive; spawns also register in its live count for the wait/join deadlock detection.
+    futex_sched: usize,
     children: Mutex<Vec<Child>>,
     /// S1c: the OS threads spawned for **async** non-durable children (each runs `run_child_code` in the
     /// child's own guarded window and fills its completion cell). Tracked so the run **joins them all at
@@ -330,6 +433,7 @@ impl Nursery {
         cap_ctx: *mut core::ffi::c_void,
         resolve_module: Option<crate::ModuleResolver>,
         epoch_addr: usize,
+        futex_sched: usize,
         my_task: usize,
         task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
@@ -340,6 +444,7 @@ impl Nursery {
             cap_ctx,
             resolve_module,
             epoch_addr,
+            futex_sched,
             children: Mutex::new(Vec::new()),
             child_threads: Mutex::new(Vec::new()),
             coros: Mutex::new(Vec::new()),
@@ -698,6 +803,7 @@ pub(crate) unsafe extern "C" fn instantiate(
                 entry as FuncIdx,
                 size_log2 as u8,
                 rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
+                rt.futex_sched, // wait/notify against the parent domain's shared futex
             ) {
                 Ok(cc) => {
                     let a = std::sync::Arc::new(cc);
@@ -725,6 +831,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         args,
         n_results,
         std::sync::Arc::clone(&done),
+        rt.futex_sched,
     );
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
@@ -828,7 +935,8 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
 
     // Compile the child against the run's own `cap.call` thunk with the **child host** as ctx (so its
     // `Stream`/`Exit`/`Clock` cap.calls reach the re-granted cap, not the parent's powerbox), then run
-    // it in its carve. Uncached — the per-spawn child ctx is baked into the code. The child gets no
+    // it **asynchronously** on its own OS thread (S1c — granted children are concurrent, so a spawned
+    // pair can pipeline). Uncached — the per-spawn child ctx is baked into the code. The child gets no
     // nesting `InstEnv` (like every non-durable JIT child today).
     let compiled = crate::compile_child(
         child_funcs,
@@ -837,43 +945,36 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
         rt.cap_thunk,
         gc.ctx,
         rt.epoch_addr,
+        rt.futex_sched, // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
     );
-    let outcome = match compiled {
-        Ok(code) => {
-            let args = [
-                gc.inst_handle as i64,
-                gc.as_handle as i64,
-                gc.grant_handle as i64,
-            ];
-            let n_results = child_funcs[entry as usize].results.len();
-            Some(crate::run_child_code(
-                &code,
-                base + off,
-                size_log2 as u8,
-                mem_base as *mut u8,
-                &args,
-                n_results,
-            ))
-        }
-        Err(_) => None,
-    };
-    // Free the child powerbox host regardless of whether the child compiled/ran.
-    release(gc.ctx);
-
-    let (result, trap) = match outcome {
-        Some(rt) => rt,
-        None => {
+    let code = match compiled {
+        Ok(code) => code,
+        Err(_) => {
             // An un-compilable child (fibers/threads/setjmp, or a backend error) is a CapFault, like
-            // the plain `instantiate` path.
+            // the plain `instantiate` path. Free the powerbox host it will never run against.
+            release(gc.ctx);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
     };
-    let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = children.len();
-    children.push(Child::finished(result, trap));
-    slot as i32
+    let args = vec![
+        gc.inst_handle as i64,
+        gc.as_handle as i64,
+        gc.grant_handle as i64,
+    ];
+    let n_results = child_funcs[entry as usize].results.len();
+    spawn_granted_child(
+        rt,
+        code,
+        base + off,
+        size_log2 as u8,
+        mem_base as *mut u8,
+        args,
+        n_results,
+        release,
+        gc.ctx,
+    )
 }
 
 /// PROCESS.md S2 (JIT parity) — `instantiate_named(grants_ptr, grants_n, entry, off, size_log2, quota)`
@@ -974,39 +1075,35 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         rt.cap_thunk,
         gc.ctx,
         rt.epoch_addr,
+        rt.futex_sched, // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
     );
-    let outcome = match compiled {
-        Ok(code) => {
-            let mut args = vec![gc.inst_handle as i64];
-            if want_as {
-                args.push(gc.as_handle as i64);
-            }
-            let n_results = child_funcs[entry as usize].results.len();
-            Some(crate::run_child_code(
-                &code,
-                base + off,
-                size_log2 as u8,
-                mem_base as *mut u8,
-                &args,
-                n_results,
-            ))
-        }
-        Err(_) => None,
-    };
-    release(gc.ctx);
-
-    let (result, trap) = match outcome {
-        Some(rt) => rt,
-        None => {
+    let code = match compiled {
+        Ok(code) => code,
+        Err(_) => {
+            release(gc.ctx);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
     };
-    let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = children.len();
-    children.push(Child::finished(result, trap));
-    slot as i32
+    let mut args = vec![gc.inst_handle as i64];
+    if want_as {
+        args.push(gc.as_handle as i64);
+    }
+    let n_results = child_funcs[entry as usize].results.len();
+    // Async (S1c): the child runs on its own OS thread — two named-grant children can pipeline
+    // through a granted `SharedRegion` — and its powerbox host is released from that thread.
+    spawn_granted_child(
+        rt,
+        code,
+        base + off,
+        size_log2 as u8,
+        mem_base as *mut u8,
+        args,
+        n_results,
+        release,
+        gc.ctx,
+    )
 }
 
 /// STAGE1.md — `instantiate_module_named(module, grants_ptr, grants_n, entry, off, size_log2, quota)`
@@ -1133,43 +1230,39 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         rt.cap_thunk,
         gc.ctx,
         rt.epoch_addr,
+        rt.futex_sched, // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
     );
-    let outcome = match compiled {
-        Ok(code) => {
-            let mut args = vec![gc.inst_handle as i64];
-            if want_as {
-                args.push(gc.as_handle as i64);
-            }
-            let n_results = child_funcs[entry as usize].results.len();
-            Some(crate::run_child_code(
-                &code,
-                base + off,
-                size_log2 as u8,
-                mem_base as *mut u8,
-                &args,
-                n_results,
-            ))
-        }
-        Err(_) => None,
-    };
-    release(gc.ctx);
-
-    let (result, trap) = match outcome {
-        Some(rt) => rt,
-        None => {
+    let code = match compiled {
+        Ok(code) => code,
+        Err(_) => {
+            release(gc.ctx);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
     };
-    let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = children.len();
-    children.push(Child::finished(result, trap));
-    slot as i32
+    let mut args = vec![gc.inst_handle as i64];
+    if want_as {
+        args.push(gc.as_handle as i64);
+    }
+    let n_results = child_funcs[entry as usize].results.len();
+    // Async (S1c): a spawned command runs on its own OS thread — the shell-exec primitive can
+    // pipeline (`cmd1 | cmd2` over a granted region ring or pipe) instead of serializing.
+    spawn_granted_child(
+        rt,
+        code,
+        base + off,
+        size_log2 as u8,
+        mem_base as *mut u8,
+        args,
+        n_results,
+        release,
+        gc.ctx,
+    )
 }
 
-/// `join(child_handle) -> result` — block on the child's completion (an async op-0/5 child runs on its
-/// own OS thread; a durable / op-8/11/13 child is already done) and return its `i64` result,
+/// `join(child_handle) -> result` — block on the child's completion (an async op-0/5/8/11/13 child
+/// runs on its own OS thread; a durable child is already done) and return its `i64` result,
 /// propagating a child trap as the parent's (`*trap_out`). A §5 host kill on the parent's interrupt
 /// cell while parked here unwinds the waiter *as `OutOfFuel`* (see the loop below). A forged /
 /// already-joined handle is inert (a `CapFault`), matching the interpreter's once-only join.
@@ -1192,8 +1285,8 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
     };
     drop(children);
     // Park on the completion cell until the child's OS thread fills it (S1c async children). A durable
-    // or op-8/11/13 child ran synchronously, so its cell is already `Some` and this returns without
-    // waiting; an async op-0/5 child parks here until its thread publishes the outcome, with a bounded
+    // child ran synchronously, so its cell is already `Some` and this returns without waiting; an
+    // async (op-0/5/8/11/13) child parks here until its thread publishes the outcome, with a bounded
     // re-check so a §5 host interrupt on the parent's `epoch_addr` still unwinds a waiter (the child
     // bakes that same cell, so it unwinds too).
     let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1227,10 +1320,10 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
     }
 }
 
-/// PROCESS.md S3 `poll(child) -> 0 running | 1 returned | 2 trapped` (JIT). An **async** op-0/5 child
-/// (S1c) runs on its own OS thread, so `poll` reports the live cell state: `0` while its thread is still
-/// executing, then `1` (clean) / `2` (trapped) once it publishes an outcome. A synchronous child
-/// (durable, or op-8/11/13) is already done, so it never reads `0`. Non-destructive: the slot + its
+/// PROCESS.md S3 `poll(child) -> 0 running | 1 returned | 2 trapped` (JIT). An **async** child (S1c,
+/// ops 0/5/8/11/13) runs on its own OS thread, so `poll` reports the live cell state: `0` while its
+/// thread is still executing, then `1` (clean) / `2` (trapped) once it publishes an outcome. A
+/// synchronous (durable) child is already done, so it never reads `0`. Non-destructive: the slot + its
 /// result stay for a later `join`. A forged / already-joined handle is a `CapFault` (matching this
 /// runtime's `join`).
 ///
@@ -1479,6 +1572,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         coro_cap_thunk,
         &*shared as *const CoroShared as *mut core::ffi::c_void,
         rt.epoch_addr, // §5: the co-fiber child polls the parent's kill-path cell
+        0, // a co-fiber runs inline on the parent's thread — no futex sharing (waits stay rejected)
         crate::InstEnv::null(), // a co-fiber child cannot itself nest (its Instantiator → CapFault)
     ) {
         Ok(c) => c,

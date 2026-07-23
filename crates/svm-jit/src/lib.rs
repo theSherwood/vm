@@ -2434,13 +2434,17 @@ impl CompiledModule {
         // §12 threads: stand up the 1:1 OS-thread executor `Domain` whose stable address is baked into the
         // `thread.*` sites. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
         // guest builds any M:N model itself, D22). The per-run `Env` (call-trampoline, window, trap cell)
-        // is supplied after finalize via `set_env`; the address is stable now.
+        // is supplied after finalize via `set_env`; the address is stable now. Also stood up for a
+        // **nesting** module with no thread ops of its own: §14 children compile their `atomic.wait`/
+        // `notify` against this domain's futex (via the nursery), so concurrent children — and the
+        // parent's own waits, if any — rendezvous in one table (the granted-children pipeline).
         #[cfg(fiber_rt)]
-        let domain: Option<Box<os_thread_rt::Domain>> = if uses_threads {
-            Some(Box::new(os_thread_rt::Domain::new(quota.max_vcpus)))
-        } else {
-            None
-        };
+        let domain: Option<Box<os_thread_rt::Domain>> =
+            if uses_threads || module_uses_instantiator(m) {
+                Some(Box::new(os_thread_rt::Domain::new(quota.max_vcpus)))
+            } else {
+                None
+            };
         #[cfg(fiber_rt)]
         let thread = if let Some(d) = &domain {
             ThreadEnv {
@@ -2469,6 +2473,13 @@ impl CompiledModule {
                 cap_ctx,
                 resolve_module,
                 epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
+                // The run's thread `Domain` (always stood up for a nesting module, above): children
+                // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
+                // the parent rendezvous in one table.
+                domain
+                    .as_ref()
+                    .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
+                    .unwrap_or(0),
                 0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
                 std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
@@ -3169,8 +3180,9 @@ impl CompiledModule {
                     mem_base as u64,
                     fn_table_ptr as u64,
                     trap_cell.as_ptr(),
-                    t.call_tramp
-                        .expect("call-trampoline set for a threaded module"),
+                    // `None` on a futex-only domain (a nesting module with no `thread.*`/`cont.*` ops
+                    // of its own): no spawn site exists to call through it.
+                    t.call_tramp,
                     window.fault_range(),
                     t.fiber_cfg,
                     t.fiber_table.clone(), // the domain-shared table spawned vCPUs build over
@@ -3848,6 +3860,7 @@ pub(crate) unsafe fn compile_child_and_run(
             &*child_win_size as *const u64 as *mut core::ffi::c_void,
             None, // same-module grandchildren only (separate-module is a later slice)
             epoch_addr,
+            0,       // durable subtree: no shared futex domain (child futex ops stay rejected)
             my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
             std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
             std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
@@ -3885,6 +3898,7 @@ pub(crate) unsafe fn compile_child_and_run(
         empty_cap_thunk,
         core::ptr::null_mut(),
         epoch_addr, // §5 kill-path: the child polls the parent's interrupt cell
+        0,          // durable path: no shared futex domain — child futex ops stay rejected
         child_inst,
     )?;
     let n_results = funcs[child_entry as usize].results.len();
@@ -4094,6 +4108,7 @@ const _: fn() = || {
 /// A child using §12 fibers/threads is rejected (`Unsupported`) — those need per-child runtimes,
 /// and compiling them against null thunks would be unsound.
 #[cfg(fiber_rt)]
+#[allow(clippy::too_many_arguments)] // a child compile threads its full cap/kill/futex/nesting context
 fn compile_child(
     funcs: &[Func],
     child_entry: FuncIdx,
@@ -4101,6 +4116,11 @@ fn compile_child(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     epoch_addr: usize,
+    // The parent domain's futex (`os_thread_rt::Domain` address), or `0`. Nonzero lets the child's
+    // `atomic.wait`/`notify` compile against the **parent's shared futex table** — how concurrent
+    // §14 children (and the parent) rendezvous, e.g. a pipeline over a granted `SharedRegion` ring.
+    // Zero (the coroutine / durable paths) keeps futex ops rejected as before.
+    futex_sched: usize,
     inst_env: InstEnv,
 ) -> Result<ChildCode, JitError> {
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
@@ -4120,9 +4140,16 @@ fn compile_child(
         ensure_supported(f)?;
         // A child using §12 fibers/threads would compile against null fiber/thread thunks (no
         // per-child runtime yet) — reject rather than emit a call through a null pointer.
-        if f.uses_concurrency() {
+        if f.uses_fibers_or_threads() {
             return Err(JitError::Unsupported(
                 "a §14 JIT child using fibers/threads is not supported yet",
+            ));
+        }
+        // `atomic.wait`/`notify` compile against the parent domain's shared futex when one was
+        // supplied; without it (coroutine / durable children) they would bake a null sched — reject.
+        if futex_sched == 0 && f.uses_futex() {
+            return Err(JitError::Unsupported(
+                "a §14 JIT child using atomic.wait/notify needs the parent's futex domain",
             ));
         }
         // Likewise `setjmp`/`longjmp`: the child gets a null `SetjmpEnv` (no per-child `setjmp` table
@@ -4170,6 +4197,19 @@ fn compile_child(
         ctx_addr: cap_ctx as i64,
         fast_resolver: None, // nested child: `cap.call`s go to the coroutine thunk, not a fast path
     };
+    // Wait/notify-only thread env over the **parent's** futex domain (spawn/join stay rejected
+    // above, so their null thunks are never reached); null when no domain was supplied.
+    let thread_env = if futex_sched != 0 {
+        ThreadEnv {
+            sched_addr: futex_sched as i64,
+            spawn_thunk: 0,
+            join_thunk: 0,
+            wait_thunk: os_thread_rt::thread_wait as *const () as i64,
+            notify_thunk: os_thread_rt::thread_notify as *const () as i64,
+        }
+    } else {
+        ThreadEnv::null()
+    };
     let mut ctx = module.make_context();
     for (f, id) in funcs.iter().zip(&ids) {
         build_clif(
@@ -4179,7 +4219,7 @@ fn compile_child(
             &distinct,
             cap,
             FiberEnv::null(),
-            ThreadEnv::null(),
+            thread_env,
             inst_env, // §4: a durable child's baked nested-nursery `InstEnv` (else null — no nesting)
             SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
             &mut ctx.func,
@@ -4277,6 +4317,7 @@ pub(crate) fn compile_nondurable_child(
     child_entry: FuncIdx,
     child_size_log2: u8,
     epoch_addr: usize,
+    futex_sched: usize,
 ) -> Result<ChildCode, JitError> {
     compile_child(
         funcs,
@@ -4285,6 +4326,7 @@ pub(crate) fn compile_nondurable_child(
         empty_cap_thunk,
         core::ptr::null_mut(),
         epoch_addr,
+        futex_sched,
         InstEnv::null(),
     )
 }
@@ -4310,6 +4352,36 @@ pub(crate) unsafe fn run_child_code(
     parent_mem_base: *mut u8,
     args: &[i64],
     n_results: usize,
+) -> (i64, i64) {
+    run_child_code_then(
+        code,
+        sub_base,
+        child_size_log2,
+        parent_mem_base,
+        args,
+        n_results,
+        || (),
+    )
+}
+
+/// [`run_child_code`] with a **teardown hook** that runs after the copy-back but **before the child
+/// window is freed**. A granted child (Instantiator op 8/11/13) releases its powerbox `Host` here:
+/// the host's region-canon purge guard forgets `[child_base, +size)` when it drops, and running that
+/// while the window's VA range is still reserved means the purge can never erase entries a *later*
+/// window at a reused address just recorded (S1b/S1c canonical futex keys). The plain non-durable
+/// child passes `|| ()` — its empty powerbox installs no hook.
+///
+/// # Safety
+/// As [`run_child_code`].
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn run_child_code_then(
+    code: &ChildCode,
+    sub_base: u64,
+    child_size_log2: u8,
+    parent_mem_base: *mut u8,
+    args: &[i64],
+    n_results: usize,
+    teardown: impl FnOnce(),
 ) -> (i64, i64) {
     let child_size = 1u64 << child_size_log2;
     let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
@@ -4346,6 +4418,9 @@ pub(crate) unsafe fn run_child_code(
         );
         dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
     }
+    // Run the teardown (e.g. free a granted child's powerbox host) while `child_window` is alive —
+    // see the doc comment: the host's region-canon purge must precede the window VA becoming reusable.
+    teardown();
     (results.first().copied().unwrap_or(0), trap_cell)
 }
 
