@@ -124,6 +124,13 @@ fn link_shim(name: &str) -> Option<svm_ir::Resolved> {
     let cap = match name {
         "__spawn" => svm_ir::ResolvedCap { type_id: 6, op: 13 },
         "__join" => svm_ir::ResolvedCap { type_id: 6, op: 1 },
+        // The ring-pipeline surface (STAGE1.md item 6): mint a region (`AddressSpace` op 5) and
+        // alias/query it (`SharedRegion` ops 0/1/3) — the shell pumps stage-0 output into a mapped
+        // ring; the `__stage` filter runner maps its granted rings the same way.
+        "__as_region" => svm_ir::ResolvedCap { type_id: 5, op: 5 },
+        "__rg_map" => svm_ir::ResolvedCap { type_id: 4, op: 0 },
+        "__rg_unmap" => svm_ir::ResolvedCap { type_id: 4, op: 1 },
+        "__rg_granule" => svm_ir::ResolvedCap { type_id: 4, op: 3 },
         n => svm_posix::resolve(n.strip_prefix("__px_")?)?,
     };
     Some(svm_ir::Resolved::Cap(cap))
@@ -176,6 +183,14 @@ long __px_exec_lookup(int cap, long name, long len);
 long __px_exec_stdout(int cap);
 long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
 long __join(int inst, long child);
+/* Ring pipelines (STAGE1.md item 6): mint a shareable region (`AddressSpace` op 5) and alias it into
+   this window (`SharedRegion` ops 0/1/3), dispatched on the reflection-discovered handles below. */
+long __as_region(int cap, long len);
+long __rg_map(int cap, long win_off, long region_off, long len, long prot);
+long __rg_unmap(int cap, long win_off, long len);
+long __rg_granule(int cap);
+static int __h_as = -1;
+static int __as(void) { if (__h_as < 0) __h_as = __capof(5); return __h_as; }   /* AddressSpace = 5 */
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
@@ -196,6 +211,78 @@ long closedir(long dir) { return __px_closedir(__px(), dir); }
 /* The host-side argument vector (personality extension): sh reads its own argv here. */
 int argc_(void) { return (int)__px_argc(__px()); }
 long getarg(int i, char *buf, long cap) { return __px_argv(__px(), i, (long)buf, cap); }
+"#;
+
+/// The SPSC byte ring over a mapped `SharedRegion` (guest code, STAGE1.md item 6) — shared verbatim
+/// by the shell (the stage-0 producer side) and the `__stage` filter runner (both sides). Layout at
+/// ring base `b`: `[0]` head (bytes produced), `[4]` tail (bytes consumed), `[8]` done (writer
+/// finished), `[12]` rclosed (reader gone — SIGPIPE-lite, so `| head -n 1` never wedges its
+/// producer), data at `[64, 64+rcap)`. `rcap` = map granule − 64, set by each side after mapping.
+/// The producer parks on the **tail** word when full, the consumer parks on the **head** word when
+/// empty (`__vm_wait32`/`__vm_notify` — real futexes, canonical keys across windows); waits carry a
+/// 5 s timeout and bail after 6, so a lost wake poisons the status loudly instead of hanging.
+const RING: &str = r#"
+int __vm_wait32(void *p, int expected, long timeout_ns);
+int __vm_notify(void *p, int count);
+int __vm_atomic_load32(void *p);
+void __vm_atomic_store32(void *p, int v);
+
+static long rcap = 0;      /* ring data capacity: map granule - 64 */
+static int ring_bail = 0;  /* set when a wait timed out 6+ times — a lost wake, surfaced loudly */
+
+static long rmin2(long a, long b) { return a < b ? a : b; }
+static long ring_to(void) { long s = 5; return s * 1000000000; }   /* 5 s in ns */
+
+/* Write n bytes into the ring at b. Returns n; 0 when the reader closed its end (stop producing —
+   the SIGPIPE analogue); -1 after repeated timeouts (ring_bail set). */
+static long ring_write(long b, char *src, long n) {
+  long done_n = 0; int tos = 0;
+  while (done_n < n) {
+    if (__vm_atomic_load32((void *)(b + 12))) return 0;
+    long h = (long)__vm_atomic_load32((void *)b);
+    long t = (long)__vm_atomic_load32((void *)(b + 4));
+    long freeb = rcap - (h - t);
+    if (freeb <= 0) {
+      int st = __vm_wait32((void *)(b + 4), (int)t, ring_to());
+      if (st == 2) { tos++; if (tos > 6) { ring_bail = 1; return -1; } }
+      continue;
+    }
+    long k = rmin2(n - done_n, freeb);
+    char *d = (char *)(b + 64);
+    for (long i = 0; i < k; i++) d[(h + i) % rcap] = src[done_n + i];
+    __vm_atomic_store32((void *)b, (int)(h + k));
+    __vm_notify((void *)b, 1);
+    done_n += k;
+  }
+  return n;
+}
+
+/* Read up to cap bytes from the ring at b. Returns the byte count (>0); 0 at EOF (writer done and
+   the ring drained); -1 after repeated timeouts (ring_bail set). */
+static long ring_read(long b, char *dst, long cap) {
+  int tos = 0;
+  for (;;) {
+    long h = (long)__vm_atomic_load32((void *)b);
+    long t = (long)__vm_atomic_load32((void *)(b + 4));
+    long used = h - t;
+    if (used > 0) {
+      long k = rmin2(cap, used);
+      char *d = (char *)(b + 64);
+      for (long i = 0; i < k; i++) dst[i] = d[(t + i) % rcap];
+      __vm_atomic_store32((void *)(b + 4), (int)(t + k));
+      __vm_notify((void *)(b + 4), 1);
+      return k;
+    }
+    if (__vm_atomic_load32((void *)(b + 8))) return 0;
+    int st = __vm_wait32((void *)b, (int)h, ring_to());
+    if (st == 2) { tos++; if (tos > 6) { ring_bail = 1; return -1; } }
+  }
+}
+
+/* Writer finished: set done and wake the reader (it drains, then sees EOF). */
+static void ring_done(long b) { __vm_atomic_store32((void *)(b + 8), 1); __vm_notify((void *)b, 1); }
+/* Reader finished (possibly early — `head`): set rclosed and wake the writer so it stops. */
+static void ring_close_read(long b) { __vm_atomic_store32((void *)(b + 12), 1); __vm_notify((void *)(b + 4), 1); }
 "#;
 
 /// The Stage-0 shell itself (guest code). `run_line` first strips `< file`, `> file`, and `>> file`
@@ -227,14 +314,31 @@ static long in_fd = 0;
 /* Exit status of the last command, surfaced as `$?` and consumed by `&&`/`||`. 0 = success. */
 static int last_status = 0;
 static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }
-static void puts_(char *s) { write(out_fd, s, slen(s)); }
+
+/* Ring pipelines (STAGE1.md item 6): when a stage-0 producer pumps into a ring, `run_line_io` gets
+   `def_out = -2` (the RING_FD sentinel) and `ring_out` holds the mapped ring's window address; every
+   output funnel routes through `wr_out`, so a stage's own `>` redirect still overrides the pipe
+   (out_fd then points at the file, not the sentinel). A closed ring (the consumer exited early —
+   `head`) swallows further output, the SIGPIPE-lite. */
+static long ring_out = 0;
+static int ring_out_closed = 0;
+static long wr_out(char *b, long n) {
+  if (out_fd == -2) {
+    if (ring_out_closed) return n;
+    long r = ring_write(ring_out, b, n);
+    if (r <= 0) { ring_out_closed = 1; return n; }
+    return r;
+  }
+  return write(out_fd, b, n);
+}
+static void puts_(char *s) { wr_out(s, slen(s)); }
 
 /* Emit a non-negative count in decimal (wc's output). */
 static void put_num(long n) {
   static char b[24]; int i = 24;
   if (n == 0) { puts_("0"); return; }
   while (n > 0) { b[--i] = '0' + (int)(n % 10); n /= 10; }
-  write(out_fd, b + i, 24 - i);
+  wr_out(b + i, 24 - i);
 }
 
 /* Read source for a filter: an explicit path (caller must close), else the current in_fd. */
@@ -425,7 +529,7 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
    The command's stdout is the personality's forwardable `Stream` (`exec_stdout`), re-granted by name so
    its `write(1, …)` reaches the shell's sink — a `>`/`|` redirect on an external command is not honored
    (that needs the Power-2 `Endpoint`, STAGE1.md); the command always writes to the terminal sink. */
-static char pool[393216];
+static char pool[1179648];
 static int spawn_cmd(long mod, int argc, char **argv) {
   long out = __px_exec_stdout(__px());
   long base = (long)pool;
@@ -517,10 +621,10 @@ static int exec_line(char *line) {
       for (int ai = 1; ai < argc; ai++) {          /* concatenate each file argument */
         long fd = open(argv[ai], 0);
         if (fd < 0) { puts_(argv[ai]); puts_(": not found\n"); st = 1; }
-        else { while ((r = read(fd, buf, 256)) > 0) write(out_fd, buf, r); close(fd); }
+        else { while ((r = read(fd, buf, 256)) > 0) wr_out(buf, r); close(fd); }
       }
     } else {
-      while ((r = read(in_fd, buf, 256)) > 0) write(out_fd, buf, r);   /* no args: stream in_fd */
+      while ((r = read(in_fd, buf, 256)) > 0) wr_out(buf, r);   /* no args: stream in_fd */
     }
   } else if (streq(cmd, "wc")) {
     int ci; long fd = src_fd(arg, &ci);
@@ -680,11 +784,115 @@ done:
 /* A command with its own redirects but default stdin/stdout. */
 static int run_line(char *line) { return run_line_io(line, 0, 1); }
 
-/* Run a pipeline `A | B | C`: each stage's stdout is staged into a fresh memfs temp file that the
-   next stage reads as stdin. Not real concurrent processes — the playground has no fork yet — but it
-   reproduces pipeline *semantics* (each stage sees the previous stage's full output) end to end on
-   the personality's file surface. The exit status is the last stage's. A stage may still carry its
-   own `<`/`>` redirects, which override the pipe. Temp files are unlinked when the pipeline ends. */
+/* ---- Ring pipelines (STAGE1.md item 6): concurrent children over SharedRegion rings ---- */
+
+/* Is stage text `st` (a stage AFTER the first) a pure ring filter — runnable by the `__stage`
+   runner, which has stdin (its ring), stdout, argv, and nothing else (no memfs, no vars)? First
+   token in the known filter set; no redirects/vars/globs anywhere; no file arguments (`cat`/`wc`/
+   `sort`/`uniq` bare; `grep` flags + exactly a pattern; `head`/`tail` bare or `-n N`). */
+static int ring_filter_ok(char *st) {
+  for (int i = 0; st[i]; i++) {
+    char c = st[i];
+    if (c == '<' || c == '>' || c == '$' || c == '*' || c == '?') return 0;
+  }
+  static char cp[256]; scpy(cp, st);
+  char *av[MAXARGS]; int ac = tokenize(cp, av);
+  if (ac == 0) return 0;
+  char *c0 = av[0];
+  if (streq(c0, "cat") || streq(c0, "wc") || streq(c0, "sort") || streq(c0, "uniq")) return ac == 1;
+  if (streq(c0, "grep")) {
+    int ai = 1;
+    while (ai < ac && av[ai][0] == '-') ai++;
+    return ai < ac && ai + 1 == ac;      /* a pattern and nothing after it */
+  }
+  if (streq(c0, "head") || streq(c0, "tail")) {
+    if (ac == 1) return 1;
+    return ac == 3 && streq(av[1], "-n");
+  }
+  return 0;
+}
+
+/* The pool layout for a ring pipeline: 256 KiB-aligned stage carves (one per child — concurrent,
+   so they must be distinct; the `__stage` runner declares memory 18), then the parent's ring-0 map
+   slot (256 KiB-aligned ⇒ granule-aligned), then the spawn grant-record scratch — kept OUTSIDE
+   every carve, because records are (re)written while earlier children are already running in
+   theirs. */
+static long stage_carve0(void) { return ((long)pool + 262143) & ~262143; }
+static long stage_mapslot(void) { return stage_carve0() + 786432; }
+static long stage_records(void) { return stage_carve0() + 851968; }
+
+/* Spawn one ring stage: the `__stage` runner in its own 128 KiB carve, granted the shell's stdout,
+   its input ring `rin`, and (for a non-final stage) its output ring `rout`; argv = the stage's
+   tokens (argv[0] picks the filter). Returns the op-13 child handle. */
+static long spawn_stage(long mod, char *stage, long carve, int rin, int rout) {
+  static char cp[256]; scpy(cp, stage);
+  char *av[MAXARGS]; int ac = tokenize(cp, av);
+  long base = stage_records();
+  int *rec = (int *)base;
+  char *nm = (char *)(base + 64);
+  long out = __px_exec_stdout(__px());
+  rec[0] = (int)(base + 64); rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
+  nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
+  rec[4] = (int)(base + 70); rec[5] = 3; rec[6] = rin; rec[7] = 0;
+  nm[6]='r'; nm[7]='i'; nm[8]='n';
+  long gn = 2;
+  if (rout >= 0) {
+    rec[8] = (int)(base + 73); rec[9] = 4; rec[10] = rout; rec[11] = 0;
+    nm[9]='r'; nm[10]='o'; nm[11]='u'; nm[12]='t';
+    gn = 3;
+  }
+  /* the runner's args buffer at carve+128 (POWERBOX_ARGS_BASE): {argc, envc=0} + packed argv */
+  char *ab = (char *)(carve + 128);
+  int *hdr = (int *)ab;
+  hdr[0] = ac; hdr[1] = 0;
+  char *p = ab + 8;
+  for (int i = 0; i < ac; i++) {
+    char *sv = av[i]; long L = slen(sv);
+    for (long k = 0; k < L; k++) *p++ = sv[k];
+    *p++ = 0;
+  }
+  return __spawn(__inst(), mod, base, gn, 0, carve, 18, 0);
+}
+
+static int run_line_io(char *line, long def_in, long def_out);
+
+/* The concurrent pipeline: mint ns-1 regions, spawn stages 1..ns-1 as `__stage` children wired
+   ring→ring→stdout, run stage 0 IN the shell (full builtin power — files, redirects) pumping into
+   ring 0 through the mapped alias, mark it done, and join every child; the status is the last
+   stage's, as in bash. The children run concurrently on both backends (interp fibers / JIT OS
+   threads), parking on the ring futexes — real streaming with backpressure, not temp files. */
+static int run_ring_pipeline(char **stages, int ns, long mod) {
+  long c0 = stage_carve0();
+  long mapoff = stage_mapslot();
+  int nr = ns - 1;
+  int rh[3];
+  for (int r = 0; r < nr; r++) rh[r] = (int)__as_region(__as(), 65536);
+  long g = __rg_granule(rh[0]);
+  if (g <= 64 || __rg_map(rh[0], mapoff, 0, g, 3) != 0) return 125;   /* loudly, never silently */
+  rcap = g - 64;
+  long child[3];
+  for (int s = 1; s < ns; s++) {
+    int rin = rh[s - 1];
+    int rout = s < ns - 1 ? rh[s] : -1;
+    child[s - 1] = spawn_stage(mod, stages[s], c0 + (long)(s - 1) * 262144, rin, rout);
+  }
+  ring_out = mapoff;
+  ring_out_closed = 0;
+  run_line_io(stages[0], 0, -2);      /* RING_FD: unredirected stage-0 output pumps the ring */
+  ring_done(ring_out);
+  ring_out = 0;
+  int st = 0;
+  for (int s = 1; s < ns; s++) st = (int)__join(__inst(), child[s - 1]);
+  __rg_unmap(rh[0], mapoff, g);
+  return st;
+}
+
+/* Run a pipeline `A | B | C`. When every stage after the first is a pure filter and the `__stage`
+   runner is on PATH, the stages run **concurrently** — stage 0 in the shell, the rest as spawned
+   children piped through `SharedRegion` rings (STAGE1.md item 6). Otherwise (redirects/vars/globs/
+   file args in a later stage, no runner registered, or >4 stages) fall back to the sequential
+   memfs-temp staging: each stage's stdout lands in a temp file the next stage reads as stdin —
+   same pipeline *semantics*, no concurrency. The exit status is the last stage's either way. */
 static int run_pipeline(char *seg) {
   char *stages[8];
   int ns = 0, i = 0, start = 0;
@@ -695,6 +903,16 @@ static int run_pipeline(char *seg) {
     else i++;
   }
   if (ns == 1) return run_line(stages[0]);
+  if (ns <= 4) {
+    int ok = 1;
+    for (int s = 1; s < ns; s++) if (!ring_filter_ok(stages[s])) { ok = 0; break; }
+    if (ok) {
+      static char sn[8];
+      sn[0]='_'; sn[1]='_'; sn[2]='s'; sn[3]='t'; sn[4]='a'; sn[5]='g'; sn[6]='e'; sn[7]=0;
+      long mod = __px_exec_lookup(__px(), (long)sn, 7);
+      if (mod >= 0) return run_ring_pipeline(stages, ns, mod);
+    }
+  }
   static char tmp[8];                    /* "/.pipeN" — one name per producing stage */
   tmp[0] = '/'; tmp[1] = '.'; tmp[2] = 'p'; tmp[3] = 'i'; tmp[4] = 'p'; tmp[5] = 'e'; tmp[7] = 0;
   long prev_in = 0;                      /* stage 0 reads real stdin */
@@ -841,7 +1059,7 @@ fn run_shell_ex(
     args: &[&str],
     cmds: &[(&str, &str)],
 ) -> (Vec<u8>, Vec<u8>) {
-    let src = format!("{SHIM}\n{SHELL_MAIN}");
+    let src = format!("{SHIM}\n{RING}\n{SHELL_MAIN}");
     let ir = c_to_ir(&src);
     let raw = parse_module_raw(&ir)
         .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
@@ -851,9 +1069,21 @@ fn run_shell_ex(
     let cmd_mods: Vec<(&str, svm_ir::Module)> = cmds
         .iter()
         .map(|&(name, csrc)| {
-            // Phase 3: keep the manifest — the op-13 spawn binds the child's slots.
+            // Phase 3: keep the manifest — the op-13 spawn binds the child's slots. (The `__stage`
+            // ring runner needs no special linking: its region ops are chibicc `__vm_region_*`
+            // builtins, inline `cap.call`s dispatched on the runtime-minted region handles.)
             let m = parse_module_raw(&c_to_ir_child(csrc)).expect("parse cmd");
             verify_module(&m).expect("verify cmd");
+            // The shell spawns `__stage` children with `size_log2 = 18` (a carve must equal the
+            // child's declared memory); the runner pins itself there with a pad, and this assert
+            // makes any drift loud instead of a probeable-but-silent spawn `-EINVAL`.
+            if name == "__stage" {
+                assert_eq!(
+                    m.memory.map(|mm| mm.size_log2),
+                    Some(18),
+                    "__stage runner must declare memory 18 (the spawn's carve size)"
+                );
+            }
             (name, m)
         })
         .collect();
@@ -864,9 +1094,15 @@ fn run_shell_ex(
     // forwardable stdout `Stream` back the shell's `__spawn`/`exec_stdout`; the personality's fd-1 writes
     // route to the same shared sink as the child's re-granted `Stream`, unifying their output.
     let setup = |host: &mut Host| -> (svm_posix::Posix, i32, i32) {
+        // Ring pipelines (STAGE1.md item 6): regions minted by the shell are real OS shared-memory
+        // objects, so the JIT (parent map + child maps) gets hardware aliasing; the interpreter's
+        // software aliasing is backing-agnostic, so both hosts get the same factory (differential
+        // symmetry).
+        host.set_region_factory(svm_run::new_shared_region);
         let sink = host.shared_stdout();
         let out_h = host.grant_stream(StreamRole::Out);
         let inst_h = host.grant_instantiator(0, win as u64);
+        let _as_h = host.grant_address_space(0, win as u64);
         let cmd_handles: Vec<(&str, i32)> = cmd_mods
             .iter()
             .map(|(n, m)| (*n, host.grant_module(m)))
@@ -912,7 +1148,11 @@ fn run_shell_ex(
     let mut fuel = 200_000_000u64;
     match run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &init, 0, &mut ih).0 {
         Ok(_) | Err(Trap::Exit(_)) => {}
-        Err(e) => panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"),
+        Err(e) => panic!(
+            "interp trapped: {e:?}\n--- stdout so far ---\n{}\n--- IR (head) ---\n{}",
+            String::from_utf8_lossy(&iposix.stdout()),
+            &ir[..ir.len().min(400)]
+        ),
     }
     // JIT — given the module resolver + named-grant hooks op 13 needs.
     let (jout, _) = compile_and_run_capture_reserved_with_host_ex(
@@ -951,6 +1191,211 @@ fn stage0_shell_runs_a_script() {
         "interp: the shell ran the script (echo, $VAR, cd+pwd, unknown cmd)"
     );
     assert_eq!(jout, iout, "jit: shell output must match interp");
+}
+
+/// The `__stage` filter runner (guest code, STAGE1.md item 6) — the program a ring pipeline spawns
+/// once per stage after the first. An ordinary `--child-entry` command: it discovers its grants by
+/// `cap.self` reflection (regions in grant order — input ring first, output ring second when
+/// present; a `Stream` = the shell's stdout), maps each ring into its **own** window
+/// (`SharedRegion` op 0 — real aliasing on the JIT, separate windows per stage), and runs the one
+/// filter `argv[0]` names, reading its input ring and writing its output ring — or, as the final
+/// stage, the granted stdout. Statuses match the shell's builtins (`grep` no-match → 1); a wait
+/// bail poisons the status to 99. It holds no memfs/personality capability at all, which is exactly
+/// why only pure filters ride the ring path.
+const STAGE_RUNNER_MAIN: &str = r#"
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
+long write(long fd, void *buf, long n);
+long __vm_region_map(int r, long win_off, long region_off, long len, int prot);
+long __vm_region_page_size(int r);
+
+/* Pin the declared window at `memory 18` (chibicc sizes proportionally to the static region): the
+   shell spawns stages with size_log2 = 18, and a §14 module child's carve must equal its declared
+   memory. The harness asserts the pin, so drift is loud. */
+static char window_pin_[50000];
+
+static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
+static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }
+static long atoi_(char *s) {
+  long v = 0; int i = 0;
+  while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+  return v;
+}
+static int contains(char *hay, char *needle) {
+  for (int i = 0; hay[i]; i++) {
+    int j = 0; while (needle[j] && hay[i + j] == needle[j]) j++;
+    if (needle[j] == 0) return 1;
+  }
+  return needle[0] == 0;
+}
+static int scmp(char *a, char *b) {
+  int i = 0; while (a[i] && a[i] == b[i]) i++;
+  return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
+}
+static void scpy(char *d, char *s) {
+  int i = 0; while (s[i] && i < 255) { d[i] = s[i]; i++; } d[i] = 0;
+}
+
+/* Mapped ring bases: rin is always present; rout == 0 means "final stage — write the stdout
+   Stream" (fd 1, the chibicc Stream builtin over the granted handle). */
+static long rin = 0;
+static long rout = 0;
+static int out_dead = 0;   /* our reader closed (SIGPIPE-lite): swallow further output */
+
+static void outb(char *b, long n) {
+  if (rout) {
+    if (out_dead) return;
+    if (ring_write(rout, b, n) <= 0) out_dead = 1;
+  } else {
+    write(1, b, n);
+  }
+}
+static void oputs(char *s) { outb(s, slen(s)); }
+static void onum(long n) {
+  static char b[24]; int i = 24;
+  if (n == 0) { oputs("0"); return; }
+  while (n > 0) { b[--i] = '0' + (int)(n % 10); n /= 10; }
+  outb(b + i, 24 - i);
+}
+
+/* Buffered byte/line input over the input ring. */
+static char rbuf[256];
+static long rlen = 0, rpos = 0;
+static int rin_eof = 0;
+static int rgetc(void) {
+  if (rpos >= rlen) {
+    if (rin_eof) return -1;
+    long r = ring_read(rin, rbuf, 256);
+    if (r <= 0) { rin_eof = 1; return -1; }
+    rlen = r; rpos = 0;
+  }
+  int c = rbuf[rpos]; rpos++;
+  return c & 255;
+}
+static long rline(char *b, long lim) {
+  long n = 0;
+  for (;;) {
+    int c = rgetc();
+    if (c < 0) { if (n == 0) return -1; break; }
+    if (c == '\n') break;
+    if (n < lim - 1) b[n++] = (char)c;
+  }
+  b[n] = 0;
+  return n;
+}
+
+static int regs[2];
+static int nregs = 0;
+
+int main(int argc, char **argv) {
+  /* Discover the grants by reflection: regions in grant order (rin, then rout when present). */
+  int n = __vm_cap_count();
+  for (int i = 0; i < n; i++) {
+    int t = 0;
+    int h = __vm_cap_at(i, &t);
+    /* (Indexed post-increment stores — `regs[nregs++] = h` — miscompile under chibicc, so the
+       slots are picked explicitly; see ISSUES.md.) */
+    if (t == 4) {
+      if (nregs == 0) regs[0] = h;
+      else if (nregs == 1) regs[1] = h;
+      nregs = nregs + 1;
+    }
+  }
+  if (nregs > 2) nregs = 2;
+  if (nregs == 0 || argc == 0) return 126;
+  window_pin_[0] = 0;   /* keep the pad live (see its comment) */
+  long g = __vm_region_page_size(regs[0]);
+  if (g <= 64) return 125;
+  rcap = g - 64;
+  /* Map the rings into the upper half of the 256 KiB window — clear of the globals/args/frame
+     region below and shallow enough that the data stack (near the top) never reaches down here. */
+  if (__vm_region_map(regs[0], 131072, 0, g, 3) != 0) return 125;
+  rin = 131072;
+  if (nregs > 1) {
+    if (__vm_region_map(regs[1], 131072 + g, 0, g, 3) != 0) return 125;
+    rout = 131072 + g;
+  }
+
+  char *cmd = argv[0];
+  int st = 0;
+  if (streq(cmd, "cat")) {
+    static char buf[256]; long r;
+    while ((r = ring_read(rin, buf, 256)) > 0) outb(buf, r);
+  } else if (streq(cmd, "wc")) {
+    static char buf[256];
+    long r, lines = 0, words = 0, bytes = 0; int inword = 0;
+    while ((r = ring_read(rin, buf, 256)) > 0) {
+      for (long i = 0; i < r; i++) {
+        char c = buf[i]; bytes++;
+        if (c == '\n') lines++;
+        if (c == ' ' || c == '\n' || c == '\t') inword = 0;
+        else { if (!inword) words++; inword = 1; }
+      }
+    }
+    onum(lines); oputs(" "); onum(words); oputs(" "); onum(bytes); oputs("\n");
+  } else if (streq(cmd, "grep")) {
+    int ai = 1, inv = 0, cnt = 0;
+    while (ai < argc && argv[ai][0] == '-') {
+      if (streq(argv[ai], "-v")) inv = 1;
+      else if (streq(argv[ai], "-c")) cnt = 1;
+      ai++;
+    }
+    long matches = 0;
+    if (ai < argc) {
+      char *pat = argv[ai];
+      static char lb[256];
+      while (rline(lb, 256) >= 0) {
+        int m = contains(lb, pat);
+        if (inv) m = !m;
+        if (m) { matches++; if (!cnt) { oputs(lb); oputs("\n"); } }
+      }
+    }
+    if (cnt) { onum(matches); oputs("\n"); }
+    if (matches == 0) st = 1;
+  } else if (streq(cmd, "head")) {
+    long want = 10;
+    if (argc > 2 && streq(argv[1], "-n")) want = atoi_(argv[2]);
+    static char lb[256];
+    for (long k = 0; k < want && rline(lb, 256) >= 0; k++) { oputs(lb); oputs("\n"); }
+  } else if (streq(cmd, "tail")) {
+    long want = 10;
+    if (argc > 2 && streq(argv[1], "-n")) want = atoi_(argv[2]);
+    if (want > 16) want = 16;
+    static char lines[16][256];
+    long count = 0;
+    while (rline(lines[count % 16], 256) >= 0) count++;
+    long start = count > want ? count - want : 0;
+    for (long k = start; k < count; k++) { oputs(lines[k % 16]); oputs("\n"); }
+  } else if (streq(cmd, "sort")) {
+    static char buf[64][256]; int nl = 0;
+    while (nl < 64 && rline(buf[nl], 256) >= 0) nl++;
+    for (int i = 1; i < nl; i++) {
+      static char key[256]; scpy(key, buf[i]);
+      int j = i - 1;
+      while (j >= 0 && scmp(buf[j], key) > 0) { scpy(buf[j + 1], buf[j]); j--; }
+      scpy(buf[j + 1], key);
+    }
+    for (int i = 0; i < nl; i++) { oputs(buf[i]); oputs("\n"); }
+  } else if (streq(cmd, "uniq")) {
+    static char cur[256], prev[256]; int have = 0;
+    while (rline(cur, 256) >= 0)
+      if (!have || scmp(cur, prev) != 0) { oputs(cur); oputs("\n"); scpy(prev, cur); have = 1; }
+  } else {
+    st = 127;   /* the shell's classifier admits only the filters above */
+  }
+
+  /* Epilogue: finish our output ring (the next stage drains then sees EOF) and close our input ring
+     even when we exited early (`head`) — the producer stops instead of parking to a timeout. */
+  if (rout) ring_done(rout);
+  ring_close_read(rin);
+  if (ring_bail && st == 0) st = 99;   /* a lost wake surfaces loudly in $? */
+  return st;
+}
+"#;
+
+/// The complete `__stage` runner source: the shared ring protocol + the filter dispatch.
+fn stage_runner_src() -> String {
+    format!("{RING}\n{STAGE_RUNNER_MAIN}")
 }
 
 /// An external command: echo every `argv[i]` on its own line, return `argc` (a non-zero status that
@@ -1514,4 +1959,70 @@ fn stage0_shell_if_with_pipeline_condition() {
         "interp: pipeline condition drives if; redirected body writes the result"
     );
     assert_eq!(jout, iout, "jit: if-with-pipeline output must match interp");
+}
+
+/// STAGE1.md item 6 — the shell's `|` runs **concurrent** stages over `SharedRegion` rings. With the
+/// `__stage` runner on PATH, every stage after the first is a spawned child of its own window; the
+/// stages stream through ring futexes (stage 0 pumps from inside the shell, the last child writes
+/// the granted stdout). The output is byte-identical to the sequential temp-file staging — the
+/// concurrency is the point, not a semantics change. Differential interp==JIT.
+#[test]
+fn stage0_shell_pipeline_over_rings() {
+    let runner = stage_runner_src();
+    let script = b"echo b > f\n\
+                   echo a >> f\n\
+                   echo b >> f\n\
+                   cat f | sort | uniq\n";
+    let (iout, jout) = run_shell_ex(script, &[], &[], &[], &[("__stage", &runner)]);
+    assert_eq!(
+        iout,
+        b"a\nb\n".as_slice(),
+        "interp: cat f | sort | uniq over rings — three concurrent stages, sorted + deduped"
+    );
+    assert_eq!(jout, iout, "jit: ring-pipeline output must match interp");
+}
+
+/// The ring path end to end: a 4-stage pipeline (two ring→ring middles), `grep` status flowing into
+/// `$?` from a ring child, `grep -c` counting, and `head`'s early exit closing its input ring so the
+/// producer stops (the SIGPIPE-lite) instead of wedging to a timeout. Differential interp==JIT.
+#[test]
+fn stage0_shell_ring_pipeline_status_and_early_exit() {
+    let runner = stage_runner_src();
+    let script = b"echo one > f\n\
+                   echo two >> f\n\
+                   echo one >> f\n\
+                   echo three >> f\n\
+                   cat f | grep -v two | sort | uniq\n\
+                   cat f | grep -c one\n\
+                   cat f | grep zzz\n\
+                   echo rc $?\n\
+                   cat f | head -n 2\n\
+                   echo rc $?\n";
+    let (iout, jout) = run_shell_ex(script, &[], &[], &[], &[("__stage", &runner)]);
+    assert_eq!(
+        iout,
+        b"one\nthree\n2\nrc 1\none\ntwo\nrc 0\n".as_slice(),
+        "interp: 4-stage ring pipeline, -c count, no-match status 1, head early-exit status 0"
+    );
+    assert_eq!(jout, iout, "jit: ring-pipeline statuses must match interp");
+}
+
+/// The fallback contract: a later stage that the ring path cannot serve (a `>` redirect — the
+/// runner has no filesystem) silently takes the sequential memfs-temp path with identical
+/// semantics, and the two paths coexist in one script. Differential interp==JIT.
+#[test]
+fn stage0_shell_ring_pipeline_falls_back_on_redirect() {
+    let runner = stage_runner_src();
+    let script = b"echo x > f\n\
+                   echo y >> f\n\
+                   cat f | grep x > out\n\
+                   cat out\n\
+                   cat f | grep y\n";
+    let (iout, jout) = run_shell_ex(script, &[], &[], &[], &[("__stage", &runner)]);
+    assert_eq!(
+        iout,
+        b"x\ny\n".as_slice(),
+        "interp: redirected stage falls back to temps (x lands in `out`), plain stage rides rings"
+    );
+    assert_eq!(jout, iout, "jit: fallback + ring outputs must match interp");
 }
