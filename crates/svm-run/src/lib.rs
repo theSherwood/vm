@@ -3503,6 +3503,22 @@ impl HostCap {
         }
     }
 
+    /// PROCESS.md §5 — a **window minter** with a byte `quota`: the authority to spawn
+    /// **detached** children (`Instantiator.instantiate_detached`, op 15) whose fresh platform
+    /// windows no ancestor below the platform can read (the child attests
+    /// `window_exposed = false` — the distrust-spawner trust anchor). Embedder-granted like
+    /// `exec`/`fs`; each mint deducts the child's window size from the quota.
+    pub fn window_minter(quota: u64) -> HostCap {
+        HostCap {
+            type_id: cap_id::WINDOW_MINTER,
+            op: 0,
+            grant: Arc::new(move |h, _| h.grant_window_minter(quota)),
+            unbound: false,
+            offer: None,
+            iface: None,
+        }
+    }
+
     /// §3.2 (IMPORTS.md): bind an import slot to **op `op` of a guest interface offer** — a
     /// named `impl` export of `provider` (`export "<offer>" impl <funcidx>...`). The wiring is
     /// the authority-moving act: at instantiation the offer is wired into the instance's table

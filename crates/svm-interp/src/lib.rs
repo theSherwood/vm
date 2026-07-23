@@ -7427,6 +7427,179 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 .vals
                                 .push(Reg::from_i32(cap.unwrap_or(EINVAL as i32)));
                         }
+                        // PROCESS.md §5 — `instantiate_detached(minter, module, grants_ptr,
+                        // grants_n, entry, size_log2, quota) -> child | -EINVAL`: spawn a
+                        // child from a granted module into a **fresh platform window**, minted
+                        // through a `WindowMinter` capability — outside this domain's window,
+                        // so no ancestor below the platform holds read authority and the child
+                        // attests `window_exposed = false` (the distrust-spawner trust model).
+                        // The §14 free data plane is gone BY DESIGN: data flows through the
+                        // module's own segments and the named grants (streams / pipe ends /
+                        // regions — the op-11 record format), the separate-process discipline.
+                        // The spawner keeps kill/join/fuel authority — detachment severs
+                        // *read*, not lifecycle. A quota miss / forged minter / bad entry or
+                        // size refuses probeably (and a refused spawn charges nothing); a
+                        // **durable** domain refuses outright (a detached window is outside
+                        // the subtree snapshot — fail closed; multi-window freeze is the
+                        // recorded §5/O6 follow-up). No D38 contact: the child's window is an
+                        // ordinary reservation with its own guard, exactly a root run's.
+                        15 => {
+                            let argn = |i: usize| -> Result<i64, Trap> {
+                                Ok(
+                                    get(&frames[top].vals, *args.get(i).ok_or(Trap::Malformed)?)?
+                                        .i64(),
+                                )
+                            };
+                            let minter = argn(0)? as i32;
+                            let mh = argn(1)? as i32;
+                            let grants_ptr = argn(2)? as u64;
+                            let grants_n = argn(3)? as u64;
+                            let entry = argn(4)? as u64;
+                            let size_log2 = argn(5)?;
+                            let quota = argn(6)?;
+                            // The module grant (a forged module handle is a CapFault, as ops
+                            // 5/13); the child runs it as its own program + self module.
+                            let cm = {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let g = hg.resolve_module(mh)?;
+                                ChildMod {
+                                    funcs: g.funcs.clone(),
+                                    memory_log2: g.memory_log2,
+                                    data: g.data.clone(),
+                                    durable: g.durable,
+                                    digest: g.digest,
+                                    imports: g.imports.clone(),
+                                    types: g.types.clone(),
+                                    module: Arc::clone(&g.module),
+                                }
+                            };
+                            // Named grants (the op-11 record format), pre-validated fail-closed.
+                            let mut glist: Vec<(String, i32)> = Vec::new();
+                            for i in 0..grants_n {
+                                let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                                let name_off =
+                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                                let name_len =
+                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                                let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                                let name_bytes = m.read_window(name_off, name_len)?;
+                                let name =
+                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                                {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.can_regrant(gh).then_some(()).ok_or(Trap::CapFault)?;
+                                }
+                                glist.push((name, gh));
+                            }
+                            let cfs: &[Func] = &cm.funcs;
+                            let want_as =
+                                cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
+                            let ok_entry = cfs.get(entry as usize).is_some_and(|f| {
+                                f.results == [ValType::I64]
+                                    && f.params.iter().all(|p| *p == ValType::I64)
+                                    && (f.params.len() == 1 || f.params.len() == 2)
+                            });
+                            let child_size = if (0..64).contains(&size_log2) {
+                                1u64 << size_log2
+                            } else {
+                                0
+                            };
+                            // §14 transparency: the detached window equals the module's
+                            // declared memory (a module with no memory can't spawn).
+                            let mod_ok = cm.memory_log2 == Some(size_log2 as u8);
+                            let admitted = !durable
+                                && ok_entry
+                                && child_size != 0
+                                && mod_ok
+                                && host
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .window_minter_take(minter, child_size);
+                            if !admitted {
+                                frames[top].vals.push(Reg::from_i32(EINVAL as i32));
+                            } else {
+                                // The fresh platform window: its own reservation + guard,
+                                // exactly a root run's — nothing of it in this domain's VA.
+                                let mut fm =
+                                    Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8);
+                                fm.init_data(&cm.data);
+                                let mut ch = Host::new();
+                                ch.set_attestation({
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.detached_child_attestation()
+                                });
+                                let cinst = ch.grant_instantiator(0, child_size);
+                                let cas = ch.grant_address_space(0, child_size);
+                                for (name, gh) in &glist {
+                                    let cg = {
+                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        hg.regrant_into_child(*gh, &mut ch)
+                                    };
+                                    if let Some(cg) = cg {
+                                        ch.register_cap_name(name, cg);
+                                    }
+                                }
+                                if ch.bind_child_manifest(&cm.imports, &cm.types).is_err() {
+                                    frames[top].vals.push(Reg::from_i32(EINVAL as i32));
+                                } else {
+                                    ch.self_module = Some(Arc::clone(&cm.module));
+                                    let child_host = Arc::new(Mutex::new(ch));
+                                    let child_host_keep = Arc::clone(&child_host);
+                                    let mut child_args = vec![Value::I64(cinst as i64)];
+                                    if want_as {
+                                        child_args.push(Value::I64(cas as i64));
+                                    }
+                                    let child_fuel = if quota <= 0 {
+                                        *fuel
+                                    } else {
+                                        (quota as u64).min(*fuel)
+                                    };
+                                    let cfuncs = Arc::clone(&cm.funcs);
+                                    let csched = sched.clone();
+                                    let kflag = Arc::new(AtomicBool::new(false));
+                                    let kflag_child = Arc::clone(&kflag);
+                                    let made = sched.spawn(move |id| {
+                                        // A detached child is its own domain: own dispatch
+                                        // table, own window; NOT `nested_child` (no carve to
+                                        // self-describe) and never in `nested_children` (no
+                                        // carve geometry exists — and the durable refusal
+                                        // above keeps it out of every freeze path).
+                                        let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                                        let mut child = VCpu::new(
+                                            cfuncs,
+                                            entry as u32,
+                                            &child_args,
+                                            Some(fm),
+                                            child_host,
+                                            child_fuel,
+                                            depth + 1,
+                                            id,
+                                            csched,
+                                            spawn_quota,
+                                            cdt,
+                                        );
+                                        child.memop = memop;
+                                        child.kill = Some(kflag_child); // lifecycle stays the spawner's
+                                        Box::new(child)
+                                    });
+                                    match made {
+                                        Some(child_id) => {
+                                            threads.push(Some(child_id));
+                                            child_kill.insert(threads.len() - 1, kflag);
+                                            // Live offers over a detached child work exactly as
+                                            // nested (`child_offer` + caller parking): the
+                                            // linkage is the powerbox Arc, not the window.
+                                            child_hosts.insert(threads.len() - 1, child_host_keep);
+                                            frames[top]
+                                                .vals
+                                                .push(Reg::from_i32((threads.len() - 1) as i32));
+                                        }
+                                        None => return Err(Trap::ThreadFault),
+                                    }
+                                }
+                            }
+                        }
                         _ => return Err(Trap::CapFault),
                     }
                 }
@@ -10222,6 +10395,14 @@ pub mod cap_id {
     /// (the `create(module, window, budget)` accounting) is the follow-up; this is the passable object
     /// + attenuation the rest builds on.
     pub const BUDGET: u32 = 14;
+    /// PROCESS.md §5 **window minter** — the authority to mint **detached** windows: a child
+    /// spawned through it (`Instantiator.instantiate_detached`, op 15) gets a fresh platform
+    /// window *outside* the parent's — no ancestor below the minter holds read authority, and
+    /// the child attests `window_exposed = false` (the jacl distrust-spawner trust anchor).
+    /// The capability carries a **byte quota**, deducted at each mint (host-enforced); an
+    /// ordinary granted authority (D46 `Resolver`-shaped: you can mint detached windows only
+    /// if someone granted you that), embedder-granted at the root.
+    pub const WINDOW_MINTER: u32 = 15;
     /// Base of the **guest-interface id space** (IMPORTS.md §3.2): ids for wired interface offers
     /// are interned per-`Host` from this base upward ([`super::Host::intern_interface`] — the id ≡
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
@@ -10554,6 +10735,11 @@ enum Binding {
         pipe: u32,
         write: bool,
     },
+    /// PROCESS.md §5 — a **window minter** (detached-window authority), carrying the index of
+    /// its remaining byte quota in [`Host::window_minters`]. Index-carrying (mutable quota
+    /// state), so non-copyable and non-durable like [`Binding::SharedRegion`]; serviced by the
+    /// eval loop's `instantiate_detached` arm, inert under the generic dispatch.
+    WindowMinter(u32),
     Exit,
     Clock,
     Memory,
@@ -10740,6 +10926,9 @@ pub enum NonDurableKind {
     /// §3.6 a live-callee offer — points at a *running* domain's powerbox, which no snapshot
     /// can carry; re-wired after restore like a GuestImpl.
     LiveImpl,
+    /// PROCESS.md §5 a window minter — mutable quota state (and the detached children it
+    /// minted are outside the snapshot anyway); re-granted by the embedder after restore.
+    WindowMinter,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -11302,6 +11491,10 @@ pub struct Host {
     svc_next_ticket: u64,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
+    /// PROCESS.md §5 — the side table a [`Binding::WindowMinter`] indexes: each entry the
+    /// minter's **remaining byte quota**, deducted at every detached mint (numeric,
+    /// host-enforced; no refund on child completion — the quota bounds lifetime total, v1).
+    window_minters: Vec<u64>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -11582,6 +11775,7 @@ impl Host {
             svc_results: BTreeMap::new(),
             svc_next_ticket: 0,
             live_impls: Vec::new(),
+            window_minters: Vec::new(),
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -12199,6 +12393,9 @@ impl Host {
                 }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
                 Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
+                Binding::WindowMinter(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::WindowMinter))
+                }
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -12254,6 +12451,7 @@ impl Host {
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
                 Binding::Budget(_) => NonDurableKind::Budget,
                 Binding::PipeEnd { .. } => NonDurableKind::Pipe,
+                Binding::WindowMinter(_) => NonDurableKind::WindowMinter,
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -12938,6 +13136,33 @@ impl Host {
         self.grant_module_inner(m, true)
     }
 
+    /// Grant a PROCESS.md §5 **window-minter** capability with a byte `quota`: the authority to
+    /// spawn **detached** children (`Instantiator.instantiate_detached`, op 15) whose windows no
+    /// ancestor below the platform can read. Embedder-granted (like `exec`/`fs` — nothing
+    /// ambient); each mint deducts the child's window size from the remaining quota.
+    pub fn grant_window_minter(&mut self, quota: u64) -> i32 {
+        let idx = self.window_minters.len() as u32;
+        self.window_minters.push(quota);
+        self.grant(cap_id::WINDOW_MINTER, Binding::WindowMinter(idx))
+    }
+
+    /// Deduct `bytes` from the minter behind `handle` — the detached-spawn admission check.
+    /// `false` (nothing deducted) for a forged/wrong-type handle or an exhausted quota: the
+    /// spawn refuses probeably, never a trap.
+    fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
+        let idx = match self.resolve(handle, cap_id::WINDOW_MINTER) {
+            Ok(Binding::WindowMinter(i)) => i as usize,
+            _ => return false,
+        };
+        match self.window_minters.get_mut(idx) {
+            Some(rem) if *rem >= bytes => {
+                *rem -= bytes;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn grant_module_inner(&mut self, m: &Module, durable: bool) -> i32 {
         let id = self.modules.len() as u32;
         self.modules.push(ModuleGrant {
@@ -13062,6 +13287,18 @@ impl Host {
     /// the parent's isolation tier, is always `window_exposed` (the parent sees its carve — the §14
     /// superset, so an ancestor holds read authority), and is `freeze_exposed` iff spawned into a
     /// **durable** subtree (an ancestor may snapshot it — a snapshot is a read).
+    /// PROCESS.md §5 — a **detached** child's attestation: same in-process tier (never a
+    /// Spectre boundary — real distrust is a separate process), but `window_exposed = false`
+    /// (no ancestor below the platform holds read authority over its platform-minted window)
+    /// and never ancestor-freezable. The jacl distrust-spawner report.
+    fn detached_child_attestation(&self) -> Attestation {
+        Attestation {
+            tier: self.attestation.tier,
+            window_exposed: false,
+            freeze_exposed: false,
+        }
+    }
+
     fn child_attestation(&self, durable: bool) -> Attestation {
         Attestation {
             tier: self.attestation.tier,
@@ -13822,6 +14059,9 @@ impl Host {
             // host-side dispatch cannot park). Reaching it here means a backend tier without
             // the servicing arm: answer probeable, never trap.
             Binding::LiveImpl(_) => Ok(vec![EINVAL]),
+            // PROCESS.md §5: a window minter is spawn *evidence* (an `instantiate_detached`
+            // argument), not a dispatch target — inert probeable refusal.
+            Binding::WindowMinter(_) => Ok(vec![EINVAL]),
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
             // turned inward: the holder hangs up). Null the slot entry so every later use of the
             // handle is the clean D37 use-after-close fault the docs always promised, and so a
