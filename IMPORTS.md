@@ -1429,15 +1429,34 @@ grouped bindings later). (3) **Rebind revokes the outgoing connection**:
 `import.attach` wakes fibers parked in calls through the slot's old
 binding handle with the revocation errno (the pinned "closing/rebinding"
 trigger); **in-flight live dispatches deliberately still complete** —
-program order is call → results; rebind governs future calls. **Recorded
-finding — handler-fiber parking is gated on fiber-level park routing:**
-today a park (`memory.wait`, a blocking read) parks the whole *vCPU*, so
-a handler that parked would wedge the very serve loop that must keep
-running to unblock it; §3.6's "the vCPU idles only if it has no other
-runnable fiber" presumes the §12 fiber-level-park substrate, which does
-not exist yet. Handlers therefore stay run-to-completion (a parking
-handler is a fail-closed `CapFault`), and handler-fiber admission lands
-with that substrate, not before.
+program order is call → results; rebind governs future calls. **[BUILT
+2026-07-22] §3.6 slice 5a — fiber-level park routing (the keystone).**
+A park inside a fiber now parks the **fiber**, not the vCPU (DESIGN.md
+"blocks the fiber, never the domain"), for the three parks a handler
+plausibly hits: futex `memory.wait`, a blocking stream read, and a
+live-callee call. Mechanism, per the pinned cooperative model (D56: no
+in-VM run-queue): the fiber's frames are set aside as a new
+`RegFiber::ParkedOn` event-park (not claimable until woken), a
+**fiber-keyed waiter** (`Waiter::Fiber`) replaces the boxed-vCPU entry
+in the same scheduler maps, and control unwinds one chain link to the
+resumer with a third `cont.resume` status — **`FIBER_PARKED` (3)**,
+extending suspended/returned exactly as `CORO_FAULTED` did. Re-resuming
+while blocked reports it again (the cooperative poll); the wake
+delivers the event's result onto the set-aside top frame and flips the
+fiber claimable, so the next resume continues it past the park with the
+result in place (the resume arg is deliberately not pushed). Park races
+close by register-then-recheck (an already-fired event insta-wakes;
+stale waiter entries are idempotent no-ops). Soundness: the GC roots
+scan walks `ParkedOn` frames; a durable freeze **fails closed** on one
+(its wake is host scheduler state no snapshot carries — durable
+event-parks are a follow-up); the deterministic explorer keeps
+whole-vCPU parks (interleavings stay explorable). Pinned by
+`fiber_parks.rs` — including the single-vCPU racing-fibers test: the
+root revokes a read *its own fiber* is parked in, and the fiber
+completes with the errno while the domain never stopped. `Join` stays a
+vCPU-level park (child-trap propagation into a parked fiber is its own
+design question); handler-fiber admission at the serve loop (5b) builds
+on this next.
 
 **[BUILT 2026-07-22] §3.6 backend parity — one oracle, identical
 behavior on all three backends.** The serve loop stays a **single

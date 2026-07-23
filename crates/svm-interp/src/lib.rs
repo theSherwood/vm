@@ -3446,6 +3446,13 @@ const FIBER_RETURNED: i32 = 1;
 /// Extra §14 coroutine-`resume` status: the child suspended on a **page fault** (its `(status, value)`
 /// is `(2, fault_addr)`) — the parent supplies the page and resumes (fault-driven yield / lazy paging).
 const CORO_FAULTED: i32 = 2;
+/// §3.6 slice 5a — the third `cont.resume` status (beside suspended/returned, extending the
+/// family exactly as [`CORO_FAULTED`] did): the fiber hit an event park (`memory.wait`, a
+/// blocking read, a live-callee call) and was set aside — **the fiber parked, not the vCPU**
+/// (DESIGN.md "blocks the fiber, never the domain"). The resumer proceeds; re-resuming while
+/// still blocked reports this again (a poll); after the event fires, a resume continues the
+/// fiber past its park with the event's result delivered.
+const FIBER_PARKED: i32 = 3;
 
 /// `<ty>.atomic.wait` status results (§12), matching wasm: woken by a notify / value mismatch / timed
 /// out.
@@ -3636,6 +3643,19 @@ struct Scheduler {
     max_workers: usize,
 }
 
+/// §3.6 slice 5a — one parked entity in a scheduler waiter map: a whole **vCPU** (the fiberless
+/// / root-level park, as always) or a single **fiber** (a fiber-level park — the vCPU moved on;
+/// only the fiber's continuation waits, in the registry's `ParkedOn` slot). A fiber wake flips
+/// the slot claimable with the event's result delivered ([`FiberRegistry::wake_blocked`]); a
+/// vCPU wake re-enqueues the box with a `Pending`, exactly as before.
+enum Waiter {
+    VCpu(Box<VCpu>),
+    Fiber {
+        reg: Arc<FiberRegistry>,
+        slot: usize,
+    },
+}
+
 #[derive(Default)]
 struct Sched {
     /// vCPUs ready to run.
@@ -3645,17 +3665,16 @@ struct Sched {
     /// A vCPU parked in `join`, keyed by the child it awaits.
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
-    wait_waiters: BTreeMap<FutexKey, Vec<(u64, Box<VCpu>)>>,
+    wait_waiters: BTreeMap<FutexKey, Vec<(u64, Waiter)>>,
     /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
     /// (§3.6 slice 1 — the handle → parked-fibers index revocation-unparks needs). Woken only by
     /// [`Scheduler::cap_revoke`] with a negative errno; the wait_waiters/notify pair is the template.
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
-    #[allow(clippy::vec_box)]
-    cap_waiters: BTreeMap<i32, Vec<Box<VCpu>>>,
+    cap_waiters: BTreeMap<i32, Vec<Waiter>>,
     /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by the dispatch
     /// ticket (exactly one caller per ticket; woken by [`Scheduler::cap_reply`] with the result).
-    ticket_waiters: BTreeMap<u64, Box<VCpu>>,
+    ticket_waiters: BTreeMap<u64, Waiter>,
     /// §3.6 slice 3 — serving fibers parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -3722,7 +3741,7 @@ impl Scheduler {
     /// Wake up to `count` vCPUs parked on `key`; return how many were woken.
     fn notify(&self, key: FutexKey, count: u32) -> u32 {
         let mut s = self.lock();
-        let mut woken: Vec<Box<VCpu>> = Vec::new();
+        let mut woken: Vec<Waiter> = Vec::new();
         if let Some(q) = s.wait_waiters.get_mut(&key) {
             while (woken.len() as u32) < count {
                 match q.pop() {
@@ -3735,9 +3754,18 @@ impl Scheduler {
             }
         }
         let n = woken.len() as u32;
-        for mut v in woken {
-            v.pending = Some(Pending::Wait(WAIT_WOKEN));
-            s.runnable.push_back(v);
+        for w in woken {
+            match w {
+                Waiter::VCpu(mut v) => {
+                    v.pending = Some(Pending::Wait(WAIT_WOKEN));
+                    s.runnable.push_back(v);
+                }
+                // §3.6 5a: a fiber-level waiter — deliver the status into its set-aside
+                // frames and make it claimable; its resumer re-admits it cooperatively.
+                Waiter::Fiber { reg, slot } => {
+                    reg.wake_blocked(slot, Reg::from_i32(WAIT_WOKEN));
+                }
+            }
         }
         if n > 0 {
             self.work.notify_all();
@@ -3754,9 +3782,16 @@ impl Scheduler {
         let mut s = self.lock();
         let woken = s.cap_waiters.remove(&handle).unwrap_or_default();
         let n = woken.len() as u32;
-        for mut v in woken {
-            v.pending = Some(Pending::CapResult(status));
-            s.runnable.push_back(v);
+        for w in woken {
+            match w {
+                Waiter::VCpu(mut v) => {
+                    v.pending = Some(Pending::CapResult(status));
+                    s.runnable.push_back(v);
+                }
+                Waiter::Fiber { reg, slot } => {
+                    reg.wake_blocked(slot, Reg::from_i64(status));
+                }
+            }
         }
         if n > 0 {
             self.work.notify_all();
@@ -3772,10 +3807,14 @@ impl Scheduler {
     fn cap_reply(&self, ticket: u64, result: i64) -> bool {
         let mut s = self.lock();
         match s.ticket_waiters.remove(&ticket) {
-            Some(mut v) => {
+            Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
                 s.runnable.push_back(v);
                 self.work.notify_all();
+                true
+            }
+            Some(Waiter::Fiber { reg, slot }) => {
+                reg.wake_blocked(slot, Reg::from_i64(result));
                 true
             }
             None => false,
@@ -3813,12 +3852,19 @@ fn process_timers(s: &mut Sched) {
                 woken = Some(q.remove(pos).1);
             }
         }
-        if let Some(mut v) = woken {
+        if let Some(w) = woken {
             if s.wait_waiters.get(&key).is_some_and(|q| q.is_empty()) {
                 s.wait_waiters.remove(&key);
             }
-            v.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
-            s.runnable.push_back(v);
+            match w {
+                Waiter::VCpu(mut v) => {
+                    v.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
+                    s.runnable.push_back(v);
+                }
+                Waiter::Fiber { reg, slot } => {
+                    reg.wake_blocked(slot, Reg::from_i32(WAIT_TIMED_OUT));
+                }
+            }
         }
     }
 }
@@ -4131,7 +4177,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let wid = s.next_wid;
                 s.next_wid += 1;
                 s.timers.push(Reverse((deadline, wid, key)));
-                s.wait_waiters.entry(key).or_default().push((wid, v));
+                s.wait_waiters
+                    .entry(key)
+                    .or_default()
+                    .push((wid, Waiter::VCpu(v)));
                 sched.work.notify_all(); // let idle workers recompute their timer deadline
             }
         }
@@ -4149,7 +4198,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 .unwrap_or_else(|e| e.into_inner())
                 .handle_live(handle);
             if live {
-                s.cap_waiters.entry(handle).or_default().push(v);
+                s.cap_waiters
+                    .entry(handle)
+                    .or_default()
+                    .push(Waiter::VCpu(v));
             } else {
                 v.pending = Some(Pending::CapResult(CAP_REVOKED));
                 s.runnable.push_back(v);
@@ -4173,7 +4225,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_one();
                 }
                 None => {
-                    s.ticket_waiters.insert(ticket, v);
+                    s.ticket_waiters.insert(ticket, Waiter::VCpu(v));
                 }
             }
         }
@@ -5123,6 +5175,13 @@ enum RegFiber {
     /// stored here, but only that claimant pops back into them — a foreign claim would alias a
     /// running computation).
     Running(Option<Vec<Frame>>),
+    /// §3.6 slice 5a — **event-parked** (a fiber-level park): blocked inside a capability or
+    /// futex park while running as a fiber. Unlike `Parked`, NOT claimable until its event
+    /// fires — a `cont.resume` of it reports `FIBER_PARKED` to the resumer without switching
+    /// (a poll). The wake pushes the event's result onto the set-aside top frame and flips
+    /// `woken`; a claim then delivers the frames **verbatim** (the result is already in place,
+    /// so the resumer's `arg` is deliberately not pushed).
+    ParkedOn { frames: Vec<Frame>, woken: bool },
     /// Returned: resuming it again traps. Slots are **not recycled** (matching both backends'
     /// historical tables, so handles stay dense and deterministic); recycling + the generation
     /// tag land with the JIT shared registry (3b-ii) so both backends adopt one policy together.
@@ -5140,6 +5199,12 @@ enum Claimed {
     Start { func: i32, sp: i64 },
     /// A `Parked` fiber: its reified call stack, ready to continue past its `suspend`.
     Live(Vec<Frame>),
+    /// A **woken** event-parked fiber ([`RegFiber::ParkedOn`]): frames verbatim — the wake
+    /// already delivered the park's result onto the top frame; do NOT push the resume arg.
+    LiveWoken(Vec<Frame>),
+    /// A **still-blocked** event-parked fiber: not a fault and not a claim — the resumer gets
+    /// `(FIBER_PARKED, 0)` without a switch (the cooperative poll).
+    StillParked,
 }
 
 /// The **run-shared fiber registry** (D57 step 3b-i, DESIGN.md §23): one
@@ -5326,10 +5391,54 @@ impl FiberRegistry {
         match std::mem::replace(&mut t.fibers[slot], RegFiber::Running(None)) {
             RegFiber::Pending { func, sp } => Ok((slot, Claimed::Start { func, sp })),
             RegFiber::Parked(f) => Ok((slot, Claimed::Live(f))),
+            // §3.6 slice 5a: a woken event-park continues verbatim (result already delivered);
+            // a still-blocked one is a poll — the resumer learns FIBER_PARKED, no switch.
+            RegFiber::ParkedOn {
+                frames,
+                woken: true,
+            } => Ok((slot, Claimed::LiveWoken(frames))),
+            old @ RegFiber::ParkedOn { woken: false, .. } => {
+                t.fibers[slot] = old;
+                Ok((slot, Claimed::StillParked))
+            }
             old => {
                 t.fibers[slot] = old; // lost: already running (or done) — put it back untouched
                 Err(Trap::FiberFault)
             }
+        }
+    }
+
+    /// §3.6 slice 5a — park the running fiber on an **event** (fiber-level park): its frames
+    /// are set aside, not claimable until [`FiberRegistry::wake_blocked`] flips it. The
+    /// suspend-shaped counterpart of [`FiberRegistry::park_suspended`] for parks the guest
+    /// did not choose.
+    fn park_blocked(&self, slot: usize, frames: Vec<Frame>) {
+        let mut t = self.lock();
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::ParkedOn {
+            frames,
+            woken: false,
+        };
+    }
+
+    /// §3.6 slice 5a — the event fired: deliver `result` onto the parked fiber's top frame
+    /// (the park op's return value, exactly what the `Pending` resume would have pushed) and
+    /// make it claimable. `false` if the slot is not a blocked park (already woken, freed —
+    /// the wake is then a no-op, matching every other idempotent wake path).
+    fn wake_blocked(&self, slot: usize, result: Reg) -> bool {
+        let mut t = self.lock();
+        match &mut t.fibers[slot] {
+            RegFiber::ParkedOn {
+                frames,
+                woken: woken @ false,
+            } => {
+                if let Some(f) = frames.last_mut() {
+                    f.vals.push(result);
+                }
+                *woken = true;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -5389,6 +5498,16 @@ impl FiberRegistry {
     /// Freeze driver (slice 3.1.4): take the lowest still-`Parked` fiber's frames and mark its slot
     /// `Frozen`, so the driver can flatten it into its shadow region and not revisit it. Returns
     /// `(slot, frames)`, or `None` once every fiber is flattened (no `Parked` slot remains).
+    /// §3.6 slice 5a — whether any fiber is **event-parked** (`ParkedOn`). A durable freeze
+    /// fails closed on one: its wake is host-side scheduler state (a waiter entry) that no
+    /// snapshot can carry — durable event-parks are a recorded follow-up.
+    fn has_blocked_parks(&self) -> bool {
+        self.lock()
+            .fibers
+            .iter()
+            .any(|f| matches!(f, RegFiber::ParkedOn { .. }))
+    }
+
     fn take_parked_for_freeze(&self) -> Option<(usize, Vec<Frame>)> {
         let mut t = self.lock();
         let slot = t
@@ -5920,6 +6039,11 @@ impl VCpu {
     /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
     /// is a 3.1.5/3.2 follow-up.
     fn freeze_drive(&mut self) -> Result<(), Trap> {
+        // §3.6 slice 5a: an event-parked fiber cannot freeze (its wake lives in host scheduler
+        // state no snapshot carries) — fail the freeze closed rather than drop the park.
+        if self.registry.has_blocked_parks() {
+            return Err(Trap::FiberFault);
+        }
         // §12.8 4A.5: this vCPU's root region word (where the root's SP lives); restored at the end so
         // the window is thaw-ready (the root rewinds first).
         let root_word = shadow_region_base(self.vcpu_ctx);
@@ -6259,6 +6383,44 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // host dispatch) are shared between their two dispatch forms — the resolved
             // `cap.call` and the phase-3 executable `call.import` routed through the
             // instance binding — as local macros, so the special semantics exist once.
+            // §3.6 slice 5a — fiber-level park routing (DESIGN.md: "blocks the fiber, never
+            // the domain"). When a park happens while a FIBER runs (and the real M:N
+            // scheduler is driving — the deterministic explorer keeps whole-vCPU parks so
+            // interleavings stay explorable), the fiber's frames are set aside as an event
+            // park, a fiber-keyed waiter is registered and the event re-checked (a race that
+            // already fired wakes the fiber immediately; a stale waiter entry is an
+            // idempotent no-op later), and control unwinds one chain link to the resumer
+            // with `(FIBER_PARKED, 0)` — exactly a `suspend` the guest didn't write. The
+            // vCPU keeps running; it idles only when nothing in its chain is runnable.
+            macro_rules! fiber_park {
+                ($register_and_recheck:expr) => {{
+                    let leaving = *cur;
+                    registry.park_blocked(leaving, std::mem::take(frames));
+                    ($register_and_recheck)(leaving);
+                    chain.pop();
+                    *cur = *chain.last().expect("chain keeps the root");
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
+                    *frames = if *cur == ROOT_FIBER {
+                        root_parked.take().ok_or(Trap::Malformed)?
+                    } else {
+                        registry.unpark_resumer(*cur)?
+                    };
+                    *parked_frames -= frames.len();
+                    let rtop = frames.len() - 1;
+                    frames[rtop].vals.push(Reg::from_i32(FIBER_PARKED));
+                    frames[rtop].vals.push(Reg::from_i64(0));
+                    continue 'frames;
+                }};
+            }
             macro_rules! jit_install_body {
                 ($h:expr, $args:expr) => {{
                     let ch =
@@ -7371,6 +7533,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         match ticket {
                             Some(t) => {
                                 sched.svc_wake(Arc::as_ptr(&callee) as usize);
+                                if *cur != ROOT_FIBER {
+                                    if let SchedRef::Real(sr) = sched {
+                                        let regc = Arc::clone(registry);
+                                        let calleec = Arc::clone(&callee);
+                                        fiber_park!(|slot: usize| {
+                                            let mut sg = sr.lock();
+                                            sg.ticket_waiters.insert(
+                                                t,
+                                                Waiter::Fiber {
+                                                    reg: Arc::clone(&regc),
+                                                    slot,
+                                                },
+                                            );
+                                            drop(sg);
+                                            let early = calleec
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .svc_results
+                                                .remove(&t);
+                                            if let Some(r) = early {
+                                                regc.wake_blocked(slot, Reg::from_i64(r));
+                                            }
+                                        });
+                                    }
+                                }
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
@@ -7392,6 +7579,27 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     //     discarded; the wake delivers the real one via `Pending::CapResult`);
                     if hg.take_stdin_parked() {
                         drop(hg);
+                        if *cur != ROOT_FIBER {
+                            if let SchedRef::Real(sr) = sched {
+                                let regc = Arc::clone(registry);
+                                let hostc = Arc::clone(host);
+                                fiber_park!(|slot: usize| {
+                                    let mut sg = sr.lock();
+                                    sg.cap_waiters.entry(h).or_default().push(Waiter::Fiber {
+                                        reg: Arc::clone(&regc),
+                                        slot,
+                                    });
+                                    drop(sg);
+                                    let live = hostc
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .handle_live(h);
+                                    if !live {
+                                        regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
+                                    }
+                                });
+                            }
+                        }
                         return Ok(Inner::Park(Blocked::CapRead { handle: h }));
                     }
                     // (b) a `Stream.close` that just revoked `h` wakes every sibling fiber
@@ -7465,6 +7673,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         match ticket {
                             Some(t) => {
                                 sched.svc_wake(Arc::as_ptr(&callee) as usize);
+                                if *cur != ROOT_FIBER {
+                                    if let SchedRef::Real(sr) = sched {
+                                        let regc = Arc::clone(registry);
+                                        let calleec = Arc::clone(&callee);
+                                        fiber_park!(|slot: usize| {
+                                            let mut sg = sr.lock();
+                                            sg.ticket_waiters.insert(
+                                                t,
+                                                Waiter::Fiber {
+                                                    reg: Arc::clone(&regc),
+                                                    slot,
+                                                },
+                                            );
+                                            drop(sg);
+                                            let early = calleec
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .svc_results
+                                                .remove(&t);
+                                            if let Some(r) = early {
+                                                regc.wake_blocked(slot, Reg::from_i64(r));
+                                            }
+                                        });
+                                    }
+                                }
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
@@ -7727,6 +7960,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 .push(Reg::from_i64(av));
                             f
                         }
+                        // §3.6 slice 5a: a woken event-park continues verbatim — its park op's
+                        // result was already delivered by the wake; the resume arg is not pushed.
+                        Claimed::LiveWoken(f) => f,
+                        // §3.6 slice 5a: still blocked — the cooperative poll. Report
+                        // `(FIBER_PARKED, 0)` to the resumer without switching.
+                        Claimed::StillParked => {
+                            frames[top].vals.push(Reg::from_i32(FIBER_PARKED));
+                            frames[top].vals.push(Reg::from_i64(0));
+                            continue;
+                        }
                     };
                     // Park the resumer — it stays claimed (`Running`), since an ancestor in a
                     // resume chain is never stealable — and switch to the target.
@@ -7867,7 +8110,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gc_scan_frames(rp, lo, hi, mask, &mut roots);
                     }
                     for fib in registry.lock().fibers.iter() {
-                        if let RegFiber::Parked(f) | RegFiber::Running(Some(f)) = fib {
+                        if let RegFiber::Parked(f)
+                        | RegFiber::Running(Some(f))
+                        | RegFiber::ParkedOn { frames: f, .. } = fib
+                        {
                             gc_scan_frames(f, lo, hi, mask, &mut roots);
                         }
                     }
@@ -8008,6 +8254,32 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         Duration::from_nanos(to_ns as u64).min(MAX_WAIT)
                     };
+                    if *cur != ROOT_FIBER {
+                        if let SchedRef::Real(sr) = sched {
+                            let regc = Arc::clone(registry);
+                            fiber_park!(|slot: usize| {
+                                let mut sg = sr.lock();
+                                let wid = sg.next_wid;
+                                sg.next_wid += 1;
+                                sg.timers.push(Reverse((Instant::now() + wait, wid, key)));
+                                sg.wait_waiters.entry(key).or_default().push((
+                                    wid,
+                                    Waiter::Fiber {
+                                        reg: Arc::clone(&regc),
+                                        slot,
+                                    },
+                                ));
+                                // Compare-under-lock: a value that already changed wakes the
+                                // fiber immediately with the not-equal status.
+                                let curv = mem.as_ref().map_or(0, |mm| mm.atomic_value(a, width));
+                                drop(sg);
+                                if curv != exp {
+                                    regc.wake_blocked(slot, Reg::from_i32(WAIT_NOT_EQUAL));
+                                }
+                                sr.work.notify_all(); // idle workers recompute timer deadlines
+                            });
+                        }
+                    }
                     return Ok(Inner::Park(Blocked::Wait {
                         key,
                         addr: base,
