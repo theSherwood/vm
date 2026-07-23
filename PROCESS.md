@@ -304,8 +304,12 @@ the 2026-era sketch:
 1. **Guest-side self-mint**: a domain minting a client cap over its *own*
    impl-export to hand to a peer (`export.handle` reifies the *passive* form
    today; the live form is "`export.handle` but `Binding::LiveImpl` at me").
-   With §3.3 regrant policies this closes sibling-as-service: parent mints
-   A's live offer, grants it into B.
+   **The parent-mediated form is BUILT (2026-07-23)**: a live offer re-grants
+   into a spawned child (op 8/11/13 named grants cover `Binding::LiveImpl`),
+   so sibling-as-service works through the grant graph today — parent mints
+   A's live offer, grants it into B, B calls A (pinned in
+   `svc_serve_loop.rs`). Self-mint proper (the distrust-parent variant)
+   remains the residue.
 2. **The serve/reply *split* question**: the proposal's explicit
    `(caller, op, args) … reply(caller, result)` lets one fiber multiplex many
    in-flight calls without fiber-per-handler. §3.6 answered this differently

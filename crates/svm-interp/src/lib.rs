@@ -11112,10 +11112,13 @@ pub const CAP_SELF_SVC_POLL: u32 = 9;
 pub const CAP_SELF_SVC_WAIT: u32 = 10;
 
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
-/// + the target impl-export. Index-carried so `Binding` stays `Copy`.
+/// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's
+/// **shape** (fetched from the callee's module at wire time) so a re-grant into another
+/// powerbox can intern it there without touching the callee's lock.
 struct LiveImplEntry {
     callee: Arc<Mutex<Host>>,
     export: u32,
+    sigs: Arc<[FuncType]>,
 }
 
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
@@ -12610,13 +12613,37 @@ impl Host {
         export: u32,
         sigs: &[FuncType],
     ) -> Result<i32, Trap> {
-        let type_id = self.intern_interface(sigs);
+        Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into()))
+    }
+
+    /// Install a live-callee offer entry + grant its handle — shared by the wire
+    /// ([`Host::wire_live_impl`]) and the child re-grant ([`Host::regrant_into_child`]), so
+    /// the two mint identical bindings.
+    fn install_live_impl(
+        &mut self,
+        callee: Arc<Mutex<Host>>,
+        export: u32,
+        sigs: Arc<[FuncType]>,
+    ) -> i32 {
+        let type_id = self.intern_interface(&sigs);
         let idx = self.live_impls.len() as u32;
         self.live_impls.push(LiveImplEntry {
-            callee: Arc::clone(callee),
+            callee,
             export,
+            sigs,
         });
-        Ok(self.grant(type_id, Binding::LiveImpl(idx)))
+        self.grant(type_id, Binding::LiveImpl(idx))
+    }
+
+    /// Resolve `handle` as a live-callee offer, whatever its interface type — the re-grant
+    /// path's lookup (which has only the handle, not the interned id). `None` for anything
+    /// else, including forged handles.
+    fn resolve_live_impl(&self, handle: i32) -> Option<&LiveImplEntry> {
+        let tid = self.type_id_of(handle)?;
+        match self.resolve(handle, tid).ok()? {
+            Binding::LiveImpl(i) => self.live_impls.get(i as usize),
+            _ => None,
+        }
     }
 
     /// §3.6 slice 4 — the live-callee target behind import slot `i`, iff the slot is bound to a
@@ -13415,6 +13442,7 @@ impl Host {
     /// closed *before* any child state is built.
     fn can_regrant(&self, handle: i32) -> bool {
         self.resolve_pipe_end(handle).is_some()
+            || self.resolve_live_impl(handle).is_some()
             || self.resolve_guest_impl(handle).is_ok()
             || self.resolve_copyable(handle).is_ok()
     }
@@ -13428,6 +13456,15 @@ impl Host {
     fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
         if let Some((write, backing)) = self.resolve_pipe_end(handle) {
             return Some(child.install_pipe_end(write, backing));
+        }
+        // §3.6 sibling-as-service: re-granting a **live-callee offer** wires the SAME running
+        // domain into the child — the child's calls enqueue on the original callee (park,
+        // serve, reply, all as-built), so two siblings coordinate through a live peer their
+        // parent introduced. The shape rides the entry (captured at wire), so the child-side
+        // intern never touches the callee's lock.
+        if let Some(e) = self.resolve_live_impl(handle) {
+            let (callee, export, sigs) = (Arc::clone(&e.callee), e.export, Arc::clone(&e.sigs));
+            return Some(child.install_live_impl(callee, export, sigs));
         }
         // A **wired interface offer** (IMPORTS.md §3.2/§3.3): re-granting it is how a parent
         // forwards, wraps, or overrides a capability for a child — the entry (shared function

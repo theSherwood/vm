@@ -1549,6 +1549,22 @@ op 14 of its own) keeps the JIT — where the child's `svc.*` answers
 the probeable refusal instead of serving. Any parent that actually
 *talks* to the child contains op 14 and folds to the oracle.
 
+**[BUILT 2026-07-23] §3.6 — sibling-as-service (live-offer re-grant).**
+A live-callee offer is now **re-grantable into a spawned child**
+(`can_regrant`/`regrant_into_child` cover `Binding::LiveImpl`): the
+parent takes `child_offer` over serving child A and hands the cap to
+child B at spawn (op 8/11/13 named grants), where it is installed
+against B's own powerbox — the shape rides the `LiveImplEntry`
+(captured at wire time), so the child-side intern never touches the
+callee's lock. B resolves it by name and calls: enqueue on A, park B,
+A serves, reply wakes B — **two siblings coordinating through a live
+peer their parent introduced**, no shared memory, no parent relay.
+This closes the S9 sibling-as-service topology through the grant
+graph (PROCESS.md §4 rescope); guest-side *self*-mint (a domain
+minting its own live offer, the distrust-parent variant) remains the
+recorded residue. Pinned by `svc_serve_loop.rs`
+(`a_sibling_calls_a_sibling_through_a_regranted_live_offer`, 142).
+
 ---
 
 ## 4. Interactions with settled decisions

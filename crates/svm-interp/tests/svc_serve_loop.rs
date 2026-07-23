@@ -466,6 +466,102 @@ fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
     );
 }
 
+/// §3.6 — **sibling-as-service**: the parent spawns serving child A, takes a live offer over
+/// it (`child_offer`), and re-grants that cap into child B at spawn (`instantiate_named`,
+/// op 11 — the grant record's handle field is stored at runtime). B discovers it by
+/// `cap.self.resolve("adder")` in its OWN powerbox (the re-grant interned the shape there —
+/// B's first guest intern, `GUEST_IMPL_BASE`) and calls through it: the call enqueues on A,
+/// parks B's vCPU, A's `svc.wait` serves `add(40, 2)`, and the reply wakes B — two siblings
+/// coordinating through a live peer their parent introduced, no shared memory, no parent
+/// relay. Composite: join(A=1)*100 + join(B=42) = 142.
+const SIBLING_AS_SERVICE: &str = r#"
+memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 3 }
+data 200 "adder"
+
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ve1 = i64.const 1
+  voffA = i64.const 65536
+  vlog = i64.const 12
+  vq = i64.const 0
+  vA = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve1, voffA, vlog, vq)
+  vz = i64.const 0
+  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vA, vz)
+  va1 = i64.const 256
+  vv1 = i32.const 200
+  i32.store va1 vv1
+  va2 = i64.const 260
+  vv2 = i32.const 5
+  i32.store va2 vv2
+  va3 = i64.const 264
+  i32.store va3 vcap
+  vgp = i64.const 256
+  vgn = i64.const 1
+  ve2 = i64.const 2
+  voffB = i64.const 69632
+  vB = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve2, voffB, vlog, vq)
+  vjB = cap.call 6 1 (i32) -> (i64) v0 (vB)
+  vjA = cap.call 6 1 (i32) -> (i64) v0 (vA)
+  vk = i64.const 100
+  vm = i64.mul vjA vk
+  vs = i64.add vm vjB
+  return vs
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnm = i64.const 491327349857
+  vza = i64.const 0
+  i64.store vza vnm
+  vp = i64.const 0
+  vl = i64.const 5
+  vh = cap.self.resolve vp vl
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) vh (va, vb)
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_sibling_calls_a_sibling_through_a_regranted_live_offer() {
+    let m = Arc::new({
+        let m = svm_text::parse_module(SIBLING_AS_SERVICE).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        m
+    });
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let h = host.grant_instantiator(0, 1u64 << 17);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(142)],
+        "B's call parked, A served, the reply woke B — through a parent-regranted live offer"
+    );
+}
+
 #[test]
 fn a_caller_parks_on_a_live_child_and_wakes_with_the_reply() {
     let m = Arc::new({
