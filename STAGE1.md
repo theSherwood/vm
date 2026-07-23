@@ -236,9 +236,13 @@ keystone of self-similarity. It is **not built**. Until it lands:
    and waking each other — the shape sequential spawn/wait deadlocks on
    outright. Regressions surface loudly (30 s wait timeouts fold into the
    result ×1000), and the run completes in well under a second — real wakes.
-   **Remaining for this item:** the JIT pipeline (aliasing a `SharedRegion`
-   into a *separate child window* is the S1c deferred deep-PAL piece) and the
-   `c_shell` personality `|` wiring over rings — both in TODO.md.
+   Also pinned: the same ring between two **detached** stages (op-15 spawns —
+   private windows + the explicit shared channel compose, the §5 model
+   sentence as a test) and bytecode-entry equality via the standing oracle
+   fallback. **Remaining for this item:** the JIT pipeline (aliasing a
+   `SharedRegion` into a *separate child window* is the S1c deferred deep-PAL
+   piece) and the `c_shell` personality `|` wiring over rings — both in
+   TODO.md.
 7. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
    piece for shells that fork *themselves*.
 

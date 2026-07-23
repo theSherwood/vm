@@ -176,6 +176,220 @@ block 5 (vsum: i64, vtos: i64) {
 }
 "#;
 
+/// The **detached** variant — the §5 model sentence as a test ("a shell would plausibly run
+/// coreutils detached"): the same one-slot ring, but the two stages are spawned through a
+/// `WindowMinter` (op 15) from their own module into windows the parent cannot read. The
+/// region grant rides the same op-11-format named-grant records; the module's own data
+/// segment carries the `"ring"` name into each private window. Private memory and an
+/// explicit shared channel compose — exactly the separate-process discipline, in-process.
+const DETACHED_STAGES: &str = r#"
+memory 15
+data 0 "ring"
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vp = i64.const 0
+  vl = i64.const 4
+  vh = cap.self.resolve vp vl
+  vg = cap.call 4 3 () -> (i64) vh ()
+  vroff = i64.const 0
+  vprot = i32.const 3
+  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vone = i64.const 1
+  br 1(vone, vroff)
+  }
+block 1 (vi: i64, vtos: i64) {
+  vfour = i64.const 4
+  vdone = i64.lt_s vfour vi
+  br_if vdone 5(vtos) 2(vi, vtos)
+  }
+block 2 (vi: i64, vtos: i64) {
+  vfa = i64.const 0
+  vf = i32.load vfa
+  br_if vf 3(vi, vtos) 4(vi, vtos)
+  }
+block 3 (vi: i64, vtos: i64) {
+  vfa = i64.const 0
+  vexp = i32.const 1
+  vto = i64.const 30000000000
+  vst = i32.atomic.wait vfa vexp vto
+  vtwo = i32.const 2
+  vis = i32.eq vst vtwo
+  vis64 = i64.extend_i32_u vis
+  vtos2 = i64.add vtos vis64
+  br 2(vi, vtos2)
+  }
+block 4 (vi: i64, vtos: i64) {
+  vda = i64.const 8
+  i64.store vda vi
+  vfa = i64.const 0
+  vfull = i32.const 1
+  i32.store vfa vfull
+  vcnt = i32.const 1
+  vw = atomic.notify vfa vcnt
+  vone = i64.const 1
+  vni = i64.add vi vone
+  br 1(vni, vtos)
+  }
+block 5 (vtos: i64) {
+  vk = i64.const 1000
+  vm = i64.mul vtos vk
+  vfour = i64.const 4
+  vr = i64.add vm vfour
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vp = i64.const 0
+  vl = i64.const 4
+  vh = cap.self.resolve vp vl
+  vg = cap.call 4 3 () -> (i64) vh ()
+  vroff = i64.const 0
+  vprot = i32.const 3
+  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vone = i64.const 1
+  br 1(vone, vroff, vroff)
+  }
+block 1 (vn: i64, vsum: i64, vtos: i64) {
+  vfour = i64.const 4
+  vdone = i64.lt_s vfour vn
+  br_if vdone 5(vsum, vtos) 2(vn, vsum, vtos)
+  }
+block 2 (vn: i64, vsum: i64, vtos: i64) {
+  vfa = i64.const 0
+  vf = i32.load vfa
+  br_if vf 4(vn, vsum, vtos) 3(vn, vsum, vtos)
+  }
+block 3 (vn: i64, vsum: i64, vtos: i64) {
+  vfa = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const 30000000000
+  vst = i32.atomic.wait vfa vexp vto
+  vtwo = i32.const 2
+  vis = i32.eq vst vtwo
+  vis64 = i64.extend_i32_u vis
+  vtos2 = i64.add vtos vis64
+  br 2(vn, vsum, vtos2)
+  }
+block 4 (vn: i64, vsum: i64, vtos: i64) {
+  vda = i64.const 8
+  vd = i64.load vda
+  vsum2 = i64.add vsum vd
+  vfa = i64.const 0
+  vempty = i32.const 0
+  i32.store vfa vempty
+  vcnt = i32.const 1
+  vw = atomic.notify vfa vcnt
+  vone = i64.const 1
+  vnn = i64.add vn vone
+  br 1(vnn, vsum2, vtos)
+  }
+block 5 (vsum: i64, vtos: i64) {
+  vk = i64.const 1000
+  vm = i64.mul vtos vk
+  vr = i64.add vm vsum
+  return vr
+  }
+}
+"#;
+
+/// The detached-pipeline parent: mint the region, build the grant record, spawn producer
+/// (entry 0) and consumer (entry 1) DETACHED from the granted module, join both → 410.
+const DETACHED_PIPELINE_PARENT: &str = r#"
+memory 17
+data 200 "ring"
+
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+  vlen = i64.const 32768
+  vrh64 = cap.call 5 5 (i64) -> (i64) v1 (vlen)
+  vrh = i32.wrap_i64 vrh64
+  va1 = i64.const 256
+  vv1 = i32.const 200
+  i32.store va1 vv1
+  va2 = i64.const 260
+  vv2 = i32.const 4
+  i32.store va2 vv2
+  va3 = i64.const 264
+  i32.store va3 vrh
+  vmh = i64.extend_i32_u v2
+  vmin = i64.extend_i32_u v3
+  vgp = i64.const 256
+  vgn = i64.const 1
+  ve0 = i64.const 0
+  ve1 = i64.const 1
+  vlog = i64.const 15
+  vq = i64.const 0
+  vp = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve0, vlog, vq)
+  vc = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve1, vlog, vq)
+  vjp = cap.call 6 1 (i32) -> (i64) v0 (vp)
+  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vk = i64.const 100
+  vm = i64.mul vjp vk
+  vs = i64.add vm vjc
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn two_detached_stages_pipe_through_a_shared_region_ring() {
+    let a = svm_text::parse_module(DETACHED_PIPELINE_PARENT).expect("parse parent");
+    svm_verify::verify_module(&a).expect("verify parent");
+    let b = svm_text::parse_module(DETACHED_STAGES).expect("parse stages");
+    svm_verify::verify_module(&b).expect("verify stages");
+    let mut host = Host::new();
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let ha = host.grant_address_space(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let hw = host.grant_window_minter(2 << 15); // exactly two 2^15 windows
+    let mut fuel = 50_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[
+            Value::I32(hi),
+            Value::I32(ha),
+            Value::I32(hm),
+            Value::I32(hw),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("no trap, no hang");
+    assert_eq!(
+        r,
+        vec![Value::I64(410)],
+        "the same ring, between two windows nobody's parent can read — private memory \
+         and an explicit shared channel compose"
+    );
+}
+
+/// The bytecode entry serves the pipeline identically via the standing oracle fallback
+/// (Instantiator ops decline to compile → whole-module tree-walk).
+#[test]
+fn the_bytecode_entry_runs_the_pipeline_identically() {
+    let m = svm_text::parse_module(PIPELINE).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let m = Arc::new(m);
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let ha = host.grant_address_space(0, 1u64 << 17);
+    let mut fuel = 50_000_000u64;
+    let r = svm_interp::run_with_host_fast(
+        &m,
+        0,
+        &[Value::I32(hi), Value::I32(ha)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("no trap, no hang");
+    assert_eq!(r, vec![Value::I64(410)], "identical to the tree-walk run");
+}
+
 #[test]
 fn two_concurrent_children_pipe_through_a_shared_region_ring() {
     let m = svm_text::parse_module(PIPELINE).expect("parse");
