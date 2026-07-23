@@ -13,6 +13,38 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I35 — chibicc miscompile (unreduced): an indexed array store through a post-incremented counter inside a capability-enumeration loop read back zeros (S3) — seen 2026-07-23, building the c_shell `__stage` ring runner
+
+**Where:** guest C compiled by the chibicc frontend (`--child-entry`). The `__stage` filter
+runner's grant-discovery loop originally read
+
+```c
+int regs[2]; int nregs = 0;
+int n = __vm_cap_count();
+for (int i = 0; i < n; i++) {
+  int t = 0;
+  int h = __vm_cap_at(i, &t);
+  if (t == 4 && nregs < 2) regs[nregs++] = h;
+}
+```
+
+and `regs[0]`/`regs[1]` later read back **0** (both) even though `nregs` correctly reached 2 and
+an *inline* re-enumeration in the same function saw the right handles/types — so the powerbox and
+`cap.self.get` are fine; the `regs[nregs++] = h` stores are what went missing. A **minimal**
+probe (straight-line `a[n++] = 7; a[n++] = 9;` in a `--child-entry` `main`) compiles *correctly*
+(the emitted IR increments and indexes right), so the bug needs more of the surrounding shape —
+suspects: the loop back-edge interaction with the promote-scalars pass on `nregs`, the
+address-taken `&t` neighbor, or the local (frame-relocated) array in a `main(argc, argv)` child.
+Not reduced further.
+
+**Workaround (in-tree):** the runner uses explicit slot picks (`if (nregs == 0) regs[0] = h; else
+if (nregs == 1) regs[1] = h; nregs = nregs + 1;`) on `static` storage — see
+`crates/svm/tests/c_shell.rs` (`STAGE_RUNNER_MAIN`), which carries a pointer to this entry.
+
+**Fix sketch:** reduce by re-adding the original shape piecewise (loop, `&t`, local vs static
+array, `--child-entry` argv frame) against the emitted IR diff; the defect is frontend-only
+(codegen_ir.c), no VM/TCB involvement.
+
 ### I34 — CI flake: `apt-get install gcc-mingw-w64-x86-64` stalled ~29 min on the `fiber-scaling (stack-check + arena-stacks)` job until the run was cancelled (S4) — seen 2026-07-23, PR #422 run 30027500683
 
 **Where:** the ubuntu-latest job's mingw cross-toolchain install step (for the

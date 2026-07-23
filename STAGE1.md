@@ -261,8 +261,36 @@ keystone of self-similarity. It is **not built**. Until it lands:
    **parent's shared futex table** (spawn/join/fibers stay rejected;
    `Func::uses_fibers_or_threads`/`uses_futex` split `uses_concurrency`).
    Spawned children register in the domain's live count so wait/join deadlock
-   detection stays sound. **Remaining for this item:** the `c_shell`
-   personality `|` wiring over rings — in TODO.md.
+   detection stays sound.
+
+   **[BUILT 2026-07-23 — the `c_shell` personality `|` wiring.]** The Stage-0
+   shell's `run_pipeline` now runs eligible pipelines **concurrently over
+   rings** (`crates/svm/tests/c_shell.rs`): when every stage after the first is
+   a pure filter and the `__stage` runner is on PATH, the shell mints one
+   region per `|`, spawns each later stage as an op-13 child of the runner
+   (grants: `stdout` + input ring + output ring by name), runs stage 0 *in the
+   shell* (full builtin power — files, redirects, globs) pumping into ring 0
+   through its own mapped alias, and joins the children; the status is the
+   last stage's, as in bash. The ring is a byte SPSC FIFO in the region
+   (head/tail/done/reader-closed words + data), parking on real futexes with
+   the loud 5 s-timeout bail; `head`'s early exit sets reader-closed so its
+   producer stops (SIGPIPE-lite) instead of wedging. The `__stage` runner is
+   an ordinary `--child-entry` C program — grants discovered by `cap.self`
+   reflection, rings mapped with the `__vm_region_*` builtins into its own
+   256 KiB window, filters (`cat`/`grep [-v -c]`/`wc`/`head`/`tail`/`sort`/
+   `uniq`) byte-matching the shell's builtins — and holds no memfs capability
+   at all, which is exactly why only pure filters ride the ring path:
+   anything else (redirects, `$`/glob tokens, file args, >4 stages, no runner
+   registered) **falls back** to the sequential memfs-temp staging with
+   identical semantics. Zero substrate change — the slice is personality glue
+   over #422/#424's regions-into-children + async op-13 children + shared
+   futex. Pinned differentially interp==JIT: a 3-stage `cat|sort|uniq`, a
+   4-stage pipeline with ring→ring middles, `grep` status into `$?` from a
+   ring child, `grep -c`, `head` early-exit, and the redirect fallback
+   coexisting with ring runs in one script. (Found on the way: a chibicc
+   indexed-post-increment-store miscompile, worked around and logged —
+   ISSUES.md I35.) **Remaining:** redirects on external commands stay
+   Power-2-gated (the Endpoint work), below.
 7. **`fork`/`clone`** — the parked-domain clone path (PROCESS.md §7), the last
    piece for shells that fork *themselves*.
 
