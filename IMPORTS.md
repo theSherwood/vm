@@ -1486,6 +1486,41 @@ so it waits for benchmark evidence (jacl workloads) or settled
 semantics, whichever demands it first; the oracle fold is the baseline
 any native port will be differential-tested against.
 
+**[BUILT 2026-07-23] §3.6 slice 5b — handler-fiber parking at the serve
+loop.** Handlers now run as **fibers of the serving vCPU** (a registry
+slot per dispatch, recycled on finish, bounded by the §15 fiber quota —
+exhaustion is `-EAGAIN` backpressure to the dispatch, never a trap), so
+a handler that blocks rides slice 5a's park routing: a park suspends
+the *dispatch*, never the domain. The serve arm is a **rewind-driven
+state machine** — one fiber switch per execution, the serve frame
+rewound and parked as the handler's resumer, state carried in
+`serve_run`/`handler_parks`/`serve_count` on the vCPU — where
+`FIBER_RETURNED` replies and counts, **`FIBER_PARKED` is a
+completed-but-not-replied dispatch** (its caller stays parked in
+`ticket_waiters`, its completion cell stays empty; the serve loop moves
+on to the next dispatch), and a handler `suspend` is a `FiberFault`
+(no resumer to receive its yield). Parked handlers are re-claimed on
+every re-execution — still-blocked ones are put back (the `ParkedOn`
+poll), a woken one resumes before new admissions and its return finally
+replies. `Waiter::Fiber` now carries its **domain key**, so every
+fiber wake also `svc_wake`s the domain: a `svc.wait` parked with
+in-flight handlers (no progress, empty queue) is re-admitted by the
+handler's wake, not just by an enqueue — `svc.wait` returns once
+progress is made. A nested `svc.*` from *under* a running handler is a
+probeable `-EINVAL` (the serve loop is the domain's outermost
+dispatcher; re-entry into a domain is a fresh dispatch, never a nested
+drain). Soundness inherited whole from 5a: parked-handler frames are
+`ParkedOn` registry state, so the GC roots scan walks them, a durable
+freeze fails closed on them, and the single-root checkpoint now also
+refuses while any event-park exists. Pinned by `svc_handler_parks.rs`,
+all single-vCPU: park-then-wake across dispatches (one world, ordered),
+the racing-**handlers** revocation (a sibling dispatch closes the
+handle a parked handler reads — D37 turned inward inside one serve
+loop), the timer wake re-admitting a `svc.wait`-parked loop, the
+nested-serve refusal, and the suspend fault. With this, the §3.6 core
+loop is semantically complete on the oracle: callers park, servers
+serve, handlers park, and nothing blocks a domain but its own choice.
+
 ---
 
 ## 4. Interactions with settled decisions
