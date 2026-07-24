@@ -159,9 +159,10 @@ all three backends, for memory-safety validation and cache/page-fault scoring; a
 | `svm-mem` | Shared guest-memory substrate (§12/§13) — owns the memory `unsafe` behind a safe API (audited in isolation, like `svm-mask`), so the interpreter stays `forbid(unsafe_code)` | escape-TCB |
 | `svm-encode` | Binary encode + **decode** (untrusted-input-facing) (§3a) | escape-TCB |
 | `svm-verify` | The verifier — single linear pass, fail-closed (§2a I2/I3/I4; §3b) | escape-TCB |
-| `svm-interp` | Two of the three IR backends: the **tree-walk interpreter** (the differential oracle, §18) and the **bytecode interpreter** (`bytecode.rs` — the JIT-not-viable / wasm64 fallback). All three backends must agree (§3 parity invariant) | — |
+| `svm-interp` | Two of the four IR backends: the **tree-walk interpreter** (the differential oracle, §18) and the **bytecode interpreter** (`bytecode.rs` — the portable / JIT-not-viable path, incl. the wasm64 browser platform). All four backends must agree (§3 parity invariant) | — |
 | `svm-fiber` | Native stack-switch primitive for fibers / green threads (§3d/§6/§12); the lone home for that `unsafe`, tiny and auditable (x86-64 + aarch64 unix, x86-64 Windows) | escape-TCB |
-| `svm-jit` | Cranelift JIT — CLIF lowering + the §4 masking lowering + guard page/signal (§9) | escape-TCB† |
+| `svm-jit` | **Cranelift JIT** (backend 3, the native speed path) — CLIF lowering + the §4 masking lowering + guard page/signal (§9). By convention bare "JIT" means *this* one | escape-TCB† |
+| `svm-wasmjit` | **wasm-JIT** (backend 4; canonical crate name `svm-wasm-jit`, rename pending) — emits WebAssembly from the IR so hot compute runs on a wasm engine (§21, `BROWSER.md`); a leaf accelerator under the bytecode interpreter, fail-closed to it | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm-wasm` | **Core-wasm → IR transpiler** — a second frontend (untrusted, re-verified); stack→SSA reconstruction (`WASM.md`) | — |
 | `svm-llvm` | **LLVM-bitcode → IR translator** — the AOT LLVM on-ramp (untrusted, re-verified); dominance-SSA → block-args (§20a, D54; `LLVM.md`) | — |
@@ -180,7 +181,7 @@ all three backends, for memory-safety validation and cache/page-fault scoring; a
 | `svm-webgpu` | Headless **WebGPU compute** capability — host holds a real GPU via `wgpu` (`LLVM.md`; workspace-excluded) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
 | `svm-run` | Embedding runtime + **`svm-run` CLI**: instantiate with the powerbox, run on the JIT | — |
-| `browser/` | The bytecode interpreter compiled to **wasm64** — run SVM guests client-side (`BROWSER.md`) | — |
+| `browser/` | The **browser platform**: the bytecode interpreter (backend 2) compiled to **wasm64** to run SVM guests client-side, hosting the **wasm-JIT** (backend 4) for hot compute (`BROWSER.md`). Not a separate backend — backend 2 on a wasm host | — |
 | `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
 
 †`svm-jit` is escape-TCB but, by design (§1), shares Wasmtime's codegen — so unlike

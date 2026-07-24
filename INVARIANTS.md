@@ -76,13 +76,17 @@ carry payloads, or any hot path routed through handlers. (F6; I39; the c_shell r
 
 ## 9. The interpreter is the oracle; decline, never diverge
 
-The tree-walker defines **guest-observable semantics** — results, traps, errnos, memory;
-fast backends run only what they can run identically and **decline the rest** (compile
-vetoes, routing folds — one shared predicate, one definition) back to the oracle. Anything a
-backend or a step can't handle refuses probeably or falls back — it never runs wrong and
-never hangs where refusal is possible. Differential tests gate every backend feature.
+The tree-walk interpreter defines **guest-observable semantics** — results, traps, errnos,
+memory; the three fast backends (**bytecode interpreter**, **Cranelift JIT**, **wasm-JIT** —
+the four-backend taxonomy and naming standard live in DESIGN.md §3) run only what they can run
+identically and **decline the rest** (compile vetoes, routing folds — one shared predicate, one
+definition) back to the oracle. Each fast backend is differential-tested against the tree-walk
+oracle: the bytecode interpreter bit-exact, the Cranelift JIT and wasm-JIT NaN-insensitive.
+Anything a backend or a step can't handle refuses probeably or falls back — it never runs wrong
+and never hangs where refusal is possible. Differential tests gate every backend feature.
 *Violated by:* a fast-backend feature without an oracle counterpart, a second copy of a veto
-predicate, or silent divergence documented as a quirk. (DESIGN.md §18; the
+predicate, silent divergence documented as a quirk, or naming that hides which engine ran (bare
+"JIT" is ambiguous — say "Cranelift JIT" or "wasm-JIT"). (DESIGN.md §3/§18; the
 serve-qualification veto.)
 
 **Observability corollary.** Debugging/tracing is a *view onto* execution, not part of the
