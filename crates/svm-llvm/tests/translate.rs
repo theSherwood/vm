@@ -1592,20 +1592,44 @@ fn fetch_openlibm() -> Option<PathBuf> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !ok {
-        eprintln!("note: skipping libm (openlibm fetch failed — offline?)");
-        return None;
+    if ok {
+        let untarred = Command::new("tar")
+            .arg("xf")
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&cache)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if untarred && dir.join("src/e_log.c").exists() {
+            return Some(dir);
+        }
+        eprintln!("note: openlibm untar failed; trying a shallow tag clone");
+    } else {
+        eprintln!("note: openlibm archive unavailable; trying a shallow tag clone");
     }
-    let ok = Command::new("tar")
-        .arg("xf")
-        .arg(&tgz)
-        .arg("-C")
-        .arg(&cache)
+    // GitHub's archive endpoint is gated on some networks (403) while git over https stays
+    // reachable — the same split `demos/doom/fetch.sh` works around. The clone is tag-pinned to
+    // the same commit, so the sources are identical to the archive's.
+    std::fs::remove_dir_all(&dir).ok();
+    let cloned = Command::new("git")
+        .args([
+            "-c",
+            "advice.detachedHead=false",
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            "--branch",
+        ])
+        .arg(format!("v{VER}"))
+        .args(["https://github.com/JuliaMath/openlibm"])
+        .arg(&dir)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !ok || !dir.join("src/e_log.c").exists() {
-        eprintln!("note: skipping libm (untar failed)");
+    if !cloned || !dir.join("src/e_log.c").exists() {
+        eprintln!("note: skipping libm (openlibm archive + clone both failed — offline?)");
         return None;
     }
     Some(dir)

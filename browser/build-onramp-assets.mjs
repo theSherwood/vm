@@ -137,10 +137,10 @@ if (ensureAmalgamation()) {
 //     JS program from **stdin**, evaluates it (print/console.log + the completion value), and prints.
 //     Multi-TU, mirroring the `demo_quickjs_eval_vs_native` test: the engine + a guest libm (openlibm,
 //     for the address-taken Math functions) + the reused printf/strtod/libc shims, `llvm-link`ed into
-//     one `.ll`, then translated. Fetched-and-cached (QuickJS from bellard.org, openlibm from GitHub);
-//     when the openlibm fetch is unavailable (the Pages pipeline can't reach GitHub) this rebuild is
-//     skipped and the **committed** `web/assets/qjs_repl.svmb` is left in place, so the JS playground
-//     works out of the box regardless (see `web/assets/.gitignore` whitelist).
+//     one `.ll`, then translated. Fetched-and-cached (QuickJS from bellard.org, openlibm from GitHub —
+//     see `ensureOpenlibm` for why that one needs two mirrors); when either fetch is unavailable this
+//     rebuild is skipped and the **committed** `web/assets/qjs_repl.svmb` is left in place, so the JS
+//     playground works out of the box regardless (see `web/assets/.gitignore` whitelist).
 const QJS_VER = '2024-01-13';
 const QJS_CACHE = '/tmp/svm_quickjs_cache';
 const QJS_DIR = join(QJS_CACHE, `quickjs-${QJS_VER}`);
@@ -167,6 +167,12 @@ function ensureQuickJS() {
     return existsSync(join(QJS_DIR, 'quickjs.c'));
   } catch { return false; }
 }
+// GitHub's **archive** endpoint (`/archive/refs/tags/*.tar.gz`) is gated on some networks — it 403s
+// while `github.com` git and `raw.githubusercontent.com` stay reachable. `demos/doom/fetch.sh` already
+// works around exactly this split for doomgeneric; openlibm never got the same treatment, so a gated
+// archive silently skipped the whole QuickJS rebuild. Mirror order: archive (fast, what CI takes),
+// then a shallow **tag clone** — tag-pinned to the same commit, and it needs no per-file list to stay
+// in sync with whichever sources a consumer happens to compile.
 function ensureOpenlibm() {
   if (existsSync(join(OL_DIR, 'src', 'e_log.c'))) return true;
   mkdirSync(OL_CACHE, { recursive: true });
@@ -175,8 +181,20 @@ function ensureOpenlibm() {
     execFileSync('curl', ['-sfL', '--max-time', '120', '-o', tgz,
       `https://github.com/JuliaMath/openlibm/archive/refs/tags/v${OL_VER}.tar.gz`], { stdio: 'inherit' });
     execFileSync('tar', ['xf', tgz, '-C', OL_CACHE], { stdio: 'inherit' });
+    if (existsSync(join(OL_DIR, 'src', 'e_log.c'))) return true;
+  } catch (e) {
+    // Say which mirror failed and why — a silent `catch` here is what hid the doom outage (I42).
+    console.log(`    – openlibm archive unavailable: ${e.message}`);
+  }
+  try {
+    rmSync(OL_DIR, { recursive: true, force: true });
+    execFileSync('git', ['-c', 'advice.detachedHead=false', 'clone', '-q', '--depth', '1', '--branch', `v${OL_VER}`,
+      'https://github.com/JuliaMath/openlibm', OL_DIR], { stdio: 'inherit' });
     return existsSync(join(OL_DIR, 'src', 'e_log.c'));
-  } catch { return false; }
+  } catch (e) {
+    console.log(`    – openlibm shallow clone failed: ${e.message}`);
+    return false;
+  }
 }
 function buildQuickJS() {
   const svmb = join(ASSETS, 'qjs_repl.svmb');
