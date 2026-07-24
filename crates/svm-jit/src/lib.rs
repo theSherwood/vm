@@ -7790,7 +7790,7 @@ fn mask_addr(
         // promised Spectre boundary — DESIGN.md §2a). Dropping the per-access branch **and** the
         // memory-operand AND (a 40-bit mask is not an x86 immediate, so it was a RIP-relative load each
         // access) closes the residual array-kernel gap to Wasmtime-w64 (matmul 1.06→0.94,
-        // matmul_eb 1.34→0.97 svm÷wt64; see the `confine` harness / TRAP_CONFINEMENT.md). The
+        // matmul_eb 1.34→0.97 svm÷wt64; see the `confine` harness / DESIGN.md §4). The
         // clear-`MemoryFault`-at-the-offending-access property of §4/D38 is preserved — only the
         // mechanism (guard-page fault vs `ud2`) differs.
         let shifted = if lower.sub_base == 0 {
