@@ -244,10 +244,13 @@ pub unsafe extern "C" fn cap_thunk(
     // §3.6 / I36 slice 3 — the native JIT **serve loop**: `svc.poll` / `svc.wait` (the CAP_SELF
     // ops 9/10, as in `module_serves`) serviced here rather than folding the whole module to the
     // tree-walk oracle. Only serve-qualified modules reach this arm (the routing veto,
-    // `bytecode::serve_qualifies`, folds any module whose handlers could park). The `host`
-    // borrow above is dead on this path — `serve_native` re-derives from `ctx` in short scopes,
-    // because a handler's own `cap.call`s re-enter this thunk mid-serve.
-    if type_id == svm_ir::CAP_SELF_TYPE_ID && matches!(op, 9 | 10) {
+    // `bytecode::serve_qualifies`, folds any module whose handlers could park). The I38 **timed**
+    // `svc.wait` (op 10 with the optional timeout arg) is oracle-only — the veto folds such
+    // modules; a stray dispatch falls through to the generic Host answer (probeable `-EINVAL`),
+    // never a bogus untimed serve. The `host` borrow above is dead on this path —
+    // `serve_native` re-derives from `ctx` in short scopes, because a handler's own `cap.call`s
+    // re-enter this thunk mid-serve.
+    if type_id == svm_ir::CAP_SELF_TYPE_ID && (op == 9 || (op == 10 && n_args == 0)) {
         serve_native(
             ctx as *mut Host,
             op == 10,

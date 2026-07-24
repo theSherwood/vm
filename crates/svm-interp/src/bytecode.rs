@@ -773,6 +773,18 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                         type_id: super::cap_id::INSTANTIATOR | super::cap_id::YIELDER,
                         ..
                     } => s.has_coro = true,
+                    // I38's **timed** `svc.wait` (op 10 with the optional timeout arg) needs
+                    // the scheduler's deadline machinery — oracle-only; veto like a park seam
+                    // so both fast backends decline the module.
+                    Inst::CapCall {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: 10,
+                        args,
+                        ..
+                    } if !args.is_empty() => {
+                        s.has_svc = true;
+                        s.has_park_seam = true;
+                    }
                     // §3.6 service points (I36 slice 1): svc.poll/svc.wait sites — natively
                     // servable only when nothing in the module could park a handler (below).
                     Inst::CapCall {
@@ -1334,7 +1346,11 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 // cooperative scheduler doesn't host yet, and a no-result `svc.poll` would
                 // leave the op without its result-slot scratch — both still decline, falling
                 // the whole module back to the tree-walk oracle, which serves.
-                (svm_ir::CAP_SELF_TYPE_ID, op @ (9 | 10)) if sig.results.len() == 1 => {
+                // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
+                // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
+                (svm_ir::CAP_SELF_TYPE_ID, op @ (9 | 10))
+                    if sig.results.len() == 1 && args.is_empty() =>
+                {
                     Op::SvcPoll {
                         dst,
                         wait: op == 10,

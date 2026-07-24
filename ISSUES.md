@@ -193,6 +193,12 @@ enqueue path already knows the caller's identity (ticket/domain); plus an option
 `svc.wait` so an idle-but-scheduled servicer can run its own housekeeping. Parked-handler
 discipline stays guest-side (handlers use timed waits). Small, additive, no model change.
 
+**Timed `svc.wait` BUILT (2026-07-24)** as part of the I39 multi-consumer rung (it turned out
+to be that rung's prerequisite — the consumer wind-down primitive; see the I39 rung-3 block for
+the as-built): op 10's optional single arg is a timeout in ns; a deadline that fires with
+nothing served returns `0`. Oracle-only (the fast backends' serve veto treats the timed form
+as a park seam). The sub-queue/fairness half of this issue remains open.
+
 ### I39 — handler execution is serialized: one domain's dispatches never use more than one core (S3, latent hazard — a constraint to keep documented, not a bug)
 
 **Where:** concurrency in the serve loop comes only from handler *parks*; a CPU-bound handler
@@ -222,6 +228,51 @@ as `thread.spawn` generally, per D22), and the woken-before-admissions/completio
 guarantees become per-worker. A domain that spawns one server keeps today's lock-free semantics
 untouched. Transactional per-dispatch worlds were considered and rejected (fights flat memory +
 the JIT's raw stores; guest-visible aborts).
+
+**Rung 3 BUILT on the oracle (2026-07-24) — multi-consumer `svc.wait`, plus the wind-down it
+forced and a latent settle race it flushed out.** Three pieces:
+
+*(a) Multi-waiter `svc_waiters` + wake-all.* Exactly the sketched substrate change:
+`Sched::svc_waiters` became multi-waiter per domain key (a `Vec` of parked vCPUs — the old
+single-slot map silently **displaced** a second parker, dropping a live vCPU: a latent hang for
+any svc+threads module on the oracle), and a wake re-admits **all** of a domain's parked
+consumers. Wake-all is the deliberately boring form: the wake path knows only the domain key,
+never which vCPU owns a parked handler (`handler_parks` is per-vCPU), admission is race-free
+under the powerbox lock, and a consumer that finds nothing runnable re-parks via its rewound
+`svc.wait`.
+
+*(b) Timed `svc.wait` (the I38 sketch, pulled in as the wind-down primitive).* Hammering the
+first test draft proved multi-consumer is unusable without it: consumers **work-steal** (any
+sibling may serve every dispatch), so a spare consumer parked in an untimed `svc.wait` can
+never exit — it stranded the child's `thread.join` and hung the run. Op 10 now takes an
+optional single arg (timeout in ns; `< 0`/absent = forever, today's form byte-identical): the
+park registers a deadline in a new `Sched::svc_timers` heap; a fire re-admits the still-parked
+consumer with `Pending::SvcTimeout`, whose rewound `svc.wait` admits anything that raced the
+timer and then returns its count — `0` on a pure timeout — instead of re-parking. Timed form
+is **oracle-only**: `serve_qualifies`/the bytecode compile veto treat it as a park seam (both
+fast backends decline the module), and the JIT cap-thunk intercept lets it fall through to the
+generic probeable `-EINVAL`.
+
+*(c) A pre-existing settle/park TOCTOU (slice 5b), found by the hammer.* The serve settle was
+two-step: `cap_reply` (miss — caller not parked yet), scheduler lock released, then the cell
+insert under a separate powerbox lock. A caller could park exactly in between — its park-time
+cell probe empty, its `ticket_waiters` entry never woken (no second reply ever comes) —
+stranded forever with the value in the cell. Multi-consumer's spurious wakes widened the
+window, but the race is reachable single-consumer too. Fix: `Scheduler::cap_reply_or_stash` —
+wake-or-stash under ONE scheduler lock (lock order scheduler→powerbox, matching the park
+handler and the fiber early-probe), used by all three serve-arm settle sites (result, arity
+`-EINVAL`, quota `-EAGAIN`).
+
+Pinned in `svm-interp/tests/svc_multi_consumer.rs`: two pollers split one queue (counts sum,
+pure-handler cells exact); a pure timed-wait timeout returns 0 (fast entry declines and falls
+back identically); and two timed-`svc.wait` consumers inside a §14 serving child serve a live
+caller's three sequential calls (`add`, `add`, `finish`-sets-the-flag wind-down protocol)
+across repeated interleavings — hammered 60× clean where the old map/race hung within ~5 runs.
+The fast backends' serve veto still declines svc+thread modules (pinned), so the oracle is the
+only backend running these shapes — the "pinned in the differential before the JIT loop"
+prerequisite is met; the native serve loops pick the rung up when a consumer demands it. The
+threaded-handler discipline (atomics/locks, per D22) is the opt-in contract; the two-pollers
+test's handler is pure for exactly that reason.
 
 ### I41 — revocation is observably inconsistent: a *parked* call through a revoked handle completes with an errno, a *fresh* call traps the domain (S3) — found 2026-07-24 answering "can a trap be triggered by a simple revocation?"
 
