@@ -260,6 +260,17 @@ enum Op {
         dst: u32,
         results: Box<[ValType]>,
     },
+    /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`cap.call CAP_SELF 9`) — drain
+    /// the domain's inbound queue, running each servable dispatch as a handler activation over
+    /// the one world. Rewind-driven like the tree-walk serve arm: an admitted handler's return
+    /// linkage re-enters THIS op (pc un-advanced) with its result in `dst` (the linkage's result
+    /// slot), which the re-execution settles into the ticket's completion cell before admitting
+    /// the next dispatch; the final execution overwrites `dst` with the served count. Compiled
+    /// only when the module-level qualification veto admits it (no park-capable seams — see
+    /// [`compile_module`]), so a handler always runs to completion or traps.
+    SvcPoll {
+        dst: u32,
+    },
     /// §7 reflection `cap.self.count` — number of caps this domain holds (one `i32` result).
     CapSelfCount {
         dst: u32,
@@ -734,6 +745,8 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     let mut has_thread = false;
     let mut has_instantiate = false;
     let mut has_gc = false;
+    let mut has_svc = false;
+    let mut has_park_seam = false;
     for f in funcs {
         for b in &f.blocks {
             for inst in &b.insts {
@@ -749,6 +762,28 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
                         type_id: super::cap_id::INSTANTIATOR | super::cap_id::YIELDER,
                         ..
                     } => has_coro = true,
+                    // §3.6 service points (I36 slice 1): svc.poll sites — natively servable
+                    // only when nothing in the module could park a handler (below).
+                    Inst::CapCall {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: 9,
+                        ..
+                    } => has_svc = true,
+                    // A blocking stream `read` (type 0 op 0) can stdin-park, and an import call
+                    // can be *bound* to one at spawn — either inside a handler would need the
+                    // tree-walker's FIBER_PARKED (completed-but-not-replied) machinery.
+                    Inst::CapCall {
+                        type_id: super::cap_id::STREAM,
+                        op: 0,
+                        ..
+                    }
+                    | Inst::CapCall {
+                        type_id: svm_ir::CAP_IMPORT_TYPE_ID,
+                        ..
+                    }
+                    | Inst::CallImport { .. }
+                    | Inst::SetJmp { .. }
+                    | Inst::LongJmp { .. } => has_park_seam = true,
                     Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
                         has_fiber = true
                     }
@@ -766,9 +801,19 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     // module that also spawns threads could hold roots in a sibling vCPU we wouldn't scan — reject
     // that combination (fall back) to stay sound. `gc.roots` + fibers / coroutines is fine (those
     // continuations *are* scanned).
+    //
+    // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
+    // park or unwind mid-dispatch — the `SvcPoll` rewind linkage runs handlers to completion (or
+    // trap), so any park-capable seam anywhere in the module (futex waits / threads, fibers,
+    // coroutines, nested instantiate, setjmp/longjmp — a `longjmp` out of a handler would unwind
+    // past the serve linkage — blocking stream reads, spawn-bound imports, gc.roots) falls the
+    // whole module back to the tree-walk oracle, whose serve arm has the fiber-park machinery
+    // (slice 5b). The veto is module-wide, so it covers handlers' transitive callees for free.
     if (has_coro && (has_fiber || has_thread))
         || (has_instantiate && has_fiber)
         || (has_gc && has_thread)
+        || (has_svc
+            && (has_park_seam || has_fiber || has_thread || has_coro || has_instantiate || has_gc))
     {
         return None;
     }
@@ -1222,11 +1267,15 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 },
                 (cap_id::INSTANTIATOR, _) | (cap_id::YIELDER, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
-                // §3.6 service points (svc.poll/svc.wait) are eval-loop-serviced — they run
-                // guest handler code, which the bytecode engine cannot. Decline the compile so
-                // the whole module falls back to the tree-walk oracle and SERVES (the same
-                // free-correctness path as the Instantiator ops above), instead of answering
-                // a refusal from host-side dispatch.
+                // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
+                // shape compiles to the native serve-loop-core op — the module-level veto in
+                // [`compile_module`] guarantees its handlers cannot park mid-dispatch, so the
+                // rewind linkage runs each one to completion (or trap). `svc.wait`'s
+                // empty-queue park needs a waker topology (cross-domain callers, timers) the
+                // cooperative scheduler doesn't host yet, and a no-result `svc.poll` would
+                // leave the op without its result-slot scratch — both still decline, falling
+                // the whole module back to the tree-walk oracle, which serves.
+                (svm_ir::CAP_SELF_TYPE_ID, 9) if sig.results.len() == 1 => Op::SvcPoll { dst },
                 (svm_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
@@ -7394,6 +7443,12 @@ struct Vm {
     /// function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers, invoked units,
     /// non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never a correctness gate.
     jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket — `Some`
+    /// between admitting a handler activation (whose return linkage rewinds into the `SvcPoll`
+    /// op) and the re-execution that settles its result — and the count of dispatches completed
+    /// by the current `svc.poll` activation.
+    serve_ticket: Option<u64>,
+    serve_count: i64,
 }
 
 impl Vm {
@@ -7417,6 +7472,8 @@ impl Vm {
             setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            serve_ticket: None,
+            serve_count: 0,
         })
     }
 
@@ -7996,6 +8053,64 @@ impl Vm {
                         self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
                     }
                     pc += 1;
+                }
+                Op::SvcPoll { dst } => {
+                    // §3.6 serve-loop core (I36 slice 1), the tree-walk serve arm's rewind state
+                    // machine in register-window form. A handler that just returned re-entered
+                    // this op via its rewound linkage with its result in `dst` — settle it into
+                    // the ticket's completion cell. No cross-domain caller can be parked on the
+                    // ticket in this engine yet (caller-side parking is a later I36 slice), so
+                    // the reply always rides the cell — the tree-walker's unclaimed-result path.
+                    if let Some(t) = self.serve_ticket.take() {
+                        let v = self.regs[base + *dst as usize].i64();
+                        host.with(|p| p.svc_results.insert(t, v));
+                        self.serve_count += 1;
+                    }
+                    // Admit queued dispatches: un-servable ones settle inline with a probeable
+                    // errno (the dispatch's fault, never the domain's — it keeps serving); the
+                    // first servable one switches into a handler activation whose return linkage
+                    // re-executes this op (pc deliberately NOT advanced).
+                    let mut admitted = false;
+                    loop {
+                        let d = host.with(|p| p.svc_queue.pop_front());
+                        let Some(d) = d else { break };
+                        // The queue only holds servable dispatches (checked at enqueue), so a
+                        // missing handler here is host-state corruption: fail closed. Handlers
+                        // are the primary module's functions (the serve loop is the domain's).
+                        let fidx = host
+                            .with(|p| p.svc_handler_func(d.export, d.op))
+                            .ok_or(Trap::CapFault)? as usize;
+                        if module != 0 {
+                            return Err(Trap::CapFault);
+                        }
+                        let (params, _) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
+                        if d.args.len() != params.len() {
+                            host.with(|p| p.svc_results.insert(d.ticket, super::EINVAL));
+                            continue;
+                        }
+                        let nb = base + c.progs[cur].nslots as usize;
+                        let need = nb + c.progs[fidx].nslots as usize;
+                        if self.regs.len() < need {
+                            self.regs.resize(need, Reg::default());
+                        }
+                        for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
+                            self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
+                        }
+                        self.stack
+                            .push((module, cur, base, pc, base + *dst as usize));
+                        self.serve_ticket = Some(d.ticket);
+                        cur = fidx;
+                        base = nb;
+                        pc = 0;
+                        admitted = true;
+                        break;
+                    }
+                    if !admitted {
+                        // Queue drained: deliver the completed count and close the activation.
+                        self.regs[base + *dst as usize] = Reg::from_i64(self.serve_count);
+                        self.serve_count = 0;
+                        pc += 1;
+                    }
                 }
                 Op::CapSelfCount { dst } => {
                     // §7 reflection op 0 — same `self_dispatch` the tree-walker uses; one i32 result.

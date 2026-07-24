@@ -51,19 +51,28 @@ deterministic cooperative scheduler over `TaskSlot { vt, threads, env, state }` 
 fiber registry** (`FiberState`, D57 migration), confined `ChildEnv`s for §14 children, and —
 crucially — all §3.6 *state* already lives on the shared `Host` (`svc_queue`, `svc_results`,
 tickets, `svc_handler_func`), so enqueue/settle/reply plumbing is reused verbatim; only the
-scheduling is engine-local. Slice 1 builds, in order: (a) **caller side** — `LiveImpl` cap.call
-compiles to an enqueue + a new `TaskState::BlockedTicket { ticket, dst }` (fiber-level variant
-rides the existing `FiberState::Parked` shape); (b) **serve side** — svc ops 9/10 compile to a
-drain op: admit dispatches as fibers of the serving vCPU (the registry exists), settle
-returns/parks exactly like the tree-walk arm (`FIBER_RETURNED` → reply-or-`svc_results`,
-`FIBER_PARKED` → handler-parks map), park the vCPU as `TaskState::BlockedSvc { key }` when idle;
-(c) **wakes in `drive`** — enqueue wakes `BlockedSvc`, handler completion wakes `BlockedTicket`,
-notify/timer/revocation wakes route to parked handlers then `svc_wake` their domain (the
-tree-walker's four wake paths, cooperative form); (d) differential: the existing
-`svc_serve_loop.rs` / `svc_handler_parks.rs` corpus run through `run_with_host_fast` and asserted
-equal to the tree-walk. Granted spawns (8/11/13) on bytecode stay declined in slice 1 (separate
-gap, now recorded here); lifting them is slice 2 so a serving *child* spawned from bytecode also
-runs native.
+scheduling is engine-local. The staged plan: (a) serve-loop core, (b) caller-side
+`TaskState::BlockedTicket` parking, (c) the wake paths in `drive`, (d) granted spawns (8/11/13)
+so a serving *child* spawned from bytecode runs native too.
+
+**Slice 1 BUILT (2026-07-24) — the `svc.poll` serve-loop core, native on bytecode.** A serving
+module now compiles when a **qualification veto** admits it: any park-capable seam anywhere in
+the module (futex waits/threads, fibers, coroutines, nested instantiate, setjmp/longjmp — a
+`longjmp` out of a handler would unwind past the serve linkage — blocking stream reads,
+spawn-bound imports, gc.roots) still declines to the tree-walk oracle, whose serve arm has the
+fiber-park machinery, so a native handler always runs to completion or traps. `Op::SvcPoll` is
+the tree-walk serve arm's rewind state machine in register-window form: an admitted handler
+activation's return linkage re-enters the op (pc un-advanced) with its result in `dst`, the
+re-execution settles it into the ticket's completion cell (no cross-domain caller can be
+ticket-parked in this engine yet, so the reply always rides the cell — the tree-walker's
+unclaimed-result path), and the drained-queue execution delivers the served count. Arity
+mismatches errno inline and serving continues; a handler trap is terminal (one world), matching
+the oracle. Pinned by `svm-interp/tests/bytecode_svc.rs`: cross-entry equality on the slice-2
+corpus scenarios, a full-queue (64-dispatch) native drain, and `compile_module` is-Some/is-None
+pins so the differential can never silently degrade into re-testing the fallback. Remaining, in
+order: **slice 2** — `svc.wait` + its waker topology in `drive` (needs an enqueuer: caller-side
+ticket parking and/or the granted spawns, which stay declined); **slice 3** — the JIT serve
+loop.
 
 ### I37 — a handler trap kills the whole serving domain: total blast radius per bad request (S3)
 
