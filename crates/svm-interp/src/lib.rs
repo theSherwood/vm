@@ -3579,8 +3579,13 @@ enum Blocked {
     /// §3.6 slice 3 — a serving fiber parked in `svc.wait` on an empty queue, keyed by its
     /// domain identity. The frame was rewound before parking, so the wake re-executes the
     /// `svc.wait` (which then finds work). The park handler re-checks the queue under the
-    /// scheduler lock (the park-vs-enqueue race).
-    SvcWait { key: usize },
+    /// scheduler lock (the park-vs-enqueue race). `deadline_ns` is the I38 **timed** form's
+    /// optional timeout (the op's single optional arg; `< 0` = wait forever): a consumer whose
+    /// deadline fires with no progress is re-admitted with [`Pending::SvcTimeout`] and its
+    /// re-executed `svc.wait` returns `0` instead of re-parking — the multi-consumer
+    /// wind-down primitive (a spare consumer can otherwise never exit: any sibling may
+    /// work-steal every dispatch).
+    SvcWait { key: usize, deadline_ns: i64 },
 }
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
@@ -3596,6 +3601,11 @@ enum Pending {
     /// result — a negative errno the parked fiber probes on its own error path. The fiber is
     /// never killed and never traps; cancellation is a returned value (§3.6 revocation-unparks).
     CapResult(i64),
+    /// A timed `svc.wait`'s deadline fired with nothing served ([`Blocked::SvcWait`]): the
+    /// frame was rewound at the park, so nothing is pushed here — the flag makes the
+    /// re-executed serve arm return `0` instead of re-parking (concurrent work that raced the
+    /// timer is still admitted first; a non-zero count wins over the timeout).
+    SvcTimeout,
 }
 
 /// One run of a vCPU until it finishes or yields.
@@ -3672,9 +3682,15 @@ enum Waiter {
 /// caller then signals the condvar; [`process_timers`]'s caller is a worker already awake).
 fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
     match s.svc_waiters.remove(&key) {
-        Some(v) => {
-            s.runnable.push_back(v);
-            true
+        Some(vs) => {
+            // Wake every parked consumer of the domain (see [`Sched::svc_waiters`]): only the
+            // owner of a woken handler can resume it, and admission is race-free under the
+            // powerbox lock — the others re-park on their re-executed `svc.wait`.
+            let woke = !vs.is_empty();
+            for v in vs {
+                s.runnable.push_back(v);
+            }
+            woke
         }
         None => false,
     }
@@ -3697,14 +3713,28 @@ struct Sched {
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
     /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by the dispatch
-    /// ticket (exactly one caller per ticket; woken by [`Scheduler::cap_reply`] with the result).
+    /// ticket (exactly one caller per ticket; woken by [`Scheduler::cap_reply_or_stash`] with
+    /// the result).
     ticket_waiters: BTreeMap<u64, Waiter>,
-    /// §3.6 slice 3 — serving fibers parked in `svc.wait` on an empty queue, keyed by their
+    /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
-    svc_waiters: BTreeMap<usize, Box<VCpu>>,
+    /// **Multi-consumer** (I39's top rung): a domain may park N vCPUs here (N spawned server
+    /// threads draining one queue), so the value is a `Vec` and a wake re-admits **all** of
+    /// them — the wake path knows only the domain key, never which vCPU owns a parked handler
+    /// (per-vCPU `handler_parks`), so wake-all is the obviously-correct form: the queue pop is
+    /// under the powerbox lock (each dispatch admitted exactly once), and a woken vCPU that
+    /// finds nothing runnable simply re-parks.
+    /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — the box moves between
+    /// this map and `runnable` as a pointer, never by value.)
+    #[allow(clippy::vec_box)]
+    svc_waiters: BTreeMap<usize, Vec<Box<VCpu>>>,
     /// Min-heap of `(deadline, waiter id, futex key)` for timing out `wait`s.
     timers: BinaryHeap<Reverse<(Instant, u64, FutexKey)>>,
+    /// Min-heap of `(deadline, domain key, task)` for the I38 **timed `svc.wait`** — fired by
+    /// [`process_timers`] like the futex timers (a waiter already woken by an enqueue is
+    /// simply absent from `svc_waiters`; its stale timer is skipped).
+    svc_timers: BinaryHeap<Reverse<(Instant, usize, TaskId)>>,
     /// OS-thread handles of spawned workers (joined by `drive` at the end).
     handles: Vec<std::thread::JoinHandle<()>>,
     /// vCPUs not yet finished (running + queued + parked). The run ends when this hits 0.
@@ -3826,43 +3856,50 @@ impl Scheduler {
         n
     }
 
-    /// §3.6 slice 3 — deliver a live-callee **reply**: wake the one caller parked on `ticket`
-    /// with the handler's result (the same `Pending::CapResult` vehicle as a revocation — it
-    /// carries any i64). `false` when no caller is parked (an embedder-enqueued dispatch, or
-    /// the caller hasn't parked yet — the result then rides the completion cell and the park
-    /// handler's race check finds it).
-    fn cap_reply(&self, ticket: u64, result: i64) -> bool {
+    /// §3.6 — deliver a served dispatch's result **atomically** against a racing caller park:
+    /// wake the ticket's parked caller, or — under the SAME scheduler lock — stash the value in
+    /// the callee's completion cell. The two-step form (a reply-wake miss, then a
+    /// separate cell insert) had a TOCTOU window: the caller could park between the miss and
+    /// the insert — its park-time cell probe empty, its `ticket_waiters` entry never woken (no
+    /// second reply ever comes) — stranding it forever with the value sitting in the cell.
+    /// Found hammering the multi-consumer suite; reachable (rarer) with a single consumer too.
+    /// Lock order (scheduler, then callee powerbox) matches the caller's park handler and the
+    /// fiber early-probe, so the pair can't deadlock.
+    fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
         match s.ticket_waiters.remove(&ticket) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
                 s.runnable.push_back(v);
                 self.work.notify_all();
-                true
             }
             Some(Waiter::Fiber { reg, slot, svc }) => {
                 reg.wake_blocked(slot, Reg::from_i64(result));
                 if svc_wake_locked(&mut s, svc) {
                     self.work.notify_all();
                 }
-                true
             }
-            None => false,
+            None => {
+                callee
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .svc_results
+                    .insert(ticket, result);
+            }
         }
     }
 
-    /// §3.6 slice 3 — a caller's enqueue landed on domain `key`'s queue: wake its fiber parked
-    /// in `svc.wait`, if any. Resume re-executes the `svc.wait` (the frame was rewound at the
-    /// park), which now finds the queue non-empty and serves.
+    /// §3.6 slice 3 — a caller's enqueue landed on domain `key`'s queue: wake its vCPUs parked
+    /// in `svc.wait`, if any (all of them — see [`Sched::svc_waiters`]). Resume re-executes the
+    /// `svc.wait` (the frame was rewound at the park), which then finds the queue non-empty and
+    /// serves — or, for a consumer that lost the admission race, re-parks.
     fn svc_wake(&self, key: usize) -> bool {
         let mut s = self.lock();
-        match s.svc_waiters.remove(&key) {
-            Some(v) => {
-                s.runnable.push_back(v);
-                self.work.notify_all();
-                true
-            }
-            None => false,
+        if svc_wake_locked(&mut s, key) {
+            self.work.notify_all();
+            true
+        } else {
+            false
         }
     }
 }
@@ -3871,6 +3908,25 @@ impl Scheduler {
 /// already woken by `notify` is simply absent — its stale timer is skipped.)
 fn process_timers(s: &mut Sched) {
     let now = Instant::now();
+    // Timed `svc.wait` deadlines (I38): re-admit the still-parked consumer with the timeout
+    // pending — its rewound `svc.wait` re-executes, admits anything that raced the timer, and
+    // returns its count (0 on a pure timeout) instead of re-parking.
+    while let Some(&Reverse((dl, key, tid))) = s.svc_timers.peek() {
+        if dl > now {
+            break;
+        }
+        s.svc_timers.pop();
+        if let Some(q) = s.svc_waiters.get_mut(&key) {
+            if let Some(pos) = q.iter().position(|v| v.id == tid) {
+                let mut v = q.remove(pos);
+                v.pending = Some(Pending::SvcTimeout);
+                s.runnable.push_back(v);
+            }
+            if q.is_empty() {
+                s.svc_waiters.remove(&key);
+            }
+        }
+    }
     while let Some(&Reverse((dl, wid, key))) = s.timers.peek() {
         if dl > now {
             break;
@@ -3914,7 +3970,14 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                 if s.shutdown {
                     break None;
                 }
-                match s.timers.peek().map(|Reverse((dl, _, _))| *dl) {
+                let dl_futex = s.timers.peek().map(|Reverse((dl, _, _))| *dl);
+                let dl_svc = s.svc_timers.peek().map(|Reverse((dl, _, _))| *dl);
+                let dl_next = match (dl_futex, dl_svc) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, None) => a,
+                    (None, b) => b,
+                };
+                match dl_next {
                     Some(dl) => {
                         let now = Instant::now();
                         if dl > now {
@@ -4260,11 +4323,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
             }
         }
-        Step::Park(Blocked::SvcWait { key }) => {
-            // §3.6 slice 3: park the serving fiber on its empty queue. Park-vs-enqueue race
+        Step::Park(Blocked::SvcWait { key, deadline_ns }) => {
+            // §3.6 slice 3: park the serving vCPU on its empty queue. Park-vs-enqueue race
             // check under the scheduler lock: an enqueue that landed since the empty check
             // found no waiter, so re-run ourselves (the frame was rewound — the re-executed
-            // `svc.wait` finds the work).
+            // `svc.wait` finds the work). Multi-consumer: push alongside any sibling
+            // consumers already parked on this domain (never displace them).
             let mut s = sched.lock();
             let empty = v
                 .host
@@ -4273,7 +4337,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 .svc_queue
                 .is_empty();
             if empty {
-                s.svc_waiters.insert(key, v);
+                if deadline_ns >= 0 {
+                    s.svc_timers.push(Reverse((
+                        Instant::now() + std::time::Duration::from_nanos(deadline_ns as u64),
+                        key,
+                        v.id,
+                    )));
+                }
+                s.svc_waiters.entry(key).or_default().push(v);
             } else {
                 s.runnable.push_back(v);
                 sched.work.notify_one();
@@ -4320,11 +4391,18 @@ impl SchedRef {
             SchedRef::Det(_) => 0,
         }
     }
-    /// §3.6 slice 3 reply-wake ([`Scheduler::cap_reply`]); the explorer has no caller parks.
-    fn cap_reply(&self, ticket: u64, result: i64) -> bool {
+    /// Atomic reply-or-stash ([`Scheduler::cap_reply_or_stash`]); the explorer has no caller
+    /// parks, so its arm stashes straight into the cell.
+    fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         match self {
-            SchedRef::Real(s) => s.cap_reply(ticket, result),
-            SchedRef::Det(_) => false,
+            SchedRef::Real(s) => s.cap_reply_or_stash(ticket, result, callee),
+            SchedRef::Det(_) => {
+                callee
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .svc_results
+                    .insert(ticket, result);
+            }
         }
     }
     /// §3.6 slice 3 serve-wake ([`Scheduler::svc_wake`]); the explorer has no svc parks.
@@ -6243,7 +6321,11 @@ fn handle_mem(
 
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
-                              // Resuming from a park: finish the op the scheduler woke us for.
+                              // A timed `svc.wait`'s deadline fired (I38): consumed by the rewound serve arm below, which
+                              // returns its count instead of re-parking. Only ever set in the same `run_inner` call that
+                              // re-executes the arm (the pending is taken at resume, the rewound op runs first).
+    let mut svc_timed_out = false;
+    // Resuming from a park: finish the op the scheduler woke us for.
     match v.pending.take() {
         Some(Pending::Join { slot }) => {
             let child = v
@@ -6276,6 +6358,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let top = v.frames.len() - 1;
             v.frames[top].vals.push(Reg::from_i64(status));
         }
+        Some(Pending::SvcTimeout) => svc_timed_out = true,
         None => {}
     }
 
@@ -7680,6 +7763,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     type_id: svm_ir::CAP_SELF_TYPE_ID,
                     op: op @ (CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT),
                     sig,
+                    args,
                     ..
                 } => {
                     if let Some(sr_) = serve_run.as_ref() {
@@ -7702,12 +7786,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let status = frames[top].vals.pop().ok_or(Trap::Malformed)?.i32();
                         match status {
                             FIBER_RETURNED => {
-                                // Reply-wake the parked caller; an unclaimed result rides the
-                                // completion cell.
-                                if !sched.cap_reply(run.ticket, value) {
-                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.svc_results.insert(run.ticket, value);
-                                }
+                                // Reply-wake the parked caller, or stash in the completion
+                                // cell — atomically, so a caller parking mid-settle can't
+                                // strand ([`Scheduler::cap_reply_or_stash`]).
+                                sched.cap_reply_or_stash(run.ticket, value, host);
                                 *serve_count += 1;
                             }
                             FIBER_PARKED => {
@@ -7788,10 +7870,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         let params = &funcs.get(fidx as usize).ok_or(Trap::CapFault)?.params;
                         if d.args.len() != params.len() {
-                            if !sched.cap_reply(d.ticket, EINVAL) {
-                                let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                hg.svc_results.insert(d.ticket, EINVAL);
-                            }
+                            sched.cap_reply_or_stash(d.ticket, EINVAL, host);
                             continue;
                         }
                         let child_vals: Vec<Reg> = d
@@ -7806,10 +7885,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let handle = match registry.create(0, 0, spawn_quota.max_fibers, durable) {
                             Ok(h_) => h_,
                             Err(_) => {
-                                if !sched.cap_reply(d.ticket, EAGAIN) {
-                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.svc_results.insert(d.ticket, EAGAIN);
-                                }
+                                sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
                                 continue;
                             }
                         };
@@ -7834,10 +7910,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // domain's powerbox identity (a caller's enqueue — or a parked handler's
                     // wake — computes the same key and re-admits us); otherwise deliver the
                     // completed count and close the activation.
-                    if *op == CAP_SELF_SVC_WAIT && *serve_count == 0 {
+                    if *op == CAP_SELF_SVC_WAIT
+                        && *serve_count == 0
+                        && !std::mem::take(&mut svc_timed_out)
+                    {
                         frames[top].inst -= 1;
                         let key = Arc::as_ptr(host) as usize;
-                        return Ok(Inner::Park(Blocked::SvcWait { key }));
+                        // I38 timed form: the op's single optional arg is a timeout in ns
+                        // (`< 0` / absent = wait forever). Re-read on every (re-)park, so a
+                        // spurious wake restarts the clock — "at least this long" semantics.
+                        let deadline_ns = match args.first() {
+                            Some(a) => get(&frames[top].vals, *a)?.i64(),
+                            None => -1,
+                        };
+                        return Ok(Inner::Park(Blocked::SvcWait { key, deadline_ns }));
                     }
                     if !sig.results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(*serve_count));
