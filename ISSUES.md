@@ -60,6 +60,25 @@ primitives exist; a documented pattern, optionally a personality-level respawn h
 the server spawns (pay-for-what-you-isolate). Action: document both as THE pattern in
 IMPORTS.md/PROCESS.md so personalities choose their blast radius deliberately.
 
+**Supervision mechanics correction (2026-07-24):** `join` of a trapped child **re-raises the
+child's trap in the joiner** (interp `Pending::Join` → `out.result?`; JIT `join` →
+`*trap_out = trap`) — so a naive supervisor that joins a crashed worker dies with it. The
+supervision idiom is **`poll` → status `2` (trapped, non-propagating) → `detach` + respawn**;
+`join` only after `poll` reports a clean return. Any supervision pattern doc must lead with this.
+
+**Escalation options if the domain-fatal default proves too sharp** (recorded for the future,
+none built): (a) **poison-drain** — on a handler trap, errno the trapped dispatch's caller *and*
+every queued/parked dispatch, refuse new work, exit cleanly: converts a blast into an orderly
+shutdown with no execution over torn state (errno plumbing is host-side); cheapest real
+softening. (b) **opt-in resilient mode** — the trap kills only the handler fiber, its caller
+gets an errno, the loop continues: VM-sound (confinement holds regardless — torn state is a
+guest-consistency risk the domain explicitly accepts, with crash-only handler discipline);
+interp-side cheap (drop the fiber's frames), JIT-side sensitive (the detect-and-kill guard must
+unwind to the serve frame instead of the domain — trap-shim/guard machinery, escape-TCB-adjacent)
+plus a leaked-resource sweep for the dead handler's tickets (cf. I40). (c) durability (see the
+TODO.md durable-serving row): thaw-from-snapshot turns domain death into state rollback — the
+complementary answer rather than a trap-scoping one.
+
 ### I38 — the servicer cannot shed or shape load: no per-client fairness, no admission control beyond one global quota (S3)
 
 **Where:** the svc queue is one bounded FIFO per domain; the only backpressure is queue-full and
@@ -89,6 +108,45 @@ plane through handlers and discovers the ceiling in production.
 clients to N workers — the grant graph is the load balancer), and keep bulk data on the
 `SharedRegion` ring plane, never in handler args. Action: state the ceiling and both patterns
 explicitly next to F6 so the constraint is designed around, not tripped over.
+
+**Resolution path (owner-agreed 2026-07-24) — serial by default, an opt-in ladder up:** the
+serialization is a *serve-loop* property, not a one-world property (the substrate already has
+real parallelism over one window via `thread.spawn` + atomics/futexes). The ladder:
+(1) *available today* — handler-internal parallelism: a handler `thread.spawn`s workers and
+rendezvouses on a futex (`atomic.wait` fiber-parks correctly in handlers, slice 5b), so the loop
+keeps serving while the handler's compute uses other cores; the Join-in-fiber residue is the
+rough edge to smooth. (2) *available today* — shard across worker domains when state partitions.
+(3) *substrate extension, sequenced AFTER I36* — **multi-consumer `svc.wait`**: N spawned server
+vCPUs each park on the domain queue (`svc_waiters` becomes multi-waiter per key; queue pops are
+already host-locked; per-vCPU serve state needs no sharing; near-free on the native JIT loop).
+The cost is semantic and must be pinned in the differential before the JIT loop exists: handlers
+in a multi-server domain are threaded code (atomics/locks discipline — the same opt-in contract
+as `thread.spawn` generally, per D22), and the woken-before-admissions/completion ordering
+guarantees become per-worker. A domain that spawns one server keeps today's lock-free semantics
+untouched. Transactional per-dispatch worlds were considered and rejected (fights flat memory +
+the JIT's raw stores; guest-visible aborts).
+
+### I41 — revocation is observably inconsistent: a *parked* call through a revoked handle completes with an errno, a *fresh* call traps the domain (S3) — found 2026-07-24 answering "can a trap be triggered by a simple revocation?"
+
+**Where:** yes, it can — and it's the most likely non-bug trap in a long-running server. D37
+makes a revoked handle indistinguishable from a forged one (the slot's generation bumps; "any
+later `cap.call` on it traps", `Host::close`), so a server whose grantor revokes *anything* it
+holds dies on its next use of that handle. But §3.6 slice 1 (revocation-unparks) already broke
+the revoked≡forged equivalence for the *parked* case: a fiber parked in a call through the
+revoked handle wakes with a **negative errno** — the in-code comment says it outright:
+"the call completes with the negative errno … no trap, no kill; **cancellation is a value**"
+(`Pending::CapResult`). So the same lifecycle event is a value if you were mid-call and a
+domain-killing trap if you call a moment later. There is no guest-side defense: reflection
+can't check-then-use atomically (TOCTOU).
+
+**Fix sketch — graceful revocation (tombstones):** distinguish *revoked-once-valid* from
+*never-existed* in the holder's table (a tombstone binding, or a generation→revoked side map):
+use of a tombstoned handle returns a probeable `-EREVOKED`-style errno (consistent with the
+unpark path — cancellation is a value); a forged handle (dead generation, no tombstone) still
+traps. Costs to weigh deliberately: tombstone storage until a slot-reuse policy exists, and the
+D37 anti-probing property — which revocation-unparks has already half-surrendered, so the
+tombstone *completes* an inconsistency rather than creating one. This pairs with I37: it removes
+the dominant benign trigger before any trap-scoping mechanism is considered.
 
 ### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4)
 
