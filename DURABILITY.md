@@ -2039,6 +2039,23 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    arm branches on. The park kind is probed at freeze time from which scheduler map holds
    the fiber's waiter (`wait_waiters` vs `cap_waiters`/`ticket_waiters`) — a probe, not a
    record; the snapshot still carries nothing new.
+   **BUILT 2026-07-24** (the corrected scope): `freeze_drive` classifies every `ParkedOn`
+   fiber up front — serve-handler parks (`handler_parks`) and unwoken non-futex parks fail
+   the freeze closed (`FiberFault`) — then flattens the rest through the same
+   sub-run the suspend-parked loop uses (`flatten_fiber_for_freeze`): a *woken* park's
+   frames already carry the delivered result (no placeholder; a `Leaf` spill then reloads
+   the real value), an *unwoken futex* park has its waiter entry purged
+   (`Scheduler::purge_fiber_wait_park`) and an inert `i32 0` status pushed — the
+   `MemoryWait` point spills `out − nres`, so the placeholder is never captured and the
+   thaw arm re-issues the wait against the restored cell. Round-trip pinned in
+   `svm-durable/tests/fiber.rs`: the unwoken-park freeze→thaw re-issues the wait, which
+   re-parks and re-derives its waiter entry, and the replayed store+notify complete it
+   identically to the uninterrupted run; the woken branch and the cap-park refusal are
+   pinned freeze-side. One step-3 note from the woken-branch analysis: re-entering a
+   flattened fiber rewinds only while the *claiming* resume still runs under `REWINDING`
+   (the phase rides `shadow_switch`'s carry) — a woken park claimed by post-rewind NORMAL
+   execution would start fresh and orphan its spilled frame, so step 4's thaw wiring must
+   seed per-fiber thaw words (or re-arm them per claim) before woken parks thaw.
 3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
    `serve_count`, `serve_run` linkage), versioned like the fiber section (elided when empty).
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
