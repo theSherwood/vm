@@ -40,8 +40,8 @@
 
 use svm_encode::{digest256, encode_module};
 use svm_interp::{
-    DurableBinding, DurableHandle, FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle,
-    StreamRole, SvcDispatch, SHADOW_BASE,
+    DurableBinding, DurableHandle, FrozenChildState, FrozenFiber, FrozenNested, FrozenVCpu, Host,
+    NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
 };
 use svm_ir::Module;
 
@@ -100,7 +100,14 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// (`svc_next_ticket`) — all plain guest-meaningful data (§13.2 "serialize as-is"; tickets are
 /// cut-internal under §13.1). Elided when the trio is empty/zero, so a never-served domain's
 /// artifact keeps the v12 section layout (only the version differs).
-const FORMAT_VERSION: u16 = 13;
+/// v14 (§13.4 slice 4c: per-child host state): each nested record gains an optional
+/// **child-state** blob — `uleb 0`, or `uleb 1` + the child's serve trio (queue / completion
+/// cells / ticket counter, the v13 shapes) + its durable handle table (the §12.5 record shape) —
+/// merged from the child's own freeze residue (`FrozenChildState`, keyed `(parent_task, slot)`).
+/// The thaw seeds the re-created child's fresh host from it verbatim (slots/generations
+/// preserved), so a serving or cap-holding child survives the subtree cut. One extra `uleb` (0)
+/// per plain nested record otherwise, so a v13 nested record mis-parses.
+const FORMAT_VERSION: u16 = 14;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -256,6 +263,8 @@ pub fn freeze_with_prots(
     // artifact (every `parent_task == 0`) this reduces to ascending slot, as in v8–v11.
     let mut nested = host.frozen_nested().to_vec();
     nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+    // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
+    let child_state = host.frozen_child_state().to_vec();
     let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
     let digest = digest256(&encode_module(module));
     let reserved_log2 = window.len().trailing_zeros() as u8;
@@ -372,6 +381,40 @@ pub fn freeze_with_prots(
                         Some(r) => {
                             write_uleb(b, 1);
                             write_uleb(b, r as u64);
+                        }
+                    }
+                    // v14 (§13.4 slice 4c): the child's host state — serve trio + durable
+                    // handle table — when its self-unwind recorded one; 0 for a plain child.
+                    let cs = child_state
+                        .iter()
+                        .find(|c| c.parent_task == n.parent_task && c.slot == n.slot);
+                    match cs {
+                        None => write_uleb(b, 0),
+                        Some(c) => {
+                            write_uleb(b, 1);
+                            write_uleb(b, c.svc_queue.len() as u64);
+                            for d in &c.svc_queue {
+                                write_uleb(b, d.export as u64);
+                                write_uleb(b, d.op as u64);
+                                write_uleb(b, d.args.len() as u64);
+                                for &a in &d.args {
+                                    write_uleb(b, a as u64);
+                                }
+                                write_uleb(b, d.ticket);
+                            }
+                            write_uleb(b, c.svc_results.len() as u64);
+                            for &(t, v_) in &c.svc_results {
+                                write_uleb(b, t);
+                                write_uleb(b, v_ as u64);
+                            }
+                            write_uleb(b, c.svc_next_ticket);
+                            write_uleb(b, c.handles.len() as u64);
+                            for h in &c.handles {
+                                write_uleb(b, h.slot as u64);
+                                write_uleb(b, h.generation as u64);
+                                write_uleb(b, h.type_id as u64);
+                                write_binding(b, &h.binding);
+                            }
                         }
                     }
                 }
@@ -552,7 +595,7 @@ pub fn restore_with_prots(
     // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
     // thaw. The section is present iff there are fibers or spawned vCPUs (canonical); restore re-seeds
     // the Host so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
-    let (fibers, vcpus, root_sp, nested) =
+    let (fibers, vcpus, root_sp, nested, child_state) =
         decode_control(control_body, fiber_count, spawned_count)?;
     host.set_frozen_fibers(fibers);
     if !vcpus.is_empty() {
@@ -561,6 +604,9 @@ pub fn restore_with_prots(
     }
     if !nested.is_empty() {
         host.set_frozen_nested(nested);
+    }
+    if !child_state.is_empty() {
+        host.set_frozen_child_state(child_state);
     }
 
     // ---- Serve state (§13.4 step 3, v13): decode the serve trio and restore it. The section is
@@ -619,9 +665,21 @@ fn decode_control(
     body: Option<&[u8]>,
     fiber_count: u64,
     spawned_count: u64,
-) -> Result<(Vec<FrozenFiber>, Vec<FrozenVCpu>, u64, Vec<FrozenNested>), RestoreError> {
+) -> Result<
+    (
+        Vec<FrozenFiber>,
+        Vec<FrozenVCpu>,
+        u64,
+        Vec<FrozenNested>,
+        Vec<FrozenChildState>,
+    ),
+    RestoreError,
+> {
     let body = match (body, fiber_count, spawned_count) {
-        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), SHADOW_BASE, Vec::new())), // no residue ⇒ no section
+        (None, 0, 0) => {
+            return Ok((Vec::new(), Vec::new(), SHADOW_BASE, Vec::new(), Vec::new()));
+            // no residue ⇒ no section
+        }
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
         (Some(b), _, _) => b,
     };
@@ -694,6 +752,7 @@ fn decode_control(
     // exactly "bytes remain" (canonical: absent when empty, ascending `(parent_task, slot)` — `slot`
     // is only unique within a parent's namespace, so the parent tag is the primary key; v12).
     let mut nested = Vec::new();
+    let mut child_state = Vec::new();
     if !cr.at_end() {
         let nn = cr.uleb()?;
         let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
@@ -726,6 +785,68 @@ fn decode_control(
                 0 => None,
                 _ => Some(cr.uleb()? as i64),
             };
+            // v14 (§13.4 slice 4c): the child's optional host state.
+            if cr.uleb()? != 0 {
+                let nq = cr.uleb()?;
+                let mut svc_queue = Vec::with_capacity(nq as usize);
+                for _ in 0..nq {
+                    let export = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let op = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let na = cr.uleb()?;
+                    let mut args = Vec::with_capacity(na as usize);
+                    for _ in 0..na {
+                        args.push(cr.uleb()? as i64);
+                    }
+                    let ticket = cr.uleb()?;
+                    svc_queue.push(SvcDispatch {
+                        export,
+                        op,
+                        args,
+                        ticket,
+                    });
+                }
+                let nr = cr.uleb()?;
+                let mut svc_results = Vec::with_capacity(nr as usize);
+                let mut lastt: Option<u64> = None;
+                for _ in 0..nr {
+                    let t = cr.uleb()?;
+                    if lastt.is_some_and(|p| t <= p) {
+                        return Err(RestoreError::Malformed); // non-canonical: tickets ascend
+                    }
+                    lastt = Some(t);
+                    svc_results.push((t, cr.uleb()? as i64));
+                }
+                let svc_next_ticket = cr.uleb()?;
+                let nh = cr.uleb()?;
+                let mut handles = Vec::with_capacity(nh as usize);
+                for _ in 0..nh {
+                    let hslot = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let generation =
+                        u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let type_id = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let binding = read_binding(&mut cr)?;
+                    // The child-window containment gate, mirroring the root handle table's
+                    // `binding_in_window`: a child's AddressSpace/Instantiator base/size are
+                    // carve-relative and must stay inside its own window.
+                    if !binding_in_window(&binding, 1u64 << size_log2) {
+                        return Err(RestoreError::BindingOutOfWindow);
+                    }
+                    handles.push(DurableHandle {
+                        slot: hslot,
+                        generation,
+                        type_id,
+                        binding,
+                    });
+                }
+                child_state.push(FrozenChildState {
+                    parent_task,
+                    slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+                    svc_queue,
+                    svc_results,
+                    svc_next_ticket,
+                    handles,
+                });
+            }
             nested.push(FrozenNested {
                 // v12: carried on the wire (above), so a restored subtree reconstructs to arbitrary
                 // depth — a grandchild's `parent_task` is its parent-child's task, not `0`.
@@ -742,7 +863,7 @@ fn decode_control(
     if !cr.at_end() {
         return Err(RestoreError::Malformed);
     }
-    Ok((fibers, vcpus, root_sp, nested))
+    Ok((fibers, vcpus, root_sp, nested, child_state))
 }
 
 // ---- Binding (de)serialization (§12.5) ----

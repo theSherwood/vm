@@ -1903,6 +1903,7 @@ fn drive_arc(
     // `thread.spawn` (in ascending task order). Taken here; empty for a freeze or ordinary run.
     let thaw_vcpus = std::mem::take(&mut host.frozen_vcpus);
     let thaw_nested = std::mem::take(&mut host.frozen_nested);
+    let thaw_child_state = std::mem::take(&mut host.frozen_child_state);
     // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
     // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
     let thaw_root_sp = host.frozen_root_sp.take();
@@ -2186,15 +2187,47 @@ fn drive_arc(
                     .map(|m| m.nested_view(m.window.base() + abs_carve, fnr.size_log2));
                 let mut ch = Host::new();
                 ch.set_durable(true);
-                let cinst = ch.grant_instantiator(0, csize);
+                // §13.4 slice 4c: a child with recorded host state restores it **verbatim** —
+                // the captured handle table (slots/generations preserved, so guest handle
+                // values reloaded from its spilled frames still resolve) and its serve trio —
+                // instead of the fresh-grant path. Its `self_module` (serve admission /
+                // handler resolution for the re-issued drain) is the grant's own module for a
+                // separate-module child, or the root's registered module otherwise. Entry
+                // args are inert for a rewind (the prologue reloads spilled values), so the
+                // restored path passes zero placeholders of the entry's shape.
+                let cstate = thaw_child_state
+                    .iter()
+                    .find(|cs| cs.parent_task == fnr.parent_task && cs.slot == fnr.slot);
                 let want_as = cfuncs
                     .get(fnr.entry as usize)
                     .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
-                let child_args = if want_as {
-                    let cas = ch.grant_address_space(0, csize);
-                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                let child_args = if let Some(cs) = cstate {
+                    ch.restore_durable_handles(&cs.handles);
+                    ch.set_svc_state(
+                        cs.svc_queue.clone(),
+                        cs.svc_results.clone(),
+                        cs.svc_next_ticket,
+                    );
+                    ch.self_module = {
+                        let hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+                        match fnr.module_digest {
+                            Some(d) => hg.module_arc_by_digest(&d),
+                            None => hg.self_module.clone(),
+                        }
+                    };
+                    if want_as {
+                        vec![Value::I64(0), Value::I64(0)]
+                    } else {
+                        vec![Value::I64(0)]
+                    }
                 } else {
-                    vec![Value::I64(cinst as i64)]
+                    let cinst = ch.grant_instantiator(0, csize);
+                    if want_as {
+                        let cas = ch.grant_address_space(0, csize);
+                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                    } else {
+                        vec![Value::I64(cinst as i64)]
+                    }
                 };
                 let cid = s.next_task;
                 s.next_task += 1;
@@ -2222,6 +2255,7 @@ fn drive_arc(
                 ));
                 child.durable = true;
                 child.nested_child = true;
+                child.nested_slot = fnr.slot;
                 child.dstate = STATE_REWINDING;
                 child.root_shadow_sp = child_extent;
                 child.parent_task = parent;
@@ -4172,7 +4206,45 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     refuse
                 }
             };
-            let result = if nested_refused {
+            // DURABILITY.md §13.4 slice 4c: a **nested child's** host state — its serve trio
+            // and durable handle table — rides the subtree's shared sink as a
+            // [`FrozenChildState`] keyed by `(parent_task, nested_slot)`, merged into its
+            // nested record at codec time and seeded back onto the re-created child's fresh
+            // host at thaw. A child holding a **non-durable** handle refuses the subtree
+            // freeze exactly like a root would (`capture_durable_handles` errs — the same
+            // fail-closed shape as `nested_refused`). Plain children (empty trio, only the
+            // fresh-grant instantiator/AS handles) record nothing, keeping plain-subtree
+            // artifacts unchanged.
+            let child_state_refused = froze && v.nested_child && {
+                let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                let (q, r, t) = hg.svc_state();
+                match hg.capture_durable_handles() {
+                    Err(_) => true, // a non-durable child handle: fail the freeze closed
+                    Ok(handles) => {
+                        // Record whenever the child holds ANY state a fresh-host thaw would
+                        // drop — handles included (every child holds at least its
+                        // instantiator grant; restoring the captured table verbatim
+                        // preserves guest-held handle values exactly).
+                        if !q.is_empty() || !r.is_empty() || t != 0 || !handles.is_empty() {
+                            drop(hg);
+                            let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                            sink.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .frozen_child_state
+                                .push(FrozenChildState {
+                                    parent_task: v.parent_task as usize,
+                                    slot: v.nested_slot,
+                                    svc_queue: q,
+                                    svc_results: r,
+                                    svc_next_ticket: t,
+                                    handles,
+                                });
+                        }
+                        false
+                    }
+                }
+            };
+            let result = if nested_refused || child_state_refused {
                 Err(Trap::ThreadFault)
             } else if froze {
                 // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
@@ -5224,6 +5296,29 @@ pub struct FrozenFiber {
     pub generation: u64,
 }
 
+/// §13.4 slice 4c — a nested child's **host state** at a subtree freeze: its serve trio and its
+/// durable handle table, keyed by the same `(parent_task, slot)` as its [`FrozenNested`] record.
+/// Pushed by the child's own self-unwind into the subtree's shared freeze-residue sink (its own
+/// powerbox is private); the codec merges it into the child's nested record, and the thaw seeds
+/// the re-created child's fresh host from it (`set_svc_state` + `restore_durable_handles` —
+/// preserving the original slots/generations, so guest handle values reloaded from the child's
+/// spilled frames still resolve). Absent for a plain child (fresh-grant thaw path, unchanged).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenChildState {
+    /// The task id of the vCPU that instantiated the child (mirrors [`FrozenNested::parent_task`]).
+    pub parent_task: usize,
+    /// The parent's join-table slot for the child (mirrors [`FrozenNested::slot`]).
+    pub slot: usize,
+    /// The child's inbound dispatch queue (FIFO), completion cells (ascending ticket), and ticket
+    /// counter — the child-side v13 serve trio.
+    pub svc_queue: Vec<SvcDispatch>,
+    pub svc_results: Vec<(u64, i64)>,
+    pub svc_next_ticket: u64,
+    /// The child's durable handle table (its `capture_durable_handles` output — a child holding a
+    /// non-durable handle refuses the subtree freeze exactly like a root).
+    pub handles: Vec<DurableHandle>,
+}
+
 /// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
 /// Like [`FrozenFiber`] but for a whole green thread rather than a fiber: under a multi-vCPU freeze the
 /// child unwinds its own native stack into *its* per-context shadow region (`context = task id`), and
@@ -5889,6 +5984,11 @@ struct VCpu {
     /// its extent lives in its carve's shadow-SP word, inside the parent's window image — so its
     /// freeze completion records no host-side residue (and must not clobber the root's).
     nested_child: bool,
+    /// §13.4 slice 4c — this nested child's join-table slot in its **parent's** table, threaded in
+    /// at instantiation so the child's own self-unwind can key its [`FrozenChildState`] residue
+    /// (`(parent_task, nested_slot)` matches its `FrozenNested` record). Meaningless unless
+    /// `nested_child`.
+    nested_slot: usize,
     /// This vCPU's §14 **co-fiber** children (`Instantiator.spawn_coroutine`): suspended continuations
     /// (their own frames/mem/host) driven *inline* by `resume`, by handle (slot). `None` once the
     /// coroutine has run to completion (a later `resume` is inert). Distinct from `threads` — a
@@ -6033,6 +6133,7 @@ impl VCpu {
             nested_children: Vec::new(),
             child_hosts: BTreeMap::new(),
             nested_child: false,
+            nested_slot: 0,
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
@@ -6107,6 +6208,7 @@ impl VCpu {
             nested_children: Vec::new(),
             child_hosts: BTreeMap::new(),
             nested_child: false,
+            nested_slot: 0,
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
@@ -6525,6 +6627,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         nested_children,
         child_hosts,
         nested_child: _,
+        nested_slot: _,
         coroutines,
         fault_yields,
         depth,
@@ -7322,6 +7425,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // parent sets it via `Instantiator.kill`.
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
+                                    // §13.4 slice 4c: the join slot `threads.push` below will
+                                    // assign — threaded into the child so its self-unwind can
+                                    // key its host-state residue.
+                                    let jslot = threads.len();
                                     let made = sched.spawn(move |id| {
                                         // A nested child is its **own** domain (own host/window/program),
                                         // so it gets its own dispatch table, not the parent's.
@@ -7347,6 +7454,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // Its freeze-unwind is carve-self-describing: record no
                                         // host-side extent (see `VCpu::nested_child`).
                                         child.nested_child = true;
+                                        // §13.4 slice 4c: the child's join slot — `threads.push`
+                                        // below assigns exactly `threads.len()` at this point —
+                                        // so its self-unwind can key its host-state residue.
+                                        child.nested_slot = jslot;
                                         // §4 depth-2: the child pushes its own [`FrozenNested`] residue
                                         // (for any grandchild) into the subtree's shared sink, so it
                                         // coalesces in the root host rather than the child's private one.
@@ -11839,6 +11950,12 @@ pub struct Host {
     frozen_vcpus: Vec<FrozenVCpu>,
     /// §14 nested-child residue of a subtree freeze (DURABILITY.md §4) — see [`FrozenNested`].
     frozen_nested: Vec<FrozenNested>,
+    /// §13.4 slice 4c — per-child **host state** residue of a subtree freeze: a serving (or
+    /// cap-holding) nested child's serve trio + durable handle table, keyed by the same
+    /// `(parent_task, slot)` as its [`FrozenNested`] record (pushed by the child's own
+    /// self-unwind into the subtree's shared sink; the codec merges it into the child's
+    /// nested record). Empty for plain children, so plain-subtree artifacts are unchanged.
+    frozen_child_state: Vec<FrozenChildState>,
     /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
     /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
     /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
@@ -12075,6 +12192,7 @@ impl Host {
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
             frozen_nested: Vec::new(),
+            frozen_child_state: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
             import_bindings: Vec::new(),
@@ -12329,6 +12447,18 @@ impl Host {
     /// [`Host::set_durable`] (the in-memory counterpart of [`Host::set_frozen_vcpus`]).
     pub fn set_frozen_nested(&mut self, frozen: Vec<FrozenNested>) {
         self.frozen_nested = frozen;
+    }
+
+    /// §13.4 slice 4c — the per-child host-state residue of the last subtree freeze (serve trio +
+    /// durable handles of serving / cap-holding nested children), keyed by `(parent_task, slot)`.
+    pub fn frozen_child_state(&self) -> &[FrozenChildState] {
+        &self.frozen_child_state
+    }
+
+    /// Seed the per-child host state a **thaw** must re-establish on the re-created children
+    /// (alongside [`Host::set_frozen_nested`]).
+    pub fn set_frozen_child_state(&mut self, state: Vec<FrozenChildState>) {
+        self.frozen_child_state = state;
     }
 
     /// The root vCPU's flattened shadow-SP extent from the last multi-vCPU freeze (slice 3.2.1), or
@@ -13532,6 +13662,16 @@ impl Host {
             .iter()
             .find(|g| g.durable && &g.digest == digest)
             .map(|g| Arc::clone(&g.funcs))
+    }
+
+    /// §13.4 slice 4c — the whole granted `Module` matching a nested record's digest, for the
+    /// thaw to register as the re-created serving child's **self module** (serve admission +
+    /// handler resolution need the module, not just its functions).
+    fn module_arc_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<Module>> {
+        self.modules
+            .iter()
+            .find(|g| g.durable && &g.digest == digest)
+            .map(|g| Arc::clone(&g.module))
     }
 
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
