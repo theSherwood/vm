@@ -1064,8 +1064,10 @@ capabilities the guest imports, or a `main(argc, argv)` vs `main(void)` signatur
 before the change below.
 
 **Fix (svm-llvm, off-workspace lane):** make the on-ramp's `synth_*_start` emit the **by-name**
-paramless entry (the S15 `synth_powerbox_start` / `synth_powerbox_start_for_imports` path) for *every*
-guest, regardless of cap count or `main` signature. Once every emitted guest is by-name, drop the
+paramless entry for *every* guest, regardless of cap count or `main` signature. (The S15
+`synth_powerbox_start*` family this originally named was deleted in IMPORTS.md phase 4; the
+frontend-neutral public equivalent is now `svm_ir::synth_manifest_start`, and svm-llvm's private
+`synth_start` is already paramless.) Once every emitted guest is by-name, drop the
 positional branch from `grant_onramp_caps` and the `arity > 5` guard in `onramp_exec`, collapsing the
 host to a single by-name grant; regenerate the committed `.svmb` fixtures/assets so they're by-name
 too. `svm-run`'s `grant_caps` (which also still keeps a positional branch) can drop it in the same pass.

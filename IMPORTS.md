@@ -1347,6 +1347,35 @@ Remaining before the slice: ~~build revocation-unparks~~ **[BUILT
 exec-interface contract~~ **[EXEC.md landed; host/scripted backends
 built]** — its guest-served backend is the first Endpoint consumer.
 
+**Separate-artifact linking — jacl (2026-07-24).** The phase-4 deletions
+left direct-IR frontends that link separately-compiled artifacts (a runtime
+library carrying live §7 capability imports + program units) with no public
+path to a runnable manifest module: `link` fail-closed on any name no unit
+exports and unconditionally emptied the merged manifest, and the synthesized
+`_start` builders were gone with the stash bootstraps. The gap is closed by
+two additive `svm_ir` functions, consistent with §2.5 (the linker is the one
+pass that legitimately produces new module bytes; instantiation still never
+rewrites):
+
+- **`link_with_manifest`** — `link`, except an import no unit exports is
+  **retained** as a merged-manifest slot instead of failing (DESIGN §7: the
+  same named-import mechanism generalizes to cross-unit linking). Same-named
+  retained imports dedup by resolved structural shape + mode (D59),
+  fail-closed on disagreement; slot references (`call.import`, `call.sym`,
+  `import.attach`) reindex into the merged manifest. `link` itself is
+  unchanged: fail-closed stays the default, retention is opt-in.
+- **`synth_manifest_start`** — wraps a `(i64 sp)` entry in the §3e paramless
+  `_start` (function 0, `export "_start" 0`), growing the window and
+  optionally seeding the heap words. **No capability prologue, no stash, no
+  resolve** — slots are bound by the host at instantiation, so this is not
+  the deleted `synth_powerbox_*` machinery under a new name; it is only the
+  func-index reshuffle a frontend should not have to reimplement.
+
+Together: `link_with_manifest(units)` → `synth_manifest_start(module,
+entry, seed_heap)` → verify → `instantiate_with_imports` — the whole
+runtime-plus-program powerbox path through public API
+(`crates/svm/tests/link_manifest.rs` is the pinned end-to-end shape).
+
 **[BUILT 2026-07-22] §3.6 slice 1 — revocation-unparks.** The substrate
 primitive is live on the reference interpreter's M:N scheduler:
 `Stream.close` is now **real** (slot entry cleared in the one shared

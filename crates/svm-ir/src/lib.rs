@@ -15,7 +15,8 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 
@@ -2818,6 +2819,119 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
         * POWERBOX_STACK_ALIGN
 }
 
+/// Wrap `entry` in a synthesized **paramless powerbox `_start`** (function 0, `export "_start" 0`
+/// — the §3e manifest-module entry shape) so a frontend that emits SVM-IR directly (e.g. the
+/// [`link_with_manifest`] output of a separately-compiled runtime + program) becomes a runnable
+/// powerbox module without reimplementing the linker's func-index reshuffle. Capabilities are
+/// **manifest slots the host binds at instantiation** (IMPORTS.md phases 3–4): the synthesized
+/// entry has no capability prologue and the module's import manifest travels through untouched —
+/// nothing here is the retired resolve-and-rewrite bootstrap.
+///
+/// The entry must take a single `i64` (the data-stack pointer) and return 0 or 1 values; its
+/// result becomes `_start`'s result. `_start` optionally seeds the guest heap words
+/// ([`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`], to the window's mapped boundary) when
+/// `seed_heap`, then calls the entry with `sp` = [`powerbox_entry_sp`]. The declared memory grows
+/// (never shrinks) to cover the data stack reserve. Every existing funcidx — in code, exports,
+/// impl-export ops, and debug info — shifts up by one as `_start` becomes function 0. (Funcref
+/// *values* already flowing through data or patched constants are the caller's to fix; synthesize
+/// before any [`Resolved::Slot`]-style patching.)
+pub fn synth_manifest_start(
+    mut module: Module,
+    entry: FuncIdx,
+    seed_heap: bool,
+) -> Result<Module, String> {
+    let ef = module.funcs.get(entry as usize).ok_or_else(|| {
+        format!(
+            "entry funcidx {entry} out of range ({} funcs)",
+            module.funcs.len()
+        )
+    })?;
+    if ef.params.as_slice() != [ValType::I64] {
+        return Err(format!(
+            "powerbox entry must take a single i64 (the data-stack pointer), got params {:?}",
+            ef.params
+        ));
+    }
+    if ef.results.len() > 1 {
+        return Err(format!(
+            "powerbox entry must return 0 or 1 value, got {:?}",
+            ef.results
+        ));
+    }
+    if module.exports.iter().any(|e| e.name == "_start") {
+        return Err("module already exports `_start` — it already has an entry bootstrap".into());
+    }
+    let results = ef.results.clone();
+
+    // Globals/data live at/above STACK_PAGE; the data stack starts page-aligned above the highest
+    // segment. The window must cover it plus the data-stack reserve — grow the declared memory to
+    // fit (never shrink); beyond the mapped window is the faulting guard region (§5).
+    let entry_sp = powerbox_entry_sp(&module);
+    let top = entry_sp + POWERBOX_STACK_RESERVE;
+    let need_log2 = (64 - (top - 1).leading_zeros()) as u8;
+    let size_log2 = module
+        .memory
+        .map_or(need_log2, |m| m.size_log2.max(need_log2));
+    module.memory = Some(Memory { size_log2 });
+    // The guest heap (when the program allocates) begins at the window's mapped boundary and grows
+    // up into the reserved tail via `Memory.map`.
+    let heap_base = seed_heap.then(|| 1u64 << size_log2);
+
+    // Every existing funcidx (code, exports, impl-export ops, debug info) shifts up by one — the
+    // prepended `_start` becomes function 0.
+    offset_func_indices(&mut module, 1);
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut next: ValIdx = 0;
+    if let Some(hb) = heap_base {
+        for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
+            insts.push(Inst::ConstI64(off as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI64(hb as i64));
+            let value = next;
+            next += 1;
+            insts.push(Inst::Store {
+                op: StoreOp::I64,
+                addr,
+                value,
+                offset: 0,
+                align: 0,
+            });
+        }
+    }
+    insts.push(Inst::ConstI64(entry_sp as i64));
+    let sp = next;
+    next += 1;
+    insts.push(Inst::Call {
+        func: entry + 1,
+        args: vec![sp],
+    });
+    let term = if results.is_empty() {
+        Terminator::Return(vec![])
+    } else {
+        Terminator::Return(vec![next]) // the entry's single result, appended by the call
+    };
+    module.funcs.insert(
+        0,
+        Func {
+            params: Vec::new(),
+            results,
+            blocks: vec![Block {
+                params: Vec::new(),
+                insts,
+                term,
+            }],
+        },
+    );
+    // Expose the bootstrap as a named export so an embedder reaches it by name (`call("_start")`),
+    // not by a magic funcidx. The frontend's own entry export (e.g. "main") survives, shifted.
+    module.exports.push(Export {
+        name: "_start".to_string(),
+        func: 0,
+    });
+    Ok(module)
+}
+
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
@@ -3481,6 +3595,14 @@ pub enum LinkError {
     BadImportIndex(u32),
     /// A relocation pointed at a missing instruction, or one that isn't an address constant.
     BadReloc(DataReloc),
+    /// Retained-manifest linking ([`link_with_manifest`]) found units disagreeing on a shared
+    /// import's structural shape or mode, a malformed shape reference, or a grouped
+    /// (interface-shaped) call site whose name resolved to a single exported function. The
+    /// message names the import and the disagreement.
+    ImportShapeMismatch(String),
+    /// An `import.attach` targeted an import whose name resolved to an exported **function** —
+    /// a statically-linked call has no slot to rebind (the unit meant a runtime-bound name).
+    AttachResolved(String),
 }
 
 /// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
@@ -3492,6 +3614,26 @@ pub enum LinkError {
 /// re-verify it before running, since a unit is untrusted like any frontend output (a cross-unit
 /// signature mismatch is caught there).
 pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
+    link_impl(units, false)
+}
+
+/// [`link`], for **separate-artifact frontends** (a runtime library carrying live §7 capability
+/// imports, linked against program units — the jacl shape): cross-unit symbols resolve exactly as
+/// [`link`] does, but an import **no unit exports is retained** in the merged module's manifest
+/// instead of failing the link — the host binds it at instantiation, per DESIGN §7 ("the same
+/// named-import mechanism generalizes to cross-unit linking"). Same-named retained imports dedup
+/// to one slot when their structural shape and mode agree (D59 — meaning, not type indices);
+/// disagreement fails closed ([`LinkError::ImportShapeMismatch`]). Slot references
+/// (`call.import`, `call.sym`, `import.attach`) reindex into the merged manifest; a `call.sym`
+/// to a retained name stays symbolic (executable slot dispatch at wire v8). Fail-closed moves to
+/// instantiation for retained names (an unregistered name still cannot run); data symbols are
+/// unaffected (an unresolved one is still [`LinkError::Unresolved`]). Feed the result to
+/// [`synth_manifest_start`] for a runnable powerbox module, and re-verify like any linked output.
+pub fn link_with_manifest(units: &[LinkUnit]) -> Result<Module, LinkError> {
+    link_impl(units, true)
+}
+
+fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     // Function and data layout: each unit's functions occupy `[fbase, fbase + n_funcs)` in the merged
     // list, and its data occupies the window region `[dbase, dbase + data_span)` (16-byte aligned, so
     // units never overlap). `data_span` is the high-water mark of the unit's own (un-relocated) data.
@@ -3557,10 +3699,68 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             Some(b)
         })
         .collect();
+    // Partition every unit's imports (DESIGN §7: "the same named-import mechanism generalizes to
+    // cross-unit linking"): a name some unit exports is link-time resolved to a direct call; any
+    // other name is a host-bound slot — retained in the merged manifest when `retain`
+    // ([`link_with_manifest`]), fail-closed otherwise ([`link`]). Retained same-named imports
+    // dedup to one merged slot iff their **resolved** shapes and modes agree (D59: structural
+    // identity — compare meaning, never raw type indices).
+    let mut merged_imports: Vec<Import> = Vec::new();
+    let mut merged_shapes: Vec<ResolvedShape> = Vec::new();
+    let mut merged_by_name: alloc::collections::BTreeMap<String, u32> =
+        alloc::collections::BTreeMap::new();
+    let mut disps: Vec<Vec<ImportDisp>> = Vec::with_capacity(units.len());
+    for (u, &tbase) in units.iter().zip(&tbases) {
+        let mut d = Vec::with_capacity(u.module.imports.len());
+        for imp in &u.module.imports {
+            if let Some(&f) = funcs_tab.get(&imp.name) {
+                d.push(ImportDisp::Func(f));
+                continue;
+            }
+            if !retain {
+                return Err(LinkError::Unresolved(imp.name.clone()));
+            }
+            let shape = resolved_import_shape(&u.module, imp.shape).ok_or_else(|| {
+                LinkError::ImportShapeMismatch(format!(
+                    "import `{}` has a malformed type-section reference",
+                    imp.name
+                ))
+            })?;
+            if let Some(&j) = merged_by_name.get(&imp.name) {
+                let prev = &merged_imports[j as usize];
+                if prev.mode != imp.mode || merged_shapes[j as usize] != shape {
+                    return Err(LinkError::ImportShapeMismatch(format!(
+                        "units disagree on import `{}` (structural shape or mode)",
+                        imp.name
+                    )));
+                }
+                d.push(ImportDisp::Keep(j));
+            } else {
+                let j = merged_imports.len() as u32;
+                merged_imports.push(Import {
+                    name: imp.name.clone(),
+                    // The shape's type reference follows its unit's entries into the merged
+                    // type section (concatenated at `tbase`, below).
+                    shape: match imp.shape {
+                        ImportShape::Func(t) => ImportShape::Func(tbase + t),
+                        ImportShape::Interface(t) => ImportShape::Interface(tbase + t),
+                    },
+                    mode: imp.mode,
+                });
+                merged_shapes.push(shape);
+                merged_by_name.insert(imp.name.clone(), j);
+                d.push(ImportDisp::Keep(j));
+            }
+        }
+        disps.push(d);
+    }
     // Per unit: place its data, apply its relocations, reindex its functions, resolve its imports.
     let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
     let mut data: Vec<Data> = Vec::new();
-    for (u, ((&fbase, &dbase), &tbase)) in units.iter().zip(fbases.iter().zip(&dbases).zip(&tbases))
+    for ((u, ((&fbase, &dbase), &tbase)), disp) in units
+        .iter()
+        .zip(fbases.iter().zip(&dbases).zip(&tbases))
+        .zip(&disps)
     {
         let mut m = u.module.clone();
         offset_type_indices(&mut m, tbase);
@@ -3579,19 +3779,9 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             apply_reloc(&mut m, r, base)?;
         }
         offset_func_indices(&mut m, fbase);
-        let resolved =
-            resolve_imports_with(&m, |name| funcs_tab.get(name).copied().map(Resolved::Func))
-                .map_err(|e| match e {
-                    ImportError::Unresolved(n) => LinkError::Unresolved(n),
-                    ImportError::BadImportIndex(i) => LinkError::BadImportIndex(i),
-                    // `link` only ever resolves to `Func` (static merge), never `Slot`, so a
-                    // slot-handle error cannot arise here.
-                    ImportError::SlotHandleNotConst => {
-                        unreachable!("static link never resolves to a Slot")
-                    }
-                })?;
-        funcs.extend(resolved.funcs);
-        data.extend(resolved.data);
+        rewrite_unit_imports(&mut m, disp)?;
+        funcs.extend(m.funcs);
+        data.extend(m.data);
     }
     // Merge the units' impl surfaces (offers + the type section, IMPORTS.md §3.2/OQ3): type
     // entries concatenate with a per-unit index offset (declarations only — identity is
@@ -3639,7 +3829,8 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             .filter_map(|u| u.module.memory)
             .max_by_key(|m| m.size_log2),
         data,
-        imports: Vec::new(),
+        // Empty for [`link`]; the deduped host-bound slots for [`link_with_manifest`].
+        imports: merged_imports,
         exports,
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
         // `merge_impl_surfaces`; a link unit's own module may carry both.
@@ -3648,6 +3839,94 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
         debug_info: None,
     })
+}
+
+/// How one unit-local import is handled by [`link`]/[`link_with_manifest`]: statically resolved
+/// to a merged function index, or kept as a host-bound slot at its merged-manifest index.
+enum ImportDisp {
+    Func(FuncIdx),
+    Keep(u32),
+}
+
+/// An [`ImportShape`] with its type reference **resolved** — what the shape *means*, so cross-unit
+/// dedup compares structure (D59 identity), never unit-local type indices. `None`-producing
+/// references (out of range, wrong entry kind) fail the link closed before any merge.
+#[derive(PartialEq)]
+enum ResolvedShape {
+    Func(FuncType),
+    Interface(Vec<(String, FuncType)>),
+}
+
+fn resolved_import_shape(m: &Module, shape: ImportShape) -> Option<ResolvedShape> {
+    match shape {
+        ImportShape::Func(t) => match m.types.get(t as usize)? {
+            TypeEntry::Func(ft) => Some(ResolvedShape::Func(ft.clone())),
+            TypeEntry::Interface(_) => None,
+        },
+        ImportShape::Interface(t) => Some(ResolvedShape::Interface(
+            m.interface_named_ops(t)?
+                .into_iter()
+                .map(|(n, ft)| (n.to_string(), ft.clone()))
+                .collect(),
+        )),
+    }
+}
+
+/// Rewrite one unit's import references per its dispositions — the [`link_impl`] counterpart of
+/// [`resolve_imports_with`]'s `Func` case, extended with slot **retention**. A link-resolved name
+/// lowers 1:1 to a direct [`Inst::Call`] (`call.sym`'s unused handle operand is dropped, no value
+/// renumbering — the same rewrite [`resolve_imports_with`] does; a manifest-form `call.import`
+/// must be flat, op 0). A retained name's references reindex into the merged manifest: `call.sym`
+/// stays symbolic (executable slot dispatch at wire v8), `call.import`/`import.attach` follow
+/// their slot. Fail-closed on an out-of-range index; `import.attach` to a link-resolved function
+/// is [`LinkError::AttachResolved`] (there is no slot to rebind). Clears the unit manifest — the
+/// retained entries live in the merged module's.
+fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), LinkError> {
+    let names: Vec<String> = m.imports.iter().map(|i| i.name.clone()).collect();
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                let slot = match inst {
+                    Inst::CallSym { import, .. }
+                    | Inst::CallImport { import, .. }
+                    | Inst::ImportAttach { import, .. } => *import,
+                    _ => continue,
+                };
+                let disp = disps
+                    .get(slot as usize)
+                    .ok_or(LinkError::BadImportIndex(slot))?;
+                match (disp, &mut *inst) {
+                    (ImportDisp::Func(func), Inst::CallSym { args, .. }) => {
+                        let args = core::mem::take(args);
+                        *inst = Inst::Call { func: *func, args };
+                    }
+                    (ImportDisp::Func(func), Inst::CallImport { op, args, .. }) => {
+                        if *op != 0 {
+                            return Err(LinkError::ImportShapeMismatch(format!(
+                                "grouped `call.import` op {} of `{}` cannot resolve to a single \
+                                 exported function",
+                                op, names[slot as usize]
+                            )));
+                        }
+                        let args = core::mem::take(args);
+                        *inst = Inst::Call { func: *func, args };
+                    }
+                    (ImportDisp::Func(_), Inst::ImportAttach { .. }) => {
+                        return Err(LinkError::AttachResolved(names[slot as usize].clone()));
+                    }
+                    (
+                        ImportDisp::Keep(j),
+                        Inst::CallSym { import, .. }
+                        | Inst::CallImport { import, .. }
+                        | Inst::ImportAttach { import, .. },
+                    ) => *import = *j,
+                    _ => unreachable!("slot extraction and rewrite match the same instructions"),
+                }
+            }
+        }
+    }
+    m.imports.clear();
+    Ok(())
 }
 
 /// Apply one [`DataReloc`]: add `base` to the addend held in the constant it points at (a `ConstI64`/
@@ -3712,9 +3991,30 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
             }
         }
     }
-    // Named exports point at funcidxs too, so they shift with the functions.
+    // Named exports, impl-export ops, and function-indexed debug info point at funcidxs too, so
+    // they shift with the functions. ([`link`] merges impl surfaces and debug info from the
+    // *original* unit modules, so this only serves whole-module shifts like
+    // [`synth_manifest_start`]'s prepend — never double-applies there.)
     for e in &mut m.exports {
         e.func += offset;
+    }
+    for e in &mut m.impl_exports {
+        for f in &mut e.ops {
+            *f += offset;
+        }
+    }
+    if let Some(di) = &mut m.debug_info {
+        for l in &mut di.locs {
+            l.func += offset;
+        }
+        for v in &mut di.vars {
+            if v.func != GLOBAL_SCOPE {
+                v.func += offset;
+            }
+        }
+        for n in &mut di.func_names {
+            n.func += offset;
+        }
     }
 }
 
