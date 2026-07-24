@@ -1999,6 +1999,15 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
 ### 13.4 Build order
 
 1. **Stable domain keys** (13.3) — behavior-neutral, unblocks everything.
+   **BUILT 2026-07-24:** `Host::domain_id` (process-unique, minted at construction from a
+   static counter — a snapshot records the ids it saw and a thaw re-links by record, so the
+   absolute values never matter). Every serve-path key producer converted: the `svc.wait`
+   park key, both live-call `svc_wake` targets (direct + import-bound routes, the callee's id
+   read in the same lock scope as the enqueue), and every fiber waiter's domain field (live
+   calls, stdin reads, futex waits). The futex canonical-*region* identity keeps its backing
+   `Arc` key — that is cross-domain futex plumbing, not a serve key; its durable form arrives
+   with the step-2 `FrozenPark::Futex` record. Behavior-neutral: the whole serve corpus
+   (incl. the multi-consumer hammer) is green unchanged.
 2. **`FrozenPark` capture** — event-parked fibers freeze with their park reason; thaw
    re-derives waiter entries. Lifts the `has_blocked_parks` fail-closed for in-cut parks.
 3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
