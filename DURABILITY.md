@@ -2118,10 +2118,34 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      root's). A child holding a *non-durable* handle refuses the freeze like a root. The
      handle path is exercised by every existing nested round trip (all children record);
      two pieces remain before the serving-subtree fixture can pin the trio path end-to-end:
-     (1) **wake-for-freeze** — a child *parked in `svc.wait`* never observes the `UNWINDING`
-     broadcast (a parked vCPU isn't executing), so the flagship freeze-while-parked scenario
-     needs the freeze driver to wake parked consumers into their sentinel arm; (2) the
-     op-14 caller flow (a parent's `LiveImpl` still refuses capture — 4d).
+     (1) **the parked-in-`svc.wait` child** (below); (2) the op-14 caller flow (a parent's
+     `LiveImpl` still refuses capture — 4d).
+   * **4c-bis — the parked-in-`svc.wait` child (design corrected 2026-07-24, from a failed
+     wake-in-epilogue experiment):** a child blocked in `svc.wait` at freeze does **not**
+     self-unwind. The first cut waked its serve key from the parent's freeze-collection loop
+     so its rewound park would re-execute `svc.wait`, observe `UNWINDING`, and take the 4b
+     sentinel — but that loop runs in `drive`'s **post-execution epilogue**, after the worker
+     pool has already quiesced, so the wake pushes the child to `runnable` and *nothing runs
+     it* (verified: `svc_wake` returns `woke=true`, the child never executes, the freeze
+     records no child state). Wake-in-epilogue is structurally wrong. The right model uses
+     §13.2's own note — an `svc.wait` park is **trivially durable: re-execution is the
+     recovery**, no continuation to flatten: the child's "continuation" is literally *re-run
+     `svc.wait`*. So a parked-in-`svc.wait` child needs **capture-without-unwind** — record
+     its `FrozenNested` + `FrozenChildState` directly (detect it: the child vCPU is parked on
+     its own domain key in `svc_waiters` at freeze), and on thaw re-create it and **re-run its
+     entry** (O10 / re-execution-is-recovery: any pre-`svc.wait` side effects replay, then it
+     re-parks on the restored — now seeded — queue). This is the durable-serving flagship
+     (freeze a server idle in its accept loop, thaw it still serving) and its own slice; the
+     op-14/`LiveImpl` capture (4d) is the other half of the same fixture.
+     **Deeper blocker found (2026-07-24):** the slice is bigger than "capture-without-unwind"
+     — a server parked *forever* in `svc.wait` never lets the run **quiesce**, so `drive`'s
+     freeze-collection epilogue is never reached while any consumer is parked. The freeze
+     **trigger** (the `ARMED → UNWINDING` promotion, or an externally-set `UNWINDING`) must
+     therefore first **drain the scheduler's park sets** — `svc_waiters` (and the fiber/cap
+     waiter maps) back to `runnable` — so those vCPUs re-execute their park op, observe
+     `UNWINDING`, and capture/quiesce, *before* the worker loop can finish. That is a
+     run/scheduler-lifecycle change (a "freeze unparks everything" step at trigger time),
+     not an epilogue probe — the reason 4c-bis is its own slice rather than a rider here.
    * **4d — live-cap re-link:** capture `Binding::LiveImpl` as a durable descriptor naming
      its callee **structurally** — the `(parent_task, slot)` of the callee's own nested
      record (a `DomainId` is process-local, so the artifact never carries it; the id is
