@@ -260,6 +260,31 @@ enum Op {
         dst: u32,
         results: Box<[ValType]>,
     },
+    /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`cap.call CAP_SELF 9`) — drain
+    /// the domain's inbound queue, running each servable dispatch as a handler activation over
+    /// the one world. Rewind-driven like the tree-walk serve arm: an admitted handler's return
+    /// linkage re-enters THIS op (pc un-advanced) with its result in `dst` (the linkage's result
+    /// slot), which the re-execution settles into the ticket's completion cell before admitting
+    /// the next dispatch; the final execution overwrites `dst` with the served count. Compiled
+    /// only when the module-level qualification veto admits it (no park-capable seams — see
+    /// [`compile_module`]), so a handler always runs to completion or traps.
+    SvcPoll {
+        dst: u32,
+        /// `svc.wait` (op 10): identical drain, but a no-progress empty-queue execution parks
+        /// the task on its domain ([`Outcome::SvcWait`]) instead of delivering a zero count; a
+        /// caller's enqueue re-admits it and the rewound op re-executes the whole drain.
+        wait: bool,
+    },
+    /// §3.6 (I36 slice 2) — `Instantiator.child_offer` (op 14): mint a live-callee offer over a
+    /// running child's impl-export into the wirer's table. The authority check (the Instantiator
+    /// handle) runs in the op exec; the mint itself needs the child's env/host, so it surfaces to
+    /// the driver ([`Outcome::ChildOffer`]).
+    ChildOffer {
+        handle: u32,
+        child: u32,
+        export: u32,
+        dst: u32,
+    },
     /// §7 reflection `cap.self.count` — number of caps this domain holds (one `i32` result).
     CapSelfCount {
         dst: u32,
@@ -734,6 +759,8 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     let mut has_thread = false;
     let mut has_instantiate = false;
     let mut has_gc = false;
+    let mut has_svc = false;
+    let mut has_park_seam = false;
     for f in funcs {
         for b in &f.blocks {
             for inst in &b.insts {
@@ -742,13 +769,35 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
                     // everything else on INSTANTIATOR/YIELDER is the inline coroutine round-trip.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5,
+                        op: 0 | 1 | 5 | 14,
                         ..
                     } => has_instantiate = true,
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR | super::cap_id::YIELDER,
                         ..
                     } => has_coro = true,
+                    // §3.6 service points (I36 slice 1): svc.poll sites — natively servable
+                    // only when nothing in the module could park a handler (below).
+                    Inst::CapCall {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: 9 | 10,
+                        ..
+                    } => has_svc = true,
+                    // A blocking stream `read` (type 0 op 0) can stdin-park, and an import call
+                    // can be *bound* to one at spawn — either inside a handler would need the
+                    // tree-walker's FIBER_PARKED (completed-but-not-replied) machinery.
+                    Inst::CapCall {
+                        type_id: super::cap_id::STREAM,
+                        op: 0,
+                        ..
+                    }
+                    | Inst::CapCall {
+                        type_id: svm_ir::CAP_IMPORT_TYPE_ID,
+                        ..
+                    }
+                    | Inst::CallImport { .. }
+                    | Inst::SetJmp { .. }
+                    | Inst::LongJmp { .. } => has_park_seam = true,
                     Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
                         has_fiber = true
                     }
@@ -766,9 +815,19 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     // module that also spawns threads could hold roots in a sibling vCPU we wouldn't scan — reject
     // that combination (fall back) to stay sound. `gc.roots` + fibers / coroutines is fine (those
     // continuations *are* scanned).
+    //
+    // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
+    // park or unwind mid-dispatch — the `SvcPoll` rewind linkage runs handlers to completion (or
+    // trap), so any park-capable seam anywhere in the module (futex waits / threads, fibers,
+    // coroutines, nested instantiate, setjmp/longjmp — a `longjmp` out of a handler would unwind
+    // past the serve linkage — blocking stream reads, spawn-bound imports, gc.roots) falls the
+    // whole module back to the tree-walk oracle, whose serve arm has the fiber-park machinery
+    // (slice 5b). The veto is module-wide, so it covers handlers' transitive callees for free.
     if (has_coro && (has_fiber || has_thread))
         || (has_instantiate && has_fiber)
         || (has_gc && has_thread)
+        || (has_svc
+            && (has_park_seam || has_fiber || has_thread || has_coro || has_instantiate || has_gc))
     {
         return None;
     }
@@ -1176,6 +1235,15 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                         demand: op == 7,
                     }
                 }
+                // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
+                // child's export. The mint needs the child's live env, so the op surfaces to the
+                // driver; the compile only marshals `(child, export)`.
+                (cap_id::INSTANTIATOR, 14) if args.len() >= 2 => Op::ChildOffer {
+                    handle: g(*handle),
+                    child: g(args[0]),
+                    export: g(args[1]),
+                    dst,
+                },
                 // §14 cooperative coroutine round-trip — spawn_coroutine (op 2) / spawn_demand_coroutine
                 // (op 4, window starts unmapped) / resume / yield.
                 (cap_id::INSTANTIATOR, op @ (2 | 4)) if args.len() >= 3 => Op::SpawnCoroutine {
@@ -1222,11 +1290,20 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 },
                 (cap_id::INSTANTIATOR, _) | (cap_id::YIELDER, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
-                // §3.6 service points (svc.poll/svc.wait) are eval-loop-serviced — they run
-                // guest handler code, which the bytecode engine cannot. Decline the compile so
-                // the whole module falls back to the tree-walk oracle and SERVES (the same
-                // free-correctness path as the Instantiator ops above), instead of answering
-                // a refusal from host-side dispatch.
+                // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
+                // shape compiles to the native serve-loop-core op — the module-level veto in
+                // [`compile_module`] guarantees its handlers cannot park mid-dispatch, so the
+                // rewind linkage runs each one to completion (or trap). `svc.wait`'s
+                // empty-queue park needs a waker topology (cross-domain callers, timers) the
+                // cooperative scheduler doesn't host yet, and a no-result `svc.poll` would
+                // leave the op without its result-slot scratch — both still decline, falling
+                // the whole module back to the tree-walk oracle, which serves.
+                (svm_ir::CAP_SELF_TYPE_ID, op @ (9 | 10)) if sig.results.len() == 1 => {
+                    Op::SvcPoll {
+                        dst,
+                        wait: op == 10,
+                    }
+                }
                 (svm_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
@@ -2344,6 +2421,7 @@ impl<'p> Vcpu<'p> {
         ));
         let mut vt = VTask::new(&cunit, entry as usize, &args)?;
         vt.active.module = module as usize;
+        vt.active.home = module as usize;
         let own_dom = Domain::child(
             std::sync::Arc::clone(&prog.dom.source),
             build_table_for(cunit.progs.len(), 0, module),
@@ -2457,6 +2535,13 @@ impl<'p> Vcpu<'p> {
                 u64::MAX,
             );
             match stop {
+                // §3.6 (I36 slice 2): live calls / svc.wait / child_offer need the cooperative
+                // scheduler's waker topology (`drive`); on this single-vCPU driver nothing could
+                // ever wake or mint them — fail closed rather than hang. Unreachable through the
+                // compile (op-14 implies the drive path); requires a hand-wired live cap.
+                Ok(VcpuStop::LiveCall { .. })
+                | Ok(VcpuStop::SvcWait)
+                | Ok(VcpuStop::ChildOffer { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
                 Ok(VcpuStop::TierUp {
@@ -4765,6 +4850,26 @@ enum Outcome {
         handle: i32,
         dst: u32,
     },
+    /// §3.6 (I36 slice 2) — a caller's `cap.call` through a live-callee offer. The dispatch is
+    /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
+    /// task on `ticket` until the callee's serve loop settles the completion cell, then delivers
+    /// the reply to `dst`. The cursor is persisted PAST the op (the reply is the call's result).
+    LiveCall {
+        ticket: u64,
+        callee: std::sync::Arc<std::sync::Mutex<Host>>,
+        dst: u32,
+    },
+    /// §3.6 (I36 slice 2) — `svc.wait` with an empty queue and no progress: park this task on its
+    /// domain until a caller's enqueue re-admits it. The cursor is persisted AT the op, so the
+    /// wake re-executes the whole serve drain (the tree-walker's rewound park).
+    SvcWait,
+    /// §3.6 (I36 slice 2) — `child_offer`: mint a live offer over child `child`'s export
+    /// `export` (driver-side — it owns the child envs); the handle (or `-EINVAL`) lands at `dst`.
+    ChildOffer {
+        child: i32,
+        export: u32,
+        dst: u32,
+    },
     /// §14 `Instantiator.instantiate`: the authority `(ibase, isize)` is resolved; the driver builds a
     /// **confined executor child** running entry `entry` over `[ibase+off, +2^size_log2)` with its own
     /// attenuated powerbox and `quota` fuel, registers it (handle = thread slot), and writes the handle
@@ -5234,6 +5339,21 @@ fn run_invoke(
 /// (`thread.*` / `memory.*`) event the scheduler must service. Intra-vCPU fiber switches never reach
 /// here — `step_vcpu` handles them against the vCPU's own registry.
 enum VcpuStop {
+    /// §3.6 (I36 slice 2): park this task on a live-call `ticket` against `callee` (see
+    /// [`Outcome::LiveCall`] — the enqueue already happened in the op exec).
+    LiveCall {
+        ticket: u64,
+        callee: std::sync::Arc<std::sync::Mutex<Host>>,
+        dst: u32,
+    },
+    /// §3.6 (I36 slice 2): park this task in `svc.wait` on its own domain ([`Outcome::SvcWait`]).
+    SvcWait,
+    /// §3.6 (I36 slice 2): mint a live offer over child `child`'s export ([`Outcome::ChildOffer`]).
+    ChildOffer {
+        child: i32,
+        export: u32,
+        dst: u32,
+    },
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
     /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
@@ -5528,6 +5648,23 @@ fn step_vcpu(
                 return Ok(VcpuStop::Spawn { func, sp, arg, dst })
             }
             Outcome::ThreadJoin { handle, dst } => return Ok(VcpuStop::Join { handle, dst }),
+            // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
+            // qualification veto keeps them out of fiber contexts, so no registry state is live.
+            Outcome::LiveCall {
+                ticket,
+                callee,
+                dst,
+            } => {
+                return Ok(VcpuStop::LiveCall {
+                    ticket,
+                    callee,
+                    dst,
+                })
+            }
+            Outcome::SvcWait => return Ok(VcpuStop::SvcWait),
+            Outcome::ChildOffer { child, export, dst } => {
+                return Ok(VcpuStop::ChildOffer { child, export, dst })
+            }
             Outcome::Instantiate {
                 ibase,
                 isize: isz,
@@ -5808,7 +5945,10 @@ const FIBER_RESULTS: [ValType; 1] = [ValType::I64];
 /// the tree-walker's fresh `DomainTable::new(&cfuncs, 0)`), and `fuel` a sub-allocated quota.
 struct ChildEnv {
     mem: Option<Mem>,
-    host: Host,
+    /// The child's live powerbox. `Arc<Mutex<…>>` (single-threaded here, so uncontended) so a
+    /// §3.6 live-callee offer can hold the SAME callee the tree-walker's `wire_live_impl`
+    /// machinery expects — enqueue, offer-shape, and settle all go through the shared type.
+    host: std::sync::Arc<std::sync::Mutex<Host>>,
     table: SharedSlots,
     fuel: u64,
 }
@@ -5838,6 +5978,17 @@ enum TaskState {
     BlockedWait {
         key: u64,
         deadline: u64,
+        dst: u32,
+    },
+    /// §3.6 (I36 slice 2): parked in `svc.wait` on this task's own domain (its env's host); a
+    /// caller's enqueue on that host re-admits it (the rewound op re-executes the drain).
+    BlockedSvc,
+    /// §3.6 (I36 slice 2): parked on a live-call `ticket` against `callee`'s completion cells;
+    /// the settle-wake scan delivers the reply to `dst` (the claim — the tree-walker's
+    /// `cap_reply` preference, cooperative form).
+    BlockedTicket {
+        ticket: u64,
+        callee: std::sync::Arc<std::sync::Mutex<Host>>,
         dst: u32,
     },
     /// Finished — its result (or trap) is retained for a joiner.
@@ -5938,6 +6089,28 @@ fn drive(
             }
             return res;
         }
+        // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
+        // callee's serve loop completed its dispatch; claiming the completion cell delivers the
+        // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
+        for t in &mut tasks {
+            let hit = match &t.state {
+                TaskState::BlockedTicket {
+                    ticket,
+                    callee,
+                    dst,
+                } => callee
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .svc_results
+                    .remove(ticket)
+                    .map(|v| (v, *dst)),
+                _ => None,
+            };
+            if let Some((v, dst)) = hit {
+                t.vt.active.set(dst, Reg::from_i64(v));
+                t.state = TaskState::Runnable;
+            }
+        }
         let Some(ti) = tasks
             .iter()
             .position(|t| matches!(t.state, TaskState::Runnable))
@@ -5980,12 +6153,17 @@ fn drive(
             },
             Some(k) => {
                 let e = &mut extra_envs[k];
+                let durable = e
+                    .host
+                    .lock()
+                    .unwrap_or_else(|er| er.into_inner())
+                    .is_durable();
                 RunCtx {
                     table: &e.table,
                     fuel: &mut e.fuel,
                     mem: &mut e.mem,
-                    durable: e.host.is_durable(),
-                    host: HostCell::Excl(&mut e.host),
+                    durable,
+                    host: HostCell::Shared(&e.host),
                 }
             }
         };
@@ -6008,6 +6186,64 @@ fn drive(
             // a scheduler task — same rationale as tier-up above.
             Ok(VcpuStop::StdinPark) => {
                 unreachable!("blocking stdin not enabled on the scheduler driver")
+            }
+            // §3.6 (I36 slice 2) — the serve/call/offer trio, cooperative form.
+            Ok(VcpuStop::SvcWait) => {
+                tasks[ti].state = TaskState::BlockedSvc;
+            }
+            Ok(VcpuStop::LiveCall {
+                ticket,
+                callee,
+                dst,
+            }) => {
+                // The enqueue already happened in the op exec (holding only the callee's lock).
+                // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
+                // `svc_wake` — then park the caller on its ticket.
+                let k = extra_envs
+                    .iter()
+                    .position(|e| std::sync::Arc::ptr_eq(&e.host, &callee));
+                if let Some(k) = k {
+                    for t in &mut tasks {
+                        if t.env == Some(k) && matches!(t.state, TaskState::BlockedSvc) {
+                            t.state = TaskState::Runnable;
+                        }
+                    }
+                }
+                tasks[ti].state = TaskState::BlockedTicket {
+                    ticket,
+                    callee,
+                    dst,
+                };
+            }
+            Ok(VcpuStop::ChildOffer { child, export, dst }) => {
+                // Mint a live-callee offer over a running child's export: shape from the
+                // CALLEE's module (fetched before the wirer's lock — the tree-walker's lock
+                // order), interned structurally into the wirer's table. A bad child handle /
+                // no such export is a probeable -EINVAL, matching the oracle.
+                let callee = usize::try_from(child)
+                    .ok()
+                    .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
+                    .and_then(|cidx| tasks[cidx].env)
+                    .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
+                let cap = callee.and_then(|callee: std::sync::Arc<std::sync::Mutex<Host>>| {
+                    let sigs = callee
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .offer_shape(export)?;
+                    match tasks[ti].env {
+                        None => host.wire_live_impl(&callee, export, &sigs).ok(),
+                        Some(pk) => extra_envs[pk]
+                            .host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .wire_live_impl(&callee, export, &sigs)
+                            .ok(),
+                    }
+                });
+                tasks[ti]
+                    .vt
+                    .active
+                    .set(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
             }
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
                 if func as usize >= dom.source.primary().progs.len() {
@@ -6116,6 +6352,18 @@ fn drive(
                 let mut child_host = Host::new();
                 let cinst = child_host.grant_instantiator(0, child_size);
                 let cas = child_host.grant_address_space(0, child_size);
+                // §3.6: a same-module child serves over the shared program — its serve machinery
+                // (enqueue admission, handler resolution) and any `child_offer` shape read the
+                // domain's registered module, exactly the tree-walker's `self_module` handoff.
+                child_host.self_module = match tasks[ti].env {
+                    None => host.self_module.clone(),
+                    Some(k) => extra_envs[k]
+                        .host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .self_module
+                        .clone(),
+                };
                 let child_args = if want_as {
                     vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                 } else {
@@ -6134,7 +6382,7 @@ fn drive(
                 let eidx = extra_envs.len();
                 extra_envs.push(ChildEnv {
                     mem: child_mem,
-                    host: child_host,
+                    host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
                     table: child_table,
                     fuel: child_fuel,
                 });
@@ -6160,8 +6408,13 @@ fn drive(
                 dst,
             }) => {
                 // Resolve the granted Module (a forged/closed/wrong-type handle is an inert CapFault).
-                let (cfuncs, cmem_log2, cdata) = match host.resolve_module(mh) {
-                    Ok(g) => (g.funcs.clone(), g.memory_log2, g.data.clone()),
+                let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
+                    Ok(g) => (
+                        g.funcs.clone(),
+                        g.memory_log2,
+                        g.data.clone(),
+                        std::sync::Arc::clone(&g.module),
+                    ),
                     Err(t) => {
                         complete(&mut tasks, ti, Err(t));
                         continue;
@@ -6248,6 +6501,10 @@ fn drive(
                 let mut child_host = Host::new();
                 let cinst = child_host.grant_instantiator(0, child_size);
                 let cas = child_host.grant_address_space(0, child_size);
+                // §3.6: a separate-module child serves its OWN offers — enqueue admission,
+                // handler resolution, and `child_offer` shape all read its module (tree-walk
+                // lockstep: the spawn sets `self_module` from the grant).
+                child_host.set_self_module(&cmodule);
                 let child_args = if want_as {
                     vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                 } else {
@@ -6266,10 +6523,11 @@ fn drive(
                 let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
                 let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
                 child_vt.active.module = cm;
+                child_vt.active.home = cm;
                 let eidx = extra_envs.len();
                 extra_envs.push(ChildEnv {
                     mem: child_mem,
-                    host: child_host,
+                    host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
                     table: child_table,
                     fuel: child_fuel,
                 });
@@ -6782,6 +7040,13 @@ fn run_vcpu_parallel<'scope, 'env>(
             u64::MAX,
         );
         match stop {
+            // §3.6 (I36 slice 2): the serve/call/offer trio runs only on the cooperative
+            // driver (`drive`); a serving module never reaches the parallel driver (the
+            // qualification veto refuses svc + threads together) — fail closed if it somehow
+            // does, rather than park unwakeably.
+            Ok(VcpuStop::LiveCall { .. })
+            | Ok(VcpuStop::SvcWait)
+            | Ok(VcpuStop::ChildOffer { .. }) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
@@ -7180,6 +7445,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     Err(t) => return (Err(t), mem),
                 };
                 child_vt.active.module = cm;
+                child_vt.active.home = cm;
                 let id = reg
                     .next_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7394,6 +7660,18 @@ struct Vm {
     /// function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers, invoked units,
     /// non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never a correctness gate.
     jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket — `Some`
+    /// between admitting a handler activation (whose return linkage rewinds into the `SvcPoll`
+    /// op) and the re-execution that settles its result — and the count of dispatches completed
+    /// by the current `svc.poll` activation.
+    serve_ticket: Option<u64>,
+    serve_count: i64,
+    /// The domain's **home module** — the unit whose functions are its service handlers (0 for the
+    /// primary; a separate-module child's pushed unit index). `svc.poll`/`svc.wait` only dispatch
+    /// handlers while executing in this module: `svc_handler_func` resolves indices against the
+    /// domain's registered `self_module`, so serving from any *other* unit (an installed §22 unit
+    /// running in the root domain) would index the wrong program table — fail closed instead.
+    home: usize,
 }
 
 impl Vm {
@@ -7417,6 +7695,9 @@ impl Vm {
             setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            serve_ticket: None,
+            serve_count: 0,
+            home: 0,
         })
     }
 
@@ -7965,6 +8246,33 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
+                    // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
+                    // offer never reaches the generic dispatch. It enqueues on the callee's
+                    // inbound queue and parks this task until the handler's reply (the
+                    // tree-walker's caller-parking arm, task-level). A full callee queue is
+                    // probeable backpressure (`EAGAIN` as the call's result), never a trap.
+                    if let Some((callee, export)) = host.with(|p| p.live_impl_of(h, *type_id)) {
+                        let t = callee
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .svc_enqueue(export, *op, argv);
+                        if let Some(ticket) = t {
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc + 1;
+                            return Ok(Outcome::LiveCall {
+                                ticket,
+                                callee,
+                                dst: *dst,
+                            });
+                        }
+                        if !results.is_empty() {
+                            self.regs[base + *dst as usize] = Reg::from_i64(super::EAGAIN);
+                        }
+                        pc += 1;
+                        continue;
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let res = host.with(|p| p.cap_dispatch_slots(*type_id, *op, h, &argv, gm))?;
                     // Blocking-stdin park: a `Stream{In}` `read` (type 0, op 0) whose buffer was empty
@@ -7996,6 +8304,75 @@ impl Vm {
                         self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
                     }
                     pc += 1;
+                }
+                Op::SvcPoll { dst, wait } => {
+                    // §3.6 serve-loop core (I36 slice 1), the tree-walk serve arm's rewind state
+                    // machine in register-window form. A handler that just returned re-entered
+                    // this op via its rewound linkage with its result in `dst` — settle it into
+                    // the ticket's completion cell. No cross-domain caller can be parked on the
+                    // ticket in this engine yet (caller-side parking is a later I36 slice), so
+                    // the reply always rides the cell — the tree-walker's unclaimed-result path.
+                    if let Some(t) = self.serve_ticket.take() {
+                        let v = self.regs[base + *dst as usize].i64();
+                        host.with(|p| p.svc_results.insert(t, v));
+                        self.serve_count += 1;
+                    }
+                    // Admit queued dispatches: un-servable ones settle inline with a probeable
+                    // errno (the dispatch's fault, never the domain's — it keeps serving); the
+                    // first servable one switches into a handler activation whose return linkage
+                    // re-executes this op (pc deliberately NOT advanced).
+                    let mut admitted = false;
+                    loop {
+                        let d = host.with(|p| p.svc_queue.pop_front());
+                        let Some(d) = d else { break };
+                        // The queue only holds servable dispatches (checked at enqueue), so a
+                        // missing handler here is host-state corruption: fail closed. Handlers
+                        // are the domain's home-module functions (`self.home` — the primary, or
+                        // a separate-module child's own unit); serving from any other unit
+                        // would resolve indices against the wrong program table.
+                        let fidx = host
+                            .with(|p| p.svc_handler_func(d.export, d.op))
+                            .ok_or(Trap::CapFault)? as usize;
+                        if module != self.home {
+                            return Err(Trap::CapFault);
+                        }
+                        let (params, _) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
+                        if d.args.len() != params.len() {
+                            host.with(|p| p.svc_results.insert(d.ticket, super::EINVAL));
+                            continue;
+                        }
+                        let nb = base + c.progs[cur].nslots as usize;
+                        let need = nb + c.progs[fidx].nslots as usize;
+                        if self.regs.len() < need {
+                            self.regs.resize(need, Reg::default());
+                        }
+                        for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
+                            self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
+                        }
+                        self.stack
+                            .push((module, cur, base, pc, base + *dst as usize));
+                        self.serve_ticket = Some(d.ticket);
+                        cur = fidx;
+                        base = nb;
+                        pc = 0;
+                        admitted = true;
+                        break;
+                    }
+                    if !admitted {
+                        if *wait && self.serve_count == 0 {
+                            // svc.wait with no progress: persist the cursor AT this op (a wake
+                            // re-executes the whole drain) and park the task on its domain.
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc;
+                            return Ok(Outcome::SvcWait);
+                        }
+                        // Queue drained: deliver the completed count and close the activation.
+                        self.regs[base + *dst as usize] = Reg::from_i64(self.serve_count);
+                        self.serve_count = 0;
+                        pc += 1;
+                    }
                 }
                 Op::CapSelfCount { dst } => {
                     // §7 reflection op 0 — same `self_dispatch` the tree-walker uses; one i32 result.
@@ -8126,6 +8503,25 @@ impl Vm {
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
                 // (a forged/ungranted cap is an inert CapFault in place), then the driver builds the
                 // confined child (it owns the task set + the per-child environments).
+                Op::ChildOffer {
+                    handle,
+                    child,
+                    export,
+                    dst,
+                } => {
+                    // The family-level authority check (as the tree-walker's Instantiator arm):
+                    // a forged/wrong-type handle is a CapFault before the op logic runs.
+                    let ih = r!(*handle).i32();
+                    host.with(|p| p.resolve_instantiator(ih))?;
+                    let child = r!(*child).i32();
+                    let export = r!(*export).i64() as u32;
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ChildOffer { child, export, dst });
+                }
                 Op::Instantiate {
                     handle,
                     entry,

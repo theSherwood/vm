@@ -13,6 +13,216 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+> **I36–I40 (2026-07-23):** the §3.6 serving-substrate review, recorded at the owner's request
+> after a design walkthrough. Two further items from the same review were **already tracked** and
+> are not duplicated here: fiber-level `svc.wait`/`Join` parks (TODO.md §3.6 residue,
+> "Join-in-fiber parks") and durability × serving (TODO.md "Durable event-parks" + PROCESS.md O10).
+> Verdict from the review: none of these needs a different design — the model is the actor model
+> (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
+> and I37/I38 need their idioms documented so they're chosen, not stumbled into.
+
+### I36 — a serving module runs its ENTIRE program on the tree-walk oracle: `module_serves` folds the fast backends away (S3, **promoted 2026-07-23 — owner: the cliff is not acceptable**)
+
+**Where:** the §3.6 parity decision (IMPORTS.md): the serve loop (`svc.wait`/`svc.poll` + handler
+admission) exists only in the tree-walk eval loop; the bytecode and JIT entries detect a serving
+module (`module_serves`) and fall back to the oracle **for the whole module** — compute included.
+One impl-export handler costs a personality its fast backend everywhere.
+
+**Why it's a gap, not a design flaw:** nothing in the model precludes native serve loops — the
+JIT already has the pieces (fiber runtime, futex thunks, call trampolines, host-side queue). The
+fold was the correct differential-first baseline; it was parked "awaiting benchmark evidence,"
+and the owner's verdict supersedes that: a parent-as-kernel personality (jacl) is exactly a
+serving domain that needs its compute fast.
+
+**Fix sketch (staged):** (1) bytecode serve loop — the same rewind-driven state machine
+(`serve_run`/`handler_parks`/`serve_count`) in the bytecode dispatch loop, sharing the Host queue
+and Sched wake paths; differential vs the tree-walk. (2) JIT serve loop — `svc.wait` as a thunk
+parking on the domain queue (condvar keyed like the futex table), handlers launched as fibers via
+the existing call trampoline, handler parks riding the S1c shared-futex machinery. The oracle
+fold stays as the differential baseline, not the shipped path.
+
+**Bytecode map + slice-1 design (2026-07-24).** The gap is wider than the fold comment reads:
+`compile_inst` declines the *whole* §3.6 surface — svc ops 9/10 (`bytecode.rs:1230`), every
+`Instantiator` op past 7 via the catch-all (`:1223` — so granted spawns 8/11/13 and `child_offer`
+14 also fall back), and a caller's `cap.call` on a `LiveImpl` handle reaches generic dispatch and
+refuses. What the engine already has is the right substrate, in cooperative form: `drive` (a
+deterministic cooperative scheduler over `TaskSlot { vt, threads, env, state }` with
+`TaskState::{Runnable, BlockedJoin, BlockedWait, Done}` and a logical clock), a **run-shared
+fiber registry** (`FiberState`, D57 migration), confined `ChildEnv`s for §14 children, and —
+crucially — all §3.6 *state* already lives on the shared `Host` (`svc_queue`, `svc_results`,
+tickets, `svc_handler_func`), so enqueue/settle/reply plumbing is reused verbatim; only the
+scheduling is engine-local. The staged plan: (a) serve-loop core, (b) caller-side
+`TaskState::BlockedTicket` parking, (c) the wake paths in `drive`, (d) granted spawns (8/11/13)
+so a serving *child* spawned from bytecode runs native too.
+
+**Slice 1 BUILT (2026-07-24) — the `svc.poll` serve-loop core, native on bytecode.** A serving
+module now compiles when a **qualification veto** admits it: any park-capable seam anywhere in
+the module (futex waits/threads, fibers, coroutines, nested instantiate, setjmp/longjmp — a
+`longjmp` out of a handler would unwind past the serve linkage — blocking stream reads,
+spawn-bound imports, gc.roots) still declines to the tree-walk oracle, whose serve arm has the
+fiber-park machinery, so a native handler always runs to completion or traps. `Op::SvcPoll` is
+the tree-walk serve arm's rewind state machine in register-window form: an admitted handler
+activation's return linkage re-enters the op (pc un-advanced) with its result in `dst`, the
+re-execution settles it into the ticket's completion cell (no cross-domain caller can be
+ticket-parked in this engine yet, so the reply always rides the cell — the tree-walker's
+unclaimed-result path), and the drained-queue execution delivers the served count. Arity
+mismatches errno inline and serving continues; a handler trap is terminal (one world), matching
+the oracle. Pinned by `svm-interp/tests/bytecode_svc.rs`: cross-entry equality on the slice-2
+corpus scenarios, a full-queue (64-dispatch) native drain, and `compile_module` is-Some/is-None
+pins so the differential can never silently degrade into re-testing the fallback. Remaining, in
+order: **slice 2** — `svc.wait` + its waker topology in `drive` (needs an enqueuer: caller-side
+ticket parking and/or the granted spawns, which stay declined); **slice 3** — the JIT serve
+loop.
+
+**Slice 2 BUILT (2026-07-24) — `svc.wait`, caller-side parking, and `child_offer`: the whole
+caller ↔ servicer round-trip native on bytecode.** `Op::SvcPoll` grew the wait form (CAP_SELF
+op 10): an empty queue with no progress persists the cursor AT the op (a wake re-executes the
+whole drain — the tree-walker's rewound park) and surfaces `Outcome::SvcWait`, which `drive`
+parks as `TaskState::BlockedSvc`. The caller side rides three new pieces: (1) `cap.call` on a
+handle probes `live_impl_of` first — a live-callee hit enqueues on the callee's `Host` (its
+lock only) and surfaces `Outcome::LiveCall { ticket, callee, dst }`; `drive` wakes any
+`BlockedSvc` task of the callee's domain (the tree-walker's `svc_wake`) and parks the caller as
+`TaskState::BlockedTicket`; a full callee queue is the probeable `-EAGAIN`. (2) A settle-wake
+scan at the top of the pick loop claims settled completion cells (`svc_results.remove`) into
+parked callers' `dst` — the tree-walker's cap_reply preference in cooperative form. (3)
+`Instantiator` op 14 (`child_offer`) mints a live offer over a spawned child's export:
+`offer_shape` from the callee's module (its lock, fetched before the wirer wires — the
+tree-walker's lock order), `wire_live_impl` into the parent's table, bad handle/export a
+probeable `-EINVAL`. To make the callee reachable, `ChildEnv.host` became `Arc<Mutex<Host>>`
+(the same shape the tree-walker's live bindings hold, so `wire_live_impl`/`live_impl_of` are
+reused verbatim) and both spawn arms set the child's `self_module` (op-0 same-module children
+clone the parent's; op-5 grants carry their own). The serve loop's home-module guard
+generalized from `module != 0` to `module != self.home` (a `Vm` field: 0 for the primary, the
+pushed unit index for a separate-module child) — the slice-1 pin was the *reason* for the
+guard (handlers resolve against the domain's `self_module`, so serving from any other unit
+would index the wrong program table), and a spawned serving child IS its own home. The
+non-scheduler drivers (single-vCPU `Vcpu::run`, `run_vcpu_parallel`) fail closed
+(`ThreadFault`) on the new stops, and an unwakeable park is the scheduler's existing deadlock
+`ThreadFault` — fail-closed where the tree-walker's richer waker set (timers, cross-process)
+would hang differently; the differential never runs hang cases. Pinned in `bytecode_svc.rs`:
+the separate-module corpus round-trip (op-5 spawn → op-14 mint → live call parks → `svc.wait`
+serves → settle-wake → join = 142) with is-Some compile pins on BOTH modules, and
+`svc.wait`-with-queued-work ≡ `svc.poll` progress semantics. Remaining: **slice 3** — the JIT
+serve loop; then the granted spawns 8/11/13 (still declined → tree-walk).
+
+### I37 — a handler trap kills the whole serving domain: total blast radius per bad request (S3)
+
+**Where:** §3.6 handlers run over the domain's **one world** (same window/powerbox/fuel), so a
+trap in any handler is terminal for the domain and every in-flight dispatch — any client that
+finds a crashing input in any handler takes the service down for everyone. Death-is-revocation
+keeps the failure *clean* (parked callers wake with a probeable errno; nothing hangs), but the
+blast radius is the domain.
+
+**Why "continue after trap" is not the fix:** the world may be half-mutated at the trap point;
+resuming the serve loop over corrupted state would be unsound. Trap-is-terminal is forced by
+one-world semantics, which is also what makes handlers race-free without locks.
+
+**Fix (idioms, not substrate):** the actor-model answers, both already expressible —
+(1) **supervision**: the parent `join`/`poll`s its serving child and respawns it on death (all
+primitives exist; a documented pattern, optionally a personality-level respawn helper);
+(2) **isolation granularity is domain granularity**: put risky handlers in worker child domains
+the server spawns (pay-for-what-you-isolate). Action: document both as THE pattern in
+IMPORTS.md/PROCESS.md so personalities choose their blast radius deliberately.
+
+**Supervision mechanics correction (2026-07-24):** `join` of a trapped child **re-raises the
+child's trap in the joiner** (interp `Pending::Join` → `out.result?`; JIT `join` →
+`*trap_out = trap`) — so a naive supervisor that joins a crashed worker dies with it. The
+supervision idiom is **`poll` → status `2` (trapped, non-propagating) → `detach` + respawn**;
+`join` only after `poll` reports a clean return. Any supervision pattern doc must lead with this.
+
+**Escalation options if the domain-fatal default proves too sharp** (recorded for the future,
+none built): (a) **poison-drain** — on a handler trap, errno the trapped dispatch's caller *and*
+every queued/parked dispatch, refuse new work, exit cleanly: converts a blast into an orderly
+shutdown with no execution over torn state (errno plumbing is host-side); cheapest real
+softening. (b) **opt-in resilient mode** — the trap kills only the handler fiber, its caller
+gets an errno, the loop continues: VM-sound (confinement holds regardless — torn state is a
+guest-consistency risk the domain explicitly accepts, with crash-only handler discipline);
+interp-side cheap (drop the fiber's frames), JIT-side sensitive (the detect-and-kill guard must
+unwind to the serve frame instead of the domain — trap-shim/guard machinery, escape-TCB-adjacent)
+plus a leaked-resource sweep for the dead handler's tickets (cf. I40). (c) durability (see the
+TODO.md durable-serving row): thaw-from-snapshot turns domain death into state rollback — the
+complementary answer rather than a trap-scoping one.
+
+### I38 — the servicer cannot shed or shape load: no per-client fairness, no admission control beyond one global quota (S3)
+
+**Where:** the svc queue is one bounded FIFO per domain; the only backpressure is queue-full and
+the fiber quota at admission (`EAGAIN`). A single chatty client with a live offer can keep the
+queue full and starve every sibling into `EAGAIN`; the servicer cannot cancel a stuck parked
+handler, deadline a dispatch, or distinguish callers. Caller-side timeouts (racing fibers +
+revocation-unparks, O1) protect *callers* — nothing protects the *servicer* beyond provider-pays
+fuel caps.
+
+**Boundary:** mid-flight handler cancellation is unsound for the same one-world reason as I37 —
+load control must live at **admission**, where nothing has mutated yet.
+
+**Fix sketch:** per-caller (or per-offer) bounded sub-queues with round-robin admission — the
+enqueue path already knows the caller's identity (ticket/domain); plus an optional timed
+`svc.wait` so an idle-but-scheduled servicer can run its own housekeeping. Parked-handler
+discipline stays guest-side (handlers use timed waits). Small, additive, no model change.
+
+### I39 — handler execution is serialized: one domain's dispatches never use more than one core (S3, latent hazard — a constraint to keep documented, not a bug)
+
+**Where:** concurrency in the serve loop comes only from handler *parks*; a CPU-bound handler
+blocks every other dispatch until it finishes or parks. This is the flip side of the race-freedom
+guarantee (one world, no locks) and matches F6's scoping of guest-served calls to
+**shell-frequency control traffic**. The hazard is latent: someone routes a hot path or a data
+plane through handlers and discovers the ceiling in production.
+
+**Fix (pattern, not substrate):** shard state across worker domains (the parent introduces
+clients to N workers — the grant graph is the load balancer), and keep bulk data on the
+`SharedRegion` ring plane, never in handler args. Action: state the ceiling and both patterns
+explicitly next to F6 so the constraint is designed around, not tripped over.
+
+**Resolution path (owner-agreed 2026-07-24) — serial by default, an opt-in ladder up:** the
+serialization is a *serve-loop* property, not a one-world property (the substrate already has
+real parallelism over one window via `thread.spawn` + atomics/futexes). The ladder:
+(1) *available today* — handler-internal parallelism: a handler `thread.spawn`s workers and
+rendezvouses on a futex (`atomic.wait` fiber-parks correctly in handlers, slice 5b), so the loop
+keeps serving while the handler's compute uses other cores; the Join-in-fiber residue is the
+rough edge to smooth. (2) *available today* — shard across worker domains when state partitions.
+(3) *substrate extension, sequenced AFTER I36* — **multi-consumer `svc.wait`**: N spawned server
+vCPUs each park on the domain queue (`svc_waiters` becomes multi-waiter per key; queue pops are
+already host-locked; per-vCPU serve state needs no sharing; near-free on the native JIT loop).
+The cost is semantic and must be pinned in the differential before the JIT loop exists: handlers
+in a multi-server domain are threaded code (atomics/locks discipline — the same opt-in contract
+as `thread.spawn` generally, per D22), and the woken-before-admissions/completion ordering
+guarantees become per-worker. A domain that spawns one server keeps today's lock-free semantics
+untouched. Transactional per-dispatch worlds were considered and rejected (fights flat memory +
+the JIT's raw stores; guest-visible aborts).
+
+### I41 — revocation is observably inconsistent: a *parked* call through a revoked handle completes with an errno, a *fresh* call traps the domain (S3) — found 2026-07-24 answering "can a trap be triggered by a simple revocation?"
+
+**Where:** yes, it can — and it's the most likely non-bug trap in a long-running server. D37
+makes a revoked handle indistinguishable from a forged one (the slot's generation bumps; "any
+later `cap.call` on it traps", `Host::close`), so a server whose grantor revokes *anything* it
+holds dies on its next use of that handle. But §3.6 slice 1 (revocation-unparks) already broke
+the revoked≡forged equivalence for the *parked* case: a fiber parked in a call through the
+revoked handle wakes with a **negative errno** — the in-code comment says it outright:
+"the call completes with the negative errno … no trap, no kill; **cancellation is a value**"
+(`Pending::CapResult`). So the same lifecycle event is a value if you were mid-call and a
+domain-killing trap if you call a moment later. There is no guest-side defense: reflection
+can't check-then-use atomically (TOCTOU).
+
+**Fix sketch — graceful revocation (tombstones):** distinguish *revoked-once-valid* from
+*never-existed* in the holder's table (a tombstone binding, or a generation→revoked side map):
+use of a tombstoned handle returns a probeable `-EREVOKED`-style errno (consistent with the
+unpark path — cancellation is a value); a forged handle (dead generation, no tombstone) still
+traps. Costs to weigh deliberately: tombstone storage until a slot-reuse policy exists, and the
+D37 anti-probing property — which revocation-unparks has already half-surrendered, so the
+tombstone *completes* an inconsistency rather than creating one. This pairs with I37: it removes
+the dominant benign trigger before any trap-scoping mechanism is considered.
+
+### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4)
+
+**Where:** a completed dispatch whose caller didn't (or can't) claim the reply parks the value in
+`Host::svc_results` keyed by ticket. If the caller died between enqueue and claim, nothing sweeps
+the entry — a long-lived serving domain accumulates orphaned tickets. Bounded by call volume, not
+by live state.
+
+**Fix sketch:** sweep a caller's outstanding tickets on its death/revocation (the
+death-is-revocation path already visits the waiter structures), or bound the map with an LRU/TTL.
+Small; suitable as a rider on any §3.6 residue slice.
+
 ### I35 — chibicc miscompile (unreduced): an indexed array store through a post-incremented counter inside a capability-enumeration loop read back zeros (S3) — seen 2026-07-23, building the c_shell `__stage` ring runner
 
 **Where:** guest C compiled by the chibicc frontend (`--child-entry`). The `__stage` filter
