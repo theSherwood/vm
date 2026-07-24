@@ -1,15 +1,33 @@
 # INTERACTIVE_EMBEDDING.md — the interactive-embedder surface (browser-first)
 
-Status: **scoping doc**, written 2026-07-17. No code in this PR — this is a work-breakdown for
-the capability surface below.
+Status: **partially built — reconciled 2026-07-24.** Written 2026-07-17 as a pure scoping doc.
+Since then the critical path (W1) **shipped through a different mechanism than sketched below** —
+a **DAP-over-the-wasm-FFI** debugger, not the low-level `svm_dbg_*` ABI this doc proposed — and now
+lives in `DEBUGGING.md` (browser slices); the memory-instrumentation substrate (W3's dependency)
+lives in `HOOKS.md`. This doc is kept for the **remaining** workstreams and as the requirements
+record; built parts are marked and cross-referenced below, not restated.
+
+| Workstream | Status | Home |
+|---|---|---|
+| **W1** interactive debug on the bytecode engine (browser) | **Built** — DAP-over-wasm (`svm_dap_*` cdylib exports, `web/dap.js`, `browser-dap-test.mjs` gates CI); incl. step-back / reverse time-travel, watchpoints, multithreaded debug | `DEBUGGING.md` browser slices |
+| **W2** machine-state view | **Partial** — named locals/frames read back over DAP; the finite-register-file *mode* (v2) unbuilt | `svm-dap`, `DEBUGGING.md` |
+| **W3** memory-access scoring | **Substrate built** (`Instance::with_mem_hooks`, the `svm-opt` instrumentation pass, C ABI `svm_instance_with_mem_hooks`, 3-backend parity gate); **not** wired into the browser cdylib | `HOOKS.md` |
+| **W4** blocking-input suspend/resume | **Remaining** | this doc |
+| **W5** in-browser C→module compile | **Remaining** — needs chibicc hosted in wasm (see the W5 section) | this doc, `BROWSER.md`, `FRONTEND.md` |
+| **W6** small host/tooling items | **Partial** — multithreaded time-travel / seed via `DEBUGGING.md`; the rest open | mixed |
+
+The design invariants and the requirements for the remaining workstreams stand as written; where a
+section below has shipped, a **Status** line at its head points at where the built form lives and
+the original design text is left as the record.
 
 An *interactive embedder* is a host that drives a guest **step by step and inspects it
 between steps**: debugger frontends, educational programming environments, REPLs and
 playgrounds, profiling/visualization tools. Natively, SVM already serves them — the
 tree-walker's `Inspector` (`svm-interp`) has stepping, breakpoints, watchpoints, time-travel,
-and a DAP server (`svm-dap`) on top (`DEBUGGING.md`). **In the browser it does not**: the
-browser build (`browser/`, `BROWSER.md`) runs the bytecode engine through run-to-completion
-entries (`svm_run*`), with no interactive surface at all.
+and a DAP server (`svm-dap`) on top (`DEBUGGING.md`). **In the browser, at the time of writing, it
+did not**: the browser build (`browser/`, `BROWSER.md`) ran the bytecode engine through
+run-to-completion entries (`svm_run*`) only. W1 has since closed the debug half of that gap via
+DAP-over-wasm (see the status block above); the profiling/input/compile halves (W3–W5) remain.
 
 This doc scopes the workstreams that close that gap, plus a few adjacent host/tooling
 capabilities interactive embedders keep needing. Requirements are stated embedder-neutrally;
@@ -34,17 +52,29 @@ escape; the interpreter tier is the debug engine.
 | Deterministic, self-contained browser `Host` (streams accumulate, stdin is a buffer, `Clock` is a counter) | Built | `BROWSER.md` § Decisions |
 | Host-serviced vCPU events (spill frame → host services → `deliver_*` resumes) | Built (pattern) | `bytecode.rs:1842ff` (`VcpuEvent`, tier-up path) |
 | Cooperative multi-vCPU `drive` + deterministic timeout selection | Built | `bytecode.rs:4623` |
-| Memory-access instrumentation pass (observe/veto every guest memory op, zero-cost-when-off, all backends) | Built natively | `HOOKS.md`, `Instance::with_mem_hooks` (`crates/svm-run/src/lib.rs:3615`) |
+| Memory-access instrumentation pass (observe/veto every guest memory op, zero-cost-when-off, all backends) | Built natively | `HOOKS.md`, `Instance::with_mem_hooks` (`crates/svm-run/src/lib.rs:4110`) |
 | Source-level debug info waist (`debug.loc`/`debug.var`/types), chibicc `-g` | Built | `svm-ir` `DebugInfo`, W4 in `DEBUGGING.md` |
 | `display` / `keyboard` / `fs` browser capabilities | Built | `browser/src/lib.rs` (~:1831), `demos/doom/` |
 
 The key prior finding (`DEBUGGING.md` §1b): *the bytecode tier is fully inspectable, not
-precluded — it is unbuilt as a DAP backend, not blocked.* Everything below is wiring, not
-research.
+precluded — it is unbuilt as a DAP backend, not blocked.* Everything below was wiring, not
+research — and W1 confirmed it: the DAP backend over the bytecode engine **did** land (through the
+wasm FFI), so the memory-access row below is now the only substrate piece the *remaining* work
+(W3-in-browser) still needs to reach.
 
 ---
 
 ## W1 — Interactive debug sessions on the bytecode engine (the critical path)
+
+> **Status (2026-07-24): BUILT — differently.** Shipped as a **DAP-over-the-wasm-FFI** debugger
+> rather than the `svm_dbg_*` ABI sketched below: the `browser/` cdylib exposes `svm_dap_request` /
+> `svm_dap_reset` / `svm_dap_response_ptr` / `_len` (`browser/src/lib.rs`) — a JSON-in / JSON-out
+> pump over `DapServer::handle`, backed by the bytecode `Debuggee` — with `web/dap.js` as the JS
+> client and `browser-dap-test.mjs` gating CI (initialize→launch→breakpoint→stackTrace→variables→
+> continue on the engine the playground ships). Step-back / reverse time-travel, watchpoints (data
+> breakpoints in the playground panel), and multithreaded debug (wait/notify over DAP) all landed
+> too. See `DEBUGGING.md` browser slices. The design text below is the original (unbuilt) sketch,
+> kept as the record of the road not taken.
 
 **Need.** An embedder must be able to: step one op / one source line (into/over/out), run
 until a breakpoint/watchpoint/fuel bound, pause, read the PC and source location, read frames
@@ -85,6 +115,10 @@ Fuel stops a runaway `run_until`.
 
 ## W2 — Machine-state view (rides on W1)
 
+> **Status (2026-07-24): PARTIAL.** v1's named locals/frames read back over the DAP surface
+> (`svm-dap` `read_var`, exercised by `browser-dap-test.mjs`). The v2 **finite-register-file
+> compile mode** below is unbuilt.
+
 **Need.** Debugger UIs want a "machine panel": a register file, a program counter, a stack
 pointer, and SIMD lanes — real machine state, not a display fiction.
 
@@ -115,10 +149,16 @@ through the wasm ABI). SP visibly moves across call/return; a `v128` local rende
 **Need.** Profiling/visualization embedders want the guest's memory-access stream: cache and
 locality models, heat maps, access ordering — without touching the engine.
 
+> **Status (2026-07-24): SUBSTRATE BUILT, browser-wiring REMAINING.** The `HOOKS.md` pass is
+> complete natively (P0–P3 + the C ABI `svm_instance_with_mem_hooks` + a 3-backend parity gate,
+> `crates/svm/tests/mem_hooks_diff.rs`); only the on-demand native high-throughput seam (P4) is
+> open. It is **not** exported from the `browser/` cdylib — so this section (reaching it from the
+> browser) is the genuine remaining work.
+
 **Today.** The `HOOKS.md` pass fires an embedder hook around every guest memory op, identical
 across backends, zero-cost when off — with cache/page-fault scoring as a named use case. It
-is wired natively (`Instance::with_mem_hooks`); whether it is reachable from the browser
-cdylib is unverified.
+is wired natively (`Instance::with_mem_hooks`); it is **not yet** exported from the browser
+cdylib (no `svm_*` mem-hook entry) — confirmed 2026-07-24.
 
 **Direction.** (1) Confirm the hook pass runs on the bytecode engine under wasm; add a
 hook-install flag to the W1 session. (2) Ship access-stream consumers (e.g. a small L1/L2
@@ -148,6 +188,15 @@ and resumes. Provided bytes join the run's deterministic input record (the `CapT
 `seek(0)` + re-run replays both, byte-identically, with no new suspensions.
 
 ## W5 — In-browser frontend (C source → module, client-side)
+
+> **Status (2026-07-24): REMAINING.** The browser has in-wasm *text-IR* parse/verify/encode
+> (`svm_parse`) and the wasm-JIT tier, but **not** C-source→module. The blocker is not C-language
+> coverage — chibicc already compiles real libraries (Clay, jsmn, tinfl, tiny-regex, stb_perlin)
+> byte-identically to native `cc` (`FRONTEND.md`) — it is **hosting the compiler in wasm**:
+> build `frontend/chibicc` to wasm32 against a wasm libc (or run it as an SVM guest over the POSIX
+> personality), give it in-memory source-in / text-IR-out instead of `fopen`/`open_file`, embed the
+> bundled `include/*.h` in a virtual FS so `#include` resolves, always pass `-g`, then pipe its
+> text IR through the existing `svm_parse` encoder. See the requirement note below and `FRONTEND.md`.
 
 **Need.** Interactive embedders want the full edit-compile-run loop client-side: source text
 in, verified module out, no server round-trip, sub-second warm compiles.
@@ -189,8 +238,11 @@ warm compile of a few-hundred-line program well under a second.
 ## Non-goals
 
 - Consumer-side integration (any embedder's UI, worker glue, content, or test suites).
-- DAP-over-the-browser-build (the native `svm-dap` stays the DAP story; the W1 ABI is
-  lower-level and JS-shaped).
+- ~~DAP-over-the-browser-build~~ **(reversed 2026-07-24 — this became the chosen path).** The
+  doc originally proposed a lower-level JS-shaped `svm_dbg_*` ABI and ruled DAP-over-the-browser
+  out; in the event, DAP-over-the-wasm-FFI (`svm_dap_*` + `web/dap.js`) is what shipped for W1, and
+  the `svm_dbg_*` ABI was never built. `DEBUGGING.md` is the DAP story on both the native and
+  browser builds.
 - Porting the tree-walker (and its OS-thread `Scheduler`) to wasm — the bytecode engine is
   the browser debug tier, per the fail-closed decision in `BROWSER.md`.
 - Matching any particular consumer's legacy machine model (register names, flags registers,
@@ -198,6 +250,10 @@ warm compile of a few-hundred-line program well under a second.
   the one concession, and it is SVM-shaped.
 
 ## Suggested slice order
+
+> **2026-07-24:** steps 1–2 (W1 + its time-travel/watchpoints, and W2 v1) are **done** (via
+> DAP-over-wasm; `DEBUGGING.md`). The live remaining order is **W4 → W5 → W3 → W2 v2**, plus the
+> open **W6** items.
 
 1. **W1 spike** — single-vCPU interactive step + source breakpoint exported from the cdylib,
    driven by a throwaway page, parity-checked against the native `Inspector`. De-risks
