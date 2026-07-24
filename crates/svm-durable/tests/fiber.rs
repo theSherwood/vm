@@ -843,3 +843,142 @@ fn an_unwoken_cap_parked_fiber_fails_the_freeze_closed() {
         "a cap-parked fiber refuses the freeze (its placeholder would masquerade as a result)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §13.4 step 4 (per-fiber thaw re-arm) — a **woken** event-park thaws through a
+// **post-rewind** claim. The freeze lands at the resume of a second fiber B (safepoint 2)
+// with fiber A already woken-but-unclaimed; on thaw the root's rewind re-issues only the
+// B resume — by the time it claims A (the next op), the root runs NORMAL again. Without the
+// re-arm the fresh `Pending` claim would start A from its entry and orphan its spilled
+// frame (observable: a transient `FIBER_PARKED` poll instead of the result). With it, A's
+// non-empty shadow region forces its context `REWINDING` at the switch, so A rewinds to its
+// `MemoryWait` arm, re-checks the restored cell (7 ≠ 0), and completes — both timelines
+// agree on `(FIBER_RETURNED, 107, 7)`.
+// ---------------------------------------------------------------------------
+
+// Root: seed witness cell 65608 = 5; resume A (reads witness, parks on 65600); store 7 +
+// notify (A woken); overwrite witness = 9 (AFTER A's read); resume B (the freeze point);
+// then LOOP resuming A until it completes (the cooperative-poll contract — a thawed park may
+// re-park transiently). A returns `witness_read * 1000 + cell`: 5007 proves the rewind
+// reloaded A's SPILLED pre-park read (5); a fresh start would re-read 9 → 9007.
+const SRC_WOKEN_PARK_COLLECTED_LATE: &str = r#"
+func () -> (i32, i64, i64) {
+block 0 () {
+  vwc = i64.const 65608
+  vfive = i64.const 5
+  i64.store vwc vfive
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 65600
+  v7 = i64.const 7
+  i64.store v6 v7
+  v8 = i32.const 1
+  v9 = atomic.notify v6 v8
+  vnine = i64.const 9
+  i64.store vwc vnine
+  v10 = ref.func 2
+  v11 = i64.const 8192
+  v12 = cont.new v10 v11
+  v13, v14 = cont.resume v12 v3
+  br 1(v2, v3)
+}
+block 1 (vk: i64, vz: i64) {
+  vs, vv = cont.resume vk vz
+  vpk = i32.const 3
+  vp = i32.eq vs vpk
+  br_if vp 1(vk, vz) 2(vs, vv)
+}
+block 2 (vrs: i32, vrv: i64) {
+  vc = i64.const 65600
+  vload = i64.load vc
+  return vrs vrv vload
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vwc = i64.const 65608
+  vw = i64.load vwc
+  v2 = i64.const 65600
+  v3 = i32.const 0
+  v4 = i64.const -1
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.load v2
+  vt = i64.const 1000
+  vm = i64.mul vw vt
+  v8 = i64.add vm v6
+  return v8
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v2 = suspend vb
+  return v2
+  }
+}
+"#;
+
+#[test]
+fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
+    use svm_durable::arm_freeze_after;
+
+    let mut m = svm_text::parse_module(SRC_WOKEN_PARK_COLLECTED_LATE).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Baseline: the woken park is claimed directly (LiveWoken) — (RETURNED, 107, 7).
+    assert_eq!(
+        run_normal(&inst),
+        Ok(vec![Value::I32(1), Value::I64(5007), Value::I64(7)]),
+        "uninterrupted run: witness_read(5)*1000 + cell(7)"
+    );
+
+    // Freeze at the second fiber safepoint — the resume of B — with A woken-but-unclaimed.
+    let (frozen_fibers, root_sp, snap) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut win = init_durable_window(WINDOW);
+        arm_freeze_after(&mut win, 2);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+        (
+            h.frozen_fibers().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            snap,
+        )
+    };
+    let mut slots: Vec<usize> = frozen_fibers.iter().map(|f| f.slot).collect();
+    slots.sort_unstable();
+    assert_eq!(
+        slots,
+        vec![0, 1],
+        "A (woken park) and B (suspend park) both flattened"
+    );
+
+    // Thaw: the rewind re-issues only the B resume; the A claim happens in post-rewind
+    // NORMAL execution — the re-arm makes it rewind instead of starting fresh.
+    let r_thaw = {
+        let mut win = snap.clone();
+        begin_thaw(&mut win, 0);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_frozen_fibers(frozen_fibers);
+        h.set_frozen_root_sp(root_sp);
+        let mut fuel = 1_000_000u64;
+        let (r, _) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        r
+    };
+    assert_eq!(
+        r_thaw,
+        Ok(vec![Value::I32(1), Value::I64(5007), Value::I64(7)]),
+        "the post-rewind claim rewinds the woken park (spilled witness 5 reloaded, not re-read as 9)"
+    );
+}

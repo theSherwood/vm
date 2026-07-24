@@ -2058,8 +2058,44 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    seed per-fiber thaw words (or re-arm them per claim) before woken parks thaw.
 3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
    `serve_count`, `serve_run` linkage), versioned like the fiber section (elided when empty).
+   **BUILT 2026-07-24** (the trio): snapshot v13 adds a `TAG_SERVE` section (after the handle
+   table) carrying the inbound queue (FIFO), the completion cells (canonical ascending
+   ticket), and the ticket counter — read/written through `Host::{svc_state, set_svc_state}`,
+   elided when empty, round-trip + §12.6 re-freeze pinned in `svm-snapshot`. The per-consumer
+   fields turned out to need **no capture at a legal freeze point**: a parked consumer's
+   `serve_count` is provably 0 (the wait parks only when the queue is drained *and* the count
+   was handed back) and its `serve_run` is `None` — and a freeze that lands **mid-handler**
+   now fails closed at the serve epilogue (under `UNWINDING` the handler's exit is an unwind
+   return whose `(FIBER_RETURNED, 0)` would have settled a *bogus zero* into the caller's
+   completion cell — a silent-corruption hole this step closes; pinned in
+   `svm-durable/tests/serve.rs`). The `serve_run` reply-linkage record stays step 4, where
+   mid-handler freezes become capturable instead of refused.
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
    re-park callers (race-check against restored cells), mark `svc.wait` consumers runnable.
+   **Slice 4a BUILT 2026-07-24 (per-fiber thaw re-arm):** `shadow_switch` now forces an
+   incoming *fiber* context to `REWINDING` whenever its restored shadow region still holds a
+   frame (SP above its frame base ⇔ seeded frozen residue not yet rewound — `create` resets
+   the region, `seed_frozen` restores the extent, and a completed rewind pops back to base;
+   the predicate self-clears). This closes the step-2 note: a flattened woken event-park
+   claimed by **post-rewind NORMAL** execution now rewinds from its spilled frame instead of
+   starting fresh and orphaning it. Pinned with a witness-cell discriminator (the rewind
+   reloads the *spilled* pre-park read; a fresh start re-reads the mutated cell) plus the
+   cooperative-poll loop a thawed park's transient re-park requires (invariant 7).
+   **Slice 4b BUILT 2026-07-24 (serve-point freeze + re-issue thaw):** the serve arm delivers
+   an inert sentinel on observing `UNWINDING` (no drain, no park — the queue survives
+   untouched for the v13 serve section) so its trailing poll unwinds with zero forward
+   progress, and the transform classifies `cap.call CAP_SELF svc.poll/svc.wait` as a new
+   **re-issue** `SuspendKind::SvcServe` (spill `out − nres`; the sentinel is never captured —
+   a `Leaf` reload would have masqueraded it as the served count). The thaw arm flips
+   `NORMAL` (the mid-handler gate guarantees the serve point is the deepest frozen frame),
+   reloads handle + args, and re-executes: the drain runs against the *restored* queue — an
+   empty one re-parks `svc.wait` exactly as an uninterrupted run would ("thaw marks them
+   runnable" via re-execution, no waiter capture). Pinned in `svm-durable/tests/serve.rs`
+   (in-memory round trip + the op-number cross-crate pin) and
+   `svm-snapshot/tests/roundtrip.rs` (the full artifact: freeze at the serve point →
+   restore → thaw drains the restored dispatch, completion cell fills). Remaining in step 4:
+   multi-domain subtree wiring — restore *hosts* plural, `LiveImplEntry` re-link by
+   `DomainId`, caller re-parks with the settle race-check.
 5. **Cross-cut O10 re-issue** — freeze-boundary calls complete with a re-issue marker on
    thaw; validate against reload-not-reissue (R8/R11) before widening.
 

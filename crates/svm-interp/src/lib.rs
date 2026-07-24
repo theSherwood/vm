@@ -5177,6 +5177,20 @@ fn shadow_switch(
     };
     let phase = m.durable_thaw_state(ctx_idx_of(out_ctx));
     m.durable_set_thaw_state(ctx_idx_of(in_ctx), phase);
+    // DURABILITY.md §13.4 step 4 (per-fiber thaw re-arm): an incoming **fiber** whose restored
+    // shadow region still holds a frame — SP above its frame base ⇔ seeded frozen residue not
+    // yet rewound (`create` resets the region; `seed_frozen` restores the frozen extent; a
+    // completed rewind pops back to base) — re-enters `REWINDING` regardless of the carried
+    // phase. Without this, a flattened fiber claimed by post-rewind NORMAL execution (e.g. a
+    // woken event-park collected after the root's own rewind finished) would start fresh and
+    // orphan its spilled frame. Self-clearing, fiber-only (root contexts are seeded by the
+    // thaw driver).
+    if in_ctx != ROOT_FIBER {
+        let fctx = shadow_context_index(in_ctx);
+        if in_sp > shadow_frame_base(fctx) {
+            m.durable_set_thaw_state(fctx, STATE_REWINDING);
+        }
+    }
 }
 
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
@@ -7903,6 +7917,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // paths pushed `(status, value)` onto this frame — pop them and settle
                     // that dispatch before the rewound op runs the machine again.
                     if let Some(run) = serve_run.take() {
+                        // DURABILITY.md §13.4 step 3: a freeze that lands **mid-handler** fails
+                        // closed. Under `UNWINDING` the handler's exit is an unwind return —
+                        // its "(FIBER_RETURNED, 0)" would settle a bogus zero into the caller's
+                        // completion cell, and even a genuine return's reply linkage is not yet
+                        // in the snapshot (the step-4 serve_run record). Refuse the freeze
+                        // (same shape as the `handler_parks` gate); the previous snapshot
+                        // remains the recovery point.
+                        if durable
+                            && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
+                        {
+                            return Err(Trap::FiberFault);
+                        }
                         let value = frames[top].vals.pop().ok_or(Trap::Malformed)?.i64();
                         let status = frames[top].vals.pop().ok_or(Trap::Malformed)?.i32();
                         match status {
@@ -7921,6 +7947,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // suspending: a fiber fault, terminal for the one world.
                             _ => return Err(Trap::FiberFault),
                         }
+                    }
+                    // DURABILITY.md §13.4 slice 4b: under `UNWINDING` a serve op makes **no
+                    // progress** — it delivers an inert sentinel so its own trailing poll
+                    // spills with the queue untouched (the vCPU-thunk sentinel pattern). The
+                    // transform's `SvcServe` re-issue arm re-executes the drain on thaw
+                    // against the restored queue — re-execution is the recovery, so the
+                    // sentinel is never captured (the point spills `out − nres`).
+                    if durable
+                        && serve_run.is_none()
+                        && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
+                    {
+                        if !sig.results.is_empty() {
+                            frames[top].vals.push(Reg::from_i64(0));
+                        }
+                        continue;
                     }
                     // Switch into handler-fiber frames: the `cont.resume` tail with the serve
                     // frame rewound, so the handler's every exit re-executes this op.
@@ -11504,6 +11545,7 @@ pub struct GuestImplEntry {
 /// `ticket`. Admitted as a handler over the domain's **one world** at a `svc.poll` service
 /// point — run-to-completion this slice (handler parking rides the fiber-admission slice),
 /// which is exactly the passive instance's serialized observable behavior (the oracle).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SvcDispatch {
     pub export: u32,
     pub op: u32,
@@ -13026,6 +13068,26 @@ impl Host {
     /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
     pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
         self.svc_results.remove(&ticket)
+    }
+
+    /// DURABILITY.md §13.4 step 3 — this domain's **serve state** for the snapshot codec:
+    /// `(queue, completion cells, next ticket)`. Plain data (the §13.2 inventory row
+    /// "serialize as-is"); the completion cells come out in ascending-ticket order (the
+    /// `BTreeMap` iteration), which is the artifact's canonical order.
+    pub fn svc_state(&self) -> (Vec<SvcDispatch>, Vec<(u64, i64)>, u64) {
+        (
+            self.svc_queue.iter().cloned().collect(),
+            self.svc_results.iter().map(|(&t, &v)| (t, v)).collect(),
+            self.svc_next_ticket,
+        )
+    }
+
+    /// DURABILITY.md §13.4 step 3 — restore this domain's serve state from a snapshot's
+    /// serve section (the inverse of [`Host::svc_state`]). Replaces whatever is present.
+    pub fn set_svc_state(&mut self, queue: Vec<SvcDispatch>, results: Vec<(u64, i64)>, next: u64) {
+        self.svc_queue = queue.into();
+        self.svc_results = results.into_iter().collect();
+        self.svc_next_ticket = next;
     }
 
     /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).

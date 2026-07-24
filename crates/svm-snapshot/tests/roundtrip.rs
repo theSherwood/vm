@@ -3,8 +3,8 @@
 //! (canonical re-serialize; identity-gated refusal) and the non-durable freeze refusal.
 
 use svm_durable::{
-    arm_freeze_after, begin_thaw, init_durable_window, transform_module, write_state,
-    STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, transform_module,
+    transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -864,5 +864,183 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
         thawed,
         Ok(baseline),
         "thawed nested tree equals the uninterrupted run (reload, not re-issue)"
+    );
+}
+
+/// DURABILITY.md §13.4 step 3 (v13) — the **serve trio** round-trips: a domain frozen with a
+/// non-empty inbound queue, completion cells, and a live ticket counter restores them exactly
+/// (queue in FIFO order, cells intact, counter monotonic), and the §12.6 canonical re-freeze
+/// of the restored domain is byte-identical.
+#[test]
+fn serve_state_round_trips_through_the_codec() {
+    use svm_interp::SvcDispatch;
+
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW);
+
+    let mut host = Host::new();
+    host.set_svc_state(
+        vec![
+            SvcDispatch {
+                export: 0,
+                op: 1,
+                args: vec![7, -3],
+                ticket: 5,
+            },
+            SvcDispatch {
+                export: 2,
+                op: 0,
+                args: vec![],
+                ticket: 6,
+            },
+        ],
+        vec![(3, 999), (4, -9)],
+        7,
+    );
+    let artifact = freeze(&inst, &win, &host).expect("freeze with serve state");
+
+    let mut rhost = Host::new();
+    let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
+    assert_eq!(
+        rhost.svc_state(),
+        host.svc_state(),
+        "queue (FIFO), completion cells, and ticket counter restore exactly"
+    );
+
+    // §12.6: re-freezing the restored domain reproduces the artifact byte-for-byte.
+    let refrozen = freeze(&inst, &rwin, &rhost).expect("re-freeze");
+    assert_eq!(
+        refrozen, artifact,
+        "canonical re-serialize is byte-identical"
+    );
+}
+
+/// The serve section is **elided** when the trio is empty (a never-served domain), so the
+/// artifact's TLV walk carries no `TAG_SERVE` (4) — and restoring such an artifact leaves the
+/// host's serve state at its empty default.
+#[test]
+fn empty_serve_state_elides_the_section() {
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW);
+    let host = Host::new();
+    let artifact = freeze(&inst, &win, &host).expect("freeze without serve state");
+
+    // Walk the TLV container (magic, u16 version, then tag/len/body) and collect tags.
+    let mut tags = Vec::new();
+    let mut at = 6; // 4-byte magic + 2-byte version
+    while at < artifact.len() {
+        let (tag, n) = read_uleb_at(&artifact, at);
+        at += n;
+        let (len, n) = read_uleb_at(&artifact, at);
+        at += n + len as usize;
+        tags.push(tag);
+    }
+    assert!(
+        !tags.contains(&4),
+        "no TAG_SERVE section for an empty serve trio: {tags:?}"
+    );
+
+    let mut rhost = Host::new();
+    restore(&artifact, &inst, &mut rhost).expect("restore");
+    assert_eq!(
+        rhost.svc_state(),
+        (Vec::new(), Vec::new(), 0),
+        "restored serve state stays at the empty default"
+    );
+}
+
+/// Minimal LEB128 read for the TLV walk above: returns `(value, bytes_consumed)`.
+fn read_uleb_at(b: &[u8], at: usize) -> (u64, usize) {
+    let (mut v, mut shift, mut n) = (0u64, 0u32, 0usize);
+    loop {
+        let byte = b[at + n];
+        v |= u64::from(byte & 0x7f) << shift;
+        n += 1;
+        if byte & 0x80 == 0 {
+            return (v, n);
+        }
+        shift += 7;
+    }
+}
+
+/// §13.4 slice 4b + v13 end-to-end: a **serving domain** frozen at its serve point round-trips
+/// through the real artifact. The freeze run reaches `svc.poll` under `UNWINDING` (inert
+/// sentinel — no drain), the artifact's serve section carries the untouched queue, and the
+/// restored domain's re-issued serve op drains it: the handler finally runs against the
+/// restored window and the completion cell fills — identical to the uninterrupted run.
+#[test]
+fn serving_freeze_serialize_restore_thaw_through_the_codec() {
+    const SRC_SERVE: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 1 }
+
+func () -> (i64) {
+block 0 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vc = i64.const 65600
+  vafter = i64.load vc
+  vk = i64.const 1000
+  vm = i64.mul vn vk
+  vr = i64.add vm vafter
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vc = i64.const 65600
+  i64.store vc vx
+  vone = i64.const 1
+  vr = i64.add vx vone
+  return vr
+  }
+}
+"#;
+    let mut m = svm_text::parse_module(SRC_SERVE).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Freeze a domain with one queued dispatch, stopped at its serve point.
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.set_self_module(&inst);
+    let ticket = host.svc_enqueue(0, 0, vec![41]).expect("enqueue");
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 1_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut host);
+    assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+    let artifact = freeze(&inst, &snap, &host).expect("freeze artifact");
+
+    // Restore into a fresh host: the serve section re-seeds the trio; thaw drains it.
+    let mut rhost = Host::new();
+    let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
+    assert_eq!(
+        rhost.svc_state().0.len(),
+        1,
+        "the artifact carried the queued dispatch"
+    );
+    rhost.set_durable(true);
+    rhost.set_self_module(&inst);
+    let mut twin = rwin.clone();
+    begin_thaw(&mut twin, 0);
+    let mut fuel = 1_000_000u64;
+    let (thawed, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &twin, SIZE_LOG2, &mut rhost);
+    assert_eq!(
+        thawed,
+        Ok(vec![Value::I64(1041)]),
+        "the restored domain served the restored dispatch (served*1000 + cell)"
+    );
+    assert_eq!(
+        rhost.svc_result(ticket),
+        Some(42),
+        "the completion cell filled on thaw"
     );
 }

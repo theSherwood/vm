@@ -41,7 +41,7 @@
 use svm_encode::{digest256, encode_module};
 use svm_interp::{
     DurableBinding, DurableHandle, FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle,
-    StreamRole, SHADOW_BASE,
+    StreamRole, SvcDispatch, SHADOW_BASE,
 };
 use svm_ir::Module;
 
@@ -94,7 +94,13 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// topologically from it (parents before children). One extra `uleb` per nested record (0 for a
 /// depth-1 direct child of the root), so a v11 nested record mis-parses; retires the v11 freeze-time
 /// refusal that fail-closed on any non-zero `parent_task`.
-const FORMAT_VERSION: u16 = 12;
+/// v13 (DURABILITY.md §13.4 step 3: serve state): a new Section 4 (`TAG_SERVE`, after the handle
+/// table) carries the domain's serve trio — the inbound dispatch queue (`svc_queue`, FIFO order),
+/// the completion cells (`svc_results`, canonical ascending ticket), and the ticket counter
+/// (`svc_next_ticket`) — all plain guest-meaningful data (§13.2 "serialize as-is"; tickets are
+/// cut-internal under §13.1). Elided when the trio is empty/zero, so a never-served domain's
+/// artifact keeps the v12 section layout (only the version differs).
+const FORMAT_VERSION: u16 = 13;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -108,6 +114,9 @@ const TAG_WINDOW: u64 = 1;
 /// domain has frozen fibers, so a single-vCPU/no-fiber artifact is byte-identical to before.
 const TAG_CONTROL: u64 = 2;
 const TAG_HANDLES: u64 = 3;
+/// Serve state (DURABILITY.md §13.4 step 3, v13) — the domain's inbound dispatch queue,
+/// completion cells, and ticket counter. Emitted only when non-empty (see `FORMAT_VERSION`).
+const TAG_SERVE: u64 = 4;
 
 // ---- Binding descriptors (§12.5). One tag byte + value-typed payload. ----
 const B_STREAM: u8 = 0;
@@ -381,6 +390,33 @@ pub fn freeze_with_prots(
         }
     });
 
+    // Section 4 — Serve state (DURABILITY.md §13.4 step 3, v13): the domain's inbound queue
+    // (FIFO order), completion cells (ascending ticket — `svc_state` yields the `BTreeMap`
+    // order), and ticket counter. Plain data (§13.2 "serialize as-is"); tickets are
+    // cut-internal under §13.1. Elided when the trio is empty/zero, so a never-served
+    // domain's artifact keeps the pre-serve section layout.
+    let (svc_queue, svc_results, svc_next_ticket) = host.svc_state();
+    if !svc_queue.is_empty() || !svc_results.is_empty() || svc_next_ticket != 0 {
+        section(&mut out, TAG_SERVE, |b| {
+            write_uleb(b, svc_queue.len() as u64);
+            for d in &svc_queue {
+                write_uleb(b, d.export as u64);
+                write_uleb(b, d.op as u64);
+                write_uleb(b, d.args.len() as u64);
+                for &a in &d.args {
+                    write_uleb(b, a as u64);
+                }
+                write_uleb(b, d.ticket);
+            }
+            write_uleb(b, svc_results.len() as u64);
+            for &(t, v) in &svc_results {
+                write_uleb(b, t);
+                write_uleb(b, v as u64);
+            }
+            write_uleb(b, svc_next_ticket);
+        });
+    }
+
     Ok(out)
 }
 
@@ -411,6 +447,7 @@ pub fn restore_with_prots(
     }
 
     let (mut header, mut win_body, mut handles_body, mut control_body) = (None, None, None, None);
+    let mut serve_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -420,6 +457,7 @@ pub fn restore_with_prots(
             TAG_WINDOW => win_body = Some(body),
             TAG_CONTROL => control_body = Some(body),
             TAG_HANDLES => handles_body = Some(body),
+            TAG_SERVE => serve_body = Some(body),
             _ => {} // forward-compatible: skip unknown sections
         }
     }
@@ -523,6 +561,50 @@ pub fn restore_with_prots(
     }
     if !nested.is_empty() {
         host.set_frozen_nested(nested);
+    }
+
+    // ---- Serve state (§13.4 step 3, v13): decode the serve trio and restore it. The section is
+    // present iff the trio is non-empty (canonical); its absence restores the empty default. ----
+    if let Some(body) = serve_body {
+        let mut sr = Reader::new(body);
+        let nq = sr.uleb()?;
+        let mut queue = Vec::with_capacity(nq as usize);
+        for _ in 0..nq {
+            let export = u32::try_from(sr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let op = u32::try_from(sr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let nargs = sr.uleb()?;
+            let mut args = Vec::with_capacity(nargs as usize);
+            for _ in 0..nargs {
+                args.push(sr.uleb()? as i64);
+            }
+            let ticket = sr.uleb()?;
+            queue.push(SvcDispatch {
+                export,
+                op,
+                args,
+                ticket,
+            });
+        }
+        let nr = sr.uleb()?;
+        let mut results = Vec::with_capacity(nr as usize);
+        let mut last: Option<u64> = None;
+        for _ in 0..nr {
+            let t = sr.uleb()?;
+            if last.is_some_and(|p| t <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: tickets must ascend
+            }
+            last = Some(t);
+            let v = sr.uleb()? as i64;
+            results.push((t, v));
+        }
+        let next_ticket = sr.uleb()?;
+        if !sr.at_end() {
+            return Err(RestoreError::Malformed);
+        }
+        if queue.is_empty() && results.is_empty() && next_ticket == 0 {
+            return Err(RestoreError::Malformed); // non-canonical: an empty trio elides the section
+        }
+        host.set_svc_state(queue, results, next_ticket);
     }
 
     Ok((window, prots))
