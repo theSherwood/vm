@@ -742,25 +742,22 @@ impl Domain {
     }
 }
 
-/// Lower every function, or `None` if any uses an op outside this slice's subset.
-pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
-    // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
-    // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
-    // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
-    // in the tree-walker), which the inline coroutine driver here doesn't service — so reject the
-    // combination (→ tree-walker fallback). §14 **executor children** (`instantiate`/`join`, ops 0/1)
-    // are different: they run on the scheduler like threads, not inline — so they classify as
-    // scheduler-driven, not as coroutines. The one combination they can't yet service is `cont.*`
-    // fibers (a confined child would share the run-shared fiber registry — a divergence), so reject
-    // instantiate+fiber. Plain coroutine / fiber / thread / instantiate modules are each fine, as are
-    // instantiate+thread and instantiate+coroutine.
-    let mut has_coro = false;
-    let mut has_fiber = false;
-    let mut has_thread = false;
-    let mut has_instantiate = false;
-    let mut has_gc = false;
-    let mut has_svc = false;
-    let mut has_park_seam = false;
+/// The concurrency/park seams a module's instructions touch — one linear scan feeding both the
+/// [`compile_module`] combination vetoes and the cross-backend serve qualification
+/// ([`serve_qualifies`]).
+#[derive(Default)]
+struct Seams {
+    has_coro: bool,
+    has_fiber: bool,
+    has_thread: bool,
+    has_instantiate: bool,
+    has_gc: bool,
+    has_svc: bool,
+    has_park_seam: bool,
+}
+
+fn scan_seams(funcs: &[Func]) -> Seams {
+    let mut s = Seams::default();
     for f in funcs {
         for b in &f.blocks {
             for inst in &b.insts {
@@ -771,18 +768,18 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
                         type_id: super::cap_id::INSTANTIATOR,
                         op: 0 | 1 | 5 | 14,
                         ..
-                    } => has_instantiate = true,
+                    } => s.has_instantiate = true,
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR | super::cap_id::YIELDER,
                         ..
-                    } => has_coro = true,
-                    // §3.6 service points (I36 slice 1): svc.poll sites — natively servable
-                    // only when nothing in the module could park a handler (below).
+                    } => s.has_coro = true,
+                    // §3.6 service points (I36 slice 1): svc.poll/svc.wait sites — natively
+                    // servable only when nothing in the module could park a handler (below).
                     Inst::CapCall {
                         type_id: svm_ir::CAP_SELF_TYPE_ID,
                         op: 9 | 10,
                         ..
-                    } => has_svc = true,
+                    } => s.has_svc = true,
                     // A blocking stream `read` (type 0 op 0) can stdin-park, and an import call
                     // can be *bound* to one at spawn — either inside a handler would need the
                     // tree-walker's FIBER_PARKED (completed-but-not-replied) machinery.
@@ -797,37 +794,76 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
                     }
                     | Inst::CallImport { .. }
                     | Inst::SetJmp { .. }
-                    | Inst::LongJmp { .. } => has_park_seam = true,
+                    | Inst::LongJmp { .. } => s.has_park_seam = true,
                     Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
-                        has_fiber = true
+                        s.has_fiber = true
                     }
                     Inst::ThreadSpawn { .. }
                     | Inst::ThreadJoin { .. }
                     | Inst::MemoryWait { .. }
-                    | Inst::MemoryNotify { .. } => has_thread = true,
-                    Inst::GcRoots { .. } => has_gc = true,
+                    | Inst::MemoryNotify { .. } => s.has_thread = true,
+                    Inst::GcRoots { .. } => s.has_gc = true,
                     _ => {}
                 }
             }
         }
     }
+    s
+}
+
+/// §3.6 (I36): the **serve qualification** — `funcs` contain a service point (`svc.poll` /
+/// `svc.wait`) and no seam that could park or unwind a handler mid-dispatch, so a fast backend
+/// may run the serve loop natively (every handler runs to completion or traps; the tree-walk
+/// oracle's fiber-park machinery is never needed). The veto is module-wide, so it covers
+/// handlers' transitive callees for free. This is the same predicate [`compile_module`]'s veto
+/// applies — exported so svm-run's JIT routing folds exactly the modules this engine declines
+/// (one definition, no drift). A module with no service point returns `false` (it has nothing
+/// to serve natively; the caller decides what that means).
+pub fn serve_qualifies(funcs: &[Func]) -> bool {
+    let s = scan_seams(funcs);
+    s.has_svc
+        && !(s.has_park_seam
+            || s.has_fiber
+            || s.has_thread
+            || s.has_coro
+            || s.has_instantiate
+            || s.has_gc)
+}
+
+/// Lower every function, or `None` if any uses an op outside this slice's subset.
+pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
+    // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
+    // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
+    // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
+    // in the tree-walker), which the inline coroutine driver here doesn't service — so reject the
+    // combination (→ tree-walker fallback). §14 **executor children** (`instantiate`/`join`, ops 0/1)
+    // are different: they run on the scheduler like threads, not inline — so they classify as
+    // scheduler-driven, not as coroutines. The one combination they can't yet service is `cont.*`
+    // fibers (a confined child would share the run-shared fiber registry — a divergence), so reject
+    // instantiate+fiber. Plain coroutine / fiber / thread / instantiate modules are each fine, as are
+    // instantiate+thread and instantiate+coroutine.
+    let s = scan_seams(funcs);
     // `gc.roots` scans only the **calling vCPU's** continuation (its stack, fibers, coroutines), so a
     // module that also spawns threads could hold roots in a sibling vCPU we wouldn't scan — reject
     // that combination (fall back) to stay sound. `gc.roots` + fibers / coroutines is fine (those
     // continuations *are* scanned).
     //
     // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
-    // park or unwind mid-dispatch — the `SvcPoll` rewind linkage runs handlers to completion (or
-    // trap), so any park-capable seam anywhere in the module (futex waits / threads, fibers,
-    // coroutines, nested instantiate, setjmp/longjmp — a `longjmp` out of a handler would unwind
-    // past the serve linkage — blocking stream reads, spawn-bound imports, gc.roots) falls the
-    // whole module back to the tree-walk oracle, whose serve arm has the fiber-park machinery
-    // (slice 5b). The veto is module-wide, so it covers handlers' transitive callees for free.
-    if (has_coro && (has_fiber || has_thread))
-        || (has_instantiate && has_fiber)
-        || (has_gc && has_thread)
-        || (has_svc
-            && (has_park_seam || has_fiber || has_thread || has_coro || has_instantiate || has_gc))
+    // park or unwind mid-dispatch ([`serve_qualifies`]) — any park-capable seam anywhere in the
+    // module (futex waits / threads, fibers, coroutines, nested instantiate, setjmp/longjmp — a
+    // `longjmp` out of a handler would unwind past the serve linkage — blocking stream reads,
+    // spawn-bound imports, gc.roots) falls the whole module back to the tree-walk oracle, whose
+    // serve arm has the fiber-park machinery (slice 5b).
+    if (s.has_coro && (s.has_fiber || s.has_thread))
+        || (s.has_instantiate && s.has_fiber)
+        || (s.has_gc && s.has_thread)
+        || (s.has_svc
+            && (s.has_park_seam
+                || s.has_fiber
+                || s.has_thread
+                || s.has_coro
+                || s.has_instantiate
+                || s.has_gc))
     {
         return None;
     }

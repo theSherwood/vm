@@ -37,6 +37,14 @@ jobs:
     # anything else. Generous vs. a healthy cold-cache run (fmt + clippy + build + test + windows
     # cross-check), tight vs. a hang.
     timeout-minutes: 30
+    # ISSUES.md I30, sightings 4-5 (2026-07-24, both PR #427 runs — WITH the -j 2 cap): the test
+    # link phase still OOM-kills the runner (~55 s in, agent lost, no logs). The dominant term in
+    # each heavy link is DEBUG INFO for the Cranelift/Wasmtime-sized dep graph, so drop it from
+    # the test profile on this job: symbol names (and thus panic backtraces) survive — only line
+    # tables go — while per-link memory falls by multiples. The dedicated debug/sanitizer lanes
+    # keep their own profiles.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

@@ -1831,6 +1831,11 @@ pub struct CompiledModule {
     fn_table: Box<[FnEntry]>,
     /// The entry's buffer-ABI trampoline (finalized code, owned by `module`).
     tramp_code: *const u8,
+    /// I36 slice 3 (§3.6 JIT serve loop) — one buffer-ABI trampoline per **impl-export
+    /// handler**: `(funcidx, code, n_params, n_results)`, invocable over the live window via
+    /// [`Self::invoke_extra`] from the embedder's serve arm ([`Self::handler_tramp`]). Empty
+    /// for a module with no impl exports.
+    serve_tramps: Vec<(u32, *const u8, usize, usize)>,
     /// The entry's parameter count — `run` rejects shorter `args` (the trampoline reads
     /// exactly this many slots).
     n_params: usize,
@@ -2708,6 +2713,39 @@ impl CompiledModule {
             .map_err(|e| JitError::Backend(e.to_string()))?;
         module.clear_context(&mut ctx);
 
+        // I36 slice 3 (§3.6 JIT serve loop): a buffer-ABI trampoline for every **impl-export
+        // handler**, so the embedder's serve arm (its cap thunk's native `svc.poll`/`svc.wait`)
+        // can invoke a handler of any signature over the live window via [`Self::invoke_extra`]
+        // — the same `build_trampoline` shape as the entry's, one per distinct handler funcidx.
+        let mut serve_ids: Vec<(u32, cranelift_module::FuncId)> = Vec::new();
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for e in &m.impl_exports {
+                for &f in &e.ops {
+                    if (f as usize) < m.funcs.len() && seen.insert(f) {
+                        build_trampoline(
+                            &mut module,
+                            &mut ctx.func,
+                            ids[f as usize],
+                            &m.funcs[f as usize],
+                        );
+                        let id = module
+                            .declare_function(
+                                &format!("serve_tramp_{f}"),
+                                Linkage::Export,
+                                &ctx.func.signature,
+                            )
+                            .map_err(|e| JitError::Backend(e.to_string()))?;
+                        module
+                            .define_function(id, &mut ctx)
+                            .map_err(|e| JitError::Backend(e.to_string()))?;
+                        module.clear_context(&mut ctx);
+                        serve_ids.push((f, id));
+                    }
+                }
+            }
+        }
+
         // The generic call-trampoline (one per module; calls any `Tail`-ABI `(sp, arg) -> i64` entry from
         // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
         #[cfg(fiber_rt)]
@@ -2837,11 +2875,25 @@ impl CompiledModule {
             .collect();
 
         let tramp_code = module.get_finalized_function(tramp);
+        // I36 slice 3: resolve the handler trampolines now that code is finalized.
+        let serve_tramps: Vec<(u32, *const u8, usize, usize)> = serve_ids
+            .iter()
+            .map(|&(f, id)| {
+                let fu = &m.funcs[f as usize];
+                (
+                    f,
+                    module.get_finalized_function(id),
+                    fu.params.len(),
+                    fu.results.len(),
+                )
+            })
+            .collect();
         #[cfg(not(fiber_rt))]
         let _ = &quota;
         Ok(CompiledModule {
             fn_table,
             tramp_code,
+            serve_tramps,
             n_params: entry.params.len(),
             n_results: entry.results.len(),
             n_real_funcs: m.funcs.len(),
@@ -2997,6 +3049,17 @@ impl CompiledModule {
         init_mem: Option<&[u8]>,
     ) -> Result<(JitOutcome, Vec<u8>), JitError> {
         Self::run_code_raw(self, code, n_params, n_results, args, init_mem, None, None)
+    }
+
+    /// I36 slice 3 — the buffer-ABI trampoline for impl-export handler `func`:
+    /// `(code, n_params, n_results)`, invocable over the live window via
+    /// [`Self::invoke_extra`] from the embedder's serve arm. `None` for a funcidx that is not
+    /// an impl-export handler of this module.
+    pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
+        self.serve_tramps
+            .iter()
+            .find(|&&(f, ..)| f == func)
+            .map(|&(_, code, np, nr)| (code, np, nr))
     }
 
     /// Invoke an extra trampoline **over the live window of an in-flight run** — the engine of

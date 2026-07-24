@@ -16,6 +16,8 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
-_(none — `workflows_src` and `.github/workflows/` are in sync.)_
+- **ci.yml** (2026-07-24): `check` job gains `env: CARGO_PROFILE_TEST_DEBUG: "0"` — the I30
+  linker-OOM runner deaths recurred twice on PR #427 *with* the `-j 2` cap (sightings 4-5);
+  dropping test-profile debug info removes the dominant per-link memory term. See ISSUES.md I30.
 
 Remove entries from this list when they land in `.github/workflows/`.
