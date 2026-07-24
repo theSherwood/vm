@@ -756,6 +756,25 @@ struct Seams {
     has_park_seam: bool,
 }
 
+impl Seams {
+    /// The **serve-qualification veto**: a service point (`svc.poll` / `svc.wait`) coexisting with
+    /// any seam that could park or unwind a handler mid-dispatch. This is the single definition of
+    /// that disjunction — consulted by both the bytecode compile gate ([`compile_module`]) and the
+    /// exported [`serve_qualifies`] that svm-run's JIT routing folds on — so the two backends can
+    /// never drift over which modules serve natively vs. decline to the tree-walk oracle. Adding a
+    /// new park-capable seam means extending this one list. (INVARIANTS.md §9: one veto predicate,
+    /// one definition.)
+    fn svc_park_veto(&self) -> bool {
+        self.has_svc
+            && (self.has_park_seam
+                || self.has_fiber
+                || self.has_thread
+                || self.has_coro
+                || self.has_instantiate
+                || self.has_gc)
+    }
+}
+
 fn scan_seams(funcs: &[Func]) -> Seams {
     let mut s = Seams::default();
     for f in funcs {
@@ -833,13 +852,7 @@ fn scan_seams(funcs: &[Func]) -> Seams {
 /// to serve natively; the caller decides what that means).
 pub fn serve_qualifies(funcs: &[Func]) -> bool {
     let s = scan_seams(funcs);
-    s.has_svc
-        && !(s.has_park_seam
-            || s.has_fiber
-            || s.has_thread
-            || s.has_coro
-            || s.has_instantiate
-            || s.has_gc)
+    s.has_svc && !s.svc_park_veto()
 }
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
@@ -869,13 +882,7 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     if (s.has_coro && (s.has_fiber || s.has_thread))
         || (s.has_instantiate && s.has_fiber)
         || (s.has_gc && s.has_thread)
-        || (s.has_svc
-            && (s.has_park_seam
-                || s.has_fiber
-                || s.has_thread
-                || s.has_coro
-                || s.has_instantiate
-                || s.has_gc))
+        || s.svc_park_veto()
     {
         return None;
     }

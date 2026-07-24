@@ -78,7 +78,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Same I7 backstop as `check` (windows/macOS runners are slower, so a wider bound).
     timeout-minutes: 45
-    # continue-on-error: true # TODO: drop once green to make parity gating (the windows guard is unverified)
+    # Gating (no continue-on-error): windows/macOS build+test parity blocks the merge.
     strategy:
       fail-fast: false
       matrix:
@@ -92,13 +92,39 @@ jobs:
       - run: cargo test --workspace
 
   fuzz:
-    name: cargo-fuzz (escape-TCB targets)
+    name: cargo-fuzz (all targets)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # EVERY declared fuzz target gates nightly — no built-but-unwired target may exist (a fuzzer
+      # that never runs is zero coverage silently). The escape-TCB hinges (decode_verify, mask,
+      # spec_verify) plus the differential/miscompile finders: diff (interp⇄JIT), onramp_diff (LLVM
+      # on-ramp source oracle), wasm_transpile, spec_ops, roundtrip (format identity), opt_* (SSA
+      # round-trip / SCCP), coverage_walk, and the durable freeze/thaw family (interp + JIT). Keep
+      # this list in lockstep with fuzz/fuzz_targets/*.rs.
       matrix:
-        target: [decode_verify, diff, mask, wasm_transpile, spec_ops, spec_verify]
+        target:
+          [
+            decode_verify,
+            diff,
+            mask,
+            wasm_transpile,
+            spec_ops,
+            spec_verify,
+            roundtrip,
+            onramp_diff,
+            opt_sccp,
+            opt_ssa_roundtrip,
+            coverage_walk,
+            durable,
+            durable_fiber,
+            durable_jit,
+            durable_loop,
+            durable_loop_jit,
+            durable_recycle,
+            durable_recycle_jit,
+          ]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Pinned to a dated nightly, unlike the other nightly lanes (ISSUES.md I18): this job's first
