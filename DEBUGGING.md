@@ -309,12 +309,27 @@ different things depending on which pair you compare:
   `bytecode_fiber_plus_thread_tick_replays_deterministically`) and `dap_over_bytecode_fiber_on_a_spawned_
   thread` (over DAP). `debug_advance_fiber` is now the single shared per-op driver for both engines.
 
+  **§14 same-module coroutines on the single-vCPU engine (slice 14a).** `debug_advance_fiber` now also
+  drives §14 **coroutines** inline — exactly as production `run_inner` does, never via the thread
+  scheduler: `spawn_coroutine` builds the confined child in `vt.coroutines`, `resume` drives it via
+  `resume_coro` (delivering yields / supplying demand-fault pages / collecting the return), and a leaked
+  top-level `yield` is a `FiberFault`. A new `DebugRun::new_with_host` lets a session carry a live
+  powerbox, so a granted `Instantiator` reaches the guest and makes a coroutine-using program debuggable
+  (previously the whole module was declined). Breakpoints fire in the coroutine **parent** across the
+  cooperative handoffs, and the run stays bit-identical to the production engine + tree-walker oracle.
+  The coroutine *body* is still stepped opaquely by `resume_coro` (step-*into* the body is a follow-up),
+  and a **separate-module** coroutine (`SpawnCoroutineModule`, needs the mutable `Domain`) plus
+  scheduler-driven **instantiate** children remain caller seams. Covered by `bytecode_debug_coroutines.rs`
+  (oracle parity on the resume/suspend round-trip and the demand-fault path, a parent breakpoint,
+  deterministic tick-replay).
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
-  `thread.spawn`/`join`/`wait`/`notify` and **fibers** — on the single-vCPU engine *and* composed with
-  threads on the scheduled engine. Remaining `Declined` ops: §14 **coroutines** (`Instantiator.spawn_
-  coroutine`/`resume`, which need the confined-child `Coro`/env machinery), and `instantiate` children —
+  `thread.spawn`/`join`/`wait`/`notify` and **fibers** (single-vCPU *and* composed with threads), and
+  **same-module §14 coroutines** driven inline on the single-vCPU engine. Remaining `Declined` ops:
+  **step-into** a coroutine/child body, **separate-module** coroutines (`spawn_coroutine_module`), and
+  scheduler-driven **instantiate** children (the confined-executor `Coro`/env + attenuated powerbox) —
   each a further slice. Plus a checkpoint ladder to bound reverse-replay cost (a perf optimization —
   today's small debugged programs replay from turn 0 cheaply).
 

@@ -3627,8 +3627,77 @@ fn debug_advance_fiber(
             vt.active.set(rdst + 1, Reg::from_i64(value));
             FiberStep::Stepped
         }
-        // Threads / wait / notify / instantiate / coroutine / tier-up — a scheduler seam the caller
-        // applies (single-vCPU `DebugRun` rejects them; the scheduled engine dispatches its subset).
+        // §14 **coroutines** are cooperative and driven **inline** here (never via the thread
+        // scheduler), exactly as production `run_inner` drives them — the debug counterpart. A
+        // same-module `spawn_coroutine`/`resume`/`yield` round-trip therefore runs correctly under the
+        // debugger; the coroutine body itself is stepped opaquely by `resume_coro` (step-into is a
+        // follow-up). A *separate-module* coroutine (`SpawnCoroutineModule`) needs the mutable `Domain`
+        // to push the granted module, so it stays a caller seam (`Other` → declined) for now.
+        Ok(Outcome::SpawnCoroutine {
+            ibase,
+            isize: isz,
+            entry,
+            off,
+            size_log2,
+            dst,
+            demand,
+        }) => {
+            let h = spawn_coroutine(
+                &mut vt.coroutines,
+                mem,
+                &source.primary(),
+                entry,
+                (ibase, isz, off, size_log2),
+                demand,
+            );
+            vt.active.set(dst, Reg::from_i32(h));
+            FiberStep::Stepped
+        }
+        Ok(Outcome::CoResume { ch, value, dst }) => {
+            // Take the coroutine; a forged/finished slot is an inert `CapFault` (propagates).
+            let mut coro = match vt.coroutines.get_mut(ch as usize).and_then(|c| c.take()) {
+                Some(c) => c,
+                None => return FiberStep::Trapped(Trap::CapFault),
+            };
+            if let Some(addr) = coro.faulted_page.take() {
+                // Resuming after a recoverable page fault: supply the page, re-run the rewound access.
+                if let Some(m) = coro.mem.as_ref() {
+                    m.supply_page(addr);
+                }
+            } else if let Some(yd) = coro.awaiting.take() {
+                coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
+            }
+            match resume_coro(&mut coro, source, fuel) {
+                Ok(CoStop::Yield(yv)) => {
+                    vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
+                    vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
+                    vt.active.set(dst + 1, Reg::from_i64(yv));
+                    FiberStep::Stepped
+                }
+                Ok(CoStop::Fault(addr)) => {
+                    // A demand child faulted: remember the page to supply, report (FAULTED, addr).
+                    coro.faulted_page = Some(addr);
+                    vt.coroutines[ch as usize] = Some(coro);
+                    vt.active.set(dst, Reg::from_i32(super::CORO_FAULTED));
+                    vt.active.set(dst + 1, Reg::from_i64(addr as i64));
+                    FiberStep::Stepped
+                }
+                Ok(CoStop::Done(vals)) => {
+                    // Finished — the slot stays `None` (a later resume is inert/CapFault).
+                    vt.active.set(dst, Reg::from_i32(super::FIBER_RETURNED));
+                    let v = vals.first().copied().unwrap_or(Value::I64(0));
+                    vt.active.set(dst + 1, Reg::from_value(v));
+                    FiberStep::Stepped
+                }
+                Err(t) => FiberStep::Trapped(t),
+            }
+        }
+        // A `Yielder.yield` only resolves inside an inline coroutine child (consumed by `resume_coro`);
+        // at the top level the yielder handle is ungranted, so any leak here is a fault.
+        Ok(Outcome::CoYield { .. }) => FiberStep::Trapped(Trap::FiberFault),
+        // Threads / wait / notify / instantiate / separate-module coroutine / tier-up — a scheduler
+        // seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine dispatches
+        // its subset).
         Ok(other) => FiberStep::Other(other),
         Err(t) => FiberStep::Trapped(t),
     }
@@ -3778,7 +3847,22 @@ impl DebugRun {
     }
 
     /// Open a debug session on `m`'s `func(args)`. `None` if the module is outside the engine's subset.
+    /// The powerbox is empty (`Host::new()`); use [`DebugRun::new_with_host`] to debug a guest that
+    /// needs a granted capability (e.g. a §14 `Instantiator` for coroutines).
     pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<DebugRun> {
+        DebugRun::new_with_host(m, func, args, Host::new())
+    }
+
+    /// [`DebugRun::new`] carrying a live powerbox `host`, so synchronous `cap.call`s execute against it
+    /// — e.g. a §14 `Instantiator` grant (`host.grant_instantiator(..)`) reaching the guest as an
+    /// argument, which makes `spawn_coroutine`/`resume`/`yield` debuggable. `None` if the module is
+    /// outside the engine's subset.
+    pub fn new_with_host(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        host: Host,
+    ) -> Option<DebugRun> {
         m.funcs.get(func as usize)?;
         let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
         // Slot base + value types per (function, block), so any frame on the call stack is readable.
@@ -3802,9 +3886,8 @@ impl DebugRun {
             ));
         }
         let c = compile_module(&m.funcs)?;
-        let dom = Domain::new(c, 0);
+        let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
-        let host = Host::new();
         let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
         let Domain { source, table } = dom;
         Some(DebugRun {
