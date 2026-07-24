@@ -286,35 +286,68 @@ review, fuzzing infra, audit), tracked as open-ended in §18.
   structured-control-flow straitjacket. This is a direct target for LLVM-style
   producers and feeds register allocation directly in the JIT.
 
-### Three backends, one observable behavior (the parity invariant)  [SETTLED]
-The same verified IR is executed by **three backends**, each with a distinct job:
+### Four backends, one observable behavior (the parity invariant)  [SETTLED]
+The same verified IR is executed by **four backends** — each a distinct *execution
+strategy* (how IR becomes execution), each with a distinct job. This is the canonical
+naming; use these names (see "Naming standard" below).
 
-1. **Tree-walk interpreter** (`svm_interp::run`/`run_with_host`) — walks the SSA IR
-   data structure directly. This is the reference **oracle**: escape-TCB,
-   `#![forbid(unsafe_code)]`, total and panic-free *even on unverified input* (so it
-   is safe to drive from a fuzzer, §18). Correctness is defined *here*.
-2. **Bytecode interpreter** (`svm_interp::bytecode`) — the IR lowered to a flat,
-   operand-resolved bytecode with threaded dispatch and its own single-OS-thread
-   cooperative scheduler; also `#![forbid(unsafe_code)]`. It is faster than the
-   tree-walker and is the portable execution path for **targets where the JIT is
-   unavailable** — notably the wasm64 browser build (§21) — and the JIT-not-viable
-   fallback generally.
-3. **Cranelift JIT** (`svm-jit`) — the production **speed** path (§9).
+1. **tree-walk interpreter** (`svm_interp::run`/`run_with_host`; crate `svm-interp`) —
+   walks the SSA IR data structure directly. This is the reference **oracle**:
+   escape-TCB, `#![forbid(unsafe_code)]`, total and panic-free *even on unverified
+   input* (so it is safe to drive from a fuzzer, §18). Correctness is defined *here*.
+2. **bytecode interpreter** (`svm_interp::bytecode`; crate `svm-interp`) — the IR
+   lowered to a flat, operand-resolved bytecode with threaded dispatch and its own
+   single-OS-thread cooperative scheduler; also `#![forbid(unsafe_code)]`. It is
+   faster than the tree-walker and is the **portable** execution path for targets
+   where a JIT is unavailable, and the JIT-not-viable fallback generally.
+3. **Cranelift JIT** (crate `svm-jit`) — the production native **speed** path (§9).
+4. **wasm-JIT** (crate `svm-wasm-jit`, currently `svm-wasmjit`) — emits WebAssembly
+   from the IR so hot guest compute runs on a wasm engine's optimizing tiers (§21,
+   `BROWSER.md`). Fail-closed like the Cranelift JIT: anything outside its subset
+   (`Error::Unsupported`) stays on the bytecode interpreter, which drives. It is a
+   **leaf accelerator, not a peer driver** — it never runs concurrency/cap-call/fiber
+   ops itself; those fold to the bytecode interpreter underneath it.
 
-> **Invariant:** on every verified module, all three backends produce **identical
+> **Invariant:** on every verified module, all four backends produce **identical
 > observable behavior** — same results, same trap kind, same final memory window.
 
-The tree-walker is the hub against which the other two are continuously
-differential-tested: the **bytecode engine is held bit-exact** against it (shared
-semantic helpers → results, trap kind, *and* float/NaN bits all identical;
-`crates/svm/tests/bytecode_diff.rs` — "the gate that must stay green before the
-bytecode path is made a default"), and the **JIT is held exact** against it *modulo*
-cross-backend float-NaN bit patterns, which are host-defined and deliberately
-unpinned (§3b; `crates/svm/tests/jit_diff.rs`). Where the bytecode engine does not
-yet implement an op, that module is excluded from its differential corpus; every op
-it *does* support must match exactly. This three-way agreement is what lets the JIT
-(the dominant escape-TCB, §2a) and the bytecode path be trusted: both are checked,
-continuously and generatively, against a small, auditable, `unsafe`-free oracle.
+**Backend ≠ platform.** *Execution strategy* (the four backends above) is orthogonal
+to *platform* — where the engine runs: **native** vs **browser** (a wasm host). Each
+platform runs a subset of the backends: native runs {tree-walk, bytecode, Cranelift
+JIT}; browser runs {bytecode, wasm-JIT}. In particular the **bytecode interpreter
+compiled to wasm64** and shipped in the browser (§21, `browser/`) is *not* a fifth
+backend — it is backend 2 on the browser platform. Do not confuse this *outbound*
+direction (the VM compiled *to* wasm) with the inbound `svm-wasm` frontend (wasm bytes
+→ IR, §20), nor with the wasm-JIT (IR → wasm bytes).
+
+**Naming standard.** Because there are now two JITs, **never write bare "JIT"** — it is
+ambiguous. Say **"Cranelift JIT"** (backend 3, `svm-jit`; "native JIT" acceptable) or
+**"wasm-JIT"** (backend 4, `svm-wasm-jit`). "oracle" names a *role* (whichever engine
+is authoritative — almost always the tree-walk interpreter), never a specific backend.
+"bytecode in wasm" / "interpreter-in-wasm" names backend 2 on the browser *platform*,
+never backend 4. Short ids: `tree-walk`, `bytecode`, `cranelift`, `wasm-jit`; platforms
+`native`, `browser`.
+
+The **tree-walk interpreter is the root oracle** against which every fast backend is
+continuously differential-tested:
+- the **bytecode interpreter is held bit-exact** against it (shared semantic helpers →
+  results, trap kind, *and* float/NaN bits all identical; `crates/svm/tests/bytecode_diff.rs`
+  — "the gate that must stay green before the bytecode path is made a default");
+- the **Cranelift JIT is held exact** against it *modulo* cross-backend float-NaN bit
+  patterns, which are host-defined and deliberately unpinned (§3b;
+  `crates/svm/tests/jit_diff.rs`);
+- the **wasm-JIT is held against the tree-walk oracle** the same way — NaN-insensitive,
+  since the wasm engine's NaN propagation is likewise host-defined — on its supported
+  subset (`crates/svm-wasmjit/tests/differential.rs`). *(Today that differential
+  anchors on the bytecode interpreter, which is itself bit-exact to the tree-walker;
+  re-anchoring it directly on the tree-walk oracle is a pending test slice — the
+  invariant is the tree-walk oracle either way, via a bit-exact hop.)*
+
+Where a fast backend does not implement an op, that module is excluded from its
+differential corpus; every op it *does* support must match exactly. This four-way
+agreement is what lets the JITs (the dominant escape-TCB, §2a) and the bytecode path
+be trusted: all are checked, continuously and generatively, against a small, auditable,
+`unsafe`-free oracle.
 
 ---
 
@@ -2886,9 +2919,11 @@ as open-ended, not a byproduct of the build.
 
 **De-risking moves that fit this setup:**
 - **Interpreter-as-oracle:** the tree-walk interpreter is the reference; differential-test
-  **both** the Cranelift JIT (`jit_diff`) **and** the bytecode interpreter (`bytecode_diff`,
-  bit-exact) against it on a large random corpus — catches codegen/compile bugs without
-  expert eyes. This is the §3 parity invariant (three backends, one observable behavior).
+  the Cranelift JIT (`jit_diff`) and the bytecode interpreter (`bytecode_diff`, bit-exact)
+  against it on a large random corpus — catches codegen/compile bugs without expert eyes.
+  The wasm-JIT is held against the same oracle by its own harness
+  (`svm-wasmjit/tests/differential.rs`). This is the §3 parity invariant (four backends, one
+  observable behavior).
 - **Fuzz the verifier from day one** (invariant: verified ⇒ cannot escape) — the
   one security validation that doesn't need a continuous expert in the loop.
 - **Fuzz the trap-confinement lowering as its own unit** (D38) — it is the part
