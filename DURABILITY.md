@@ -2072,6 +2072,15 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    mid-handler freezes become capturable instead of refused.
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
    re-park callers (race-check against restored cells), mark `svc.wait` consumers runnable.
+   **Slice 4a BUILT 2026-07-24 (per-fiber thaw re-arm):** `shadow_switch` now forces an
+   incoming *fiber* context to `REWINDING` whenever its restored shadow region still holds a
+   frame (SP above its frame base ⇔ seeded frozen residue not yet rewound — `create` resets
+   the region, `seed_frozen` restores the extent, and a completed rewind pops back to base;
+   the predicate self-clears). This closes the step-2 note: a flattened woken event-park
+   claimed by **post-rewind NORMAL** execution now rewinds from its spilled frame instead of
+   starting fresh and orphaning it. Pinned with a witness-cell discriminator (the rewind
+   reloads the *spilled* pre-park read; a fresh start re-reads the mutated cell) plus the
+   cooperative-poll loop a thawed park's transient re-park requires (invariant 7).
 5. **Cross-cut O10 re-issue** — freeze-boundary calls complete with a re-issue marker on
    thaw; validate against reload-not-reissue (R8/R11) before widening.
 

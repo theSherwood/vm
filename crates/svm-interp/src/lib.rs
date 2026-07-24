@@ -5177,6 +5177,20 @@ fn shadow_switch(
     };
     let phase = m.durable_thaw_state(ctx_idx_of(out_ctx));
     m.durable_set_thaw_state(ctx_idx_of(in_ctx), phase);
+    // DURABILITY.md §13.4 step 4 (per-fiber thaw re-arm): an incoming **fiber** whose restored
+    // shadow region still holds a frame — SP above its frame base ⇔ seeded frozen residue not
+    // yet rewound (`create` resets the region; `seed_frozen` restores the frozen extent; a
+    // completed rewind pops back to base) — re-enters `REWINDING` regardless of the carried
+    // phase. Without this, a flattened fiber claimed by post-rewind NORMAL execution (e.g. a
+    // woken event-park collected after the root's own rewind finished) would start fresh and
+    // orphan its spilled frame. Self-clearing, fiber-only (root contexts are seeded by the
+    // thaw driver).
+    if in_ctx != ROOT_FIBER {
+        let fctx = shadow_context_index(in_ctx);
+        if in_sp > shadow_frame_base(fctx) {
+            m.durable_set_thaw_state(fctx, STATE_REWINDING);
+        }
+    }
 }
 
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
