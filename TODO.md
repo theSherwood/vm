@@ -16,7 +16,7 @@ with rationale, and leave when a BUILT block lands in the owning doc.
 | **Serving-cluster sequencing (owner-agreed 2026-07-24):** I36 bytecode loop → I36 JIT loop → I41 graceful revocation (small, can interleave) → multi-consumer `svc.wait` → durable serving; poison-drain (I37 escalation a) slots in wherever the softer failure mode is wanted | this table + ISSUES.md I36–I41 | the build order for everything above — capture serve state once, against the native loops |
 | **Endpoint self-mint** — a domain minting a live offer over its *own* impl-export to hand to an arbitrary peer | PROCESS.md §4 "S9 rescope" (decision block) | **DROPPED 2026-07-23 (owner decision)** — discovery/coordination with arbitrary domains is out; every capability transfer stays **mediated by an authority in the grant graph** (spawn grants + `child_offer` regrant, all built). Note the mediation-consistent residue that survives: a domain minting an offer over its *own* export to grant **down its own grant graph** (a parent serving its children) — see the guest-served exec row |
 | ~~**jacl flagged questions**~~ | PROCESS.md §4 rescope tail | **answered 2026-07-23 (owner)** — (1) no self-mint / no peer transfer channel: authority-mediated only; (2) "Endpoint" retired as a concept name — the substrate keeps its low-level nouns (live offers, service points, handler returns); the serve/reply-split drop is confirmed |
-| **Crash handling / `poll` portability** — interp runs a synchronous child lazily, JIT eagerly, so `poll`-based control flow diverges; `$?` = 128+signal mapping lands with convergence | STAGE1.md "Known caveat" | todo — revisit after concurrent stages (eager children shrink the gap) |
+| **Crash handling / `poll` portability** — interp runs a synchronous child lazily, JIT eagerly, so `poll`-based control flow diverges; `$?` = 128+signal mapping lands with convergence | STAGE1.md "Known caveat", ISSUES.md I43 | todo — revisit after concurrent stages (eager children shrink the gap) |
 | **`fork`/`clone`** — parked-domain clone (full-copy), fork endpoint with duplicated reply token | PROCESS.md S11, STAGE1.md item 7 | parked (S11) |
 
 ## Detached-windows residue (core BUILT 2026-07-23)
@@ -53,6 +53,5 @@ with rationale, and leave when a BUILT block lands in the owning doc.
 
 | item | owner | status |
 |---|---|---|
-| I33 flake (jit_killpath_stops_runaway_child, macOS) | ISSUES.md | another agent's |
 | §3 substrate generalization (`create(module, window, budget)` subsuming the op-15 surface) | PROCESS.md §3 | future; op-15 chosen deliberately as the incremental form |
 | `Budget` charging at create (the passable object exists; per-domain charging is the follow-up) | PROCESS.md §5 / cap_id::BUDGET docs | todo |

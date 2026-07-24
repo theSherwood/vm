@@ -1,8 +1,8 @@
-//! Confinement-lowering microbench (JIT lane only) — built for the TRAP_CONFINEMENT.md
-//! Spectre-v1 decision, where a temporary `SVM_CONFINE` env gate in `svm-jit` let one binary
+//! Confinement-lowering microbench (JIT lane only) — built for the Spectre-v1 confinement
+//! decision (DESIGN.md §4), where a temporary `SVM_CONFINE` env gate in `svm-jit` let one binary
 //! A/B/C/D the candidate lowerings (mask / check / check+cmov / check+AND-clamp) on identical
-//! LLVM-frontend IR; the measurements are recorded there and the gate is gone (check+clamp is
-//! the one production lowering). Kept as a general per-access-cost probe: compiles a C kernel
+//! LLVM-frontend IR; that gate is gone now (check+clamp is the one production lowering). Kept as
+//! a general per-access-cost probe: compiles a C kernel
 //! file (`clang -O2 -emit-llvm` → `svm_llvm`), JIT-compiles each kernel once, and prints
 //! `kernel,ns_per_iter` with an interp-vs-JIT correctness pin. Usage:
 //!   cargo run --release --example spectre_bench -- <kernels.c> <sym>[:<large-n>][,<sym>...]

@@ -5,7 +5,7 @@
 //! of the §18 escape oracle, with the *expected* bytes computed by the model rather
 //! than only cross-compared between backends).
 //!
-//! The model pins trap-confinement (§4 / TRAP_CONFINEMENT.md): the whole access span,
+//! The model pins trap-confinement (§4): the whole access span,
 //! computed without wraparound, must lie in `[0, mapped)`; a wrapping effective
 //! address faults rather than aliasing; zero-length bulk ops are no-ops even at wild
 //! pointers; a faulting access mutates nothing.

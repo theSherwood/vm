@@ -170,6 +170,14 @@ all three backends, for memory-safety validation and cache/page-fault scoring; a
 | `svm-durable` | IR→IR **freeze/thaw** transform for durable domains (tooling-tier, +0 TCB; §21, D60; `DURABILITY.md`) | — |
 | `svm-snapshot` | Durable-domain **snapshot artifact codec** (window image + handle table + identity gate; §21; `DURABILITY.md`) | — |
 | `svm-dap` | Interpreter-backed **Debug Adapter Protocol** server (breakpoints/stepping/locals; §19; `DEBUGGING.md`) | — |
+| `svm-wasmjit` | **SVM IR → WebAssembly emitter** — the browser wasm-JIT tier; carries the §4 masking lowering *in emitted wasm* + cap-call outlining (`BROWSER.md`) | escape-TCB |
+| `svm-spec` | The **executable ISA spec** (`SPEC.md`): one machine-readable op table (typing + reference semantics) — the `spec_*` conformance/fuzz oracle the backends and `svm-verify` are checked against (§18) | — (spec oracle) |
+| `svm-opt` | Generic closed-module **IR→IR optimizer** (SSA construct/destruct, SCCP; `OPT.md`, §20a) — the pass library `svm-peval` builds on | — |
+| `svm-exec` | Deterministic **`exec` capability** backend + the wasm-safe exec-cap wire protocol (`EXEC.md`) | — (host cap) |
+| `svm-fs` | In-memory **`fs` capability** backend + the fs-cap wire protocol | — (host cap) |
+| `svm-posix` | A **POSIX personality** delivered as a §7 host capability (libc-as-a-capability; `POSIX.md`) | — (host shim) |
+| `svm-capi` | The **C ABI** over the `svm-run` embedding surface (`svm.h`; `POWERBOX.md` Phase 5) | — |
+| `svm-webgpu` | Headless **WebGPU compute** capability — host holds a real GPU via `wgpu` (`LLVM.md`; workspace-excluded) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
 | `svm-run` | Embedding runtime + **`svm-run` CLI**: instantiate with the powerbox, run on the JIT | — |
 | `browser/` | The bytecode interpreter compiled to **wasm64** — run SVM guests client-side (`BROWSER.md`) | — |
@@ -276,7 +284,8 @@ run first, is what makes a module safe).
 ## Fuzzing
 
 Stable CI runs the smoke fuzz as ordinary tests (`crates/svm/tests/fuzz_smoke.rs`,
-`spec_fuzz_smoke.rs`). For coverage-guided fuzzing (nightly):
+`spec_fuzz_smoke.rs`). The coverage-guided targets all gate nightly (the `cargo-fuzz` CI
+matrix runs every target in `fuzz/fuzz_targets/` — no built-but-unwired fuzzer):
 
 ```sh
 cargo install cargo-fuzz
@@ -284,8 +293,14 @@ cargo +nightly fuzz run decode_verify   # decode/verify/interp never crash
 cargo +nightly fuzz run mask            # the confinement-masking invariant (I1)
 cargo +nightly fuzz run roundtrip       # binary + text round-trip identity
 cargo +nightly fuzz run diff            # interp-vs-JIT differential (§18)
+cargo +nightly fuzz run onramp_diff     # LLVM on-ramp vs its source-semantics oracle (§18)
+cargo +nightly fuzz run wasm_transpile  # core-wasm → IR transpile (re-verified)
 cargo +nightly fuzz run spec_ops        # every backend matches the executable spec's eval (SPEC.md)
 cargo +nightly fuzz run spec_verify     # svm-verify vs the reference verifier agree (SPEC.md)
+cargo +nightly fuzz run opt_sccp        # optimizer preserves semantics (SCCP)
+cargo +nightly fuzz run opt_ssa_roundtrip   # SSA construct/destruct identity
+cargo +nightly fuzz run durable         # freeze → serialize → restore → thaw equivalence (+ _jit / _fiber / _loop / _recycle variants)
+cargo +nightly fuzz run coverage_walk   # verifier coverage walker
 ```
 
 Invariants under test (the security hinge, §2a/§4): on arbitrary bytes, `decode`

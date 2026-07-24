@@ -3,7 +3,7 @@
 Tracks building a **powerful, generic IR→IR AOT optimizer** that runs **outside svm (host-side
 tooling) and inside svm (guest-side, in-sandbox)** — the successor to the cleanup optimizer that
 lived in `svm-peval` (`optimize_module`, DESIGN.md §20c; moved here in Phase 0). Companion to `DESIGN.md`
-§20a/§20c and `PEVAL_BENCH.md`. Living doc: update the **Plan** tracker as work lands; fold into
+§20a/§20c. Living doc: update the **Plan** tracker as work lands; fold into
 `DESIGN.md` once it closes.
 
 ---
@@ -110,7 +110,7 @@ tracked enhancement, not a blocker.
 - **Fuzz from the first pass:** a `fuzz/` target — arbitrary module → verify → optimize → must
   **re-verify** and behave identically. The internal-SSA round-trip gets its own no-op fuzz
   target first.
-- **Bench from the first pass:** an optimizer on/off axis in the PEVAL_BENCH report and the
+- **Bench from the first pass:** an optimizer on/off axis in the peval bench and the
   Wasmtime-relative harness (size, compile time, run time per backend), so regressions are one
   commit old. Log flakiness to `ISSUES.md`.
 
@@ -141,7 +141,7 @@ tracked enhancement, not a blocker.
     differential on the lowered module). Cross-block-use lowering (param threading) was deferred to the
     first pass that needed it — since landed with GVN (`crate::thread`).
   - [x] (d) `OptConfig` (pass toggles) — landed once something concrete demanded it: the **ablation
-    benchmark** (`OPT_BENCH.md`), which needs to disable one pass at a time to attribute a size/speed
+    benchmark** (`tests/opt_bench.rs`), which needs to disable one pass at a time to attribute a size/speed
     delta to it. `OptConfig { sccp, reassociate, gvn, licm, local_cse, jump_thread }` (all default
     on) + `optimize_module_with` / `optimize_func_with`; `optimize_module` is the `all()` pipeline
     unchanged. Only the global/analysis passes toggle (six then; every Phase 3/4 pass has since added
@@ -183,7 +183,7 @@ tracked enhancement, not a blocker.
     `jump_thread` could no longer see them, but leaving them local lets it resolve the dispatch per edge
     until the header dies — recovering the irreducible CFG that **SVM IR runs natively and wasm can't
     represent** (measured: transpiled-from-wasm `irreducible` kernel 1.17× → 0.40× vs Wasmtime,
-    `OPT_BENCH.md`). Runs before the per-function cleanup. Tests (`tests/gvn.rs`): diamond-join
+    `tests/opt_bench.rs`). Runs before the per-function cleanup. Tests (`tests/gvn.rs`): diamond-join
     redundancy, a derived two-level expression across a diamond, a redundant **constant not threaded**, a
     hand-built dispatch loop **de-relooped** by the pipeline, impure loads at a join **not** deduped, and
     a 600-case randomized branchy-DAG differential (behavior preserved + optimizer demonstrably firing);
@@ -211,7 +211,7 @@ tracked enhancement, not a blocker.
     bare constant is never hoisted (free to recompute — threading one out is pure overhead), and an
     invariant's constant operands are re-emitted in the preheader (`Threader::emit`) rather than threaded,
     so a worthwhile hoist still fires without dragging a constant around the loop (measured: size-neutral
-    on hoist-free loops, smaller output on real-invariant loops — see `OPT_BENCH.md`). Sound by
+    on hoist-free loops, smaller output on real-invariant loops — see `tests/opt_bench.rs`). Sound by
     construction (pure+non-trapping speculated above the loop) and conservative on shape (reducible
     single-header loops with a unique preheader only). Reuses the shared `vn` / `thread` modules.
     Tests: invariant op hoisted out of every loop (SCC check) + variant op stays, behavior preserved; a
@@ -353,10 +353,10 @@ tracked enhancement, not a blocker.
     hoisting and an opt-in scratch-region contract for dead-store elimination (DSE needs a
     private-region guarantee to stay sound under shared-memory threads).
 - [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `svm-opt` on a module and JITs the
-  result, peval-demo shape); PEVAL_BENCH + Wasmtime-relative numbers with the optimizer on;
+  result, peval-demo shape); peval + Wasmtime-relative numbers with the optimizer on;
   fold the settled design into `DESIGN.md` §20 and retire this doc to a tracker stub.
-  - [x] **Per-pass ablation harness** (`crates/svm-peval/tests/opt_bench.rs`, report in
-    `OPT_BENCH.md`): leave-one-out over the six togglable passes on a corpus of a realistic
+  - [x] **Per-pass ablation harness** (`crates/svm-peval/tests/opt_bench.rs`): leave-one-out
+    over the six togglable passes on a corpus of a realistic
     specialization residual + pass-targeted micro-modules, reporting encoded size and both JIT and
     interpreter run time. Every variant is re-verified + interp-differential-tested, so the size test
     is also a correctness/size guard. First findings: the JIT's own optimizer washes out svm-opt's
@@ -365,7 +365,7 @@ tracked enhancement, not a blocker.
     while LICM/GVN *cost* static size — motivating a hoist cost model. Broaden the corpus (more
     realistic residuals, branch-heavy shapes) and add Wasmtime-relative numbers next.
 
-### Benchmark follow-ups (from `OPT_BENCH.md`, PR #337)
+### Benchmark follow-ups (from `tests/opt_bench.rs`, PR #337)
 
 The first ablation surfaced concrete next steps, tracked here so they aren't lost:
 
@@ -384,15 +384,23 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   twelve** togglable passes (was six; `const_prop` joined with its Phase 3 entry) and adds two cases so the Phase-3/4 passes have a shape that
   exercises them: a **memory** case (a redundant same-address load for `mem`, a diamond-join reload
   for `load_elim`) and an **interproc** case (a constant `call_indirect` → `devirt` → `inline` → `dfe`,
-  nearly halving the module). `OPT_BENCH.md` regenerated; the interprocedural passes turn out to be the
+  nearly halving the module). The ablation harness re-run; the interprocedural passes turn out to be the
   biggest *size* wins in the corpus. (Still open: more branch/const-prop-heavy shapes to sharpen SCCP.)
 - [ ] **Multi-run statistics in the harness.** Single-run numbers show visible variance (one JIT row
   read 2× its neighbors). Report medians + spread over several runs before treating any delta as load-
   bearing.
+- [ ] **Track OPT + PEVAL benchmarking in CI.** Today the pass-ablation harness
+  (`crates/svm-peval/tests/opt_bench.rs`) and the partial-evaluation bench
+  (`scripts/peval_bench_report.py`) are run-on-demand only — their numbers aren't watched over time
+  the way the `bench/` vs-Wasmtime harness is (the nightly, non-gating `bench` job). Wire both into
+  CI on that same nightly lane so OPT/PEVAL size + speed regressions surface one commit old, per
+  `AGENTS.md` ("benchmark as soon as there's anything to run"). This is what replaces the retired
+  standalone snapshot reports (`OPT_BENCH.md` / `PEVAL_BENCH.md`, deleted 2026-07-24): committed
+  point-in-time numbers go stale silently; a CI lane tracks them like everything else we benchmark.
 - [x] **Wasmtime-relative numbers** (Phase 5, DESIGN.md §1a). Wired svm-opt into the `bench/`
   vs-Wasmtime harness behind `--optimize`: the same wasm bytes run on the SVM JIT (transpiled to IR,
   optionally svm-opt'd) and on Wasmtime, both via Cranelift. `compute32 = svm-jit ÷ Wasmtime` best-of-5,
-  optimizer on vs off (`OPT_BENCH.md` "Wasmtime-relative"). Headline: **`irreducible` 1.17× → 0.40×**
+  optimizer on vs off (the `bench/` `--optimize` harness, "Wasmtime-relative"). Headline: **`irreducible` 1.17× → 0.40×**
   (svm-jit 2.5× *faster* than Wasmtime) via de-relooping — svm-opt recovers the irreducible CFG from
   clang's relooped wasm and SVM runs it natively (wasm can't represent it, so Wasmtime pays a
   per-iteration dispatch); the loop kernels also improve (`memsum`/`locals_c` ~1.2× → ~0.96×) from the

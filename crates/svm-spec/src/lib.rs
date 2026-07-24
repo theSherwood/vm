@@ -1282,7 +1282,7 @@ pub fn module_for(row: &OpRow, vector: &[SpecVal]) -> Module {
 
 // --- the memory window model (SPEC.md slice 5) ----------------------------------------
 //
-// Trap-confinement semantics per DESIGN.md §4 / TRAP_CONFINEMENT.md / the `svm-mask`
+// Trap-confinement semantics per DESIGN.md §4 / the `svm-mask`
 // contract, restated independently: a `width`-byte access at `addr` with immediate
 // `offset` is admitted iff the whole span `[addr+offset, addr+offset+width)` — computed
 // **without wraparound** — lies within `[0, mapped)`; anything else (including a
@@ -1896,7 +1896,7 @@ mod tests {
         );
     }
 
-    /// The window-model definitional lattice (§4 / TRAP_CONFINEMENT.md): the whole
+    /// The window-model definitional lattice (§4): the whole
     /// span within `[0, mapped)`, computed without wraparound — a wrapping effective
     /// address faults, never aliases; zero-length bulk ops are no-ops at wild
     /// pointers; a faulting access mutates nothing.

@@ -234,7 +234,7 @@ moves) becomes a red test instead of a silent format break.
 spec window model: `mapped` little-endian bytes; an access
 `[addr+offset, addr+offset+width)` succeeds iff it lies within `[0, mapped)`,
 else `MemoryFault` — trap-confinement semantics exactly as specified in
-`TRAP_CONFINEMENT.md`, including the overflow-free span check for the bulk ops
+`DESIGN.md` §4 (D63), including the overflow-free span check for the bulk ops
 (D62). Vectors include the boundary lattice (`end == mapped`, `end == mapped+1`,
 `addr` near `u64::MAX` so `addr+offset` wraps, zero-length bulk ops at wild
 pointers). This does not replace `fuzz/mask` or `escape_oracle.rs` — those prove
