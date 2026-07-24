@@ -3889,6 +3889,35 @@ impl Scheduler {
         }
     }
 
+    /// DURABILITY.md §13.4 step 2 — whether fiber `slot` of `reg` is parked in a **futex
+    /// wait** (its waiter entry sits in `wait_waiters`). The freeze driver's park-kind probe:
+    /// a futex park freezes (its `MemoryWait` thaw arm re-issues the wait), a cap park
+    /// (`cap_waiters`/`ticket_waiters`) does not (its `Leaf` spill would reload the freeze
+    /// placeholder as the call's result) — probe only, nothing is consumed.
+    fn fiber_wait_parked(&self, reg: &Arc<FiberRegistry>, slot: usize) -> bool {
+        let s = self.lock();
+        s.wait_waiters.values().any(|q| {
+            q.iter().any(|(_, w)| {
+                matches!(w, Waiter::Fiber { reg: r, slot: sl, .. }
+                    if Arc::ptr_eq(r, reg) && *sl == slot)
+            })
+        })
+    }
+
+    /// DURABILITY.md §13.4 step 2 — consume fiber `slot`'s futex waiter entry (the freeze
+    /// takes ownership of the park; the thaw's re-issued wait re-derives it). A stale timer
+    /// for the purged waiter finds it absent and is skipped, as for a notified waiter.
+    fn purge_fiber_wait_park(&self, reg: &Arc<FiberRegistry>, slot: usize) {
+        let mut s = self.lock();
+        for q in s.wait_waiters.values_mut() {
+            q.retain(|(_, w)| {
+                !matches!(w, Waiter::Fiber { reg: r, slot: sl, .. }
+                    if Arc::ptr_eq(r, reg) && *sl == slot)
+            });
+        }
+        s.wait_waiters.retain(|_, q| !q.is_empty());
+    }
+
     /// §3.6 slice 3 — a caller's enqueue landed on domain `key`'s queue: wake its vCPUs parked
     /// in `svc.wait`, if any (all of them — see [`Sched::svc_waiters`]). Resume re-executes the
     /// `svc.wait` (the frame was rewound at the park), which then finds the queue non-empty and
@@ -4389,6 +4418,20 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.cap_revoke(handle, status),
             SchedRef::Det(_) => 0,
+        }
+    }
+    /// §13.4 step 2 park-kind probe ([`Scheduler::fiber_wait_parked`]); the explorer hosts no
+    /// durable freezes, so its arm answers `false` (→ the freeze fails closed).
+    fn fiber_wait_parked(&self, reg: &Arc<FiberRegistry>, slot: usize) -> bool {
+        match self {
+            SchedRef::Real(s) => s.fiber_wait_parked(reg, slot),
+            SchedRef::Det(_) => false,
+        }
+    }
+    /// §13.4 step 2 waiter consume ([`Scheduler::purge_fiber_wait_park`]); explorer: no-op.
+    fn purge_fiber_wait_park(&self, reg: &Arc<FiberRegistry>, slot: usize) {
+        if let SchedRef::Real(s) = self {
+            s.purge_fiber_wait_park(reg, slot);
         }
     }
     /// Atomic reply-or-stash ([`Scheduler::cap_reply_or_stash`]); the explorer has no caller
@@ -5629,6 +5672,37 @@ impl FiberRegistry {
         }
     }
 
+    /// DURABILITY.md §13.4 step 2 — the event-parked (`ParkedOn`) fibers as `(slot, woken)`,
+    /// for the freeze driver's classification: a **woken** park carries its delivered result
+    /// in its frames (the point's spill reloads it at thaw), an unwoken park freezes only if
+    /// its thaw arm **re-issues** (a futex wait) — anything else fails the freeze closed.
+    fn blocked_parks(&self) -> Vec<(usize, bool)> {
+        self.lock()
+            .fibers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| match f {
+                RegFiber::ParkedOn { woken, .. } => Some((i, *woken)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Take the lowest still-event-parked fiber for the freeze flatten (the `ParkedOn`
+    /// counterpart of [`Self::take_parked_for_freeze`]): `(slot, frames, woken)`, the slot
+    /// marked `Frozen`.
+    fn take_blocked_for_freeze(&self) -> Option<(usize, Vec<Frame>, bool)> {
+        let mut t = self.lock();
+        let slot = t
+            .fibers
+            .iter()
+            .position(|f| matches!(f, RegFiber::ParkedOn { .. }))?;
+        match std::mem::replace(&mut t.fibers[slot], RegFiber::Frozen) {
+            RegFiber::ParkedOn { frames, woken } => Some((slot, frames, woken)),
+            _ => unreachable!("position found a ParkedOn slot"),
+        }
+    }
+
     /// Thaw seeding (slice 3.1.5): re-create a frozen fiber at the next slot as `Pending` (so a
     /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
@@ -6189,10 +6263,22 @@ impl VCpu {
     /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
     /// is a 3.1.5/3.2 follow-up.
     fn freeze_drive(&mut self) -> Result<(), Trap> {
-        // §3.6 slice 5a: an event-parked fiber cannot freeze (its wake lives in host scheduler
-        // state no snapshot carries) — fail the freeze closed rather than drop the park.
-        if self.registry.has_blocked_parks() {
+        // DURABILITY.md §13.4 step 2: serve-handler parks stay fail-closed until serve-state
+        // capture (step 3) — their reply linkage (`handler_parks`) is per-vCPU serve state no
+        // snapshot carries yet.
+        if !self.handler_parks.is_empty() {
             return Err(Trap::FiberFault);
+        }
+        // §13.4 step 2 classification (before anything is consumed): an event-parked fiber
+        // freezes when its thaw can re-derive the park — a WOKEN park's delivered result is
+        // already in its frames (the point's spill reloads it), and an unwoken FUTEX park
+        // re-issues at its `MemoryWait` thaw arm. An unwoken CAP park would spill the freeze
+        // placeholder into a `Leaf` frame (reloaded as the call's result — unsound), so it
+        // fails the whole freeze closed.
+        for (slot, woken) in self.registry.blocked_parks() {
+            if !woken && !self.sched.fiber_wait_parked(&self.registry, slot) {
+                return Err(Trap::FiberFault);
+            }
         }
         // §12.8 4A.5: this vCPU's root region word (where the root's SP lives); restored at the end so
         // the window is thaw-ready (the root rewinds first).
@@ -6202,49 +6288,84 @@ impl VCpu {
             .as_ref()
             .map(|m| m.durable_get_sp(root_word))
             .unwrap_or_else(|| shadow_frame_base(self.vcpu_ctx));
-        while let Some((slot, mut frames)) = self.registry.take_parked_for_freeze() {
-            // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
-            let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
-            let sp = match frames.first().and_then(|f| f.vals.first()) {
-                Some(r) => r.i64(),
-                _ => 0,
+        while let Some((slot, frames)) = self.registry.take_parked_for_freeze() {
+            // Placeholder resume value (inert; not spilled by `Yield`).
+            self.flatten_fiber_for_freeze(slot, frames, Some(Reg::from_i64(0)))?;
+        }
+        // §13.4 step 2 — flatten the event-parked fibers (classified above): a woken park's
+        // frames already carry its delivered result (no placeholder — the point's spill reloads
+        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and an
+        // inert status is delivered — the `MemoryWait` point spills `out − nres` (the status is
+        // never captured) and its thaw arm re-issues the wait, which re-checks the restored
+        // guest value (the O10 re-issue rule turned inward).
+        while let Some((slot, frames, woken)) = self.registry.take_blocked_for_freeze() {
+            let placeholder = if woken {
+                None
+            } else {
+                self.sched.purge_fiber_wait_park(&self.registry, slot);
+                Some(Reg::from_i32(0))
             };
-            if let Some(f) = frames.last_mut() {
-                f.vals.push(Reg::from_i64(0)); // placeholder resume value (inert; not spilled by Yield)
-            }
-            // The fiber spills into *its* region: its SP word starts empty (frame base) and
-            // `durable.shadow_base` must resolve to its region during the unwind sub-run (where `cur`
-            // is the `ROOT_FIBER` sentinel), so set the active spill context explicitly.
-            let fctx = shadow_context_index(slot);
-            self.durable_sp_ctx = fctx;
-            if let Some(m) = self.mem.as_mut() {
-                m.durable_set_sp(shadow_region_base(fctx), shadow_frame_base(fctx));
-            }
-            self.frames = frames;
-            self.cur = ROOT_FIBER;
-            self.chain = vec![ROOT_FIBER];
-            self.root_parked = None;
-            self.parked_frames = 0;
-            run_inner(self, u64::MAX)?; // the fiber unwinds; base return (cur == ROOT) ends the sub-run
-            let shadow_sp = self
-                .mem
-                .as_ref()
-                .map(|m| m.durable_get_sp(shadow_region_base(fctx)))
-                .unwrap_or_else(|| shadow_frame_base(fctx));
-            self.registry.set_saved_sp(slot, shadow_sp);
-            self.frozen.push(FrozenFiber {
-                slot,
-                func,
-                sp,
-                shadow_sp,
-                generation: self.registry.generation(slot),
-            });
+            self.flatten_fiber_for_freeze(slot, frames, placeholder)?;
         }
         // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
         self.durable_sp_ctx = self.vcpu_ctx;
         if let Some(m) = self.mem.as_mut() {
             m.durable_set_sp(root_word, root_sp);
         }
+        Ok(())
+    }
+
+    /// One fiber's freeze flatten (the [`VCpu::freeze_drive`] loop body, shared by the
+    /// suspend-parked and event-parked loops): resume the fiber's frames as a standalone
+    /// sub-run under `UNWINDING` — the first poll fires with zero forward progress — so its
+    /// continuation spills into *its own* shadow region, and record the [`FrozenFiber`]
+    /// residue. `placeholder` is the inert resume/status value delivered when the park's
+    /// point excludes it from the spill (`None` when the frames already carry a real
+    /// delivered result — a woken event-park).
+    fn flatten_fiber_for_freeze(
+        &mut self,
+        slot: usize,
+        mut frames: Vec<Frame>,
+        placeholder: Option<Reg>,
+    ) -> Result<(), Trap> {
+        // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
+        let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
+        let sp = match frames.first().and_then(|f| f.vals.first()) {
+            Some(r) => r.i64(),
+            _ => 0,
+        };
+        if let Some(p) = placeholder {
+            if let Some(f) = frames.last_mut() {
+                f.vals.push(p);
+            }
+        }
+        // The fiber spills into *its* region: its SP word starts empty (frame base) and
+        // `durable.shadow_base` must resolve to its region during the unwind sub-run (where `cur`
+        // is the `ROOT_FIBER` sentinel), so set the active spill context explicitly.
+        let fctx = shadow_context_index(slot);
+        self.durable_sp_ctx = fctx;
+        if let Some(m) = self.mem.as_mut() {
+            m.durable_set_sp(shadow_region_base(fctx), shadow_frame_base(fctx));
+        }
+        self.frames = frames;
+        self.cur = ROOT_FIBER;
+        self.chain = vec![ROOT_FIBER];
+        self.root_parked = None;
+        self.parked_frames = 0;
+        run_inner(self, u64::MAX)?; // the fiber unwinds; base return (cur == ROOT) ends the sub-run
+        let shadow_sp = self
+            .mem
+            .as_ref()
+            .map(|m| m.durable_get_sp(shadow_region_base(fctx)))
+            .unwrap_or_else(|| shadow_frame_base(fctx));
+        self.registry.set_saved_sp(slot, shadow_sp);
+        self.frozen.push(FrozenFiber {
+            slot,
+            func,
+            sp,
+            shadow_sp,
+            generation: self.registry.generation(slot),
+        });
         Ok(())
     }
 }

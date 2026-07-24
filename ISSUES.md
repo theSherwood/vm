@@ -1607,6 +1607,16 @@ rather than reverting to the channel.
    or install only the mingw packages actually needed. Workflow-file change (`workflow` scope), so a
    maintainer applies it.
 
+4. **GitHub archive download served a non-gzip response.** Run 30108936792 job 89533205009
+   (Jul 24, `embench differential` job, setup step): `curl -sSL …/embench-iot/…/master.tar.gz |
+   tar xz` failed with `gzip: stdin: not in gzip format` → exit 2, before any repo code ran —
+   codeload returned an error/rate-limit page instead of the tarball (the `-sS` flags hide the
+   HTTP status and `curl | tar` can't check it). Re-run clears it.
+   *Mitigation:* add `--retry 5 --retry-all-errors -f` to the curl (fail on HTTP errors and let
+   curl retry), or cache the embench checkout keyed on a pinned ref instead of re-fetching
+   `master` every run (pinning also removes a reproducibility hole). Workflow-file change
+   (`workflow` scope), so a maintainer applies it — mirrored in `.github/workflows_src/`.
+
 ### I26 — GitHub Pages deploy silently drops any playground asset not matched by `web/*.js` / `web/*.html`; nothing checks the published site (S3) — surfaced when the CodeMirror editor 404'd in production (2026-07-16)
 
 **Where:** `.github/workflows/pages.yml` → the "assemble site" step. It hand-copies `web/*.html`

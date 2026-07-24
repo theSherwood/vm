@@ -426,8 +426,10 @@ jobs:
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
+        # -f + retries: codeload sometimes serves an error page instead of the tarball, which
+        # `curl -sS | tar xz` can't detect ("not in gzip format" — ISSUES.md I18 class 4).
         run: |
-          curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
+          curl -sSL -f --retry 5 --retry-all-errors https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
           echo "EMBENCH=/tmp/embench-iot-master" >> "$GITHUB_ENV"
       - name: build the in-process Wasmtime runner (populates the wt/* columns)
         run: cargo build --release --bin embench_one --manifest-path bench/cross-engine/wasmtime-rs/Cargo.toml

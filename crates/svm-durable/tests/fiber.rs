@@ -578,3 +578,268 @@ block 0 (v0: i64, v1: i64) {
         "a stale (gen-0) handle to a recycled slot faults (the ABA guard)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DURABILITY.md §13.4 step 2 — **event-park freeze**: a fiber parked in a FUTEX WAIT (a
+// `RegFiber::ParkedOn` event-park, which used to fail every freeze closed) freezes and thaws.
+// The root resumes the fiber (it waits on cell 64 expecting 0 → parks), polls it once more
+// (resume#2 → `FIBER_PARKED`, the cooperative poll), then stores 7, notifies the cell, and
+// resumes a third time to collect the result. The freeze is armed at the SECOND fiber
+// safepoint (the countdown ticks only at `cont.resume`/`suspend`), so it lands at resume#2's
+// trailing poll with the fiber **unwoken**-parked: the freeze driver consumes the fiber's
+// futex waiter entry and flattens it with an inert status (the `MemoryWait` point spills
+// `out − nres`, so the placeholder is never captured). On thaw the root re-issues resume#2;
+// the re-seeded fiber rewinds to its `MemoryWait` re-issue arm and the re-executed wait
+// re-checks the restored cell — still 0 (the store is after the freeze point) — so it
+// re-parks, re-deriving its own waiter state from the restored world (the O10 re-issue rule
+// turned inward). The root's replayed store + notify then wake it exactly as in the
+// uninterrupted run, so both runs agree on `(FIBER_RETURNED, 107, 7)`.
+// ---------------------------------------------------------------------------
+
+const SRC_FUTEX_PARKED_FIBER: &str = r#"
+func () -> (i32, i64, i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6, v7 = cont.resume v2 v3
+  v8 = i64.const 65600
+  v9 = i64.const 7
+  i64.store v8 v9
+  v10 = i32.const 1
+  v11 = atomic.notify v8 v10
+  v12, v13 = cont.resume v2 v3
+  v14 = i64.load v8
+  return v12 v13 v14
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v2 = i64.const 65600
+  v3 = i32.const 0
+  v4 = i64.const -1
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.load v2
+  v7 = i64.const 100
+  v8 = i64.add v6 v7
+  return v8
+  }
+}
+"#;
+
+#[test]
+fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
+    use svm_durable::arm_freeze_after;
+
+    let mut m = svm_text::parse_module(SRC_FUTEX_PARKED_FIBER).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Baseline (no freeze): park → poll (FIBER_PARKED) → store+notify → collect. (The futex
+    // cell sits above `DURABLE_RESERVE` — the low 64 KiB belongs to the durable header/shadow.)
+    assert_eq!(
+        run_normal(&inst),
+        Ok(vec![Value::I32(1), Value::I64(107), Value::I64(7)]),
+        "uninterrupted run: the notified wait completes with 7 + 100"
+    );
+
+    // Freeze at the second fiber safepoint (the countdown ticks only at `cont.resume`/`suspend`:
+    // resume#1 = 1, resume#2 = 2): the freeze lands at resume#2's trailing poll with the fiber
+    // **unwoken**-parked in its wait — the exact state that used to fail closed.
+    let (frozen_fibers, root_sp, snap) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut win = init_durable_window(WINDOW);
+        arm_freeze_after(&mut win, 2);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+        (
+            h.frozen_fibers().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            snap,
+        )
+    };
+    assert_eq!(
+        frozen_fibers.len(),
+        1,
+        "the event-parked fiber was flattened (the old fail-closed would have trapped)"
+    );
+
+    // Thaw: the re-issued resume#2 re-enters the re-seeded fiber under REWINDING; its
+    // `MemoryWait` arm re-executes the wait, which re-checks the restored cell (still 0) and
+    // re-parks — re-deriving its waiter entry in the fresh scheduler — so the root's replayed
+    // store + notify wake it just as in the uninterrupted run.
+    let r_thaw = {
+        let mut win = snap.clone();
+        begin_thaw(&mut win, 0);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_frozen_fibers(frozen_fibers);
+        h.set_frozen_root_sp(root_sp);
+        let mut fuel = 1_000_000u64;
+        let (r, _) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        r
+    };
+    assert_eq!(
+        r_thaw,
+        Ok(vec![Value::I32(1), Value::I64(107), Value::I64(7)]),
+        "(FIBER_RETURNED, restored cell + 100, cell) — the thawed park re-derived itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §13.4 step 2, the **woken** branch: a fiber whose event already fired (`ParkedOn { woken }`)
+// but that no resume has claimed yet also freezes — its frames carry the delivered status, so
+// the flatten needs no placeholder and consumes no waiter (the wake already did). Fiber A parks
+// on the cell (resume#1 = safepoint 1), the root's store + notify wake it, and the freeze lands
+// at the resume of a second fiber B (safepoint 2), which suspend-parks — so the driver flattens
+// one woken event-park (A) and one ordinary suspend-park (B). Freeze-side only: re-entering a
+// flattened *woken* park from post-rewind NORMAL execution is the step-3 thaw wiring
+// (DURABILITY.md §13.4).
+// ---------------------------------------------------------------------------
+
+const SRC_WOKEN_PARKED_FIBER: &str = r#"
+func () -> (i32, i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 65600
+  v7 = i64.const 7
+  i64.store v6 v7
+  v8 = i32.const 1
+  v9 = atomic.notify v6 v8
+  v10 = ref.func 2
+  v11 = i64.const 8192
+  v12 = cont.new v10 v11
+  v13, v14 = cont.resume v12 v3
+  return v13 v14
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v2 = i64.const 65600
+  v3 = i32.const 0
+  v4 = i64.const -1
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.load v2
+  v7 = i64.const 100
+  v8 = i64.add v6 v7
+  return v8
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v2 = suspend vb
+  return v2
+  }
+}
+"#;
+
+#[test]
+fn a_woken_event_parked_fiber_freezes_without_a_placeholder() {
+    use svm_durable::arm_freeze_after;
+
+    let mut m = svm_text::parse_module(SRC_WOKEN_PARKED_FIBER).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut win = init_durable_window(WINDOW);
+    arm_freeze_after(&mut win, 2);
+    let mut fuel = 1_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+    let mut slots: Vec<usize> = h.frozen_fibers().iter().map(|f| f.slot).collect();
+    slots.sort_unstable();
+    assert_eq!(
+        slots,
+        vec![0, 1],
+        "both the woken event-park (A) and the suspend-park (B) were flattened"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §13.4 step 2, the fail-closed gate: an **unwoken capability park** cannot freeze — a
+// `Leaf` (cap.call) point spills its results *including* the call's, so a placeholder would
+// be reloaded on thaw as if it were the call's real result (reload-not-reissue). The driver
+// probes the park's kind by which scheduler map holds the waiter; a cap park is not in
+// `wait_waiters`, so the freeze refuses with `FiberFault`. The fiber parks in a blocking
+// stdin read (the racing-fibers shape from `fiber_parks.rs`, handle passed through memory —
+// the transform has no conversions).
+// ---------------------------------------------------------------------------
+
+const SRC_CAP_PARKED_FIBER: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 65608
+  i32.store v1 v0
+  v2 = ref.func 1
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  v8, v9 = cont.resume v4 v5
+  return v9
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v2 = i64.const 65608
+  v3 = i32.load v2
+  v4 = i64.const 65600
+  v5 = i64.const 4
+  v6 = cap.call 0 0 (i64, i64) -> (i64) v3 (v4, v5)
+  return v6
+  }
+}
+"#;
+
+#[test]
+fn an_unwoken_cap_parked_fiber_fails_the_freeze_closed() {
+    use svm_durable::arm_freeze_after;
+    use svm_interp::StreamRole;
+
+    let mut m = svm_text::parse_module(SRC_CAP_PARKED_FIBER).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    let handle = h.grant_stream(StreamRole::In);
+    h.set_stdin_blocking(true);
+    let mut win = init_durable_window(WINDOW);
+    arm_freeze_after(&mut win, 2);
+    let mut fuel = 1_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(handle)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut h,
+    );
+    assert_eq!(
+        r,
+        Err(Trap::FiberFault),
+        "a cap-parked fiber refuses the freeze (its placeholder would masquerade as a result)"
+    );
+}

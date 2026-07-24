@@ -2008,8 +2008,54 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    `Arc` key — that is cross-domain futex plumbing, not a serve key; its durable form arrives
    with the step-2 `FrozenPark::Futex` record. Behavior-neutral: the whole serve corpus
    (incl. the multi-consumer hammer) is green unchanged.
-2. **`FrozenPark` capture** — event-parked fibers freeze with their park reason; thaw
-   re-derives waiter entries. Lifts the `has_blocked_parks` fail-closed for in-cut parks.
+2. **Event-park freeze via sentinel-resume + trailing-poll unwind** *(design refined
+   2026-07-24 against the transform's actual poll placement — supersedes the earlier
+   `FrozenPark`-record sketch)*: the codec pass already places an unwind poll **after every
+   may-suspend op**, and the vCPU-level blocking thunks (`thread_wait`/`thread_join`) already
+   freeze by returning a sentinel under `UNWINDING` so that trailing poll unwinds with zero
+   forward progress. Event-parked fibers get the same treatment: the freeze driver takes a
+   `ParkedOn` fiber, **removes its scheduler waiter entry** (the freeze consumes it), and
+   resumes it with an inert placeholder under `UNWINDING` — the parking op's trailing poll
+   fires before any guest code consumes the placeholder. On thaw the rewind re-delivers
+   execution **into the parking op, which re-issues** (re-parking and re-deriving its own
+   waiter entry — the O10 re-issue rule turned inward; no park-reason records to carry, so
+   the snapshot format is untouched by this step). Cut-consistency falls out: an in-cut
+   servicer's restored queue/cells answer the re-issued call; a cross-cut one gets O10
+   verbatim. Re-issue is visible to the *servicer* as a duplicate dispatch when the freeze
+   raced a completed-but-unclaimed reply — the same idempotence contract O10 already imposes.
+   Lifts the `has_blocked_parks` fail-closed for in-cut parks; timed parks re-arm on
+   re-issue ("at least" semantics, as for timed `svc.wait`).
+   **Scope correction (2026-07-24, from the spill-plan code):** the trailing-poll route is
+   sound only where the point's `SuspendKind` **re-issues** — `MemoryWait`/`ThreadJoin` spill
+   `out − nres` and re-execute the op at thaw, but a **`Leaf` cap.call spills its results**
+   (reload-not-reissue), so an *unwoken* cap-parked fiber (blocking read / live call) would
+   spill the freeze placeholder and thaw would reload it as the call's result — unsound.
+   Step 2's implementable set is therefore: **woken-but-unclaimed parks of any kind** (the
+   real result is already in the frames; `Leaf` reload is then correct) and **unwoken
+   futex parks** (the `MemoryWait` re-issue arm). Unwoken **cap parks stay fail-closed**,
+   with two recorded follow-up options: promote park-capable cap.calls to a re-issue
+   `SuspendKind` (costs re-issue-vs-reload discrimination for *completed* calls — the R8
+   tension), or a per-point spill-frame validity marker (`result-valid | re-issue`) the thaw
+   arm branches on. The park kind is probed at freeze time from which scheduler map holds
+   the fiber's waiter (`wait_waiters` vs `cap_waiters`/`ticket_waiters`) — a probe, not a
+   record; the snapshot still carries nothing new.
+   **BUILT 2026-07-24** (the corrected scope): `freeze_drive` classifies every `ParkedOn`
+   fiber up front — serve-handler parks (`handler_parks`) and unwoken non-futex parks fail
+   the freeze closed (`FiberFault`) — then flattens the rest through the same
+   sub-run the suspend-parked loop uses (`flatten_fiber_for_freeze`): a *woken* park's
+   frames already carry the delivered result (no placeholder; a `Leaf` spill then reloads
+   the real value), an *unwoken futex* park has its waiter entry purged
+   (`Scheduler::purge_fiber_wait_park`) and an inert `i32 0` status pushed — the
+   `MemoryWait` point spills `out − nres`, so the placeholder is never captured and the
+   thaw arm re-issues the wait against the restored cell. Round-trip pinned in
+   `svm-durable/tests/fiber.rs`: the unwoken-park freeze→thaw re-issues the wait, which
+   re-parks and re-derives its waiter entry, and the replayed store+notify complete it
+   identically to the uninterrupted run; the woken branch and the cap-park refusal are
+   pinned freeze-side. One step-3 note from the woken-branch analysis: re-entering a
+   flattened fiber rewinds only while the *claiming* resume still runs under `REWINDING`
+   (the phase rides `shadow_switch`'s carry) — a woken park claimed by post-rewind NORMAL
+   execution would start fresh and orphan its spilled frame, so step 4's thaw wiring must
+   seed per-fiber thaw words (or re-arm them per claim) before woken parks thaw.
 3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
    `serve_count`, `serve_run` linkage), versioned like the fiber section (elided when empty).
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,

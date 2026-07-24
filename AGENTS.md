@@ -3,6 +3,10 @@
 Working agreement for agents (and humans) building this project. Keep it short;
 keep it followed. The full design lives in `DESIGN.md`.
 
+**Start every session by reading `INVARIANTS.md`** — the design rules that answer
+"is this change allowed?". A change that breaks one is wrong until the invariant
+itself is deliberately renegotiated with the owner.
+
 ## Prime directive: keep it simple
 
 This is a sandbox VM whose entire value is a **small, trustworthy core**. Every
