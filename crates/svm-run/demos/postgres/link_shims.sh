@@ -31,10 +31,20 @@ done
 if [ -z "$OL_DIR" ]; then
   OL_DIR="$OL_CACHE/openlibm-$OL_VER"
   mkdir -p "$OL_CACHE"
-  curl -sfL --max-time 120 -o "$OL_CACHE/openlibm.tar.gz" \
-    "https://github.com/JuliaMath/openlibm/archive/refs/tags/v$OL_VER.tar.gz" \
+  # Archive first (fast), then a shallow tag clone. GitHub's archive endpoint is gated on some
+  # networks (403) while git over https stays reachable — the same split `demos/doom/fetch.sh`
+  # works around. The clone is tag-pinned to the same commit, so the sources are identical.
+  if curl -sfL --max-time 120 -o "$OL_CACHE/openlibm.tar.gz" \
+      "https://github.com/JuliaMath/openlibm/archive/refs/tags/v$OL_VER.tar.gz"; then
+    tar xf "$OL_CACHE/openlibm.tar.gz" -C "$OL_CACHE"
+  else
+    echo "openlibm archive unavailable; trying a shallow tag clone"
+    rm -rf "$OL_DIR"
+    git -c advice.detachedHead=false clone -q --depth 1 --branch "v$OL_VER" \
+      https://github.com/JuliaMath/openlibm "$OL_DIR" || true
+  fi
+  [ -f "$OL_DIR/src/e_log.c" ] \
     || { echo "OPENLIBM FETCH FAILED (set SVM_OPENLIBM_DIR to a local tree)"; exit 21; }
-  tar xf "$OL_CACHE/openlibm.tar.gz" -C "$OL_CACHE"
 fi
 echo "openlibm: $OL_DIR"
 # The double-precision entry points + kernels (18 transcendentals; matches the `libm_bundled_vs_native`

@@ -1070,6 +1070,98 @@ positional branch from `grant_onramp_caps` and the `arity > 5` guard in `onramp_
 host to a single by-name grant; regenerate the committed `.svmb` fixtures/assets so they're by-name
 too. `svm-run`'s `grant_caps` (which also still keeps a positional branch) can drop it in the same pass.
 
+**Partly done (2026-07-24, `claude/doom-asset-generation-6zi7k6`):** the "regenerate the committed
+fixtures/assets" half is now current. `hello_c`/`hello_onramp` (309 → 111 B) and `life` (1644 → 1376 B)
+had drifted from what `svm-llvm-translate --host-page 65536` emits today; `gradient`/`bounce`/
+`mandelzoom`/`fsread` rebuild byte-identical. The drift was **body encoding only** — imports and
+exports are identical across old and new (`write` / `vm_map`; `_start`, `main`, `+ tick`), so this says
+nothing either way about the paramless-vs-positional question above, which is still open. The
+regenerated pair passes `onramp`, `reactor`, `shared_reactor`, and `reactor_fs`. `web/assets/qjs_repl.svmb`
+was stale too (4319380 B vs the pages run's 4318992 B) and is now regenerated as well, once I43 made
+openlibm fetchable again.
+
+### I42 — the Doom example vanished from the published playground: its single WAD mirror started 404ing, and every layer swallowed it (S3) — surfaced 2026-07-24 by `fetch ./assets/doom.svmb: 404` in production — **FIX LANDED** (`claude/doom-asset-generation-6zi7k6`)
+
+**Where:** `browser/build-onramp-assets.mjs` → `ensureWad()`. The shareware IWAD was fetched from a
+**single** URL, `https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad`, which now returns
+**404** (verified 2026-07-24). `curl -sfL` is silent, the `catch` was empty, and the loop had exactly
+one mirror — so the outage produced no output at all.
+
+**Symptom.** The playground's Doom example 404'd on `./assets/doom.svmb` in production, while the
+`pages` workflow stayed **green** on every run. The Doom *module* builds fine — the pages log shows
+`built /tmp/doomgeneric_cache/bc/doom.svmb (784303 bytes); exports: main 65 / tick 66` — but
+`copyFileSync` into `web/assets/` is gated on `doomSvmb && doomWad`, so a missing WAD dropped the
+module too. The one line printed was the catch-all
+`– doom skipped (no toolchain, or the source/WAD fetch failed — offline?)`, immediately after a
+successful module build, which pointed diagnosis at the toolchain rather than at a dead mirror.
+
+**This is the I26/I28 class again** — a Pages deploy that ships a playground missing an asset without
+ever going red. I26 was a copy-glob dropping files; I28 was an untested asset; this is a *build input*
+disappearing. Same failure mode: local dev has a warm `/tmp/doomgeneric_cache`, so nobody sees it.
+
+**Fixed:** `ensureWad()` now tries **four** mirrors and reports each failure with host + reason:
+`raw.githubusercontent.com/Akbar30Bill/DOOM_wads` (canonical shareware v1.9, md5
+`f0cefca49926d00903cf57551d901abe` — the same transport `fetch.sh` already falls back to), plus the
+official idgames archive and two of its mirrors (`gamers.org`, `youfailit.net`, `ftpmirror1.infania.net`)
+carrying the shareware v1.8 IWAD **gzipped** (decompressed in-process via `node:zlib`). The IWAD magic
+is checked **after** decompression, so a 404 body or captive-portal page still can't masquerade as the
+WAD. The skip line now names which half failed (`module build` vs `doom1.wad fetch`). Verified from a
+cold cache: `✓ doom.svmb (0.75 MB) + doom1.wad (4.00 MB)`, and `doom_reactor` boots and renders
+300/300 frames (into demo1 gameplay) over the fetched WAD.
+
+**Residual (not fixed here):** the skip is still **fail-soft by design** — an offline build must be
+able to omit Doom rather than fail — so four dead mirrors would once again ship a Doom-less playground
+green. The general guard is I26's fix sketch (b): a post-assemble gate that fails the deploy when a
+`play.js` example's asset is absent from `_site`. That needs `workflow` scope, so it goes through
+`.github/workflows_src/`. A cheaper stopgap is an env gate (`SVM_REQUIRE_DOOM=1`) that turns the skip
+into a hard error in the Pages job only.
+
+### I43 — openlibm was fetched from a **single** GitHub archive URL, and that endpoint is gated on some networks — the third instance of the one-source-fetch class (S3) — surfaced 2026-07-24 while regenerating `qjs_repl.svmb` — **FIX LANDED** (`claude/doom-asset-generation-6zi7k6`)
+
+**Where:** three independent sites, all with the same single URL
+`https://github.com/JuliaMath/openlibm/archive/refs/tags/v$VER.tar.gz`, all sharing the
+`/tmp/svm_openlibm_cache` tree:
+`ensureOpenlibm()` (`browser/build-onramp-assets.mjs`), `fetch_openlibm()`
+(`crates/svm-llvm/tests/translate.rs`), and `crates/svm-run/demos/postgres/link_shims.sh`.
+
+**Symptom.** GitHub's **archive** endpoint answers **403** on networks where `github.com` git and
+`raw.githubusercontent.com` are both fine — so this is not "offline", it is one endpoint being gated.
+Every consumer misread it as offline and degraded: the QuickJS rebuild skipped silently (leaving a
+stale committed `qjs_repl.svmb`), the `libm_bundled_vs_native` differential skipped, and `link_shims.sh`
+hard-failed with `OPENLIBM FETCH FAILED`.
+
+**This has happened before.** Same shape as I42 (doom's one WAD mirror 404ing), and
+`crates/svm-run/demos/doom/fetch.sh` *already* documents this exact endpoint split — "the GitHub
+archive tarball (fast; what CI uses), else a per-file fetch from raw.githubusercontent.com (works
+where the archive host is gated)". openlibm simply never got the same treatment.
+
+**Mirrors — what actually works** (probed 2026-07-24 from a gated sandbox):
+
+| source | result |
+|---|---|
+| `github.com/.../archive/refs/tags/v0.8.5.tar.gz` | **403** (gated; works in CI) |
+| `codeload.github.com`, `api.github.com` tarball/tree | 403 |
+| `git clone --depth 1 --branch v0.8.5 https://github.com/JuliaMath/openlibm` | **works** |
+| `raw.githubusercontent.com/JuliaMath/openlibm/v0.8.5/<path>` | **works** (per-file) |
+| `cdn.jsdelivr.net/gh/JuliaMath/openlibm@v0.8.5/<path>` | **works** (per-file, byte-identical) |
+| `data.jsdelivr.com/v1/packages/gh/JuliaMath/openlibm@v0.8.5` | **works** (file listing, for a per-file walk) |
+| Debian pool `openlibm_0.7.0+dfsg.orig.tar.xz` | reachable but **unusable** — wrong version, DFSG-stripped |
+| Gentoo distfiles, `cache.julialang.org`, archive.org | unreachable / absent |
+
+**Fixed:** all three sites now fall back to a **shallow tag clone** (`git clone --depth 1 --branch
+v$VER`) when the archive fails, and each says which mirror failed and why instead of swallowing it.
+The clone is tag-pinned to the same commit (`v0.8.5` = `db24332`), so the sources are identical to the
+archive's; unlike a per-file walk it needs no file list kept in sync with whichever sources a given
+consumer compiles (37 for QuickJS, 18 for the Postgres differential).
+
+**Verification:** with the archive gated and the cache wiped, `build-onramp-assets.mjs` takes the clone
+path and emits `qjs_repl.svmb` at **4318992 B** — byte-for-byte the size the pages run produces, i.e.
+the mirror reproduces the archive build exactly. The module runs: openlibm-backed `Math.sqrt(2)` →
+`1.4142135623730951` and `Math.log(Math.E)` → `1`, which is the precise surface openlibm supplies.
+
+**Residual:** per-file `raw.githubusercontent.com` / jsDelivr (the table above) is the known next lever
+if git-over-https is ever gated too — that is the shape `demos/doom/fetch.sh` already implements.
+
 ---
 
 ### I43 — `poll` after a synchronous spawn is not backend-portable: the interpreter runs the child lazily, the JIT eagerly (S3) — split out of STAGE1.md "Known caveat" (2026-07-24)

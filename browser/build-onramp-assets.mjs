@@ -11,7 +11,8 @@
 // Outputs to `web/assets/*.svmb` (gitignored except the tiny committed `hello_c.svmb`).
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, existsSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
+import { mkdirSync, existsSync, writeFileSync, readFileSync, copyFileSync, rmSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -136,10 +137,10 @@ if (ensureAmalgamation()) {
 //     JS program from **stdin**, evaluates it (print/console.log + the completion value), and prints.
 //     Multi-TU, mirroring the `demo_quickjs_eval_vs_native` test: the engine + a guest libm (openlibm,
 //     for the address-taken Math functions) + the reused printf/strtod/libc shims, `llvm-link`ed into
-//     one `.ll`, then translated. Fetched-and-cached (QuickJS from bellard.org, openlibm from GitHub);
-//     when the openlibm fetch is unavailable (the Pages pipeline can't reach GitHub) this rebuild is
-//     skipped and the **committed** `web/assets/qjs_repl.svmb` is left in place, so the JS playground
-//     works out of the box regardless (see `web/assets/.gitignore` whitelist).
+//     one `.ll`, then translated. Fetched-and-cached (QuickJS from bellard.org, openlibm from GitHub —
+//     see `ensureOpenlibm` for why that one needs two mirrors); when either fetch is unavailable this
+//     rebuild is skipped and the **committed** `web/assets/qjs_repl.svmb` is left in place, so the JS
+//     playground works out of the box regardless (see `web/assets/.gitignore` whitelist).
 const QJS_VER = '2024-01-13';
 const QJS_CACHE = '/tmp/svm_quickjs_cache';
 const QJS_DIR = join(QJS_CACHE, `quickjs-${QJS_VER}`);
@@ -166,6 +167,12 @@ function ensureQuickJS() {
     return existsSync(join(QJS_DIR, 'quickjs.c'));
   } catch { return false; }
 }
+// GitHub's **archive** endpoint (`/archive/refs/tags/*.tar.gz`) is gated on some networks — it 403s
+// while `github.com` git and `raw.githubusercontent.com` stay reachable. `demos/doom/fetch.sh` already
+// works around exactly this split for doomgeneric; openlibm never got the same treatment, so a gated
+// archive silently skipped the whole QuickJS rebuild. Mirror order: archive (fast, what CI takes),
+// then a shallow **tag clone** — tag-pinned to the same commit, and it needs no per-file list to stay
+// in sync with whichever sources a consumer happens to compile.
 function ensureOpenlibm() {
   if (existsSync(join(OL_DIR, 'src', 'e_log.c'))) return true;
   mkdirSync(OL_CACHE, { recursive: true });
@@ -174,8 +181,20 @@ function ensureOpenlibm() {
     execFileSync('curl', ['-sfL', '--max-time', '120', '-o', tgz,
       `https://github.com/JuliaMath/openlibm/archive/refs/tags/v${OL_VER}.tar.gz`], { stdio: 'inherit' });
     execFileSync('tar', ['xf', tgz, '-C', OL_CACHE], { stdio: 'inherit' });
+    if (existsSync(join(OL_DIR, 'src', 'e_log.c'))) return true;
+  } catch (e) {
+    // Say which mirror failed and why — a silent `catch` here is what hid the doom outage (I42).
+    console.log(`    – openlibm archive unavailable: ${e.message}`);
+  }
+  try {
+    rmSync(OL_DIR, { recursive: true, force: true });
+    execFileSync('git', ['-c', 'advice.detachedHead=false', 'clone', '-q', '--depth', '1', '--branch', `v${OL_VER}`,
+      'https://github.com/JuliaMath/openlibm', OL_DIR], { stdio: 'inherit' });
     return existsSync(join(OL_DIR, 'src', 'e_log.c'));
-  } catch { return false; }
+  } catch (e) {
+    console.log(`    – openlibm shallow clone failed: ${e.message}`);
+    return false;
+  }
 }
 function buildQuickJS() {
   const svmb = join(ASSETS, 'qjs_repl.svmb');
@@ -247,18 +266,45 @@ function ensureDoomModule() {
   }
 }
 
-// Fetch the shareware doom1.wad (freely redistributable). Returns its path, or null if unavailable.
-// Verifies the IWAD magic so a captive-portal HTML page can't masquerade as the WAD.
+// Mirrors for the freely-redistributable shareware IWAD, tried in order. **Several on purpose**: this
+// used to be a single slitaz URL, which started 404ing — and because the failure was swallowed, the
+// Pages build kept going green while quietly shipping a playground with no Doom (the page 404'd on
+// ./assets/doom.svmb). One host disappearing must not cost us the example.
+//   - raw.githubusercontent.com serves the canonical shareware v1.9 IWAD (md5 f0cefca4…); it is the
+//     same transport `fetch.sh` already falls back to, so it works wherever the sources do.
+//   - the rest are the official idgames archive + two of its mirrors, which carry the shareware v1.8
+//     IWAD **gzipped**. v1.8 boots and renders the same; its title demo is from an older engine
+//     build, which doomgeneric tolerates (it prints instead of `I_Error`-ing on a demo mismatch).
+const WAD_MIRRORS = [
+  'https://raw.githubusercontent.com/Akbar30Bill/DOOM_wads/master/doom1.wad',
+  'https://www.gamers.org/pub/idgames/idstuff/doom/doom-1.8.wad.gz',
+  'https://youfailit.net/pub/idgames/idstuff/doom/doom-1.8.wad.gz',
+  'https://ftpmirror1.infania.net/pub/idgames/idstuff/doom/doom-1.8.wad.gz',
+];
+
+// Fetch the shareware doom1.wad (freely redistributable). Returns its path, or null if every mirror
+// is unavailable. Verifies the IWAD magic **after** decompressing, so neither a captive-portal HTML
+// page nor a mirror's 404 body can masquerade as the WAD.
 function ensureWad() {
   const wad = join(DCACHE, 'doom1.wad');
-  const ok = (p) => existsSync(p) && readFileSync(p).subarray(0, 4).toString('latin1') === 'IWAD';
-  if (ok(wad)) return wad;
+  const isIwad = (buf) => buf.subarray(0, 4).toString('latin1') === 'IWAD';
+  if (existsSync(wad) && isIwad(readFileSync(wad))) return wad;
   mkdirSync(DCACHE, { recursive: true });
-  for (const url of ['https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad']) {
+  const tmp = join(DCACHE, 'doom1.wad.part');
+  for (const url of WAD_MIRRORS) {
     try {
-      execFileSync('curl', ['-sfL', '--max-time', '180', '-o', wad, url], { stdio: 'inherit' });
-      if (ok(wad)) return wad;
-    } catch { /* try the next mirror */ }
+      execFileSync('curl', ['-sfL', '--max-time', '180', '-o', tmp, url], { stdio: 'inherit' });
+      const raw = readFileSync(tmp);
+      const buf = url.endsWith('.gz') ? gunzipSync(raw) : raw;
+      if (!isIwad(buf)) throw new Error(`not an IWAD (magic ${JSON.stringify(buf.subarray(0, 4).toString('latin1'))})`);
+      writeFileSync(wad, buf);
+      return wad;
+    } catch (e) {
+      // Say which mirror failed and why — a silent `catch` here is what hid the outage.
+      console.log(`    – WAD mirror ${new URL(url).host} unavailable: ${e.message}`);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
   }
   return null;
 }
@@ -271,7 +317,11 @@ if (doomSvmb && doomWad) {
   const mb = (n) => (readFileSync(n).length / (1024 * 1024)).toFixed(2);
   console.log(`  ✓ doom.svmb (${mb(doomSvmb)} MB) + doom1.wad (${mb(doomWad)} MB)`);
 } else {
-  console.log('  – doom skipped (no toolchain, or the source/WAD fetch failed — offline?)');
+  // Name the half that failed. The old catch-all ("no toolchain, or the source/WAD fetch failed")
+  // was printed even when the module had just built successfully one line above, which sent the
+  // WAD-mirror outage looking like a toolchain problem.
+  const missing = [!doomSvmb && 'module build', !doomWad && 'doom1.wad fetch'].filter(Boolean).join(' + ');
+  console.log(`  – doom skipped (${missing} failed — offline, or no toolchain?)`);
 }
 
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');

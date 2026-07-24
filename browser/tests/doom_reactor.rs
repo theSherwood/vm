@@ -1,7 +1,8 @@
 //! **Doom boots + renders in the browser reactor** (Doom slice 4) — the end-to-end proof that the
 //! playground's run model (the wasm `svm_onramp_open_fs` → [`OnrampReactor::open_with_fs`] path)
 //! drives real Doom: `_start` (`doomgeneric_Create`) reads the shareware IWAD through the reactor's
-//! `fs` capability, then each `tick` (`doomgeneric_Tick`) renders one 640×400 frame over the
+//! `fs` capability, then each `tick` (`doomgeneric_Tick`) renders one frame (at `build.sh`'s compiled-in
+//! resolution — Doom's native 320×200 by default) over the
 //! persistent window. This is the same module + WAD the page runs, exercised natively over the exact
 //! Rust the wasm export wraps — the slice-3c `doom_diff` differential already proved the *pixels* are
 //! byte-exact; this proves the *reactor wiring* (fs-served WAD in, per-frame `tick`, `display` out).
@@ -33,9 +34,18 @@ fn doom_boots_and_renders_in_the_reactor() {
     let mut r = OnrampReactor::open_with_fs(&m, "doom1.wad".to_string(), wad)
         .expect("Doom's _start (doomgeneric_Create) runs to completion over the fs-served WAD");
 
-    // Drive frames; each `tick` is one `doomgeneric_Tick`. The title screen presents a 640x400 frame
-    // (the doomgeneric resolution) through `display`; after a few seconds of ticks Doom auto-plays the
-    // demo1 gameplay. `DOOM_FRAMES` (default 8) drives how far — 300 reaches demo playback.
+    // The frame size is the resolution `build.sh` compiled in — Doom's native 320x200 by default,
+    // overridable there via RESX/RESY. Read the same knobs instead of hardcoding: this test asserted
+    // a literal 640x400 (doomgeneric's default) long after build.sh moved to 320x200, and being
+    // `#[ignore]`d meant CI never caught the drift.
+    let (resx, resy): (u32, u32) = (
+        env_or("RESX", "320").parse().expect("RESX is a number"),
+        env_or("RESY", "200").parse().expect("RESY is a number"),
+    );
+
+    // Drive frames; each `tick` is one `doomgeneric_Tick`. The title screen presents a frame through
+    // `display`; after a few seconds of ticks Doom auto-plays the demo1 gameplay. `DOOM_FRAMES`
+    // (default 8) drives how far — 300 reaches demo playback.
     let frames: usize = env_or("DOOM_FRAMES", "8").parse().unwrap_or(8);
     let mut presented = 0;
     for i in 0..frames {
@@ -45,8 +55,8 @@ fn doom_boots_and_renders_in_the_reactor() {
         let (status, _stdout) = r.frame();
         assert_eq!(status, STATUS_OK, "tick {i} keeps going (of {frames})");
         if let Some(f) = r.take_frame() {
-            assert_eq!((f.width, f.height), (640, 400), "doomgeneric 640x400 frame");
-            assert_eq!(f.rgba.len(), 640 * 400 * 4, "RGBA framebuffer");
+            assert_eq!((f.width, f.height), (resx, resy), "doomgeneric {resx}x{resy} frame");
+            assert_eq!(f.rgba.len(), resx as usize * resy as usize * 4, "RGBA framebuffer");
             assert!(f.rgba.iter().any(|&b| b != 0), "frame {i} is not all-black");
             presented += 1;
         }
@@ -56,6 +66,6 @@ fn doom_boots_and_renders_in_the_reactor() {
         "Doom presented at least one frame through display"
     );
     eprintln!(
-        "Doom booted over the fs-served WAD and presented {presented}/{frames} frames (640x400)"
+        "Doom booted over the fs-served WAD and presented {presented}/{frames} frames ({resx}x{resy})"
     );
 }
