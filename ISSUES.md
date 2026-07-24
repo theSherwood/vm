@@ -1701,6 +1701,42 @@ positional branch from `grant_onramp_caps` and the `arity > 5` guard in `onramp_
 host to a single by-name grant; regenerate the committed `.svmb` fixtures/assets so they're by-name
 too. `svm-run`'s `grant_caps` (which also still keeps a positional branch) can drop it in the same pass.
 
+### I42 — the Doom example vanished from the published playground: its single WAD mirror started 404ing, and every layer swallowed it (S3) — surfaced 2026-07-24 by `fetch ./assets/doom.svmb: 404` in production — **FIX LANDED** (`claude/doom-asset-generation-6zi7k6`)
+
+**Where:** `browser/build-onramp-assets.mjs` → `ensureWad()`. The shareware IWAD was fetched from a
+**single** URL, `https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad`, which now returns
+**404** (verified 2026-07-24). `curl -sfL` is silent, the `catch` was empty, and the loop had exactly
+one mirror — so the outage produced no output at all.
+
+**Symptom.** The playground's Doom example 404'd on `./assets/doom.svmb` in production, while the
+`pages` workflow stayed **green** on every run. The Doom *module* builds fine — the pages log shows
+`built /tmp/doomgeneric_cache/bc/doom.svmb (784303 bytes); exports: main 65 / tick 66` — but
+`copyFileSync` into `web/assets/` is gated on `doomSvmb && doomWad`, so a missing WAD dropped the
+module too. The one line printed was the catch-all
+`– doom skipped (no toolchain, or the source/WAD fetch failed — offline?)`, immediately after a
+successful module build, which pointed diagnosis at the toolchain rather than at a dead mirror.
+
+**This is the I26/I28 class again** — a Pages deploy that ships a playground missing an asset without
+ever going red. I26 was a copy-glob dropping files; I28 was an untested asset; this is a *build input*
+disappearing. Same failure mode: local dev has a warm `/tmp/doomgeneric_cache`, so nobody sees it.
+
+**Fixed:** `ensureWad()` now tries **four** mirrors and reports each failure with host + reason:
+`raw.githubusercontent.com/Akbar30Bill/DOOM_wads` (canonical shareware v1.9, md5
+`f0cefca49926d00903cf57551d901abe` — the same transport `fetch.sh` already falls back to), plus the
+official idgames archive and two of its mirrors (`gamers.org`, `youfailit.net`, `ftpmirror1.infania.net`)
+carrying the shareware v1.8 IWAD **gzipped** (decompressed in-process via `node:zlib`). The IWAD magic
+is checked **after** decompression, so a 404 body or captive-portal page still can't masquerade as the
+WAD. The skip line now names which half failed (`module build` vs `doom1.wad fetch`). Verified from a
+cold cache: `✓ doom.svmb (0.75 MB) + doom1.wad (4.00 MB)`, and `doom_reactor` boots and renders
+300/300 frames (into demo1 gameplay) over the fetched WAD.
+
+**Residual (not fixed here):** the skip is still **fail-soft by design** — an offline build must be
+able to omit Doom rather than fail — so four dead mirrors would once again ship a Doom-less playground
+green. The general guard is I26's fix sketch (b): a post-assemble gate that fails the deploy when a
+`play.js` example's asset is absent from `_site`. That needs `workflow` scope, so it goes through
+`.github/workflows_src/`. A cheaper stopgap is an env gate (`SVM_REQUIRE_DOOM=1`) that turns the skip
+into a hard error in the Pages job only.
+
 ---
 
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
