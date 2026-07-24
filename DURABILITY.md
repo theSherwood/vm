@@ -2081,6 +2081,21 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    starting fresh and orphaning it. Pinned with a witness-cell discriminator (the rewind
    reloads the *spilled* pre-park read; a fresh start re-reads the mutated cell) plus the
    cooperative-poll loop a thawed park's transient re-park requires (invariant 7).
+   **Slice 4b BUILT 2026-07-24 (serve-point freeze + re-issue thaw):** the serve arm delivers
+   an inert sentinel on observing `UNWINDING` (no drain, no park — the queue survives
+   untouched for the v13 serve section) so its trailing poll unwinds with zero forward
+   progress, and the transform classifies `cap.call CAP_SELF svc.poll/svc.wait` as a new
+   **re-issue** `SuspendKind::SvcServe` (spill `out − nres`; the sentinel is never captured —
+   a `Leaf` reload would have masqueraded it as the served count). The thaw arm flips
+   `NORMAL` (the mid-handler gate guarantees the serve point is the deepest frozen frame),
+   reloads handle + args, and re-executes: the drain runs against the *restored* queue — an
+   empty one re-parks `svc.wait` exactly as an uninterrupted run would ("thaw marks them
+   runnable" via re-execution, no waiter capture). Pinned in `svm-durable/tests/serve.rs`
+   (in-memory round trip + the op-number cross-crate pin) and
+   `svm-snapshot/tests/roundtrip.rs` (the full artifact: freeze at the serve point →
+   restore → thaw drains the restored dispatch, completion cell fills). Remaining in step 4:
+   multi-domain subtree wiring — restore *hosts* plural, `LiveImplEntry` re-link by
+   `DomainId`, caller re-parks with the settle race-check.
 5. **Cross-cut O10 re-issue** — freeze-boundary calls complete with a re-issue marker on
    thaw; validate against reload-not-reissue (R8/R11) before widening.
 

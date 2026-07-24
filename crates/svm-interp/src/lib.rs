@@ -7948,6 +7948,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             _ => return Err(Trap::FiberFault),
                         }
                     }
+                    // DURABILITY.md §13.4 slice 4b: under `UNWINDING` a serve op makes **no
+                    // progress** — it delivers an inert sentinel so its own trailing poll
+                    // spills with the queue untouched (the vCPU-thunk sentinel pattern). The
+                    // transform's `SvcServe` re-issue arm re-executes the drain on thaw
+                    // against the restored queue — re-execution is the recovery, so the
+                    // sentinel is never captured (the point spills `out − nres`).
+                    if durable
+                        && serve_run.is_none()
+                        && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
+                    {
+                        if !sig.results.is_empty() {
+                            frames[top].vals.push(Reg::from_i64(0));
+                        }
+                        continue;
+                    }
                     // Switch into handler-fiber frames: the `cont.resume` tail with the serve
                     // frame rewound, so the handler's every exit re-executes this op.
                     macro_rules! serve_switch {

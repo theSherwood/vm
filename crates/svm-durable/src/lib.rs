@@ -57,6 +57,13 @@ use svm_ir::{
 
 // `FuncIdx` is used by `SuspendKind::Propagated` below.
 
+/// The reserved self-namespace op for `svc.poll` (IMPORTS.md §3.6). A local copy — this crate
+/// depends only on `svm-ir` — pinned equal to `svm_interp::CAP_SELF_SVC_POLL` by a dev-test
+/// (`tests/serve.rs`).
+pub const SVC_POLL_OP: u32 = 9;
+/// The reserved self-namespace op for `svc.wait`; pinned equal to `svm_interp::CAP_SELF_SVC_WAIT`.
+pub const SVC_WAIT_OP: u32 = 10;
+
 // ---- State word values (the §2 state machine) ----
 
 /// Normal forward execution; polls and prologues fall straight through.
@@ -462,6 +469,24 @@ enum SuspendKind {
     /// frozen frame) and re-executes `suspend` so control returns to the resumer awaiting a future
     /// `cont.resume` (slice 3.1.3). `value` is the suspended value's block-local index.
     Yield { value: ValIdx },
+    /// A **serve op** (`cap.call CAP_SELF svc.poll/svc.wait` — DURABILITY.md §13.4 slice 4b): a
+    /// serving domain frozen at (or parked in) its serve point is a freeze safepoint — the serve
+    /// arm delivers an inert sentinel on observing `UNWINDING` (no drain, no park; the queue
+    /// stays untouched for the snapshot's serve section), the trailing poll unwinds, and the op
+    /// is **re-issued on thaw** (like `atomic.wait`): the re-executed drain runs against the
+    /// *restored* queue — re-execution is the recovery, so the sentinel is never captured. A
+    /// mid-handler freeze is refused up front (the serve epilogue's fail-closed gate), so this
+    /// point is always the globally-deepest frozen frame on its thread: flip the state word to
+    /// `NORMAL` itself, then reload the handle + args and re-execute. The op immediates
+    /// (`type_id`/`op`/`sig`) reconstruct the instruction; `handle`/`args` are its block-local
+    /// operands (spilled + reloaded).
+    SvcServe {
+        type_id: u32,
+        op: u32,
+        sig: svm_ir::FuncType,
+        handle: ValIdx,
+        args: Vec<ValIdx>,
+    },
     /// A **loop-header poll** (Phase-4 Slice A): a state-word check prepended to a loop header's
     /// entry (the header dominates its body, so a poll-free compute loop is caught every iteration
     /// at bounded latency, closing the R6 latency caveat). It has no in-flight op — it is always
@@ -727,6 +752,22 @@ fn transform_func(
 
                 // resume plan for this point
                 let kind = match &blk.insts[pos] {
+                    // §13.4 slice 4b: a serve op re-issues (the sentinel it returned under
+                    // `UNWINDING` must never reload as the served count) — before the
+                    // generic `Leaf` arm.
+                    Inst::CapCall {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: sop @ (SVC_POLL_OP | SVC_WAIT_OP),
+                        sig,
+                        handle,
+                        args,
+                    } => SuspendKind::SvcServe {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: *sop,
+                        sig: sig.clone(),
+                        handle: *handle,
+                        args: args.clone(),
+                    },
                     Inst::CapCall { .. } => SuspendKind::Leaf,
                     Inst::Call { func, args } => SuspendKind::Propagated {
                         callee: *func,
@@ -752,6 +793,7 @@ fn transform_func(
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
                     (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
+                    (SuspendKind::SvcServe { .. }, Inst::CapCall { sig, .. }) => sig.results.len(),
                     (SuspendKind::Propagated { callee, .. }, _) => {
                         func_results[*callee as usize].len()
                     }
@@ -772,7 +814,8 @@ fn transform_func(
                     | SuspendKind::Resume { .. }
                     | SuspendKind::Yield { .. }
                     | SuspendKind::ThreadJoin { .. }
-                    | SuspendKind::MemoryWait { .. } => out - nres,
+                    | SuspendKind::MemoryWait { .. }
+                    | SuspendKind::SvcServe { .. } => out - nres,
                     // Header polls are built separately (above), never from an in-block op.
                     SuspendKind::LoopHeader => unreachable!("loop-header point not from an op"),
                 };
@@ -828,6 +871,12 @@ fn transform_func(
                     used[*addr as usize] = true; // operands of the re-issued atomic.wait
                     used[*expected as usize] = true;
                     used[*timeout as usize] = true;
+                }
+                if let SuspendKind::SvcServe { handle, args, .. } = &kind {
+                    used[*handle as usize] = true; // operands of the re-issued serve op
+                    for &a in args {
+                        used[a as usize] = true;
+                    }
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -1039,6 +1088,38 @@ fn transform_func(
                         addr: aa,
                         expected: ee,
                         timeout: tt,
+                    },
+                    pt.nres,
+                )
+            }
+            // Serve-op re-issue (§13.4 slice 4b): the mid-handler gate guarantees this point is
+            // the globally-deepest frozen frame on its thread (no handler was in flight), so —
+            // like `atomic.wait` — flip the state word to `NORMAL` itself, then reload the
+            // handle + args and re-execute. The re-executed drain runs against the restored
+            // queue (the snapshot's serve section); an empty queue re-parks `svc.wait` exactly
+            // as an uninterrupted run would.
+            SuspendKind::SvcServe {
+                type_id,
+                op,
+                sig,
+                handle,
+                args,
+            } => {
+                let (st_a, st_off) = ab.thaw_word_addr();
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
+                let hh = reloaded[spill_slot(*handle as usize).expect("serve-op handle spilled")];
+                let aa: Vec<ValIdx> = args
+                    .iter()
+                    .map(|&a| reloaded[spill_slot(a as usize).expect("serve-op arg spilled")])
+                    .collect();
+                ab.many(
+                    Inst::CapCall {
+                        type_id: *type_id,
+                        op: *op,
+                        sig: sig.clone(),
+                        handle: hh,
+                        args: aa,
                     },
                     pt.nres,
                 )
