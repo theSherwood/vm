@@ -41,6 +41,30 @@ parking on the domain queue (condvar keyed like the futex table), handlers launc
 the existing call trampoline, handler parks riding the S1c shared-futex machinery. The oracle
 fold stays as the differential baseline, not the shipped path.
 
+**Bytecode map + slice-1 design (2026-07-24).** The gap is wider than the fold comment reads:
+`compile_inst` declines the *whole* §3.6 surface — svc ops 9/10 (`bytecode.rs:1230`), every
+`Instantiator` op past 7 via the catch-all (`:1223` — so granted spawns 8/11/13 and `child_offer`
+14 also fall back), and a caller's `cap.call` on a `LiveImpl` handle reaches generic dispatch and
+refuses. What the engine already has is the right substrate, in cooperative form: `drive` (a
+deterministic cooperative scheduler over `TaskSlot { vt, threads, env, state }` with
+`TaskState::{Runnable, BlockedJoin, BlockedWait, Done}` and a logical clock), a **run-shared
+fiber registry** (`FiberState`, D57 migration), confined `ChildEnv`s for §14 children, and —
+crucially — all §3.6 *state* already lives on the shared `Host` (`svc_queue`, `svc_results`,
+tickets, `svc_handler_func`), so enqueue/settle/reply plumbing is reused verbatim; only the
+scheduling is engine-local. Slice 1 builds, in order: (a) **caller side** — `LiveImpl` cap.call
+compiles to an enqueue + a new `TaskState::BlockedTicket { ticket, dst }` (fiber-level variant
+rides the existing `FiberState::Parked` shape); (b) **serve side** — svc ops 9/10 compile to a
+drain op: admit dispatches as fibers of the serving vCPU (the registry exists), settle
+returns/parks exactly like the tree-walk arm (`FIBER_RETURNED` → reply-or-`svc_results`,
+`FIBER_PARKED` → handler-parks map), park the vCPU as `TaskState::BlockedSvc { key }` when idle;
+(c) **wakes in `drive`** — enqueue wakes `BlockedSvc`, handler completion wakes `BlockedTicket`,
+notify/timer/revocation wakes route to parked handlers then `svc_wake` their domain (the
+tree-walker's four wake paths, cooperative form); (d) differential: the existing
+`svc_serve_loop.rs` / `svc_handler_parks.rs` corpus run through `run_with_host_fast` and asserted
+equal to the tree-walk. Granted spawns (8/11/13) on bytecode stay declined in slice 1 (separate
+gap, now recorded here); lifting them is slice 2 so a serving *child* spawned from bytecode also
+runs native.
+
 ### I37 — a handler trap kills the whole serving domain: total blast radius per bad request (S3)
 
 **Where:** §3.6 handlers run over the domain's **one world** (same window/powerbox/fuel), so a
