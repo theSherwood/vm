@@ -5,12 +5,13 @@
 //! negative errno (`-EBADF`); the fiber is never killed and nothing traps — cancellation is
 //! a returned value the fiber handles on its own error path.
 //!
-//! Also pins the revocation act itself: `Stream.close` is now real (the slot entry is
-//! cleared), so a *fresh* call on the closed handle is the clean D37 use-after-close
-//! `CapFault` the docs always promised — while the in-flight parked call gets the errno,
-//! per D42 (errors return; traps stay for escape/fatal).
+//! Also pins the revocation act itself: `Stream.close` is real (the slot entry is cleared),
+//! and — since I41 (graceful revocation) — a *fresh* call on the closed handle completes with
+//! the **same probeable errno** as the in-flight parked call: cancellation is a value whether
+//! you were mid-call or call a moment later, per D42 (errors return; traps stay for
+//! escape/fatal — i.e. for *forged* handles, which D37 still faults).
 
-use svm_interp::{run_with_host, Host, StreamRole, Trap, Value};
+use svm_interp::{run_with_host, Host, StreamRole, Value};
 
 /// The §3.6 revocation completion status: `-EBADF`.
 const CAP_REVOKED: i64 = -9;
@@ -62,9 +63,9 @@ fn a_sibling_fiber_revokes_a_parked_read_which_completes_with_an_errno() {
     );
 }
 
-/// The revocation act alone: `close` returns 0 and a **fresh** call on the closed handle is
-/// the D37 use-after-close `CapFault` (fail-closed at the use site) — distinct from the
-/// in-flight errno above, per D42.
+/// The revocation act alone: `close` returns 0 and a **fresh** call on the closed handle
+/// completes with the same probeable errno as the in-flight one above (I41 graceful
+/// revocation — the once-issued generation is its own tombstone; only a forgery traps).
 const CLOSE_THEN_USE: &str = r#"
 memory 16
 func (i32) -> (i64) {
@@ -79,7 +80,7 @@ block 0 (v0: i32) {
 "#;
 
 #[test]
-fn a_fresh_call_on_a_closed_stream_is_the_d37_use_after_close_fault() {
+fn a_fresh_call_on_a_closed_stream_completes_with_the_revocation_errno() {
     let m = svm_text::parse_module(CLOSE_THEN_USE).expect("parse");
     svm_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
@@ -88,8 +89,8 @@ fn a_fresh_call_on_a_closed_stream_is_the_d37_use_after_close_fault() {
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host);
     assert_eq!(
         r,
-        Err(Trap::CapFault),
-        "use-after-close faults clean at the use site (D37)"
+        Ok(vec![Value::I64(CAP_REVOKED)]),
+        "use-after-close is the same probeable errno as the unpark (I41) — no trap"
     );
 }
 
@@ -156,10 +157,11 @@ fn a_rebind_of_the_slot_wakes_the_fiber_parked_through_its_old_binding() {
     );
 }
 
-/// Close is idempotent-shaped at the op level: closing an already-closed handle is itself the
-/// D37 fault (the handle no longer resolves) — nothing dangles, nothing double-frees.
+/// Close is idempotent-shaped at the op level: closing an already-closed handle answers the
+/// same revocation errno (I41 — the handle no longer resolves, and it is a once-valid one) —
+/// nothing dangles, nothing double-frees, nothing traps.
 #[test]
-fn close_of_a_closed_handle_faults_rather_than_dangling() {
+fn close_of_a_closed_handle_errnos_rather_than_dangling() {
     let m = svm_text::parse_module(
         r#"
 memory 16
@@ -178,5 +180,5 @@ block 0 (v0: i32) {
     let h = host.grant_stream(StreamRole::Out);
     let mut fuel = u64::MAX;
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host);
-    assert_eq!(r, Err(Trap::CapFault));
+    assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
 }

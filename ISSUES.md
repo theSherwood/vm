@@ -245,6 +245,22 @@ D37 anti-probing property — which revocation-unparks has already half-surrende
 tombstone *completes* an inconsistency rather than creating one. This pairs with I37: it removes
 the dominant benign trigger before any trap-scoping mechanism is considered.
 
+**BUILT (2026-07-24).** Better than the sketch: **no tombstone storage at all** — a slot's
+generation advances only at (re)grant (`try_grant`), so every generation `1..=current` was once
+a live handle, and a dead-but-issued generation IS the tombstone (`Host::handle_revoked`; once
+the full-width counter wraps past the handle's generation bits, every masked generation has
+genuinely been issued, so the check degrades exactly as `resolve`'s own masked ABA acceptance
+does). A `cap.call` through such a handle completes with **`CAP_REVOKED` (`-EBADF`)** — the
+*same* errno the slice-1 revocation-unpark delivers, so cancellation is a value whether the
+caller was parked mid-call or calls a moment later. Still traps: a forged generation (never
+issued — D37's real target) and a **wrong-type use of a live handle** (`handle_revoked` is
+false for live handles, so typing discipline is untouched). One seam covers all three backends
+(the single `resolve` site at the top of `cap_dispatch_slots_inner`), plus the D45 `Clock.now`
+fast path (`fast_clock_now` answers the identical errno, so the JIT's fast-cap route can't
+diverge). Pinned by `svm/tests/revocation_errno.rs`: revoked → `-9009` on tree-walk/bytecode/
+JIT (the JIT case exercising the fast path), forged → `CapFault` on all three, live-wrong-type
+→ still `CapFault`.
+
 ### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4)
 
 **Where:** a completed dispatch whose caller didn't (or can't) claim the reply parks the value in

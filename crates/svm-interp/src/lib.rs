@@ -13626,8 +13626,10 @@ impl Host {
         }
     }
 
-    /// Close a handle (§3c): free the slot but keep its generation, so the old handle
-    /// value is now a dead generation and any later `cap.call` on it traps (D37).
+    /// Close a handle (§3c): free the slot but keep its generation, so the old handle value is
+    /// now a dead generation. A later `cap.call` on it completes with the probeable `-EBADF`
+    /// errno (I41 graceful revocation — the once-issued generation is its own tombstone,
+    /// [`Host::handle_revoked`]); only a **forged** generation still traps (D37).
     pub fn close(&mut self, handle: i32) {
         let slot = (handle as u32 as usize) & (CAP - 1);
         self.table[slot].entry = None;
@@ -13643,6 +13645,25 @@ impl Host {
         let gen = (handle as u32) >> CAP_LOG2;
         let s = &self.table[slot];
         s.entry.is_some() && (s.generation & GEN_MASK) == gen
+    }
+
+    /// ISSUES.md I41 (graceful revocation) — whether `handle` names a **revoked-once-valid**
+    /// capability: its slot no longer resolves it (entry gone, or re-granted at a newer
+    /// generation) but its generation is one the slot has actually issued. No tombstone storage
+    /// is needed: a slot's counter advances only at (re)grant ([`Host::try_grant`]), so every
+    /// generation `1..=generation` was once a live handle — a dead generation at or below the
+    /// counter IS the tombstone. A **live** handle is not revoked (a wrong-type use of it stays
+    /// the D37 trap), and a generation the slot never issued (0, or above the counter) is a
+    /// forgery (trap). Once the full-width counter wraps past `GEN_MASK`, every masked
+    /// generation has genuinely been issued, so this degrades exactly as [`Host::resolve`]'s
+    /// own masked ABA acceptance does.
+    fn handle_revoked(&self, handle: i32) -> bool {
+        let h = handle as u32;
+        let slot = (h as usize) & (CAP - 1);
+        let gen = h >> CAP_LOG2;
+        let s = &self.table[slot];
+        let live = s.entry.is_some() && (s.generation & GEN_MASK) == gen;
+        !live && gen >= 1 && (s.generation > GEN_MASK || gen <= s.generation)
     }
 
     /// Resolve a handle at a `cap.call` use site (§3c) — **the security hinge**: mask
@@ -13842,6 +13863,10 @@ impl Host {
             // `resolve` already enforced `type_id == CLOCK`, so a success is always `Binding::Clock`;
             // any other binding at a CLOCK-typed slot would be a host bug — fail closed like a fault.
             Ok(_) => Err(Trap::CapFault),
+            // I41: a revoked-once-valid handle is the probeable errno on the fast path too —
+            // byte-identical to the generic dispatch's `handle_revoked` arm, so interp == JIT
+            // holds whichever path a backend takes.
+            Err(_) if self.handle_revoked(handle) => Ok(CAP_REVOKED),
             Err(t) => Err(t),
         })
     }
@@ -14110,7 +14135,25 @@ impl Host {
             }
             return self.self_dispatch(op, args);
         }
-        match self.resolve(handle, type_id)? {
+        // ISSUES.md I41 (graceful revocation): a call through a handle that was once granted and
+        // has since been revoked completes with the **same probeable errno** the §3.6
+        // revocation-unpark delivers ([`CAP_REVOKED`], `-EBADF`) — "cancellation is a value" now
+        // holds whether the caller was parked mid-call or calls a moment later, removing the
+        // dominant benign trap in a long-running server. The trap stays reserved for what D37
+        // always meant it for: a **forgery** (a generation the slot never issued), and for
+        // type-confusion on a live handle (`handle_revoked` is false for live handles, so the
+        // wrong-type resolve failure below still traps).
+        let resolved = match self.resolve(handle, type_id) {
+            Ok(b) => b,
+            Err(t) => {
+                return if self.handle_revoked(handle) {
+                    Ok(vec![CAP_REVOKED])
+                } else {
+                    Err(t)
+                }
+            }
+        };
+        match resolved {
             // §3.6 slice 3: a live-callee offer is serviced by the eval loop (enqueue + park —
             // host-side dispatch cannot park). Reaching it here means a backend tier without
             // the servicing arm: answer probeable, never trap.
@@ -14120,9 +14163,10 @@ impl Host {
             Binding::WindowMinter(_) => Ok(vec![EINVAL]),
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
             // turned inward: the holder hangs up). Null the slot entry so every later use of the
-            // handle is the clean D37 use-after-close fault the docs always promised, and so a
-            // sibling fiber parked in a read through this handle can be woken by the caller
-            // (the eval loop calls `Scheduler::cap_revoke` after this dispatch returns).
+            // handle is the clean use-after-close answer (I41: the probeable `-EBADF`, matching
+            // the revocation-unpark — a forgery still traps), and so a sibling fiber parked in a
+            // read through this handle can be woken by the caller (the eval loop calls
+            // `Scheduler::cap_revoke` after this dispatch returns).
             // Handled here rather than in `stream_op` because closing needs the *handle*,
             // which the per-role op body deliberately never sees. Uniform across backends —
             // every backend routes through this one dispatch.

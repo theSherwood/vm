@@ -1854,21 +1854,27 @@ fn cap_forged_wrong_type_and_closed_handles_are_inert() {
         Err(Trap::CapFault),
     );
 
-    // (c) A closed handle — dead generation (use-after-close, D37).
+    // (c) A closed handle — dead generation. Since I41 (graceful revocation) a once-valid
+    // revoked handle completes with the probeable `-EBADF` errno (the same value the §3.6
+    // revocation-unpark delivers) instead of trapping — still inert, still no escape; the
+    // trap stays reserved for the forgery in (a) and the type confusion in (b).
     let mut host = Host::new();
     let clk = host.grant_clock();
     host.close(clk);
     let mut fuel = 1000u64;
     assert_eq!(
         run_with_host(&m, 0, &[Value::I32(clk)], &mut fuel, &mut host),
-        Err(Trap::CapFault),
+        Ok(vec![Value::I64(-9)]),
     );
 }
 
 #[test]
 fn cap_reusing_a_closed_slot_does_not_alias_old_handle() {
     // Close a handle, then grant another (reusing the slot). The old handle value must
-    // still be inert — the per-slot generation advanced (ABA-safe).
+    // still be inert — the per-slot generation advanced (ABA-safe). Since I41 the stale
+    // handle answers the revocation errno (it was once valid) rather than trapping; the
+    // point pinned here is that it must NEVER resolve to the new grant — a successful
+    // clock read (`0`) through the old handle would be the aliasing escape.
     let m = parse_module(CAP_CLOCK).unwrap();
     verify_module(&m).unwrap();
     let mut host = Host::new();
@@ -1878,7 +1884,7 @@ fn cap_reusing_a_closed_slot_does_not_alias_old_handle() {
     let mut fuel = 1000u64;
     assert_eq!(
         run_with_host(&m, 0, &[Value::I32(old)], &mut fuel, &mut host),
-        Err(Trap::CapFault),
+        Ok(vec![Value::I64(-9)]),
         "stale handle must not alias the new grant in the same slot",
     );
 }

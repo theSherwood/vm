@@ -12,7 +12,7 @@
 //! across a restore ⇒ every guest-held handle stays valid. (The full freeze→serialize→
 //! restore→thaw run lands with the snapshot-codec slice that wires this to the window image.)
 
-use svm_interp::{cap_id, DurableBinding, DurableHandle, Host, NonDurableKind, StreamRole, Trap};
+use svm_interp::{cap_id, DurableBinding, DurableHandle, Host, NonDurableKind, StreamRole};
 
 /// Grant a spread of durable bindings, capture, restore into a fresh table, and confirm the
 /// captured set is byte-for-byte identical — slot, generation, type_id, and binding all pinned.
@@ -136,8 +136,9 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     assert_eq!(captured[0].binding, DurableBinding::Clock);
 }
 
-/// A drained handle's value is a dead generation: a `cap.call` on it is an inert `CapFault`, never
-/// authority into the freed slot (D37). The durable handles the drain left alone still resolve.
+/// A drained handle's value is a dead generation: a `cap.call` on it answers the probeable
+/// revocation errno (I41 — the drain IS a revocation of a once-valid handle), never authority
+/// into the freed slot. The durable handles the drain left alone still resolve.
 #[test]
 fn drain_non_durable_kills_stale_handle_values() {
     let mut a = Host::new();
@@ -147,11 +148,12 @@ fn drain_non_durable_kills_stale_handle_values() {
     let drained = a.drain_non_durable();
     assert_eq!(drained.len(), 1, "only the io_ring drained");
 
-    // The drained handle now faults at the use site (freed slot ⇒ resolve fails before the op runs).
+    // The drained handle completes with `-EBADF` at the use site (freed slot ⇒ resolve fails
+    // before the op runs; the once-issued generation makes it the revocation errno, not a trap).
     let r = a.cap_dispatch_slots(cap_id::IO_RING, 0, ring, &[], None);
     assert!(
-        matches!(r, Err(Trap::CapFault)),
-        "a drained handle is a dead generation, got {r:?}"
+        matches!(&r, Ok(v) if v.as_slice() == [-9]),
+        "a drained handle is a revoked-once-valid generation, got {r:?}"
     );
     // The durable Clock is untouched.
     assert!(a
