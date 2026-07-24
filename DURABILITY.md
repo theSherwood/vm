@@ -2008,8 +2008,23 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    `Arc` key — that is cross-domain futex plumbing, not a serve key; its durable form arrives
    with the step-2 `FrozenPark::Futex` record. Behavior-neutral: the whole serve corpus
    (incl. the multi-consumer hammer) is green unchanged.
-2. **`FrozenPark` capture** — event-parked fibers freeze with their park reason; thaw
-   re-derives waiter entries. Lifts the `has_blocked_parks` fail-closed for in-cut parks.
+2. **Event-park freeze via sentinel-resume + trailing-poll unwind** *(design refined
+   2026-07-24 against the transform's actual poll placement — supersedes the earlier
+   `FrozenPark`-record sketch)*: the codec pass already places an unwind poll **after every
+   may-suspend op**, and the vCPU-level blocking thunks (`thread_wait`/`thread_join`) already
+   freeze by returning a sentinel under `UNWINDING` so that trailing poll unwinds with zero
+   forward progress. Event-parked fibers get the same treatment: the freeze driver takes a
+   `ParkedOn` fiber, **removes its scheduler waiter entry** (the freeze consumes it), and
+   resumes it with an inert placeholder under `UNWINDING` — the parking op's trailing poll
+   fires before any guest code consumes the placeholder. On thaw the rewind re-delivers
+   execution **into the parking op, which re-issues** (re-parking and re-deriving its own
+   waiter entry — the O10 re-issue rule turned inward; no park-reason records to carry, so
+   the snapshot format is untouched by this step). Cut-consistency falls out: an in-cut
+   servicer's restored queue/cells answer the re-issued call; a cross-cut one gets O10
+   verbatim. Re-issue is visible to the *servicer* as a duplicate dispatch when the freeze
+   raced a completed-but-unclaimed reply — the same idempotence contract O10 already imposes.
+   Lifts the `has_blocked_parks` fail-closed for in-cut parks; timed parks re-arm on
+   re-issue ("at least" semantics, as for timed `svc.wait`).
 3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
    `serve_count`, `serve_run` linkage), versioned like the fiber section (elided when empty).
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
