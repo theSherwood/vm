@@ -76,13 +76,30 @@ carry payloads, or any hot path routed through handlers. (F6; I39; the c_shell r
 
 ## 9. The interpreter is the oracle; decline, never diverge
 
-The tree-walker defines semantics; fast backends run only what they can run identically and
-**decline the rest** (compile vetoes, routing folds — one shared predicate, one definition)
-back to the oracle. Anything a backend or a step can't handle refuses probeably or falls
-back — it never runs wrong and never hangs where refusal is possible. Differential tests
-gate every backend feature. *Violated by:* a fast-backend feature without an oracle
-counterpart, a second copy of a veto predicate, or silent divergence documented as a quirk.
-(DESIGN.md §18; the serve-qualification veto.)
+The tree-walker defines **guest-observable semantics** — results, traps, errnos, memory;
+fast backends run only what they can run identically and **decline the rest** (compile
+vetoes, routing folds — one shared predicate, one definition) back to the oracle. Anything a
+backend or a step can't handle refuses probeably or falls back — it never runs wrong and
+never hangs where refusal is possible. Differential tests gate every backend feature.
+*Violated by:* a fast-backend feature without an oracle counterpart, a second copy of a veto
+predicate, or silent divergence documented as a quirk. (DESIGN.md §18; the
+serve-qualification veto.)
+
+**Observability corollary.** Debugging/tracing is a *view onto* execution, not part of the
+semantic contract, and is deliberately tiered by backend (stepping and time travel want an
+interpreter; DWARF/gdb want native code) — but three clauses keep the tiering disciplined:
+(a) **facts agree where comparable** — when two backends report the same kind of fact (a
+trap backtrace, a source location) they report the *same* fact, differentially pinned
+(identical `IrPc`s, the cursor-advance parity); (b) **observation never perturbs
+semantics** — debug hooks are inert unless armed, single-step is pinned bit-identical to
+run-to-completion, and no guest-visible "am I traced" bit exists; every new debug feature
+lands with its own inertness pin; (c) **a tool that can't see something refuses or falls
+back — it never reports a fiction** (the traced fast entry declines to the oracle so a
+backtrace is always some faithful engine's; the explorer and checkpointing refuse outside
+their subsets). Genuine semantic divergences are either provably unwitnessable by the
+differential (refusal-vs-hang: diverging *toward refusal* is fail-closed winning, kept as a
+short enumerated list) or **tracked debt with a convergence plan** (the `poll` eager/lazy
+child divergence) — never quietly normalized.
 
 ## 10. Identity is structural
 
