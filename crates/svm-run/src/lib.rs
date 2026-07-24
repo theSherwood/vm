@@ -241,6 +241,23 @@ pub unsafe extern "C" fn cap_thunk(
     } else {
         (type_id, op, handle)
     };
+    // §3.6 / I36 slice 3 — the native JIT **serve loop**: `svc.poll` / `svc.wait` (the CAP_SELF
+    // ops 9/10, as in `module_serves`) serviced here rather than folding the whole module to the
+    // tree-walk oracle. Only serve-qualified modules reach this arm (the routing veto,
+    // `bytecode::serve_qualifies`, folds any module whose handlers could park). The `host`
+    // borrow above is dead on this path — `serve_native` re-derives from `ctx` in short scopes,
+    // because a handler's own `cap.call`s re-enter this thunk mid-serve.
+    if type_id == svm_ir::CAP_SELF_TYPE_ID && matches!(op, 9 | 10) {
+        serve_native(
+            ctx as *mut Host,
+            op == 10,
+            mem_base,
+            results,
+            n_results,
+            trap_out,
+        );
+        return;
+    }
     // Guest-driven `Jit` (iface 11, DESIGN.md §22): serviced natively here, not in the generic
     // Host dispatch — `compile` must call into Cranelift (`define_extra` on the live
     // `CompiledModule`) and `invoke` must call the unit's trampoline over the live window,
@@ -315,6 +332,19 @@ pub unsafe extern "C" fn cap_thunk_locked(
     } else {
         (type_id, op, handle)
     };
+    // §3.6 / I36 slice 3: the native serve loop re-enters guest code, so it must never run under
+    // the lock — and it never needs to: a serve-qualified module has no thread ops (the routing
+    // veto), so it always runs the unlocked [`cap_thunk`]. A `svc.poll`/`svc.wait` that somehow
+    // reaches the concurrent path keeps the pre-slice answer: the generic dispatch's probeable
+    // `-EINVAL` (fail closed, never a self-deadlock).
+    if type_id == svm_ir::CAP_SELF_TYPE_ID && matches!(op, 9 | 10) {
+        const EINVAL: i64 = -22;
+        if n_results != 0 {
+            *results = EINVAL;
+        }
+        *trap_out = 0;
+        return;
+    }
     // `Jit.invoke` (iface 11 op 1) re-enters guest code → never hold the lock across it.
     if type_id == cap_id::JIT && op == 1 {
         let arg_slots = if n_args == 0 {
@@ -411,6 +441,91 @@ unsafe fn jit_invoke_locked(
     {
         cap_fault(trap_out);
     }
+}
+
+/// §3.6 / I36 slice 3 — the **native JIT serve loop**: the `svc.poll` / `svc.wait` service point
+/// (CAP_SELF ops 9/10), served in the embedder instead of folding the whole module to the
+/// tree-walk oracle. Pops the domain's queued dispatches and invokes each handler's compiled
+/// buffer-ABI trampoline over the **live window** ([`CompiledModule::invoke_extra`]) — handlers
+/// run to completion or trap; a module whose handlers could park never reaches here (the routing
+/// veto, [`svm_interp::bytecode::serve_qualifies`], folds it). Semantics mirror the oracle's
+/// serve arm and the bytecode engine's `Op::SvcPoll`:
+/// - an arity-mismatched dispatch settles `-EINVAL` inline and serving continues (the dispatch's
+///   fault, never the domain's);
+/// - a handler trap (incl. `Exit`) is left in the run's trap cell — terminal for the domain
+///   (one-world semantics);
+/// - a drained queue delivers the served count;
+/// - `svc.wait` with an empty queue and no progress **fails closed** (`ThreadFault`): caller-side
+///   parking is not yet native on the JIT (the op-14 fold stands), so no enqueuer can exist
+///   mid-run and the park could never be woken — the deterministic-deadlock answer, exactly the
+///   bytecode drive's. Completed replies ride the completion cells (no cross-domain caller can be
+///   ticket-parked on this backend yet), the tree-walker's unclaimed-result path.
+///
+/// # Safety
+/// `host_ptr` is the run's live `*mut Host` with **no `&mut Host` held by the caller across this
+/// call** (a handler's own `cap.call`s re-enter the thunk, re-deriving from the same pointer);
+/// `mem_base` is the live run's window base and `results`/`n_results`/`trap_out` honor the
+/// [`svm_jit::CapThunk`] contract.
+unsafe fn serve_native(
+    host_ptr: *mut Host,
+    wait: bool,
+    mem_base: *mut u8,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    const EINVAL: i64 = -22;
+    let put = |v: i64, trap_out: *mut i64| {
+        if n_results != 0 {
+            *results = v;
+        }
+        *trap_out = 0;
+    };
+    let cm = (*host_ptr).serve_native_ctx() as *mut CompiledModule;
+    if cm.is_null() {
+        // No serve context registered (an embedder entry that never set one): keep the
+        // pre-slice answer — the generic dispatch's probeable `-EINVAL`.
+        return put(EINVAL, trap_out);
+    }
+    let mut count: i64 = 0;
+    loop {
+        let d = (*host_ptr).svc_pop();
+        let Some((export, op, args, ticket)) = d else {
+            break;
+        };
+        // The queue only holds servable dispatches (checked at enqueue), so a missing handler
+        // or trampoline here is host-state corruption: fail closed.
+        let Some(fidx) = (*host_ptr).svc_handler(export, op) else {
+            *trap_out = TrapKind::CapFault as i64;
+            return;
+        };
+        let Some((code, n_params, n_res)) = (*cm).handler_tramp(fidx) else {
+            *trap_out = TrapKind::CapFault as i64;
+            return;
+        };
+        if args.len() != n_params {
+            (*host_ptr).svc_settle(ticket, EINVAL);
+            continue;
+        }
+        let mut res = vec![0i64; n_res];
+        // SAFETY: `cm` is the in-flight run's CompiledModule (the guest is suspended in this
+        // synchronous `cap.call` on this thread); `code` is its finalized handler trampoline;
+        // arity checked above; no `&mut Host` is live (the scoped pops/settles above ended).
+        if CompiledModule::invoke_extra(cm, code, &args, &mut res, mem_base, trap_out).is_err() {
+            *trap_out = TrapKind::CapFault as i64; // not in-flight — unreachable from a real run
+            return;
+        }
+        if *trap_out != 0 {
+            return; // handler trap (incl. Exit) — terminal for the domain, like the oracle
+        }
+        (*host_ptr).svc_settle(ticket, res.first().copied().unwrap_or(0));
+        count += 1;
+    }
+    if wait && count == 0 {
+        *trap_out = TrapKind::ThreadFault as i64;
+        return;
+    }
+    put(count, trap_out);
 }
 
 /// The native (Cranelift) half of the guest-driven `Jit` capability (DESIGN.md §22), reached
@@ -925,12 +1040,15 @@ pub fn jit_cap_run(
     )?;
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
+    // §3.6 / I36 slice 3: register for the native serve arm too (see `powerbox_compile_run`).
+    host.set_serve_native_ctx(cm_ptr as usize);
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing.
     // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
     // re-enter through, registered above); the run is single-threaded on this thread.
     let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18), None) };
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
+    host.set_serve_native_ctx(0);
     r
 }
 
@@ -2721,8 +2839,13 @@ unsafe fn powerbox_compile_run(
     )?;
     let host = &mut *raw_host;
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+    // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
+    // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
+    // Single-threaded path only: the locked thunk never serves (see `cap_thunk_locked`).
+    host.set_serve_native_ctx(&mut cm as *mut CompiledModule as usize);
     let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
     host.set_jit_native_ctx(0);
+    host.set_serve_native_ctx(0);
     r.map(|(outcome, snapshot)| JitRun {
         outcome,
         backtrace: cm.last_trap_backtrace().to_vec(),
@@ -2991,13 +3114,15 @@ fn diff_outcome(
 
 /// §3.6 — whether a module **statically serves**: it contains a service point (`svc.poll`/
 /// `svc.wait`, the reserved self ops 9/10) or mints a live-callee offer
-/// (`Instantiator.child_offer`, op 14). Serving is eval-loop machinery — a single
-/// implementation on the reference interpreter (the oracle) — so a serving module routes to
-/// the tree-walker on every backend: bytecode declines at compile and falls back on its own;
-/// the JIT is folded here, giving **behavioral parity** (identical serving on all three
-/// backends), not just a probeable refusal. Runtime-granted live caps on a JIT run (an
-/// embedder wiring `wire_live_impl` into a compiled module) remain the embedder's choice and
-/// still answer `-EINVAL` — the static scan covers everything a guest can express in its bytes.
+/// (`Instantiator.child_offer`, op 14). Since I36 slice 3 this is only half the routing: a
+/// **serve-qualified** module ([`svm_interp::bytecode::serve_qualifies`] — service points, no
+/// park-capable seams) runs its serve loop natively on both fast backends (the bytecode engine's
+/// serve ops; the JIT cap thunk's `serve_native` arm over compiled handler trampolines), so only
+/// the remainder folds to the tree-walk oracle: op-14 offer mints (caller-side wiring is not yet
+/// native on the JIT) and serving modules whose handlers could park (the oracle's serve arm has
+/// the fiber-park machinery). Runtime-granted live caps on a JIT run (an embedder wiring
+/// `wire_live_impl` into a compiled module) remain the embedder's choice and still answer
+/// `-EINVAL` — the static scan covers everything a guest can express in its bytes.
 fn module_serves(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
@@ -4120,10 +4245,15 @@ impl Instance {
             host.register_cap_name(name, handle);
         }
 
-        // §3.6 behavioral parity: a serving module runs on the oracle regardless of the
-        // requested backend (see `module_serves`) — the same fold the bytecode engine already
-        // performs via its compile-decline fallback, applied to the JIT here.
-        let backend = if matches!(backend, Backend::Jit) && module_serves(m) {
+        // §3.6 behavioral parity (narrowed by I36 slice 3): a **serve-qualified** module (service
+        // points, no park-capable seams — `bytecode::serve_qualifies`, the same predicate the
+        // bytecode engine's compile veto applies) now runs its serve loop natively on the JIT
+        // (the cap thunk's `serve_native` arm). Everything else `module_serves` catches — op-14
+        // offer mints, serving modules whose handlers could park — still folds to the oracle.
+        let backend = if matches!(backend, Backend::Jit)
+            && module_serves(m)
+            && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+        {
             Backend::TreeWalk
         } else {
             backend
@@ -4426,9 +4556,13 @@ fn run_capture_on(
     host: &mut Host,
     limits: &Limits,
 ) -> Result<(Outcome, Vec<u8>), String> {
-    // §3.6 behavioral parity (reactor path): serving modules run on the oracle on every
-    // backend — the same fold as `Instance::run_with_caps`.
-    let backend = if matches!(backend, Backend::Jit) && module_serves(m) {
+    // §3.6 behavioral parity (reactor path; narrowed by I36 slice 3): serve-qualified modules
+    // run natively, everything else `module_serves` catches folds — the same routing as
+    // `Instance::run_with_caps`.
+    let backend = if matches!(backend, Backend::Jit)
+        && module_serves(m)
+        && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+    {
         Backend::TreeWalk
     } else {
         backend

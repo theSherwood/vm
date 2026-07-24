@@ -11494,6 +11494,13 @@ pub struct Host {
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
     svc_next_ticket: u64,
+    /// I36 slice 3 (JIT serve loop) — the JIT embedder's native context for **this domain's
+    /// serve loop** (its `*mut CompiledModule` as a `usize`): registered around a JIT run so
+    /// the embedder's cap thunk can invoke handler trampolines over the live window at a
+    /// `svc.poll`/`svc.wait` service point. Opaque here (only the embedder dereferences it);
+    /// `0` on interpreter runs. Distinct from the per-`Jit`-domain [`Host::jit_native_ctx`]
+    /// (which requires a granted `Jit` capability a serving module need not hold).
+    serve_native_ctx: usize,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// PROCESS.md §5 — the side table a [`Binding::WindowMinter`] indexes: each entry the
@@ -11779,6 +11786,7 @@ impl Host {
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
             svc_next_ticket: 0,
+            serve_native_ctx: 0,
             live_impls: Vec::new(),
             window_minters: Vec::new(),
             pool: None,
@@ -12788,6 +12796,40 @@ impl Host {
     /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
     pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
         self.svc_results.remove(&ticket)
+    }
+
+    /// I36 slice 3 — pop the next queued dispatch as `(export, op, args, ticket)`, for an
+    /// **embedder-side** serve loop (the JIT cap thunk's native `svc.poll`/`svc.wait` arm,
+    /// which invokes the handler's compiled trampoline itself). The interpreter backends
+    /// drain the queue in their own serve arms and never call this.
+    pub fn svc_pop(&mut self) -> Option<(u32, u32, Vec<i64>, u64)> {
+        self.svc_queue
+            .pop_front()
+            .map(|d| (d.export, d.op, d.args, d.ticket))
+    }
+
+    /// I36 slice 3 — settle ticket `ticket`'s completion cell with `v`: the embedder serve
+    /// loop's counterpart of the eval-loop settle (the enqueuer claims it via
+    /// [`Host::svc_result`]).
+    pub fn svc_settle(&mut self, ticket: u64, v: i64) {
+        self.svc_results.insert(ticket, v);
+    }
+
+    /// I36 slice 3 — the handler [`FuncIdx`] a queued `(export, op)` dispatch runs, for the
+    /// embedder serve loop (public face of [`Host::svc_handler_func`]).
+    pub fn svc_handler(&self, export: u32, op: u32) -> Option<FuncIdx> {
+        self.svc_handler_func(export, op)
+    }
+
+    /// I36 slice 3 — register (or clear, `0`) the JIT embedder's serve-loop native context
+    /// (its `*mut CompiledModule` as a `usize`); see [`Host::serve_native_ctx`].
+    pub fn set_serve_native_ctx(&mut self, ctx: usize) {
+        self.serve_native_ctx = ctx;
+    }
+
+    /// The registered serve-loop native context (`0` ⇒ interpreter run / none registered).
+    pub fn serve_native_ctx(&self) -> usize {
+        self.serve_native_ctx
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op

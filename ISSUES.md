@@ -105,6 +105,39 @@ serves → settle-wake → join = 142) with is-Some compile pins on BOTH modules
 `svc.wait`-with-queued-work ≡ `svc.poll` progress semantics. Remaining: **slice 3** — the JIT
 serve loop; then the granted spawns 8/11/13 (still declined → tree-walk).
 
+**Slice 3 BUILT (2026-07-24) — the JIT serve-loop core: `svc.poll`/`svc.wait` native, the fold
+narrowed to what still needs the oracle.** The shape is embedder-side, not new lowering: the ops
+already reach svm-run's `cap_thunk` through the generic `cap.call` path, so the thunk grew a
+`serve_native` arm (CAP_SELF 9/10 intercept, like the iface-11 `Jit` intercept beside it) that
+pops the Host's `svc_queue` and invokes each handler's compiled code **over the live window**
+via the pre-existing `invoke_extra` re-entry seam — the same mid-`cap.call` guest-invocation
+machinery the guest-driven `Jit` capability uses, nested detect-and-kill included. svm-jit's
+only contribution: `CompiledModule::compile` now emits a **buffer-ABI trampoline per
+impl-export handler** (the same `build_trampoline` the entry gets — any arity, no per-signature
+ABI) exposed as `handler_tramp(fidx)`, and the module pointer is registered on the Host around
+each run (`set_serve_native_ctx` — a root slot, since a serving module need not hold a `Jit`
+grant). Semantics mirror the oracle and the bytecode `Op::SvcPoll` exactly: arity-mismatch →
+inline `-EINVAL` settle, serving continues; handler trap → the run's trap cell, terminal
+(one world); drained queue → the served count; `svc.wait` with no progress → fail-closed
+`ThreadFault` (no enqueuer can exist mid-run while the op-14 fold stands — the bytecode drive's
+deterministic-deadlock answer). Replies always ride the completion cells (no ticket-parked
+caller exists on this backend yet). **Routing** (`svm-run`): the `module_serves` fold narrowed
+to `module_serves && !serve_qualifies` — `serve_qualifies` is the bytecode compile veto's
+svc-qualification predicate, extracted (`scan_seams`) and exported from
+`svm_interp::bytecode`, so both fast backends admit exactly the same serving modules (one
+definition, no drift). Still folding: op-14 offer mints (caller-side wiring, the next JIT
+slice), park-capable serving modules, and the concurrent path (`cap_thunk_locked` answers svc
+ops `-EINVAL` — a serve-qualified module has no thread ops, so it never routes there; the
+guard exists so a stray dispatch can't self-deadlock under the lock). Pinned by
+`svm/tests/jit_svc.rs`: tree-walk ↔ JIT differential on the slice-1 corpus scenarios
+(results, completion cells, drain-once, **byte-identical final memory** — the escape-oracle),
+2042/[7,12] headline pins, the `svc.wait` fail-closed pin, and `serve_qualifies` is-true/
+is-false routing pins; `svc_parity.rs` (the op-14 program) stays green on the fold. Remaining:
+**JIT caller side** — op-14 `child_offer` + live-call enqueue/park over persistent child Hosts
+(the nursery currently frees a granted child's Host when it returns; a serving child must
+outlive its spawn behind an `Arc<Mutex<Host>>`-equivalent), then the bytecode granted spawns
+8/11/13.
+
 ### I37 — a handler trap kills the whole serving domain: total blast radius per bad request (S3)
 
 **Where:** §3.6 handlers run over the domain's **one world** (same window/powerbox/fuel), so a
