@@ -1701,6 +1701,17 @@ positional branch from `grant_onramp_caps` and the `arity > 5` guard in `onramp_
 host to a single by-name grant; regenerate the committed `.svmb` fixtures/assets so they're by-name
 too. `svm-run`'s `grant_caps` (which also still keeps a positional branch) can drop it in the same pass.
 
+**Partly done (2026-07-24, `claude/doom-asset-generation-6zi7k6`):** the "regenerate the committed
+fixtures/assets" half is now current. `hello_c`/`hello_onramp` (309 → 111 B) and `life` (1644 → 1376 B)
+had drifted from what `svm-llvm-translate --host-page 65536` emits today; `gradient`/`bounce`/
+`mandelzoom`/`fsread` rebuild byte-identical. The drift was **body encoding only** — imports and
+exports are identical across old and new (`write` / `vm_map`; `_start`, `main`, `+ tick`), so this says
+nothing either way about the paramless-vs-positional question above, which is still open. The
+regenerated pair passes `onramp`, `reactor`, `shared_reactor`, and `reactor_fs`. Still stale:
+`web/assets/qjs_repl.svmb` (committed 4319380 B vs the 4318992 B the pages run emits) — it is only the
+offline fallback (CI rebuilds it for Pages), and rebuilding it needs the openlibm tarball, which is not
+reachable from the agent sandbox.
+
 ### I42 — the Doom example vanished from the published playground: its single WAD mirror started 404ing, and every layer swallowed it (S3) — surfaced 2026-07-24 by `fetch ./assets/doom.svmb: 404` in production — **FIX LANDED** (`claude/doom-asset-generation-6zi7k6`)
 
 **Where:** `browser/build-onramp-assets.mjs` → `ensureWad()`. The shareware IWAD was fetched from a
