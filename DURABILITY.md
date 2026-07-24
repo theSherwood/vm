@@ -2108,6 +2108,20 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      (and run the child's own `capture_durable_handles` so a child holding non-durable
      handles refuses exactly like a root); thaw seeds the re-created child's fresh host with
      it. Lifts this slice's serving-child refusal.
+     **BUILT 2026-07-24 (capture + codec + verbatim thaw):** the child's self-unwind pushes a
+     `FrozenChildState` — serve trio + durable handle table, keyed `(parent_task,
+     nested_slot)` (the slot now threaded into the child at instantiation) — into the
+     subtree's shared sink; snapshot v14 merges it into the child's nested record (with a
+     child-window `binding_in_window` containment gate on decode); the thaw restores it
+     **verbatim** onto the re-created child (slots/generations preserved so guest-held handle
+     values still resolve; `self_module` re-registered from the grant's own module or the
+     root's). A child holding a *non-durable* handle refuses the freeze like a root. The
+     handle path is exercised by every existing nested round trip (all children record);
+     two pieces remain before the serving-subtree fixture can pin the trio path end-to-end:
+     (1) **wake-for-freeze** — a child *parked in `svc.wait`* never observes the `UNWINDING`
+     broadcast (a parked vCPU isn't executing), so the flagship freeze-while-parked scenario
+     needs the freeze driver to wake parked consumers into their sentinel arm; (2) the
+     op-14 caller flow (a parent's `LiveImpl` still refuses capture — 4d).
    * **4d — live-cap re-link:** capture `Binding::LiveImpl` as a durable descriptor naming
      its callee **structurally** — the `(parent_task, slot)` of the callee's own nested
      record (a `DomainId` is process-local, so the artifact never carries it; the id is
