@@ -4172,7 +4172,19 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     refuse
                 }
             };
-            let result = if nested_refused {
+            // DURABILITY.md §13.4 step 4: a **nested child's** serve trio has no artifact
+            // section yet (the v13 serve section carries the ROOT host's) — a serving child
+            // fails the subtree freeze closed instead of silently dropping its queue/cells/
+            // counter on the fresh-host thaw. Narrow but real: an ancestor still *holding* a
+            // live cap onto the child already refuses at handle capture (`LiveImpl` is
+            // non-durable), so this catches the dropped-cap residue. Lifts with the per-child
+            // serve capture (step 4c).
+            let child_serving = froze && v.nested_child && {
+                let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                let (q, r, t) = hg.svc_state();
+                !q.is_empty() || !r.is_empty() || t != 0
+            };
+            let result = if nested_refused || child_serving {
                 Err(Trap::ThreadFault)
             } else if froze {
                 // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`

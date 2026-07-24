@@ -2096,6 +2096,31 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    restore → thaw drains the restored dispatch, completion cell fills). Remaining in step 4:
    multi-domain subtree wiring — restore *hosts* plural, `LiveImplEntry` re-link by
    `DomainId`, caller re-parks with the settle race-check.
+   **Step-4 remainder — survey + plan (2026-07-24, from the nested-thaw code):** the §14
+   subtree thaw re-creates each child with a **fresh `Host::new()`** (only its instantiator /
+   address-space grants re-minted) — a child's serve trio and handle table are not
+   represented in the artifact at all. The fail-closed net today: an ancestor *holding* a
+   live cap onto a serving child refuses at handle capture (`LiveImpl`/`GuestImpl` are
+   non-durable bindings), a **serving child itself** now refuses the subtree freeze (its
+   self-unwind checks its own trio — closes the dropped-cap silent-drop residue; this
+   slice), and a mid-handler freeze refuses at the serve epilogue (step 3). The build-out:
+   * **4c — per-child serve capture:** extend the nested record with the child's serve trio
+     (and run the child's own `capture_durable_handles` so a child holding non-durable
+     handles refuses exactly like a root); thaw seeds the re-created child's fresh host with
+     it. Lifts this slice's serving-child refusal.
+   * **4d — live-cap re-link:** capture `Binding::LiveImpl` as a durable descriptor naming
+     its callee **structurally** — the `(parent_task, slot)` of the callee's own nested
+     record (a `DomainId` is process-local, so the artifact never carries it; the id is
+     re-minted and re-linked at thaw). Lifts the caller-side capture refusal for in-cut
+     callees; an out-of-cut callee stays non-durable (O10 is the cross-cut story).
+   * **In-cut parked callers (the ticket question, step-5-adjacent):** a caller parked in
+     `CapReply` rewound its frame, so thaw re-execution would *re-issue* the call — a
+     double dispatch when the original survives in the callee's restored queue. Two options
+     recorded: (a) accept **O10 everywhere** — at-least-once even in-cut, idempotence is the
+     personality's problem (invariant 7's plain reading; requires dropping the original
+     queue entry or tolerating the duplicate), or (b) exactly-once in-cut by making the
+     ticket recoverable at thaw (spill-visible tickets — a heavier ABI change). Current
+     lean: (a), validated against reload-not-reissue (R8/R11) before widening.
 5. **Cross-cut O10 re-issue** — freeze-boundary calls complete with a re-issue marker on
    thaw; validate against reload-not-reissue (R8/R11) before widening.
 
