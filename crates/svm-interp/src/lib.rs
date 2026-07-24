@@ -7903,6 +7903,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // paths pushed `(status, value)` onto this frame — pop them and settle
                     // that dispatch before the rewound op runs the machine again.
                     if let Some(run) = serve_run.take() {
+                        // DURABILITY.md §13.4 step 3: a freeze that lands **mid-handler** fails
+                        // closed. Under `UNWINDING` the handler's exit is an unwind return —
+                        // its "(FIBER_RETURNED, 0)" would settle a bogus zero into the caller's
+                        // completion cell, and even a genuine return's reply linkage is not yet
+                        // in the snapshot (the step-4 serve_run record). Refuse the freeze
+                        // (same shape as the `handler_parks` gate); the previous snapshot
+                        // remains the recovery point.
+                        if durable
+                            && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
+                        {
+                            return Err(Trap::FiberFault);
+                        }
                         let value = frames[top].vals.pop().ok_or(Trap::Malformed)?.i64();
                         let status = frames[top].vals.pop().ok_or(Trap::Malformed)?.i32();
                         match status {
@@ -11504,6 +11516,7 @@ pub struct GuestImplEntry {
 /// `ticket`. Admitted as a handler over the domain's **one world** at a `svc.poll` service
 /// point — run-to-completion this slice (handler parking rides the fiber-admission slice),
 /// which is exactly the passive instance's serialized observable behavior (the oracle).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SvcDispatch {
     pub export: u32,
     pub op: u32,
@@ -13026,6 +13039,26 @@ impl Host {
     /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
     pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
         self.svc_results.remove(&ticket)
+    }
+
+    /// DURABILITY.md §13.4 step 3 — this domain's **serve state** for the snapshot codec:
+    /// `(queue, completion cells, next ticket)`. Plain data (the §13.2 inventory row
+    /// "serialize as-is"); the completion cells come out in ascending-ticket order (the
+    /// `BTreeMap` iteration), which is the artifact's canonical order.
+    pub fn svc_state(&self) -> (Vec<SvcDispatch>, Vec<(u64, i64)>, u64) {
+        (
+            self.svc_queue.iter().cloned().collect(),
+            self.svc_results.iter().map(|(&t, &v)| (t, v)).collect(),
+            self.svc_next_ticket,
+        )
+    }
+
+    /// DURABILITY.md §13.4 step 3 — restore this domain's serve state from a snapshot's
+    /// serve section (the inverse of [`Host::svc_state`]). Replaces whatever is present.
+    pub fn set_svc_state(&mut self, queue: Vec<SvcDispatch>, results: Vec<(u64, i64)>, next: u64) {
+        self.svc_queue = queue.into();
+        self.svc_results = results.into_iter().collect();
+        self.svc_next_ticket = next;
     }
 
     /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).

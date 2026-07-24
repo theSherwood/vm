@@ -2058,6 +2058,18 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    seed per-fiber thaw words (or re-arm them per claim) before woken parks thaw.
 3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
    `serve_count`, `serve_run` linkage), versioned like the fiber section (elided when empty).
+   **BUILT 2026-07-24** (the trio): snapshot v13 adds a `TAG_SERVE` section (after the handle
+   table) carrying the inbound queue (FIFO), the completion cells (canonical ascending
+   ticket), and the ticket counter — read/written through `Host::{svc_state, set_svc_state}`,
+   elided when empty, round-trip + §12.6 re-freeze pinned in `svm-snapshot`. The per-consumer
+   fields turned out to need **no capture at a legal freeze point**: a parked consumer's
+   `serve_count` is provably 0 (the wait parks only when the queue is drained *and* the count
+   was handed back) and its `serve_run` is `None` — and a freeze that lands **mid-handler**
+   now fails closed at the serve epilogue (under `UNWINDING` the handler's exit is an unwind
+   return whose `(FIBER_RETURNED, 0)` would have settled a *bogus zero* into the caller's
+   completion cell — a silent-corruption hole this step closes; pinned in
+   `svm-durable/tests/serve.rs`). The `serve_run` reply-linkage record stays step 4, where
+   mid-handler freezes become capturable instead of refused.
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
    re-park callers (race-check against restored cells), mark `svc.wait` consumers runnable.
 5. **Cross-cut O10 re-issue** — freeze-boundary calls complete with a re-issue marker on

@@ -866,3 +866,99 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
         "thawed nested tree equals the uninterrupted run (reload, not re-issue)"
     );
 }
+
+/// DURABILITY.md §13.4 step 3 (v13) — the **serve trio** round-trips: a domain frozen with a
+/// non-empty inbound queue, completion cells, and a live ticket counter restores them exactly
+/// (queue in FIFO order, cells intact, counter monotonic), and the §12.6 canonical re-freeze
+/// of the restored domain is byte-identical.
+#[test]
+fn serve_state_round_trips_through_the_codec() {
+    use svm_interp::SvcDispatch;
+
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW);
+
+    let mut host = Host::new();
+    host.set_svc_state(
+        vec![
+            SvcDispatch {
+                export: 0,
+                op: 1,
+                args: vec![7, -3],
+                ticket: 5,
+            },
+            SvcDispatch {
+                export: 2,
+                op: 0,
+                args: vec![],
+                ticket: 6,
+            },
+        ],
+        vec![(3, 999), (4, -9)],
+        7,
+    );
+    let artifact = freeze(&inst, &win, &host).expect("freeze with serve state");
+
+    let mut rhost = Host::new();
+    let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
+    assert_eq!(
+        rhost.svc_state(),
+        host.svc_state(),
+        "queue (FIFO), completion cells, and ticket counter restore exactly"
+    );
+
+    // §12.6: re-freezing the restored domain reproduces the artifact byte-for-byte.
+    let refrozen = freeze(&inst, &rwin, &rhost).expect("re-freeze");
+    assert_eq!(
+        refrozen, artifact,
+        "canonical re-serialize is byte-identical"
+    );
+}
+
+/// The serve section is **elided** when the trio is empty (a never-served domain), so the
+/// artifact's TLV walk carries no `TAG_SERVE` (4) — and restoring such an artifact leaves the
+/// host's serve state at its empty default.
+#[test]
+fn empty_serve_state_elides_the_section() {
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW);
+    let host = Host::new();
+    let artifact = freeze(&inst, &win, &host).expect("freeze without serve state");
+
+    // Walk the TLV container (magic, u16 version, then tag/len/body) and collect tags.
+    let mut tags = Vec::new();
+    let mut at = 6; // 4-byte magic + 2-byte version
+    while at < artifact.len() {
+        let (tag, n) = read_uleb_at(&artifact, at);
+        at += n;
+        let (len, n) = read_uleb_at(&artifact, at);
+        at += n + len as usize;
+        tags.push(tag);
+    }
+    assert!(
+        !tags.contains(&4),
+        "no TAG_SERVE section for an empty serve trio: {tags:?}"
+    );
+
+    let mut rhost = Host::new();
+    restore(&artifact, &inst, &mut rhost).expect("restore");
+    assert_eq!(
+        rhost.svc_state(),
+        (Vec::new(), Vec::new(), 0),
+        "restored serve state stays at the empty default"
+    );
+}
+
+/// Minimal LEB128 read for the TLV walk above: returns `(value, bytes_consumed)`.
+fn read_uleb_at(b: &[u8], at: usize) -> (u64, usize) {
+    let (mut v, mut shift, mut n) = (0u64, 0u32, 0usize);
+    loop {
+        let byte = b[at + n];
+        v |= u64::from(byte & 0x7f) << shift;
+        n += 1;
+        if byte & 0x80 == 0 {
+            return (v, n);
+        }
+        shift += 7;
+    }
+}
