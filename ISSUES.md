@@ -74,6 +74,37 @@ order: **slice 2** — `svc.wait` + its waker topology in `drive` (needs an enqu
 ticket parking and/or the granted spawns, which stay declined); **slice 3** — the JIT serve
 loop.
 
+**Slice 2 BUILT (2026-07-24) — `svc.wait`, caller-side parking, and `child_offer`: the whole
+caller ↔ servicer round-trip native on bytecode.** `Op::SvcPoll` grew the wait form (CAP_SELF
+op 10): an empty queue with no progress persists the cursor AT the op (a wake re-executes the
+whole drain — the tree-walker's rewound park) and surfaces `Outcome::SvcWait`, which `drive`
+parks as `TaskState::BlockedSvc`. The caller side rides three new pieces: (1) `cap.call` on a
+handle probes `live_impl_of` first — a live-callee hit enqueues on the callee's `Host` (its
+lock only) and surfaces `Outcome::LiveCall { ticket, callee, dst }`; `drive` wakes any
+`BlockedSvc` task of the callee's domain (the tree-walker's `svc_wake`) and parks the caller as
+`TaskState::BlockedTicket`; a full callee queue is the probeable `-EAGAIN`. (2) A settle-wake
+scan at the top of the pick loop claims settled completion cells (`svc_results.remove`) into
+parked callers' `dst` — the tree-walker's cap_reply preference in cooperative form. (3)
+`Instantiator` op 14 (`child_offer`) mints a live offer over a spawned child's export:
+`offer_shape` from the callee's module (its lock, fetched before the wirer wires — the
+tree-walker's lock order), `wire_live_impl` into the parent's table, bad handle/export a
+probeable `-EINVAL`. To make the callee reachable, `ChildEnv.host` became `Arc<Mutex<Host>>`
+(the same shape the tree-walker's live bindings hold, so `wire_live_impl`/`live_impl_of` are
+reused verbatim) and both spawn arms set the child's `self_module` (op-0 same-module children
+clone the parent's; op-5 grants carry their own). The serve loop's home-module guard
+generalized from `module != 0` to `module != self.home` (a `Vm` field: 0 for the primary, the
+pushed unit index for a separate-module child) — the slice-1 pin was the *reason* for the
+guard (handlers resolve against the domain's `self_module`, so serving from any other unit
+would index the wrong program table), and a spawned serving child IS its own home. The
+non-scheduler drivers (single-vCPU `Vcpu::run`, `run_vcpu_parallel`) fail closed
+(`ThreadFault`) on the new stops, and an unwakeable park is the scheduler's existing deadlock
+`ThreadFault` — fail-closed where the tree-walker's richer waker set (timers, cross-process)
+would hang differently; the differential never runs hang cases. Pinned in `bytecode_svc.rs`:
+the separate-module corpus round-trip (op-5 spawn → op-14 mint → live call parks → `svc.wait`
+serves → settle-wake → join = 142) with is-Some compile pins on BOTH modules, and
+`svc.wait`-with-queued-work ≡ `svc.poll` progress semantics. Remaining: **slice 3** — the JIT
+serve loop; then the granted spawns 8/11/13 (still declined → tree-walk).
+
 ### I37 — a handler trap kills the whole serving domain: total blast radius per bad request (S3)
 
 **Where:** §3.6 handlers run over the domain's **one world** (same window/powerbox/fuel), so a

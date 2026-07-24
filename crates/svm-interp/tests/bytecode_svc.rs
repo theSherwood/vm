@@ -1,13 +1,14 @@
-//! ISSUES.md I36 slice 1 — the **bytecode serve-loop core**: `svc.poll` runs natively on the
-//! bytecode engine (handlers as rewind-linked activations over the one world) instead of folding
-//! the whole module back to the tree-walk oracle. Differential: every scenario runs on both
-//! entries and must agree exactly — results, completion cells, drain-once semantics.
+//! ISSUES.md I36 slices 1 + 2 — the **bytecode serve loop**: `svc.poll`/`svc.wait` run natively
+//! on the bytecode engine (handlers as rewind-linked activations over the one world) instead of
+//! folding the whole module back to the tree-walk oracle, and the caller side rides along —
+//! `child_offer` mints, live calls enqueue + park on their ticket, the callee's serve settles
+//! them awake. Differential: every scenario runs on both entries and must agree exactly —
+//! results, completion cells, drain-once semantics.
 //!
 //! The qualification veto is pinned too: a serving module with any park-capable seam (here a
 //! futex wait; the corpus' handler-park modules are the richer cases) must *decline* the compile
 //! — `compile_module` returns `None` — and the fast entry then falls back to the tree-walker,
-//! which serves. `svc.wait` (the empty-queue park) also still declines: its waker topologies
-//! (cross-domain callers, timers) arrive with the later I36 slices.
+//! which serves.
 
 use std::sync::Arc;
 use svm_interp::{bytecode, run_with_host, run_with_host_fast, Host, Value, SVC_QUEUE_CAP};
@@ -205,6 +206,120 @@ fn a_park_seam_vetoes_the_native_serve_and_falls_back() {
     let (ri, ci, _) = scenario(&m, dispatches, run_with_host);
     let (rf, cf, _) = scenario(&m, dispatches, run_with_host_fast);
     assert_eq!(ri, rf, "fallback serves identically");
+    assert_eq!(ci, cf);
+    assert_eq!(rf, Ok(vec![Value::I64(2042)]));
+}
+
+/// The §3.6 separate-module corpus, verbatim: the parent spawns a serving child from a granted
+/// module (op 5), mints a live offer over its export (op 14), calls through it (enqueue + park),
+/// and joins — 142 = join(served=1)*100 + add(40,2).
+const SEP_CALLER: &str = r#"
+memory 17
+
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vmh = i64.extend_i32_u v1
+  ventry = i64.const 0
+  voff = i64.const 65536
+  vlog = i64.const 12
+  vq = i64.const 0
+  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v6 = i64.const 0
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vk = i64.const 100
+  vm = i64.mul vj vk
+  vs = i64.add vm vr
+  return vs
+  }
+}
+"#;
+
+const SEP_SERVER: &str = r#"
+memory 12
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 1 }
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+/// I36 slice 2 — the whole caller ↔ servicer round-trip runs natively: op-5 spawn, op-14 offer
+/// mint, live-call enqueue + `BlockedTicket` park, the child's `svc.wait` park + enqueue wake,
+/// handler dispatch, settle-wake of the caller, join. Both modules must compile natively (the
+/// caller has no svc ops; the serving child qualifies), and the result matches the tree-walker.
+#[test]
+fn a_native_caller_parks_on_a_native_serving_child_and_wakes_with_the_reply() {
+    let a = module(SEP_CALLER);
+    let b = svm_text::parse_module(SEP_SERVER).expect("parse server");
+    svm_verify::verify_module(&b).expect("verify server");
+    assert!(
+        bytecode::compile_module(&a.funcs).is_some(),
+        "the caller (op 5 + op 14 + a live call) must be admitted natively"
+    );
+    assert!(
+        bytecode::compile_module(&b.funcs).is_some(),
+        "the serving child (svc.wait + a pure handler) must be admitted natively"
+    );
+    let run = |entry: Entry| {
+        let mut host = Host::new();
+        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hm = host.grant_module(&b);
+        let mut fuel = 5_000_000u64;
+        entry(
+            &a,
+            0,
+            &[Value::I32(hi), Value::I32(hm)],
+            &mut fuel,
+            &mut host,
+        )
+    };
+    let ri = run(run_with_host);
+    let rf = run(run_with_host_fast);
+    assert_eq!(
+        ri, rf,
+        "caller/servicer round-trip must match the tree-walker"
+    );
+    assert_eq!(
+        rf,
+        Ok(vec![Value::I64(142)]),
+        "join(served=1)*100 + add(40,2) — a foreign program served the native live call"
+    );
+}
+
+/// `svc.wait` with work already queued behaves like `svc.poll` (progress ⇒ deliver the count, no
+/// park) — natively, against pre-enqueued embedder dispatches, equal to the tree-walker.
+#[test]
+fn a_native_svc_wait_with_queued_work_serves_and_returns() {
+    let src = SERVER.replace(
+        "vn = cap.call 4294967295 9 () -> (i64) vz ()",
+        "vn = cap.call 4294967295 10 () -> (i64) vz ()",
+    );
+    let m = module(&src);
+    assert!(
+        bytecode::compile_module(&m.funcs).is_some(),
+        "the svc.wait server must be admitted natively"
+    );
+    let dispatches: &[(u32, u32, Vec<i64>)] = &[(0, 0, vec![5]), (0, 0, vec![30])];
+    let (ri, ci, _) = scenario(&m, dispatches, run_with_host);
+    let (rf, cf, _) = scenario(&m, dispatches, run_with_host_fast);
+    assert_eq!(ri, rf, "svc.wait-with-work must match the tree-walker");
     assert_eq!(ci, cf);
     assert_eq!(rf, Ok(vec![Value::I64(2042)]));
 }
