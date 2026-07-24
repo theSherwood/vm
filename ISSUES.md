@@ -461,6 +461,20 @@ files** (`refusing to allow an OAuth App to ... without workflow scope`), so the
 directory over `.github/workflows/`). If a fourth death lands *with* the cap, the next escalation
 is splitting the heaviest `svm-jit` test binaries.
 
+**Sightings 4–5 (2026-07-24, PR #427 runs 30089414778 + 30091022655) — WITH the `-j 2` cap;
+escalation taken.** Both runs died the identical death (~56–59 s into `cargo test --workspace
+-j 2`, step frozen "in_progress", runner agent lost, logs never uploaded, fmt/clippy/build green;
+main green on the same day) — and the branch had added **two new heavy-link `svm` test binaries**
+(`jit_svc.rs`, `revocation_errno.rs`, each pulling svm-run → svm-jit → Cranelift), which raised
+the concurrent-link peak past whatever headroom the cap had left. Two-pronged escalation:
+(1) **in-tree** — the new tests were merged into existing binaries (`jit_cap.rs`, `pipeline.rs`),
+so the branch adds zero new link targets; hold that line — prefer extending an existing heavy
+test binary over adding a new one. (2) **durable, pending owner copy-over** — the `check` job
+gains `CARGO_PROFILE_TEST_DEBUG: "0"` in `.github/workflows_src/ci.yml`: debug info for the
+Cranelift/Wasmtime-sized dep graph is the dominant per-link memory term; dropping it keeps
+symbol-name backtraces while cutting link memory by multiples. If a death lands with BOTH in
+place, the remaining lever is `-j 1` on the test step (or self-hosted/larger runners).
+
 ### I25 — QuickJS BigInt (`libbf`) is miscompiled through the LLVM on-ramp: wrong results / hangs (S2) — **RESOLVED** (2026-07-18) — found by the QuickJS breadth harness (2026-07-17)
 
 **Where:** the LLVM on-ramp on Bellard's QuickJS 2024-01-13, the `libbf` bignum path (BigInt).
