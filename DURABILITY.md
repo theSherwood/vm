@@ -2025,6 +2025,20 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    raced a completed-but-unclaimed reply — the same idempotence contract O10 already imposes.
    Lifts the `has_blocked_parks` fail-closed for in-cut parks; timed parks re-arm on
    re-issue ("at least" semantics, as for timed `svc.wait`).
+   **Scope correction (2026-07-24, from the spill-plan code):** the trailing-poll route is
+   sound only where the point's `SuspendKind` **re-issues** — `MemoryWait`/`ThreadJoin` spill
+   `out − nres` and re-execute the op at thaw, but a **`Leaf` cap.call spills its results**
+   (reload-not-reissue), so an *unwoken* cap-parked fiber (blocking read / live call) would
+   spill the freeze placeholder and thaw would reload it as the call's result — unsound.
+   Step 2's implementable set is therefore: **woken-but-unclaimed parks of any kind** (the
+   real result is already in the frames; `Leaf` reload is then correct) and **unwoken
+   futex parks** (the `MemoryWait` re-issue arm). Unwoken **cap parks stay fail-closed**,
+   with two recorded follow-up options: promote park-capable cap.calls to a re-issue
+   `SuspendKind` (costs re-issue-vs-reload discrimination for *completed* calls — the R8
+   tension), or a per-point spill-frame validity marker (`result-valid | re-issue`) the thaw
+   arm branches on. The park kind is probed at freeze time from which scheduler map holds
+   the fiber's waiter (`wait_waiters` vs `cap_waiters`/`ticket_waiters`) — a probe, not a
+   record; the snapshot still carries nothing new.
 3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
    `serve_count`, `serve_run` linkage), versioned like the fiber section (elided when empty).
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
