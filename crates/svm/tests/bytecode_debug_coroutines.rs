@@ -16,7 +16,7 @@ use svm_text::parse_module;
 // reaches the guest as func 0's argument. Result: 100 + 210 + 1019 + RETURNED*1_000_000 = 1_001_329.
 const CORO: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -35,9 +35,10 @@ block0(v0: i32):
   v19 = i64.mul v17 v18
   v20 = i64.add v16 v19
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 0
   v3 = i32.const 7
@@ -50,6 +51,7 @@ block0(v0: i64):
   v9 = i64.const 999
   v10 = i64.add v9 v8
   return v10
+  }
 }
 "#;
 
@@ -148,7 +150,7 @@ fn breakpoint_in_a_coroutine_parent_fires() {
 // `bytecode_demand_coroutine.rs::DEMAND_SAME`. Result: 123 + FAULTED*1e6 + RETURNED*1e3.
 const DEMAND_SAME: &str = r#"memory 17
 func (i32) -> (i64) {
-block0(v0: i32):
+block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 16
@@ -169,13 +171,15 @@ block0(v0: i32):
   v19 = i64.add v12 v15
   v20 = i64.add v19 v18
   return v20
+  }
 }
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
+  }
 }
 "#;
 
