@@ -7915,7 +7915,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && !std::mem::take(&mut svc_timed_out)
                     {
                         frames[top].inst -= 1;
-                        let key = Arc::as_ptr(host) as usize;
+                        let key =
+                            host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
                         // I38 timed form: the op's single optional arg is a timeout in ns
                         // (`< 0` / absent = wait forever). Re-read on every (re-)park, so a
                         // spurious wake restarts the clock — "at least this long" semantics.
@@ -7956,18 +7957,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.live_impl_of(h, *type_id)
                     };
                     if let Some((callee, export)) = live {
-                        let ticket = {
+                        let (ticket, callee_id) = {
                             let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
-                            cg.svc_enqueue(export, *op, argv)
+                            (cg.svc_enqueue(export, *op, argv), cg.domain_id())
                         };
                         match ticket {
                             Some(t) => {
-                                sched.svc_wake(Arc::as_ptr(&callee) as usize);
+                                sched.svc_wake(callee_id as usize);
                                 if *cur != ROOT_FIBER {
                                     if let SchedRef::Real(sr) = sched {
                                         let regc = Arc::clone(registry);
                                         let calleec = Arc::clone(&callee);
-                                        let svck = Arc::as_ptr(host) as usize;
+                                        let svck = host
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .domain_id()
+                                            as usize;
                                         fiber_park!(|slot: usize| {
                                             let mut sg = sr.lock();
                                             sg.ticket_waiters.insert(
@@ -8015,7 +8020,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             if let SchedRef::Real(sr) = sched {
                                 let regc = Arc::clone(registry);
                                 let hostc = Arc::clone(host);
-                                let svck = Arc::as_ptr(host) as usize;
+                                let svck =
+                                    hostc.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
+                                        as usize;
                                 fiber_park!(|slot: usize| {
                                     let mut sg = sr.lock();
                                     sg.cap_waiters.entry(h).or_default().push(Waiter::Fiber {
@@ -8100,18 +8107,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.import_live_target(*import)
                     };
                     if let Some((callee, export, base_op)) = live {
-                        let ticket = {
+                        let (ticket, callee_id) = {
                             let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
-                            cg.svc_enqueue(export, base_op + *op, argv)
+                            (cg.svc_enqueue(export, base_op + *op, argv), cg.domain_id())
                         };
                         match ticket {
                             Some(t) => {
-                                sched.svc_wake(Arc::as_ptr(&callee) as usize);
+                                sched.svc_wake(callee_id as usize);
                                 if *cur != ROOT_FIBER {
                                     if let SchedRef::Real(sr) = sched {
                                         let regc = Arc::clone(registry);
                                         let calleec = Arc::clone(&callee);
-                                        let svck = Arc::as_ptr(host) as usize;
+                                        let svck = host
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .domain_id()
+                                            as usize;
                                         fiber_park!(|slot: usize| {
                                             let mut sg = sr.lock();
                                             sg.ticket_waiters.insert(
@@ -8693,7 +8704,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *cur != ROOT_FIBER {
                         if let SchedRef::Real(sr) = sched {
                             let regc = Arc::clone(registry);
-                            let svck = Arc::as_ptr(host) as usize;
+                            let svck =
+                                host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
                             fiber_park!(|slot: usize| {
                                 let mut sg = sr.lock();
                                 let wid = sg.next_wid;
@@ -11047,6 +11059,10 @@ const CAP: usize = 1 << CAP_LOG2;
 /// one of *this domain's own* current grants, re-checked by `type_id` at the call (D37) — so this is
 /// not an authority escape, only the documented "a forged index is inert" property.
 const GEN_BITS: u32 = 32 - CAP_LOG2;
+/// DURABILITY.md §13.3 — the process-wide [`Host::domain_id`] mint (uniqueness is all the
+/// runtime needs; a snapshot records the ids it saw and a thaw re-links by record, so the
+/// counter's absolute values never matter).
+static NEXT_DOMAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const GEN_MASK: u32 = (1u32 << GEN_BITS) - 1;
 
 /// Worker-thread count of the host **bounded blocking-offload pool** (§12 "Keeping cores busy under
@@ -11580,6 +11596,12 @@ pub struct Host {
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
     svc_next_ticket: u64,
+    /// DURABILITY.md §13.3 — this domain's **stable identity** for every serve-path key
+    /// (`svc_waiters`/`svc_timers` keys, fiber waiters' domain field, `svc_wake` targets):
+    /// process-unique, minted at construction. The `Arc` pointer it replaces was
+    /// snapshot-hostile (a thaw re-allocates every powerbox); the id is recordable in a
+    /// snapshot and re-linkable on thaw.
+    domain_id: u64,
     /// I36 slice 3 (JIT serve loop) — the JIT embedder's native context for **this domain's
     /// serve loop** (its `*mut CompiledModule` as a `usize`): registered around a JIT run so
     /// the embedder's cap thunk can invoke handler trampolines over the live window at a
@@ -11872,6 +11894,7 @@ impl Host {
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
             svc_next_ticket: 0,
+            domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_native_ctx: 0,
             live_impls: Vec::new(),
             window_minters: Vec::new(),
@@ -12882,6 +12905,11 @@ impl Host {
     /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
     pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
         self.svc_results.remove(&ticket)
+    }
+
+    /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).
+    pub fn domain_id(&self) -> u64 {
+        self.domain_id
     }
 
     /// I36 slice 3 — pop the next queued dispatch as `(export, op, args, ticket)`, for an

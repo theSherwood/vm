@@ -1958,6 +1958,68 @@ base `SHADOW_BASE + i*SHADOW_STRIDE`); the resume chain depth needs **no explici
 and with it the per-region overflow bound (the guard still uses the global `DURABLE_RESERVE`
 ceiling — see slice 1 above).
 
+## 13. Durable serving domains — design map (2026-07-24)
+
+The serving-cluster build order (TODO.md, owner-agreed 2026-07-24) ends at **durable serving
+domains**: freeze/thaw a domain parked in `svc.wait`, with in-flight handler parks and parked
+callers, so a trapped or evicted server thaws from a snapshot instead of cold-respawning
+(pairs with ISSUES.md I37). This map fixes the scope and the build order; it was written
+against the as-built serve substrate (native serve loops, multi-consumer + timed `svc.wait`,
+the atomic reply settle), so the inventory below is what actually exists.
+
+### 13.1 First target: subtree-freeze-as-unit
+
+Freeze the **server and its callers in one cut** (the §14 spawn subtree). Inside the cut,
+tickets, queue entries, and completion cells are *internal data* — both endpoints of every
+pending call are captured, so nothing dangles. A caller **outside** the cut parked on an
+in-cut servicer gets the O10 rule (PROCESS.md): its freeze-boundary call is **re-issued on
+thaw**; idempotence is the personality's problem. The reverse cross-cut (an in-cut caller
+parked on an out-of-cut servicer) is the same rule from the other side.
+
+### 13.2 Inventory — what a serving freeze must capture
+
+| state | where it lives today | capturability |
+|---|---|---|
+| Inbound queue + completion cells + ticket counter | `Host::{svc_queue, svc_results, svc_next_ticket}` — plain data | serialize as-is (new snapshot section; tickets are cut-internal under 13.1) |
+| `svc.wait`-parked consumers (incl. timed) | scheduler `svc_waiters` (+ `svc_timers`) — but the frame was **rewound at the park** | **trivially durable: re-execution is the recovery.** Thaw marks them runnable; the re-executed `svc.wait` re-drains or re-parks (a timed wait re-arms — the documented "at least" semantics). No waiter capture needed |
+| In-flight handler fibers, running | ordinary fiber state | already covered by the §12.8 fiber flatten |
+| In-flight handler fibers, **event-parked** (`RegFiber::ParkedOn`) | frames in the registry; the WAKE is a scheduler waiter entry (`cap_waiters` by handle / `ticket_waiters` by ticket / futex `wait_waiters` + timer) | frames capture like `Parked`; the park **reason** must be recorded per fiber — a `FrozenPark` tag: `Futex{key,deadline} | CapRead{handle} | CapReply{ticket}` — so thaw re-derives the waiter entry. This is the "durable event-parks" residue (IMPORTS.md §3.6 5a), scoped here to serve shapes |
+| Parked callers (`Blocked::CapReply`) | vCPU in `ticket_waiters` (or fiber `ParkedOn`) | in-cut: re-park on thaw and re-run the existing park race-check against the restored completion cells (the atomic-settle machinery already handles reply-before-park); cross-cut: O10 re-issue |
+| The serve rewind machine (`serve_run`/`handler_parks`/`serve_count`) | per-vCPU fields | `serve_run` is only `Some` while a handler is **running** (flattened as a fiber ⇒ record its `(slot, ticket)` linkage); `handler_parks` re-derives from the `FrozenPark` records; `serve_count` is a plain integer per parked consumer |
+| Domain identity (svc keys, live-impl callees) | **`Arc` pointers** (`Arc::as_ptr(host)`, `LiveImplEntry.callee`) | snapshot-hostile — the enabler below |
+
+### 13.3 Enabler: stable domain keys
+
+Every serve-path identity is an `Arc` pointer today. A snapshot needs stable per-domain ids:
+mint a `DomainId` at spawn (root = 0, children numbered per run), carry it on the `Host`, key
+`svc_waiters`/`svc_timers` by it, and record it in `LiveImplEntry` beside the `Arc` (the Arc
+stays the runtime fast path; the id is the durable name and the thaw-time re-link key). This
+is a bounded, behavior-neutral refactor and the first implementation slice.
+
+### 13.4 Build order
+
+1. **Stable domain keys** (13.3) — behavior-neutral, unblocks everything.
+   **BUILT 2026-07-24:** `Host::domain_id` (process-unique, minted at construction from a
+   static counter — a snapshot records the ids it saw and a thaw re-links by record, so the
+   absolute values never matter). Every serve-path key producer converted: the `svc.wait`
+   park key, both live-call `svc_wake` targets (direct + import-bound routes, the callee's id
+   read in the same lock scope as the enqueue), and every fiber waiter's domain field (live
+   calls, stdin reads, futex waits). The futex canonical-*region* identity keeps its backing
+   `Arc` key — that is cross-domain futex plumbing, not a serve key; its durable form arrives
+   with the step-2 `FrozenPark::Futex` record. Behavior-neutral: the whole serve corpus
+   (incl. the multi-consumer hammer) is green unchanged.
+2. **`FrozenPark` capture** — event-parked fibers freeze with their park reason; thaw
+   re-derives waiter entries. Lifts the `has_blocked_parks` fail-closed for in-cut parks.
+3. **Serve-state snapshot section** — `svc_queue`/`svc_results`/counter (+ per-consumer
+   `serve_count`, `serve_run` linkage), versioned like the fiber section (elided when empty).
+4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
+   re-park callers (race-check against restored cells), mark `svc.wait` consumers runnable.
+5. **Cross-cut O10 re-issue** — freeze-boundary calls complete with a re-issue marker on
+   thaw; validate against reload-not-reissue (R8/R11) before widening.
+
+Fail-closed stays the default at every step: anything the current step can't capture keeps
+refusing the freeze, exactly as `has_blocked_parks` does today.
+
 ---
 
 ## Proposed decision record
