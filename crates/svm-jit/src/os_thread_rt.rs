@@ -1808,6 +1808,70 @@ fn fiber_wait_deregister(
     true
 }
 
+/// [`fiber_rt::fiber_resume`]'s `FIBER_PARKED` status (the fiber hit an event park, not a guest
+/// `suspend`/return). Kept in sync with `fiber_rt::FIBER_PARKED`; the differential harness pins the
+/// numeric value across backends.
+const FIBER_PARKED_STATUS: i64 = 3;
+
+/// I48 — the **blocking** fiber resume (`cont.resume.block`). Like [`fiber_rt::fiber_resume`], but
+/// when the resumed fiber is still event-parked (`FIBER_PARKED`) it **idles this vCPU's OS thread**
+/// on the domain condvar instead of returning the poll status to the guest, then re-resumes. It is
+/// woken early by any `notify` / teardown broadcast on `futex_cv`; the `KILL_RECHECK` bound makes the
+/// re-poll observe a timed wait's deadline, a kill (epoch), a freeze, or teardown even with no
+/// broadcast — the fiber's own [`fiber_futex_wait`] guards fire at the re-poll and end the wait. So
+/// the guest sees the same `(status, value)` a polling `cont.resume` would, reached by **sleeping
+/// rather than spinning** (the tree-walk oracle and the cooperative bytecode driver idle
+/// equivalently; INVARIANTS.md #9). Advisory still holds: a transient `FIBER_PARKED` (the
+/// park-vs-store recheck) is absorbed by the one extra re-poll here, never surfaced to the guest.
+///
+/// Re-polling drives the fiber's existing `fiber_futex_wait` loop exactly as the guest's poll loop
+/// does today; the only change is the sleep between polls. Not held: the futex lock is released
+/// before each re-resume (the fiber may itself take it). Deadlock note: a genuinely stuck untimed
+/// fiber-wait with no notifier idles here forever, matching today's JIT (which busy-spins the same
+/// case) rather than the interpreters' `WAIT_DEADLOCK` — closing that gap needs the fiber's timed-ness
+/// surfaced and is a separate follow-up.
+///
+/// # Safety
+/// `sched` is the run's live [`Domain`]; `status_out`/`trap_out` are live `*mut i64` cells. The
+/// running vCPU's fiber runtime is [`fiber_rt::CURRENT_RT`] (read inside `fiber_resume`).
+pub(crate) unsafe extern "C" fn fiber_resume_block(
+    sched: *const Domain,
+    handle: i64,
+    arg: i64,
+    status_out: *mut i64,
+    trap_out: u64,
+) -> i64 {
+    let dom = &*sched;
+    loop {
+        let value = fiber_rt::fiber_resume(handle, arg, status_out, trap_out);
+        // Done (guest suspend / return), a trap in flight, or not event-parked: hand back to the
+        // guest exactly as `cont.resume` would (its `status_out`/value are already set).
+        if *status_out != FIBER_PARKED_STATUS || load_trap(trap_out as *mut i64) != 0 {
+            return value;
+        }
+        // Still event-parked: idle on the domain condvar until an event might wake the fiber, then
+        // re-poll. `ParkGuard` counts this vCPU blocked for the deadlock detector; the bounded wait
+        // re-checks a kill / timeout / freeze / teardown within `KILL_RECHECK`. The lock is dropped
+        // (with the returned guard) before the next re-resume — the fiber may take it.
+        //
+        // `KILL_RECHECK` / `wait_timeout` are the real-build cadence (both absent under loom, which
+        // has no wall clock). loom does not model fibers, so this thunk is never exercised there;
+        // the `#[cfg(loom)]` arm takes the advisory `FIBER_PARKED` downgrade purely so the crate
+        // still compiles under `--cfg loom`.
+        #[cfg(not(loom))]
+        {
+            let g = lock(&dom.futex);
+            let _pg = ParkGuard::new(&dom.parked);
+            let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
+        }
+        #[cfg(loom)]
+        {
+            let _ = &dom.futex; // touch the field so it isn't flagged unused under loom
+            return value;
+        }
+    }
+}
+
 /// `atomic.notify` thunk: wake up to `count` vCPUs parked on confined `phys`; return the `i32` count
 /// woken.
 ///

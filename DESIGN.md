@@ -1755,15 +1755,22 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   registered waiter (futex/timer/completion/revoke — every fiber-wake `svc_wake`s the
   domain, so the idle resumer re-admits for free) instead of returning `FIBER_PARKED`.
   Advisory means returning `FIBER_PARKED` stays conforming, so the guest still loops
-  and the op costs nothing in surface: only the tree-walk M:N oracle idles; the
-  bytecode/Cranelift backends and the deterministic explorer alias it to `cont.resume`
-  (no idle core, no compile veto, no divergence — invariant 9), and durable runs take
-  the same downgrade (freeze-on-quiesce untouched). It never "blocks the domain"
+  and every backend that can't (or needn't) idle stays correct. The idle now lands on
+  **all three production/reference tiers**: the tree-walk oracle parks into `svc_waiters`;
+  the cooperative bytecode driver (which also backs the wasm-jit's `InterpDriven` fold)
+  parks the resumer's task as `BlockedOnFiber` and burns zero fuel while idle; and the
+  Cranelift JIT parks the resumer's **OS thread** on the domain condvar
+  (`fiber_resume_block`) and re-resumes, woken by any `notify`/teardown broadcast and
+  bounded by the `KILL_RECHECK` re-poll (so a timed wait's deadline, a kill, or a freeze
+  is observed with no timer thread). The deterministic explorer keeps the `FIBER_PARKED`
+  downgrade (the guest loop absorbs it — determinism untouched), as do durable runs
+  (freeze-on-quiesce untouched) and the bytecode/JIT **OS-thread-parallel** driver
+  variants (their idle is a small remaining follow-up). It never "blocks the domain"
   (§12 below) — the guest issues it only when it has nothing else to run (mechanism,
   not policy), and other vCPUs keep running; teardown/exit/trap free an idle resumer
-  through the `svc_waiters` sweep. *The one guest-facing blocking primitive on the
-  scheduler park/idle core — kept advisory precisely to stay off the §18 determinism
-  surface.*
+  (the `svc_waiters` sweep on the oracle; the `KILL_RECHECK`/broadcast re-poll on the
+  JIT). *The one guest-facing blocking primitive on the scheduler park/idle core — kept
+  advisory precisely to stay off the §18 determinism surface.*
 - **Per-vCPU TLS register (`vcpu.tls.get`/`vcpu.tls.set`).** One ambient i64 of
   per-vCPU state, **read at the execution point** — so a fiber that migrated to
   another vCPU reads the *current* vCPU's word, the value only the runtime knows

@@ -125,9 +125,9 @@ fn blocking_resume_of_a_non_parking_fiber_is_plain_resume() {
 /// completion `WAIT_TIMED_OUT(2)*100 + 0 = 102`; a backend that merely aliased the op to
 /// `cont.resume` (spins) would return the transient `FIBER_PARKED(3)*100 = 300` — the guest has no
 /// loop to absorb it. So `== 102` on a no-loop kernel is a direct behavioral proof the vCPU idled
-/// and re-resumed, not spun. Pinned on the tree-walk oracle and the **bytecode** engine (which
-/// also backs the wasm-jit's `InterpDriven` fold); the Cranelift JIT still takes the advisory
-/// downgrade (its OS-thread idle is the follow-up slice), so it is excluded here.
+/// and re-resumed, not spun. Now pinned on **all three** backends: the tree-walk oracle, the
+/// bytecode engine (which also backs the wasm-jit's `InterpDriven` fold), and the Cranelift JIT
+/// (which parks its OS thread on the domain condvar and re-resumes — `fiber_resume_block`).
 const BLOCK_NO_LOOP_TIMED: &str = r#"
 memory 16
 export 0 func "_start" 0
@@ -158,13 +158,80 @@ block 0 (vsp: i64, varg: i64) {
 "#;
 
 #[test]
-fn no_loop_blocking_resume_idles_on_tree_walk_and_bytecode() {
+fn no_loop_blocking_resume_idles_on_all_backends() {
     // WAIT_TIMED_OUT(2)*100 + 0 — reached only by actually idling until the timer, then resuming.
-    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+    // All three production/reference tiers now idle: a spinning alias would return 300 (no loop).
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         assert_eq!(
             run_on(BLOCK_NO_LOOP_TIMED, backend),
             102,
             "{backend:?}: a no-loop cont.resume.block must idle-and-complete, not spin to 300"
+        );
+    }
+}
+
+/// I48 parity, the **cross-vCPU notify** wake path (the OS-thread case, not just the timer): the
+/// root spawns a worker (vCPU 1), creates a fiber that does an **untimed** `atomic.wait` on cell 8,
+/// and `cont.resume.block`s it with **no loop**. The resumer idles (on the JIT, its OS thread parks
+/// on the domain condvar) with no deadline at all — only the worker's `notify` can make progress.
+/// The worker stores 7 into cell 8 and notifies; the broadcast wakes the idle resumer, which
+/// re-resumes the now-woken fiber. Composite: `status*10 + (wait_status*100 + mem[8])` after join —
+/// `WAIT_WOKEN(0)`: `1*10 + (0 + 7) = 17`; a pre-notify race gives `WAIT_NOT_EQUAL(1)`:
+/// `1*10 + (100 + 7) = 117`. Completing at all (no spin, no hang) proves the notify wake.
+const BLOCK_NO_LOOP_NOTIFY: &str = r#"
+memory 16
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  v0 = ref.func 1
+  vk = cont.new v0 vz
+  vs, vv = cont.resume.block vk vz
+  vjr = thread.join vt
+  vk10 = i64.const 10
+  vse = i64.extend_i32_s vs
+  va = i64.mul vse vk10
+  vr = i64.add va vv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 8
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  vk100 = i64.const 100
+  vsx = i64.mul vst64 vk100
+  vm8a = i64.const 8
+  vm8 = i64.load vm8a
+  vsum = i64.add vsx vm8
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vm8a = i64.const 8
+  vseven = i64.const 7
+  i64.store vm8a vseven
+  vaddr = i64.const 8
+  vcnt = i32.const 1
+  vw = atomic.notify vaddr vcnt
+  vz = i64.const 0
+  return vz
+  }
+}
+"#;
+
+#[test]
+fn no_loop_blocking_resume_wakes_on_cross_vcpu_notify_all_backends() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = run_on(BLOCK_NO_LOOP_NOTIFY, backend);
+        assert!(
+            r == 17 || r == 117,
+            "{backend:?}: a no-loop blocking resume must idle until the notify and complete (17/117), got {r}"
         );
     }
 }

@@ -2413,8 +2413,31 @@ with `cont.resume`, and the design's hard problems dissolve —
 Pins: `svm-interp/tests/blocking_resume.rs` (oracle idle-on-timer with a **fuel** proof it does
 not spin, cross-vCPU notify wake, sibling-trap frees a blocked resumer);
 `svm/tests/fiber_blocking_resume.rs` (advisory conformance — the looping form agrees
-TreeWalk ≡ Bytecode ≡ Cranelift JIT, the oracle via idle, the others via spin). jacl swaps one
-opcode in its existing poll loop and gets idle-on-oracle with no regression anywhere.
+TreeWalk ≡ Bytecode ≡ Cranelift JIT). jacl swaps one opcode in its existing poll loop.
+
+**PARITY on the production backends (2026-08-08).** #672 idled only the oracle (the test tier); prod
+runs on svm-jit + wasm-jit, so the idle was extended to the tiers that matter:
+- **Bytecode (+ wasm-jit)** — the cooperative `drive` idles the resumer's task as
+  `TaskState::BlockedOnFiber` (rewind the resume op; a top-of-loop scan re-runs it when the fiber
+  wakes via idle-timer / notify / cap-drain), burning zero fuel. wasm-jit folds fibers to this
+  driver (`DriveMode::InterpDriven`), so it is covered for free. Scoped to `drive` via a
+  `cooperative` flag on `step_vcpu`.
+- **Cranelift JIT** — `fiber_resume_block` parks the resumer's **OS thread** on `Domain.futex_cv`
+  and re-resumes, woken by any `notify`/teardown broadcast and bounded by the `KILL_RECHECK`
+  re-poll (so a timed wait's deadline, a kill, a freeze, or teardown is observed with **no timer
+  thread**). A fiber-using module now always builds the `Domain` (the thunk takes its pointer).
+  Correctness does not depend on the broadcast — the bounded re-poll guarantees progress — so
+  there is no lost-wakeup race beyond the futex-core primitives already loom-checked; a bespoke
+  fiber-modeling loom test is out of scope (the loom model doesn't model fibers).
+
+Now pinned on **all three backends** in `svm/tests/fiber_blocking_resume.rs`: a **no-loop**
+`cont.resume.block` of a timed-wait fiber returns the fiber's real result (`102`) — a spinning alias
+would return the transient `300` — plus a cross-vCPU **notify** wake, both across TreeWalk +
+Bytecode + Cranelift JIT.
+
+**Remaining follow-up (small):** the bytecode/JIT **OS-thread-parallel** driver variants
+(`drive_parallel`, the single-vCPU `Vcpu::run`) still take the advisory `FIBER_PARKED` downgrade —
+the same OS-thread-park mechanism, applied to those driver entry points.
 
 ---
 

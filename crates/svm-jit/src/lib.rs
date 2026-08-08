@@ -2758,6 +2758,7 @@ impl CompiledModule {
             FiberEnv {
                 new_thunk: fiber_rt::fiber_new as *const () as i64,
                 resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+                block_resume_thunk: os_thread_rt::fiber_resume_block as *const () as i64,
                 suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
                 // The register-flush trampoline (not `gc_roots` directly): it spills the callee-saved
                 // registers before the scan so a guest root parked in one is captured (see its docs).
@@ -2776,9 +2777,14 @@ impl CompiledModule {
         // **nesting** module with no thread ops of its own: §14 children compile their `atomic.wait`/
         // `notify` against this domain's futex (via the nursery), so concurrent children — and the
         // parent's own waits, if any — rendezvous in one table (the granted-children pipeline).
+        // I48: a fiber-using module needs the `Domain` even without threads — the
+        // `cont.resume.block` thunk (`fiber_resume_block`) idles on `Domain.futex_cv`. (A fiber
+        // that *parks* already implies `memory.wait` ⇒ `uses_threads`; this also covers a
+        // fiber-only module whose blocking resume never reaches the park — the thunk still takes
+        // the domain pointer.)
         #[cfg(fiber_rt)]
         let domain: Option<Box<os_thread_rt::Domain>> =
-            if uses_threads || module_uses_instantiator(m) {
+            if uses_threads || uses_fibers || module_uses_instantiator(m) {
                 Some(Box::new(os_thread_rt::Domain::new(quota.max_vcpus)))
             } else {
                 None
@@ -4238,6 +4244,7 @@ impl CompiledModule {
         self.fiber = FiberEnv {
             new_thunk: fiber_rt::fiber_new as *const () as i64,
             resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+            block_resume_thunk: os_thread_rt::fiber_resume_block as *const () as i64,
             suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
             roots_thunk: fiber_rt::svm_gc_roots_flush as *const () as i64,
         };
@@ -5492,6 +5499,10 @@ struct CapEnv {
 struct FiberEnv {
     new_thunk: i64,
     resume_thunk: i64,
+    /// I48 — the `cont.resume.block` thunk (`os_thread_rt::fiber_resume_block`): resume that idles
+    /// the OS thread on a still-parked fiber instead of returning `FIBER_PARKED`. Takes the domain
+    /// pointer as its first arg (`lower.thread.sched_addr`), like the `thread.*` thunks.
+    block_resume_thunk: i64,
     suspend_thunk: i64,
     /// The `gc.roots` thunk (conservative root enumeration over the live fiber stacks). `0` when the
     /// module uses no fibers / `gc.roots`, or the target has no stack-switch support.
@@ -5503,6 +5514,7 @@ impl FiberEnv {
         FiberEnv {
             new_thunk: 0,
             resume_thunk: 0,
+            block_resume_thunk: 0,
             suspend_thunk: 0,
             roots_thunk: 0,
         }
@@ -6459,28 +6471,43 @@ fn lower_block(
             ubs.resize(vals.len(), UB_TOP);
             continue;
         }
-        // I48: `cont.resume.block` aliases to the same resume thunk. A JIT vCPU is a real OS
-        // thread; the advisory contract lets it return FIBER_PARKED (the guest loops), so no idle
-        // path is needed here — the tree-walk oracle is the tier that actually idles (invariant 9).
+        // I48: `cont.resume` returns `FIBER_PARKED` on a still-parked fiber (the guest polls);
+        // `cont.resume.block` instead calls the blocking thunk, which idles this OS thread on the
+        // domain condvar and re-resumes until the fiber completes/suspends — a sleep, not a spin,
+        // so the JIT idles like the oracle and the cooperative bytecode driver (INVARIANTS.md #9).
+        // Both append the two results (status:i32, value:i64) to match the IR's shape.
         if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
-            // fiber_resume(handle:i64, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
-            // Results are appended (status:i32, value:i64) to match the IR's two-result shape.
+            let blocking = matches!(inst, Inst::ContResumeBlock { .. });
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let kh = get(&vals, *k)?;
             let av = get(&vals, *arg)?;
             let trap_out = b.use_var(lower.trap_var);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.fiber.resume_thunk);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[kh, av, status_ptr, trap_out]);
+            let call = if blocking {
+                // fiber_resume_block(sched, handle, arg, status_out, trap_out) -> value:i64.
+                let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+                let mut tsig = module.make_signature();
+                for t in [I64, I64, I64, I64, I64] {
+                    tsig.params.push(AbiParam::new(t));
+                }
+                tsig.returns.push(AbiParam::new(I64));
+                let tref = b.import_signature(tsig);
+                let thunk = b.ins().iconst(I64, lower.fiber.block_resume_thunk);
+                b.ins()
+                    .call_indirect(tref, thunk, &[sched, kh, av, status_ptr, trap_out])
+            } else {
+                // fiber_resume(handle, arg, status_out, trap_out) -> value:i64.
+                let mut tsig = module.make_signature();
+                for t in [I64, I64, I64, I64] {
+                    tsig.params.push(AbiParam::new(t));
+                }
+                tsig.returns.push(AbiParam::new(I64));
+                let tref = b.import_signature(tsig);
+                let thunk = b.ins().iconst(I64, lower.fiber.resume_thunk);
+                b.ins()
+                    .call_indirect(tref, thunk, &[kh, av, status_ptr, trap_out])
+            };
             emit_trap_propagate(b, lower);
             let value = b.inst_results(call)[0];
             let status64 = b.ins().stack_load(I64, ss, 0);
