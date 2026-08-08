@@ -59,16 +59,43 @@ pub struct DomainProgram {
 /// fold there anyway). Blocking profile: v1 `run` executes the child inline, exactly as
 /// `host_exec` blocks on the process — one synchronous op either way.
 pub fn domain_exec(programs: Vec<DomainProgram>) -> HostCap {
+    domain_exec_inner(programs, None)
+}
+
+/// Like [`domain_exec`], but each spawned child additionally inherits `child_fs` — an explicitly
+/// provided `fs` capability, granted to the child under the name `"fs"`. Back it with a
+/// [`crate::fs::mem_fs_shared_factory`]-derived cap and every phase shares **one** working
+/// filesystem, so phase N writes `x.nif` and phase N+1 reads it — the faithful file-based `nifmake`
+/// hand-off (NIM.md §3c). This is a **deliberate widening of a child's authority** and lives at the
+/// grant site by design: plain [`domain_exec`] gives a child only stdin/stdout, and a child never
+/// gains `fs` unless the embedder hands it one here. Even then the child gets *only* this fs (the
+/// in-memory, seeded store the cap wraps) — no host filesystem, no ambient authority; a child cannot
+/// widen its own grant. The children share the store the caller chose to share; isolation between
+/// unrelated pipelines is the caller granting them *different* factories.
+pub fn domain_exec_with_fs(programs: Vec<DomainProgram>, child_fs: HostCap) -> HostCap {
+    domain_exec_inner(programs, Some(child_fs))
+}
+
+fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) -> HostCap {
     let programs = Arc::new(programs);
+    let child_fs = Arc::new(child_fs);
     HostCap::host_proc(0, move || {
         let programs = Arc::clone(&programs);
+        let child_fs = Arc::clone(&child_fs);
         let mut jobs = JobTable::default();
         Box::new(
             move |op: u32,
                   args: &[i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-                Ok(vec![domain_dispatch(&programs, &mut jobs, op, args, mem)])
+                Ok(vec![domain_dispatch(
+                    &programs,
+                    (*child_fs).as_ref(),
+                    &mut jobs,
+                    op,
+                    args,
+                    mem,
+                )])
             },
         ) as HostProc
     })
@@ -76,6 +103,7 @@ pub fn domain_exec(programs: Vec<DomainProgram>) -> HostCap {
 
 fn domain_dispatch(
     programs: &[DomainProgram],
+    child_fs: Option<&HostCap>,
     jobs: &mut JobTable,
     op: u32,
     args: &[i64],
@@ -99,7 +127,16 @@ fn domain_dispatch(
         env: Vec::new(),
         ..RunConfig::default()
     };
-    match p.instance.run(Backend::TreeWalk, &config) {
+    // The child inherits only what the parent granted: stdin/stdout always, and `fs` iff the embedder
+    // built this backend with `domain_exec_with_fs`. A fresh grant from the (shared) fs cap per spawn,
+    // so all phases reach one store.
+    let child_run = match child_fs {
+        Some(fs) => p
+            .instance
+            .run_with_caps(Backend::TreeWalk, &config, &[("fs", fs.clone())]),
+        None => p.instance.run(Backend::TreeWalk, &config),
+    };
+    match child_run {
         Ok(run) => {
             let exit = match run.outcome {
                 Outcome::Exited(c) => c as i64,

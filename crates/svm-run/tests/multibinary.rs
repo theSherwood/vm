@@ -15,7 +15,7 @@
 //! the result would be `a!` (2 bytes), not `aa!` (3) — so `aa!`/exit 3 witnesses the hand-off.
 
 use std::sync::Arc;
-use svm_run::exec::{domain_exec, DomainProgram};
+use svm_run::exec::{domain_exec, domain_exec_with_fs, DomainProgram};
 use svm_run::{
     instantiate, instantiate_with_imports, Backend, HostCap, Imports, Limits, Outcome, RunConfig,
 };
@@ -452,6 +452,227 @@ fn driver_runs_a_real_svm_leng_compiled_program_as_an_exec_child() {
             r.outcome,
             Outcome::Exited(55),
             "{backend:?}: real compiled main() summed 1..10 in an isolated child; status reached the driver"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W4, the faithful `nifmake` hand-off: phases pass an intermediate **file** through a shared memfs.
+//
+// The pipelines above hand off via stdout→stdin piping. Real `nifmake` phases pass *files*
+// (`.p.nif`/`.s.nif`/…) down the chain, and this is that shape: `domain_exec_with_fs` grants every
+// child one shared in-memory filesystem, so phase `gen` writes `mid` and phase `use` reads it — the
+// data crosses the child boundary through the file, not a pipe. The child-fs grant is a deliberate,
+// explicit widening of child authority (NIM.md §3c): plain `domain_exec` gives children only
+// stdin/stdout; here the embedder hands the phases one seeded, in-memory store and nothing else.
+//
+// `gen` writes the bytes "OK" to `mid` and exits 0; `use` opens `mid`, reads it, echoes it to stdout,
+// and exits with the byte count; the driver runs both, then emits what `use` produced. Driver stdout
+// == "OK" witnesses that the file `gen` wrote reached `use` through the shared store — a fresh store
+// per run, so `use` reads *this* run's write, not a leftover. (fs cap = iface 13, ops FS_OPEN=0,
+// FS_READ=1, FS_WRITE=2, FS_CLOSE=4; open flags O_READ=1, O_CREATE|O_WRITE=18.)
+
+/// Phase `gen`: create `mid` (O_CREATE|O_WRITE) and write "OK" into it.
+const GEN_PHASE: &str = "\
+memory 16
+data 0 \"fs\"
+data 4 \"mid\"
+data 8 \"OK\"
+func 0 () -> (i64) {
+block 0 () {
+  vfp = i64.const 0
+  vfl = i64.const 2
+  vfs = cap.self.resolve vfp vfl
+  vpath = i64.const 4
+  vplen = i64.const 3
+  vflags = i64.const 18
+  vfd = cap.call 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
+  vbuf = i64.const 8
+  vblen = i64.const 2
+  vn = cap.call 13 2 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vblen)
+  vcl = cap.call 13 4 (i64) -> (i64) vfs (vfd)
+  vz = i64.const 0
+  return vz
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// Phase `use`: open `mid` (O_READ), read it into a buffer, echo it to stdout, exit with the count.
+const USE_PHASE: &str = "\
+memory 16
+data 0 \"fs\"
+data 4 \"mid\"
+import 0 \"write\" (i64, i64) -> (i64)
+func 0 () -> (i64) {
+block 0 () {
+  vfp = i64.const 0
+  vfl = i64.const 2
+  vfs = cap.self.resolve vfp vfl
+  vpath = i64.const 4
+  vplen = i64.const 3
+  vflags = i64.const 1
+  vfd = cap.call 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
+  vbuf = i64.const 64
+  vcap = i64.const 32
+  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vcap)
+  vw = call.import 0 (vbuf, vn)
+  vcl = cap.call 13 4 (i64) -> (i64) vfs (vfd)
+  return vn
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// The driver: run `gen` (writes `mid`), then `use` (reads `mid`), drain `use`'s output and emit it.
+const DRIVER_FS: &str = "\
+memory 16
+data 0 \"exec\"
+data 8 \"gen\"
+data 12 \"use\"
+import 0 \"out\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+func 0 () -> () {
+block 0 () {
+  vep = i64.const 0
+  vel = i64.const 4
+  vh = cap.self.resolve vep vel
+  vgen = i64.const 8
+  vgenl = i64.const 3
+  vzero = i64.const 0
+  vjg = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vgen, vgenl, vzero, vzero)
+  vsg = cap.call 13 3 (i64) -> (i64) vh (vjg)
+  vuse = i64.const 12
+  vusel = i64.const 3
+  vju = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vuse, vusel, vzero, vzero)
+  vbuf = i64.const 64
+  vcap = i64.const 32
+  vnu = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vju, vbuf, vcap)
+  vw = call.import 0 (vbuf, vnu)
+  vsu = cap.call 13 3 (i64) -> (i64) vh (vju)
+  vcode = i32.wrap_i64 vsu
+  call.import 1 (vcode)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+fn fs_phase(name: &str, src: &str) -> DomainProgram {
+    DomainProgram {
+        name: name.into(),
+        instance: Arc::new(
+            instantiate(parse_module(src).expect("parse fs phase")).expect("instantiate"),
+        ),
+        limits: Limits::default(),
+    }
+}
+
+#[test]
+fn driver_hands_off_a_file_between_phases_through_a_shared_memfs() {
+    let m = parse_module(DRIVER_FS).expect("parse fs driver");
+    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        // A fresh shared store per run: both phase children are granted one grant each from the same
+        // factory, so `gen`'s write and `use`'s read hit the same filesystem.
+        let (factory, _handle) = svm_run::fs::mem_fs_shared_factory(vec![], vec![]);
+        let child_fs = HostCap::host_proc(0, factory);
+        let phases = vec![fs_phase("gen", GEN_PHASE), fs_phase("use", USE_PHASE)];
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec_with_fs(phases, child_fs))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.stdout, b"OK",
+            "{backend:?}: 'use' read the file 'gen' wrote to the shared memfs (file hand-off)"
+        );
+    }
+}
+
+/// Confinement probe: resolve `"fs"` and return whether it was granted (1) or not (0). `cap.self.resolve`
+/// yields an i32 handle ≥ 0 on success, negative `-errno` when the name isn't granted.
+const PROBE_PHASE: &str = "\
+memory 16
+data 0 \"fs\"
+func 0 () -> (i32) {
+block 0 () {
+  vfp = i64.const 0
+  vfl = i64.const 2
+  vfs = cap.self.resolve vfp vfl
+  vzero = i32.const 0
+  vok = i32.ge_s vfs vzero
+  return vok
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// A driver that runs `probe` and exits with its status (1 = it got `fs`, 0 = it didn't).
+const DRIVER_PROBE: &str = "\
+memory 16
+data 0 \"exec\"
+data 8 \"probe\"
+import 0 \"exit\" (i32) -> ()
+func 0 () -> () {
+block 0 () {
+  vep = i64.const 0
+  vel = i64.const 4
+  vh = cap.self.resolve vep vel
+  vname = i64.const 8
+  vnamel = i64.const 5
+  vzero = i64.const 0
+  vj = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamel, vzero, vzero)
+  vs = cap.call 13 3 (i64) -> (i64) vh (vj)
+  vcode = i32.wrap_i64 vs
+  call.import 0 (vcode)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn a_child_gets_fs_only_when_the_parent_grants_it() {
+    // The confinement invariant behind the file hand-off: `fs` is inherited by a child ONLY through an
+    // explicit `domain_exec_with_fs` grant. A child under plain `domain_exec` cannot resolve `fs` — no
+    // ambient authority, and a child cannot widen its own grant.
+    let m = parse_module(DRIVER_PROBE).expect("parse probe driver");
+    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let (factory, _h) = svm_run::fs::mem_fs_shared_factory(vec![], vec![]);
+        let granted = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[(
+                    "exec",
+                    domain_exec_with_fs(
+                        vec![fs_phase("probe", PROBE_PHASE)],
+                        HostCap::host_proc(0, factory),
+                    ),
+                )],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            granted.outcome,
+            Outcome::Exited(1),
+            "{backend:?}: an explicitly-granted child resolves fs"
+        );
+
+        let default = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec(vec![fs_phase("probe", PROBE_PHASE)]))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            default.outcome,
+            Outcome::Exited(0),
+            "{backend:?}: a child under plain domain_exec has no fs (default confinement)"
         );
     }
 }

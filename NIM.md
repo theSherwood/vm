@@ -826,15 +826,19 @@ files down the chain. Two existing options, no new host op:
      (phase A writes `x`, a separate grant reads it back). It's an ordinary additive `svm-fs` helper:
      it changes no existing grant and hands the *caller* the choice to share, so it is **not** on the
      security boundary. (`mem_fs_seeded_shared` now delegates to it — one grant from the factory.)
-   - (b) **Granting that store to a spawned child** — the *authority* layer, and the real gate.
-     `domain_exec` runs each child via plain `run` (`exec.rs:102`), granting it only stdin/stdout — so
-     children receive **no `fs` at all** today. Wiring the hand-off means teaching the child-spawn path
-     to grant the shared memfs (a `domain_exec` that runs children with `run_with_caps`, or the §14
-     Instantiator's `regrant_into_child` at `crates/svm-interp/src/lib.rs:18485`). This decides *what
-     filesystem authority a spawned child inherits* — a security-shaped call (INVARIANTS §1/§4), so
-     **this** part is owner-reviewed infra, not a nimony-lane edit. It is the same gate as granting the
-     real `system`'s bottom-edge caps to a child (§3c second slice) — one child-capability-inheritance
-     decision covers both.
+   - (b) **Granting that store to a spawned child** — the *authority* layer, and the real gate. This
+     decides *what filesystem authority a spawned child inherits* — a security-shaped call (INVARIANTS
+     §1/§4), so it was held as an owner-reviewed decision, not a nimony-lane edit. **Now made, and
+     wired** (`domain_exec_with_fs`, `exec.rs`): plain `domain_exec` still runs each child via `run`
+     with **only stdin/stdout** — the default is unchanged, a child gets **no `fs`** — and a child
+     gains `fs` *only* when the embedder builds the backend with `domain_exec_with_fs`, which runs each
+     child via `run_with_caps` granting the one shared memfs under the name `"fs"`. The grant lives at
+     the parent's construction site; a child cannot widen it, and gets *only* that in-memory store (no
+     host filesystem, no ambient authority). The confinement default is pinned by a test
+     (`a_child_gets_fs_only_when_the_parent_grants_it`: a probe resolves `fs` → granted only under
+     `domain_exec_with_fs`, refused under plain `domain_exec`). This is the same `run_with_caps` seam
+     that would grant the real `system`'s bottom-edge caps to a child — one child-capability-inheritance
+     mechanism covers both.
 
 **v1 gaps to hold (all bounded, none blocking).** `domain_exec` v1 runs each child **blocking and
 one-shot** — no concurrent pipeline (`exec.rs:59`). For a compiler driver this is *fine*: the phases
@@ -876,12 +880,26 @@ binary boots and computes correctly as an isolated child — the previously-open
 The remaining half of (iii) is **heap/`system`-backed** phases, and it splits cleanly by what the
 child needs at its window edge. A self-contained program (allocator over its own window, the Path-B
 shim) needs only that the shim **self-seed its brk at startup** rather than rely on harness seeding —
-an in-lane change to the shim, no infra. The mmap-backed real `system` additionally needs the
-**bottom-edge host caps granted to the child** (`mmap`/`memcpy`/atomics/`fs`), which `domain_exec` v1
-does not do — it runs each child with only stdin/stdout (`exec.rs:102`). That child-capability grant
-is the same class of owner-reviewed shared-capability infra as the shared-memfs hand-off above (it
-decides what authority a spawned child inherits — INVARIANTS §1/§4), so it is scoped here, not built
-in the nimony lane.
+an in-lane change to the shim, no infra. The mmap-backed real `system` additionally needs
+**bottom-edge host caps granted to the child** (`mmap`/`memcpy`/atomics/`fs`). The *mechanism* for
+that is now in place — `domain_exec_with_fs` runs children via `run_with_caps` (see the third slice
+below), the same seam any bottom-edge cap would ride — so what's left is only *which* caps a
+`system`-backed phase is granted, decided at the parent's construction site.
+
+**Third slice — ✅ the faithful file-based hand-off, with child-fs confinement.** The earlier slices
+hand off via stdout→stdin piping; real `nifmake` passes *files*. This closes that: `domain_exec_with_fs`
+grants every phase child one shared in-memory filesystem (the `mem_fs_shared_factory` store), so a
+phase writes `mid` and a later phase reads it — the data crosses the child boundary through the file,
+not a pipe (`crates/svm-run/tests/multibinary.rs::driver_hands_off_a_file_between_phases_through_a_shared_memfs`,
+all three engines: `gen` writes "OK" → `use` reads and echoes it → driver stdout "OK"). The
+child-capability grant that §3c held as owner-reviewed is **made and wired** as an *explicit,
+attenuated, parent-side opt-in*: the default `domain_exec` still gives a child only stdin/stdout, a
+child gains `fs` only through `domain_exec_with_fs`, and it gets *only* the one seeded in-memory store
+— no host filesystem, no ambient authority, no self-widening. The confinement default is pinned
+(`a_child_gets_fs_only_when_the_parent_grants_it`). With this, W4 is **build-out-complete on the
+mechanism**: driver shape, real compiled child, and the file hand-off all run on svm; what remains is
+compiling the four actual phase binaries (four applications of the on-ramp) and, for a heap phase, the
+self-seeding brk — no open architecture question.
 
 ## 3d. TLS model — nimony's thread-vars onto svm (single-threaded now, `vcpu.tls` later)
 
