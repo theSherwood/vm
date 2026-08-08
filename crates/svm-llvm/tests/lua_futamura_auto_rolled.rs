@@ -35,6 +35,17 @@ fn jit(m: &Module, e: u32, a: &[i64]) -> i64 {
     }
 }
 
+/// The real Lua answer for a `return <int>` chunk, via the reference interpreter (rewrite the trailing
+/// `return X` to `print(X)` and parse stdout). Used as the ground-truth oracle for the coverage test.
+fn real_lua(m: &Module, script: &str) -> i64 {
+    let mut prog = script.replacen("return ", "print(", 1).trim_end().to_string();
+    prog.push_str(")\n");
+    let out = svm_run::run_powerbox(m, prog.as_bytes())
+        .expect("interp run")
+        .stdout;
+    String::from_utf8_lossy(&out).trim().parse().expect("int stdout")
+}
+
 #[test]
 fn auto_discovers_the_hand_built_loop_cells() {
     let m = lua_module();
@@ -163,5 +174,48 @@ fn auto_rolled_div_and_mod_fold_roll_and_are_correct() {
             "{name}: folds + rolls + correct ({} residual blocks)",
             f.blocks.len()
         );
+    }
+}
+
+/// **Control-flow breadth.** The zero-config path was built for a straight numeric-`for` accumulator, but
+/// the specializer already handles richer control flow *inside* that loop with no extra machinery: a
+/// data-dependent `if` in the body (the branch stays dynamic, dispatch still folds), nested `for` loops
+/// (the inner loop rolls within the outer safepoint, using both induction variables), and an early
+/// `break`. Each folds its dispatch, verifies, and reproduces the reference interpreter on both backends
+/// at the captured trip count. This locks that breadth in against regression. (Two known walls stay out
+/// of scope: `while`/`repeat` — the FORLOOP-shaped `discover` finds no counter — and the constant K-form
+/// `i % 2` — an un-inlined helper, per the div/mod test above.)
+#[test]
+fn auto_rolled_covers_conditionals_nesting_and_break() {
+    let m = lua_module();
+    let cases = [
+        (
+            "if-in-body",
+            "local s = 0\nfor i = 1, 50 do if i < 25 then s = s + i end end\nreturn s\n",
+        ),
+        (
+            "nested-for",
+            "local s = 0\nfor i = 1, 10 do for j = 1, 10 do s = s + 1 end end\nreturn s\n",
+        ),
+        (
+            "nested-uses-both",
+            "local s = 0\nfor i = 1, 10 do for j = 1, 10 do s = s + i * j end end\nreturn s\n",
+        ),
+        (
+            "break",
+            "local s = 0\nfor i = 1, 50 do s = s + i if i >= 25 then break end end\nreturn s\n",
+        ),
+    ];
+    for (name, script) in cases {
+        let want = real_lua(&m, script);
+        let r = auto_rolled(&m, script);
+        let f = &r.residual.funcs[r.entry as usize];
+        assert!(!has_br_table(f), "{name}: the dispatch must fold");
+        let n = r.dyn_cells.len();
+        let (wm, we) = with_readback(&r.residual, r.entry, r.acc_addr, n);
+        svm_verify::verify_module(&wm).expect("wrapped residual verifies");
+        assert_eq!(jit(&wm, we, &r.captured), want, "{name}: jit == real Lua");
+        assert_eq!(tw(&wm, we, &r.captured), want, "{name}: tree-walk == real Lua");
+        println!("{name}: folds + verifies + correct (= {want})");
     }
 }
