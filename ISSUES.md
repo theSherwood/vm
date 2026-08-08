@@ -13,6 +13,31 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I75 — GitHub Pages deploy starves under burst merges, so the published playground freezes days behind `main` (S3, deploy-liveness; opened 2026-08-08 — fix pending copy-over in `workflows_src/pages.yml`)
+
+**What.** The playground on GitHub Pages was stale for days even though the code (playground
+instrumentation + wasm-JIT parity, PR #665) was merged: the live `web/play.js` was the older file
+(byte-size + `last-modified` days behind `main`; the origin served it with `age: 0`, so not a client
+cache). **0 of the last 30 Pages runs completed** — 29 `cancelled`, 1 stuck `pending`; one run
+(`#469`) sat queued **~8 hours with zero jobs ever scheduled**, then was cancelled the instant the next
+merge arrived.
+
+**Why.** `pages.yml` triggered on `push: [main]` with `concurrency: {group: pages, cancel-in-progress:
+false}`. `cancel-in-progress: false` protects a *running* deploy but a newer merge still cancels the
+older **queued** run. The Pages `build` job is long (~20–40 min: nightly `build-std` wasm + LLVM
+on-ramp + Postgres), and the repo's CI matrix (~25 jobs/push × many open PRs) saturates the Actions
+runner concurrency — so the Pages job waits in the queue and every merge resets it to the back before
+it can win a runner. Under a steady merge cadence it never deploys.
+
+**Fix (pending copy-over).** Deploy on `schedule: */30 * * * *` + `workflow_dispatch` instead of per
+push (`workflows_src/pages.yml`): a scheduled run gets a full interval to grab a runner,
+merge-independent, and `cancel-in-progress: false` lets it finish once started. A tiny `gate` job skips
+the build when `main` is unchanged since the last deploy (a `DEPLOYED_SHA` site-root marker vs `HEAD`),
+so most ticks are a ~10 s no-op. Cost: merges publish within ~30 min instead of instantly
+(`workflow_dispatch` for on-demand). The deeper fix — fold the deploy into the required `browser-real`
+CI job so it rides an already-scheduled slot — is larger (needs `browser-real` to also build the
+on-ramp assets for parity) and deferred.
+
 ### I74 — wasm-JIT confines against the **compile-time** `mapped`, so an access into `vm_map`-grown memory faults on the JIT where the interpreter allows it (S3, correctness-of-tier — masking hinge; opened 2026-08-07, root-caused; runtime decline already keeps results correct, PR #665)
 
 **What (root-caused).** The wasm tier's confinement (`emit_confine`, `svm-wasm-jit` `lib.rs:~2792`)

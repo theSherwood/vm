@@ -12,12 +12,20 @@
 name: pages
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch: {} # manual runs (e.g. to preview from a feature branch)
+  # Deploy on a cadence, NOT per-merge. A per-push deploy is superseded (cancelled while still queued)
+  # by the next merge before it can win a runner — so under a burst of merges the deploy job starves
+  # (it never gets scheduled) and the published site goes stale for hours (ISSUES.md I75; observed
+  # 0/30 completed Pages runs, one queued 8 h with zero jobs ever scheduled). A scheduled run instead
+  # gets a full interval to grab a runner, merge-independent; `cancel-in-progress: false` then lets it
+  # finish once it starts. The `gate` job skips the heavy build when `main` is unchanged since the last
+  # deploy, so most scheduled ticks are a ~10 s no-op. Merges still land within one interval; a
+  # `workflow_dispatch` deploys on demand (and always builds).
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {} # on-demand deploy / feature-branch preview (bypasses the unchanged-gate)
 
 # One in-flight deploy at a time; don't cancel a running one (a half-published site is worse than a
-# slightly stale one).
+# slightly stale one) — this is exactly what lets a scheduled run finish once it wins a runner.
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -35,7 +43,30 @@ env:
   SVM_PG_VER: "17.5"
 
 jobs:
+  # Cheap change-detector (~10 s, easy to schedule even under contention): compare the published commit
+  # — a `DEPLOYED_SHA` marker the assemble step writes into the site root — against this run's HEAD, and
+  # skip the heavy build+deploy when they match, so the 30-min schedule doesn't rebuild+republish
+  # identical content. A `workflow_dispatch` always proceeds. On any doubt (site unreachable, no marker)
+  # it defaults to building — fail-safe toward publishing, never toward a silent stale skip.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - id: check
+        run: |
+          live=$(curl -fsS https://thesherwood.github.io/vm/DEPLOYED_SHA 2>/dev/null || echo none)
+          echo "published=$live head=$GITHUB_SHA event=${{ github.event_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$live" != "$GITHUB_SHA" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "site already at $GITHUB_SHA — skipping build" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   build:
+    needs: gate
+    if: needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -124,6 +155,9 @@ jobs:
           <title>SVM playground</title></head>
           <body><p>Redirecting to the <a href="web/play.html">SVM playground</a>…</p></body></html>
           HTML
+          # Publish the built commit so the `gate` job can tell whether a later scheduled tick would be a
+          # no-op (site already at HEAD). Served at the site root: https://<pages>/DEPLOYED_SHA.
+          echo "$GITHUB_SHA" > "$SITE/DEPLOYED_SHA"
           echo "assembled:"; find "$SITE" -type f | sed "s|$SITE|_site|"
 
       # Reachability gate (ISSUES.md I26/I42/I49): every asset play.js references must actually be

@@ -16,6 +16,22 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`pages.yml` — schedule the deploy instead of per-merge (fixes I75 Pages-deploy starvation).** The
+  per-push (`push: [main]`) Pages deploy was starving: under a burst of agent-PR merges each new merge
+  supersedes the still-queued deploy (`concurrency: pages`, `cancel-in-progress: false` cancels the
+  *queued* older run), so it never wins a runner before the next merge resets it — observed **0 of 30**
+  recent Pages runs completed, one sat queued **8 h with zero jobs ever scheduled**, and the live site
+  froze days behind `main`. Fix: drop the `push` trigger; deploy on `schedule: */30 * * * *` +
+  `workflow_dispatch`. A scheduled run gets a full interval to grab a runner (merge-independent) and
+  `cancel-in-progress: false` lets it finish once started. A new tiny **`gate`** job skips the heavy
+  build when `main` is unchanged since the last deploy (compares a `DEPLOYED_SHA` marker the assemble
+  step now writes to the site root against `HEAD`); a manual dispatch always builds. **On copy-over:**
+  merges now publish within ~30 min instead of instantly — use the **Run workflow** button (or the
+  `workflow_dispatch` API) for an on-demand deploy. No other job changes. The deeper alternative (fold
+  the deploy into the required `browser-real` CI job so it rides a slot that's already scheduled) is
+  noted in the session write-up but not done here — it needs `browser-real` to also run
+  `build-onramp-assets.mjs` for asset parity, a heavier and harder-to-verify change.
+
 - **I67 apt-source hardening (all `apt-get update` steps)** — every job that runs `apt-get update`
   (the mingw cross lanes, the `clang` reference lanes, and all `llvm-18` install blocks — 10 sites)
   now first `sudo rm -f`s the runner's unused `microsoft*`/`azure*` files under
