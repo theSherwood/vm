@@ -170,12 +170,7 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         a,
         b,
     };
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
 
     let entry = Block {
         params: vec![t()],
@@ -508,7 +503,6 @@ fn mem_case() -> Module {
         op: LoadOp::I64,
         addr,
         offset: off,
-        align: 0,
     };
     let add = |a, b| Inst::IntBin {
         ty: IntTy::I64,

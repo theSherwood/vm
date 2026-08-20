@@ -229,13 +229,11 @@ fn roundtrip_preserves_behavior_through_interp() {
                     addr: 1,
                     value: 0,
                     offset: 0,
-                    align: 2,
                 },
                 Inst::Load {
                     op: LoadOp::I32,
                     addr: 1,
                     offset: 0,
-                    align: 2,
                 }, // v2 = *addr
                 Inst::IntBin {
                     ty: IntTy::I32,

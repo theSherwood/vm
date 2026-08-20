@@ -1794,14 +1794,6 @@ impl Ordering {
     pub fn from_name(s: &str) -> Option<Ordering> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
-    /// A load may not carry release semantics (`Release`/`AcqRel`).
-    pub fn valid_for_load(self) -> bool {
-        !matches!(self, Ordering::Release | Ordering::AcqRel)
-    }
-    /// A store may not carry acquire semantics (`Acquire`/`AcqRel`).
-    pub fn valid_for_store(self) -> bool {
-        !matches!(self, Ordering::Acquire | Ordering::AcqRel)
-    }
 }
 
 /// Non-terminator instructions. Each produces exactly one result — appended at the
@@ -1901,22 +1893,19 @@ pub enum Inst {
         a: ValIdx,
     },
     /// Load `op`'s width from the confined effective address `addr + offset`.
-    /// `align` is a power-of-two alignment *hint* (log2); it does not affect
-    /// semantics (unaligned access is allowed). Confinement masking is implicit.
+    /// Unaligned access is allowed; confinement masking is implicit.
     Load {
         op: LoadOp,
         addr: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// Store `value` (`op`'s width) at the confined effective address. Produces no
-    /// SSA result. `align` is a hint (see [`Inst::Load`]).
+    /// SSA result.
     Store {
         op: StoreOp,
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// Bulk copy `len` bytes from the confined span `[src, src+len)` to `[dst, dst+len)`
     /// (**non-overlapping**; lowered from `llvm.memcpy`). Both spans are confined **as a whole**
@@ -1953,7 +1942,6 @@ pub enum Inst {
         ty: IntTy,
         addr: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// §12 atomic store — a naturally-aligned write of `value` (`ty`) to `addr + offset`; a
     /// misaligned effective address **traps**. Produces no SSA result (like [`Inst::Store`]).
@@ -1962,7 +1950,6 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// §12 atomic read-modify-write: atomically apply `op` with `value` to `*(addr+offset)`
     /// (`ty`-wide, naturally aligned ⇒ else **traps**) and yield the **old** value.
@@ -1972,7 +1959,6 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// §12 atomic compare-exchange: if `*(addr+offset) == expected`, store `replacement`; always
     /// yield the **old** value (`ty`-wide, naturally aligned ⇒ else **traps**).
@@ -1982,7 +1968,6 @@ pub enum Inst {
         expected: ValIdx,
         replacement: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// Direct call to a function by index (fully static; the verifier checks the
     /// index and argument types). Appends the callee's result values — **0, 1, or
@@ -2004,19 +1989,6 @@ pub enum Inst {
         ty: FuncType,
         idx: ValIdx,
         args: Vec<ValIdx>,
-    },
-    /// Pointer arithmetic: `ptr + integer_offset`. Off-CHERI a plain `i64` wrapping
-    /// add; the distinct opcode lets the JIT/CHERI backend see pointer provenance
-    /// (§3b/§10). Operands and result are `i64`.
-    PtrAdd {
-        a: ValIdx,
-        b: ValIdx,
-    },
-    /// `ptr.from_int` (`to_int = false`) / `ptr.to_int` (`to_int = true`): a free,
-    /// no-op `i64`↔`i64` provenance cast off-CHERI (§3a/§10).
-    PtrCast {
-        to_int: bool,
-        a: ValIdx,
     },
     /// Capability call (§3c): invoke operation `op` of the interface identified by
     /// `type_id` on the capability named by `handle` — a forgeable `i32` index into
@@ -2151,44 +2123,12 @@ pub enum Inst {
         import: u32,
         handle: ValIdx,
     },
-    /// §7 capability **reflection** (`cap.self.count`): the number of capabilities the calling
-    /// **domain** currently holds — the count of live entries in its own handle table. An
-    /// always-available, read-only intrinsic (not a handle-gated `cap.call`): reflecting your own
-    /// granted set confers no authority (you already hold every one of those handles), so it does
-    /// not widen the §9 egress closure. A nested §14 child has its own table, so it sees only its
-    /// attenuated carve. Result is `i32`.
-    CapSelfCount,
-    /// §7 capability **reflection** (`cap.self.get`): the `idx`-th capability the calling domain
-    /// holds, as `(handle: i32, type_id: i32)` — the live handle-table entries in slot order, with
-    /// `idx` in `[0, cap.self.count)`. Read-only and authority-neutral (it returns a handle the
-    /// domain already possesses); an out-of-range `idx` traps (the guest bounds it by the count).
-    /// Lets runtime code discover *what* it was granted and obtain the handle to *use* it.
-    CapSelfGet {
-        idx: ValIdx,
-    },
-    /// §7 capability **reflection** (`cap.self.resolve`): resolve a capability **name** to the handle
-    /// it was granted under, as `i32` (`-errno` on miss) — the runtime, in-guest counterpart to
-    /// load-time name binding (dlopen-style discovery). `name_ptr`/`name_len` (both `i64`) point at a
-    /// UTF-8 name in the window. Read-only and authority-neutral like the rest of `cap.self`: it only
-    /// re-finds a handle the domain already holds (an unknown / ungranted name is `-EINVAL`; an
-    /// out-of-window buffer is `-EFAULT`). Sugar over the reserved `CAP_SELF_TYPE_ID` op 2, which it
-    /// lowers to on every backend.
-    CapSelfResolve {
-        name_ptr: ValIdx,
-        name_len: ValIdx,
-    },
-    /// §7 capability **reflection** (`cap.self.label`): write the human-readable **label** of the
-    /// capability `handle` into the window at `buf_ptr` (up to `buf_cap` bytes), returning the label's
-    /// full byte length — `0` if the handle has no label. The reverse of [`Inst::CapSelfResolve`]: a
-    /// guest enumerating its handles (`cap.self.count`/`get`) can name each one for diagnostics /
-    /// discovery. Cosmetic and authority-neutral (a label is not a nominal type_id; the verifier
-    /// ignores it). If the label doesn't fit (`buf_cap < len`) nothing is written — the guest retries
-    /// with a buffer of the returned size. An out-of-window buffer is `-EFAULT`.
-    CapSelfLabel {
-        handle: ValIdx,
-        buf_ptr: ValIdx,
-        buf_cap: ValIdx,
-    },
+    // §7 capability **reflection** — `cap.self.count` / `.get` / `.resolve` / `.label` / `.attest`
+    // are no longer first-class IR ops. Every backend lowered them to `cap.call CAP_SELF_TYPE_ID op N`
+    // (op 0/1/2/3/4), so the wire rev retired the typed fronts to that generic `CapCall` form (svm-llvm
+    // builds it, svm-text spells the `cap.self.*` sugar over it, and the runtime CAP_SELF handler
+    // dispatches on `op`). `cap.self.type_id`/`covers` stay typed ops below: they carry a type-section
+    // index, not expressible as a plain `cap.call` immediate.
     /// `cap.self.type_id <ty>` (IMPORTS.md §3.5): intern **this module's** type-section entry
     /// `ty` (a [`TypeEntry::Interface`]) in the domain's host and return the runtime `type_id`
     /// as `i32`. Authority-neutral pure reflection — the shape is already the module's own
@@ -2206,23 +2146,6 @@ pub enum Inst {
         handle: ValIdx,
         ty: u32,
     },
-    /// §6 (PROCESS.md) capability **attestation** (`cap.self.attest`) — the non-interposable **trust
-    /// anchor**. Reports the calling domain's platform-vouched provenance as a packed `i32`:
-    /// `tier (bits 0..8) | (window_exposed << 8) | (freeze_exposed << 9)`.
-    /// - `tier` — the §2 isolation tier (`0`/`1` in-process, `3` separate-process): the strongest
-    ///   isolation the domain can *require* from a distrusted host (tiers 0/1 are never a Spectre
-    ///   boundary; a domain needing that must see `3` or refuse).
-    /// - `window_exposed` — `1` iff an **ancestor** (not just the platform) holds map/read/pager
-    ///   rights over the domain's backing (a §14 nested carve is exposed; a platform-minted or root
-    ///   window is not) — the "who can read my memory" bit (O5: a single bit, not an authority set).
-    /// - `freeze_exposed` — `1` iff an ancestor may **snapshot** the domain (a snapshot *is* a read),
-    ///   so a domain is confidential (freezable by nobody below the platform) or ancestor-durable,
-    ///   never both.
-    ///
-    /// Like the rest of `cap.self`, it is a D46 runtime-resolved **intrinsic** (never a handle-table
-    /// entry), so no parent can interpose it and lie — the one report a hostile nested host cannot
-    /// forge. Read-only, authority-neutral, adds no grant-graph edge. Result is `i32`.
-    CapSelfAttest,
     /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
     /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
     /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
@@ -2262,31 +2185,28 @@ pub enum Inst {
         func: ValIdx,
         sp: ValIdx,
     },
-    /// §12 fiber resume (`cont.resume`): switch to fiber `k` (an `i32` handle), delivering
-    /// `arg` (`i64`) — the argument to the fiber's function on the first resume, or the
-    /// result of the fiber's `suspend` on later resumes. Runs the fiber until it suspends
-    /// or returns, then yields `(status: i32, value: i64)`: `status` 0 = **suspended** (the
-    /// fiber stays resumable), 1 = **returned** (the fiber is done; resuming it again
+    /// §12 fiber resume (`cont.resume` / `cont.resume.block`): switch to fiber `k` (an `i32`
+    /// handle), delivering `arg` (`i64`) — the argument to the fiber's function on the first
+    /// resume, or the result of the fiber's `suspend` on later resumes. Runs the fiber until it
+    /// suspends or returns, then yields `(status: i32, value: i64)`: `status` 0 = **suspended**
+    /// (the fiber stays resumable), 1 = **returned** (the fiber is done; resuming it again
     /// traps). A **call-clobbering** control op — like a call it switches stacks, but it
     /// does not end the block.
+    ///
+    /// The `block: true` form (`cont.resume.block`, ISSUES.md I48) is an advisory scheduling
+    /// hint — returning `FIBER_PARKED (3)` is always conforming, so a guest still loops for
+    /// completion; it issues this form only when it has nothing else to run, to avoid
+    /// busy-polling a lone parked fiber. After the parity commits the cooperative bytecode
+    /// driver genuinely idles the resumer (`TaskState::BlockedOnFiber`, zero fuel), the
+    /// wasm-JIT inherits that via its `DriveMode::InterpDriven` fold, and the Cranelift JIT
+    /// parks the resumer's OS thread on `Domain.futex_cv` via the `fiber_resume_block` thunk;
+    /// only the OS-thread-parallel bytecode drivers (`drive_parallel`, single-vCPU
+    /// `Vcpu::run`) take the advisory `FIBER_PARKED` downgrade. `block: false` never idles.
+    /// Advisory only — no new semantics, invariant 9 preserved.
     ContResume {
         k: ValIdx,
         arg: ValIdx,
-    },
-    /// §12 fiber resume, **blocking** variant (`cont.resume.block`, ISSUES.md I48). Identical to
-    /// [`Inst::ContResume`] — same `(status: i32, value: i64)` result, same 0/1 statuses — except
-    /// the runtime **may idle the resuming vCPU** on the resumed fiber's own registered waiter
-    /// (futex notify / timeout / completion / revoke) instead of returning the runtime-only
-    /// `FIBER_PARKED (3)` poll status. This is an **advisory scheduling hint**, not a new
-    /// semantics: returning `FIBER_PARKED` is always a conforming implementation, so a guest must
-    /// still loop for completion exactly as with `cont.resume`; the guest issues this form only
-    /// when it has *nothing else to run* (DESIGN.md §12 — mechanism, not policy) to avoid
-    /// busy-polling a lone parked fiber. Because a `FIBER_PARKED` return conforms, the fast
-    /// backends and the deterministic explorer alias it to `cont.resume` (no idle core needed, no
-    /// compile veto, no divergence — invariant 9); only the tree-walk M:N scheduler idles.
-    ContResumeBlock {
-        k: ValIdx,
-        arg: ValIdx,
+        block: bool,
     },
     /// §12 fiber suspend (`suspend`): from within a running fiber, suspend back to the
     /// resumer delivering `value` (`i64`); evaluates to the `i64` `arg` of the next resume.
@@ -2410,11 +2330,10 @@ pub enum Inst {
     /// `v128.load`: read 16 little-endian bytes from the confined effective address
     /// `addr + offset` into a `v128`. The single widened (16-byte) masked access — the
     /// only escape-TCB delta SIMD adds (§17/D58); confinement masking is implicit, as for
-    /// [`Inst::Load`]. `align` is a hint (see [`Inst::Load`]).
+    /// [`Inst::Load`].
     V128Load {
         addr: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// `v128.store`: write the 16 little-endian bytes of `value` at the confined effective
     /// address. Produces no SSA result (like [`Inst::Store`]).
@@ -2422,7 +2341,6 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// `<shape>.splat`: broadcast a scalar (the shape's [`VShape::lane_val`] type) into
     /// every lane, producing a `v128`.
@@ -2643,11 +2561,6 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
-    /// `simd.width_bytes`: the host's supported SIMD vector width in bytes, as an `i32`.
-    /// The §17/D58 **feature-detection hook**. In the fixed-128 MVP this is the constant
-    /// `16` on every backend (so it stays deterministic across the interp↔JIT oracle); it
-    /// becomes a real runtime query when feature-detected wider widths (`v256`/`v512`) land.
-    SimdWidthBytes,
 }
 
 /// What an instruction can do **besides** producing its SSA result(s) — the single source of truth
@@ -2734,9 +2647,6 @@ impl Inst {
             | Inst::DataSym { .. }
             | Inst::DataSelf { .. }
             | Inst::DataTop
-            | Inst::PtrAdd { .. }
-            | Inst::PtrCast { .. }
-            | Inst::SimdWidthBytes
             | Inst::Splat { .. }
             | Inst::ExtractLane { .. }
             | Inst::ReplaceLane { .. }
@@ -2813,7 +2723,7 @@ impl Inst {
 
             // ---- Fibers, threads, and non-local control transfer. ----
             Inst::ContNew { .. } => fx(false, false, false, true), // allocates a fiber; runs nothing yet
-            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } | Inst::Suspend { .. } => {
+            Inst::ContResume { .. } | Inst::Suspend { .. } => {
                 fx(true, true, true, true) // stack switch → clobber
             }
             Inst::SetJmp { .. } => fx(true, false, true, true), // writes an opaque token into the guest jmp_buf
@@ -2825,18 +2735,14 @@ impl Inst {
             // out-of-window buffer.
             Inst::GcRoots { .. } => fx(true, true, true, true),
 
-            // ---- Ambient runtime-state intrinsics (`cap.self.*`, `vcpu.tls`, durable shadow base).
-            // Authority-neutral and read-only over guest memory, but they touch mutable runtime state
-            // (the handle table, the per-vCPU TLS word), so they carry `side_effect` — never CSE'd
-            // across a clobber, never removed. ----
-            Inst::CapSelfCount
-            | Inst::CapSelfAttest
-            | Inst::VcpuTlsGet
-            | Inst::VcpuTlsSet { .. }
-            | Inst::DurableShadowBase => fx(false, false, false, true),
-            Inst::CapSelfGet { .. } => fx(true, false, false, true), // out-of-range idx traps
-            Inst::CapSelfResolve { .. } => fx(false, true, false, true), // reads a name from guest mem (OOB → -errno)
-            Inst::CapSelfLabel { .. } => fx(false, false, true, true), // writes the label into guest mem (OOB → -errno)
+            // ---- Ambient runtime-state intrinsics (`vcpu.tls`, durable shadow base). Authority-neutral
+            // and read-only over guest memory, but they touch mutable runtime state (the per-vCPU TLS
+            // word), so they carry `side_effect` — never CSE'd across a clobber, never removed. The
+            // `cap.self.count`/`get`/`resolve`/`label`/`attest` reflection ops are now `cap.call
+            // CAP_SELF` and take the generic `CapCall` effects. ----
+            Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } | Inst::DurableShadowBase => {
+                fx(false, false, false, true)
+            }
             // §3.5 reflection: `type_id` interns into the host table (mutable runtime state);
             // `covers` probes a handle (dead handle → -errno, no trap).
             Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => fx(false, false, false, true),
@@ -2865,14 +2771,11 @@ impl Inst {
             | Inst::DataSelf { .. }
             | Inst::DataTop
             | Inst::RefFunc { .. }
-            | Inst::CapSelfCount
-            | Inst::CapSelfAttest
             | Inst::CapSelfTypeId { .. }
             | Inst::ExportHandle { .. }
             | Inst::VcpuTlsGet
             | Inst::DurableShadowBase
-            | Inst::AtomicFence { .. }
-            | Inst::SimdWidthBytes => {}
+            | Inst::AtomicFence { .. } => {}
 
             // Exactly one operand, named `a`.
             Inst::IntUn { a, .. }
@@ -2883,11 +2786,9 @@ impl Inst {
             | Inst::FToITrap { a, .. }
             | Inst::IToFConv { a, .. }
             | Inst::Cast { a, .. }
-            | Inst::PtrCast { a, .. }
             | Inst::Load { addr: a, .. }
             | Inst::AtomicLoad { addr: a, .. }
             | Inst::V128Load { addr: a, .. }
-            | Inst::CapSelfGet { idx: a }
             | Inst::VcpuTlsSet { val: a }
             | Inst::Suspend { value: a }
             | Inst::SetJmp { buf: a }
@@ -2912,7 +2813,6 @@ impl Inst {
             | Inst::IntCmp { a, b, .. }
             | Inst::FBin { a, b, .. }
             | Inst::FCmp { a, b, .. }
-            | Inst::PtrAdd { a, b }
             | Inst::Store {
                 addr: a, value: b, ..
             }
@@ -2929,12 +2829,7 @@ impl Inst {
                 addr: a, count: b, ..
             }
             | Inst::ContNew { func: a, sp: b }
-            | Inst::ContResume { k: a, arg: b }
-            | Inst::ContResumeBlock { k: a, arg: b }
-            | Inst::CapSelfResolve {
-                name_ptr: a,
-                name_len: b,
-            }
+            | Inst::ContResume { k: a, arg: b, .. }
             | Inst::LongJmp { buf: a, val: b }
             | Inst::ThreadSpawn { sp: a, arg: b, .. }
             | Inst::ReplaceLane { a, b, .. }
@@ -2985,15 +2880,6 @@ impl Inst {
                 f(a);
                 f(b);
                 f(c);
-            }
-            Inst::CapSelfLabel {
-                handle,
-                buf_ptr,
-                buf_cap,
-            } => {
-                f(handle);
-                f(buf_ptr);
-                f(buf_cap);
             }
             Inst::AtomicCmpxchg {
                 addr,
@@ -3079,18 +2965,13 @@ impl Inst {
             | Inst::V128Store { .. } => 0,
             // `vcpu.tls.get` appends one `i64`; `durable.shadow_base` likewise (a window byte offset).
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
-            // `cont.resume` (and its blocking variant) are the multi-result non-call ops: `(status, value)`.
-            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => 2,
-            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`resolve`/`label` append
-            // one `i32`.
-            Inst::CapSelfGet { .. } => 2,
-            Inst::CapSelfCount
-            | Inst::CapSelfResolve { .. }
-            | Inst::CapSelfLabel { .. }
-            | Inst::CapSelfAttest
-            | Inst::CapSelfTypeId { .. }
-            | Inst::CapSelfCovers { .. }
-            | Inst::ExportHandle { .. } => 1,
+            // `cont.resume` (in both its blocking and non-blocking forms) is the multi-result non-call op: `(status, value)`.
+            Inst::ContResume { .. } => 2,
+            // `cap.self.type_id`/`covers` append one `i32`. (The `cap.self.count`/`get`/`resolve`/
+            // `label`/`attest` reflection ops are now `cap.call CAP_SELF` — counted by their `sig`.)
+            Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. } => {
+                1
+            }
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),
@@ -3242,7 +3123,6 @@ impl Func {
                     i,
                     Inst::ContNew { .. }
                         | Inst::ContResume { .. }
-                        | Inst::ContResumeBlock { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadSpawn { .. }
                         | Inst::ThreadJoin { .. }
@@ -3264,10 +3144,7 @@ impl Func {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    Inst::ContNew { .. }
-                        | Inst::ContResume { .. }
-                        | Inst::ContResumeBlock { .. }
-                        | Inst::Suspend { .. }
+                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
                 )
             })
         })
@@ -3299,7 +3176,6 @@ impl Func {
                     i,
                     Inst::ContNew { .. }
                         | Inst::ContResume { .. }
-                        | Inst::ContResumeBlock { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadSpawn { .. }
                         | Inst::ThreadJoin { .. }
@@ -3650,7 +3526,6 @@ pub fn synth_manifest_start(
                 addr,
                 value,
                 offset: 0,
-                align: 0,
             });
         }
     }
@@ -5411,7 +5286,6 @@ mod effects_tests {
                 a: 0,
             },
             Inst::RefFunc { func: 0 },
-            Inst::PtrAdd { a: 0, b: 1 },
             Inst::Splat {
                 shape: VShape::I32x4,
                 a: 0,
@@ -5452,7 +5326,6 @@ mod effects_tests {
             op: LoadOp::I64,
             addr: 0,
             offset: 0,
-            align: 0,
         }
         .effects();
         assert!(load.can_trap && load.reads_mem && !load.writes_mem && !load.side_effect);
@@ -5463,7 +5336,6 @@ mod effects_tests {
             addr: 0,
             value: 1,
             offset: 0,
-            align: 0,
         }
         .effects();
         assert!(store.can_trap && store.writes_mem && !store.reads_mem);
@@ -5476,7 +5348,6 @@ mod effects_tests {
             ty: IntTy::I32,
             addr: 0,
             offset: 0,
-            order: Ordering::SeqCst,
         }
         .effects();
         assert!(al.reads_mem && al.side_effect && !al.removable_if_dead());
@@ -5486,7 +5357,6 @@ mod effects_tests {
             addr: 0,
             value: 1,
             offset: 0,
-            order: Ordering::SeqCst,
         }
         .effects();
         assert!(rmw.reads_mem && rmw.writes_mem && rmw.side_effect && rmw.can_trap);
@@ -5516,7 +5386,11 @@ mod effects_tests {
                 handle: 0,
                 args: vec![],
             },
-            Inst::ContResume { k: 0, arg: 1 },
+            Inst::ContResume {
+                k: 0,
+                arg: 1,
+                block: false,
+            },
             Inst::ThreadJoin { handle: 0 },
             Inst::GcRoots {
                 heap_lo: 0,
@@ -5535,14 +5409,14 @@ mod effects_tests {
 
     #[test]
     fn ambient_intrinsics_carry_a_side_effect_but_no_guest_memory() {
-        // `cap.self`/`vcpu.tls`/durable-shadow read or write *runtime* state, not guest memory.
-        let count = Inst::CapSelfCount.effects();
-        assert!(count.side_effect && !count.reads_mem && !count.writes_mem && !count.can_trap);
-        assert!(!count.removable_if_dead());
-        let get = Inst::CapSelfGet { idx: 0 }.effects();
-        assert!(get.can_trap && get.side_effect, "out-of-range idx traps");
+        // `vcpu.tls`/durable-shadow read or write *runtime* state, not guest memory. (The `cap.self.*`
+        // reflection ops are now `cap.call CAP_SELF` and take the generic full-clobber `CapCall`
+        // effects.)
         let tls = Inst::VcpuTlsGet.effects();
-        assert!(tls.side_effect && !tls.can_trap);
+        assert!(tls.side_effect && !tls.reads_mem && !tls.writes_mem && !tls.can_trap);
+        assert!(!tls.removable_if_dead());
+        let shadow = Inst::DurableShadowBase.effects();
+        assert!(shadow.side_effect && !shadow.can_trap);
     }
 
     #[test]

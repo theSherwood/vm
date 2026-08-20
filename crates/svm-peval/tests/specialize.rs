@@ -46,12 +46,7 @@ fn encode(program: &[(u8, i64)]) -> Vec<u8> {
 /// `interp(input: i64) -> i64`.
 fn build_interpreter(program: &[(u8, i64)]) -> Module {
     let i64t = || ValType::I64;
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
     let add = |a, b| Inst::IntBin {
         ty: IntTy::I64,
         op: BinOp::Add,
@@ -341,18 +336,12 @@ const STACK_HI: u64 = 32768 + 512; // 64 i64 slots
 /// window (8-byte slots based at `STACK_LO`, addressed by a stack pointer `sp`).
 fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
     let i64t = || ValType::I64;
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
     let store = |addr, value| Inst::Store {
         op: StoreOp::I64,
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let bin = |op, a, b| Inst::IntBin {
         ty: IntTy::I64,
@@ -524,13 +513,11 @@ fn renamed_cell_flows_across_a_dynamic_branch() {
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let ld = |addr| Inst::Load {
         op: LoadOp::I64,
         addr,
         offset: 0,
-        align: 0,
     };
     let h = Module {
         funcs: vec![Func {
@@ -672,7 +659,6 @@ fn overlay_bytes_drive_folding() {
                         op: LoadOp::I64,
                         addr: 0,
                         offset: 0,
-                        align: 0,
                     }, // 1
                 ],
                 term: Terminator::Return(vec![1]),
@@ -757,7 +743,6 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
                 op: LoadOp::I32_8U,
                 addr: 4,
                 offset: 0,
-                align: 0,
             }, // 5: op
         ],
         term: Terminator::BrTable {
@@ -863,13 +848,11 @@ fn private_rename_allows_dynamic_heap_access() {
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let ld = |addr| Inst::Load {
         op: LoadOp::I64,
         addr,
         offset: 0,
-        align: 0,
     };
     let h = Module {
         funcs: vec![Func {
@@ -1300,12 +1283,7 @@ fn dynamic_branch_in_callee_inlines_as_cfg() {
 // the dispatch *and* inline the helpers, leaving the bare compiled program.
 fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
     let i64t = || ValType::I64;
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
     let add = |a, b| Inst::IntBin {
         ty: IntTy::I64,
         op: BinOp::Add,
@@ -1471,13 +1449,11 @@ fn narrow_constant_cells_round_trip_with_extension() {
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let ld = |op, addr| Inst::Load {
         op,
         addr,
         offset: 0,
-        align: 0,
     };
     let ext = |a| Inst::Convert {
         op: ConvOp::ExtendI32S,
@@ -1557,13 +1533,11 @@ fn narrow_store_overwrites_overlapping_cell() {
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let ld = |op, addr| Inst::Load {
         op,
         addr,
         offset: 0,
-        align: 0,
     };
     let m = Module {
         funcs: vec![Func {
@@ -1602,13 +1576,11 @@ fn narrow_dynamic_cell_roundtrips_but_overlap_is_unsupported() {
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let ld = |op, addr| Inst::Load {
         op,
         addr,
         offset: 0,
-        align: 0,
     };
 
     // A narrow store of a *dynamic* value renames as an `i32`-canonical narrow cell (the `TValue` tag
@@ -2557,7 +2529,6 @@ fn indirect_call_through_constant_memory_table_inlines() {
                             op: LoadOp::I32,
                             addr: 1,
                             offset: 0,
-                            align: 0,
                         }, // 2: funcref (folds to 1)
                         Inst::CallIndirect {
                             ty: i64_to_i64(),
@@ -2916,13 +2887,11 @@ fn outlining_threads_a_renamed_cell_across_a_call() {
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let ld = |addr| Inst::Load {
         op: LoadOp::I64,
         addr,
         offset: 0,
-        align: 0,
     };
     let m = Module {
         funcs: vec![

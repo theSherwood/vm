@@ -445,12 +445,12 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = i64.const 5
-  i64.atomic.store.release v0 v1
-  v2 = i64.atomic.load.acquire v0
+  i64.atomic.store v0 v1
+  v2 = i64.atomic.load v0
   atomic.fence
   atomic.fence.acquire
   v3 = i64.const 3
-  v4 = i64.atomic.rmw.add.relaxed v0 v3
+  v4 = i64.atomic.rmw.add v0 v3
   v5 = i64.atomic.load v0
   v6 = i64.add v2 v5
   return v6

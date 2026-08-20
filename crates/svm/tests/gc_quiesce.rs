@@ -1,7 +1,7 @@
 //! Reference stop-the-world **quiesce barrier** for guest-coordinated GC (GC.md §2.1).
 //!
 //! svm provides **no** world-stop primitive — STW is pure guest code over the existing window
-//! atomics + futex (`i32.atomic.load.acquire` / `i32.atomic.store.release` / `i32.atomic.wait` /
+//! atomics + futex (`i32.atomic.load` / `i32.atomic.store` / `i32.atomic.wait` /
 //! `atomic.notify`) and `thread.spawn`/`thread.join`. This test *is* the reference: it builds the
 //! barrier parametrically in `N` vCPUs and exercises it end-to-end on **both** backends, so a guest
 //! (e.g. JACL) has a tested pattern to copy. svm wraps only the collector↔vCPU rendezvous; the
@@ -75,7 +75,7 @@ block 0 (msp: i64, mme: i64) {
 }
 block 1 (twa: i64, tpa: i64, tc: i32) {
   tsa = i64.const 264
-  tst = i32.atomic.load.acquire tsa
+  tst = i32.atomic.load tsa
   tone = i32.const 1
   tis = i32.eq tst tone
   br_if tis 2(twa, tpa, tc) 3(twa, tpa, tc)
@@ -83,15 +83,15 @@ block 1 (twa: i64, tpa: i64, tc: i32) {
 block 2 (swa: i64, spa: i64, sc: i32) {
   sva = i64.const 268
   sone = i32.const 1
-  i32.atomic.store.release sva sone
+  i32.atomic.store sva sone
   br 3(swa, spa, sc)
 }
 block 3 (bwa: i64, bpa: i64, bc: i32) {
   bone = i32.const 1
   bcv = i32.add bc bone
-  i32.atomic.store.release bwa bcv
+  i32.atomic.store bwa bcv
   bea = i64.const 256
-  be = i32.atomic.load.acquire bea
+  be = i32.atomic.load bea
   bz = i32.const 0
   bchg = i32.ne be bz
   br_if bchg 5(bpa) 4(bwa, bpa, bcv)
@@ -103,14 +103,14 @@ block 4 (kwa: i64, kpa: i64, kc: i32) {
 }
 block 5 (ppa: i64) {
   pone = i32.const 1
-  i32.atomic.store.release ppa pone
+  i32.atomic.store ppa pone
   pcnt = i32.const 1
   pnfy = atomic.notify ppa pcnt
   br 6()
 }
 block 6 () {
   rra = i64.const 260
-  rr = i32.atomic.load.acquire rra
+  rr = i32.atomic.load rra
   rone = i32.const 1
   riseq = i32.eq rr rone
   br_if riseq 8() 7(rr)
@@ -160,13 +160,13 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         writeln!(s, "  {arg} = i64.const {i}").unwrap();
         writeln!(s, "  {h} = thread.spawn 1 {sp} {arg}").unwrap();
         writeln!(s, "  {ha} = i64.const {}", HANDLE_BASE + i * 4).unwrap();
-        writeln!(s, "  i32.atomic.store.release {ha} {h}").unwrap();
+        writeln!(s, "  i32.atomic.store {ha} {h}").unwrap();
     }
     let ea = fresh(&mut nv);
     let one = fresh(&mut nv);
     writeln!(s, "  {ea} = i64.const {EPOCH}").unwrap();
     writeln!(s, "  {one} = i32.const 1").unwrap();
-    writeln!(s, "  i32.atomic.store.release {ea} {one}").unwrap();
+    writeln!(s, "  i32.atomic.store {ea} {one}").unwrap();
     let ea2 = fresh(&mut nv);
     let wake = fresh(&mut nv);
     let nfy = fresh(&mut nv);
@@ -188,7 +188,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         let one = fresh(&mut nv);
         let iseq = fresh(&mut nv);
         writeln!(s, "  {pa} = i64.const {pa_off}").unwrap();
-        writeln!(s, "  {p} = i32.atomic.load.acquire {pa}").unwrap();
+        writeln!(s, "  {p} = i32.atomic.load {pa}").unwrap();
         writeln!(s, "  {one} = i32.const 1").unwrap();
         writeln!(s, "  {iseq} = i32.eq {p} {one}").unwrap();
         writeln!(s, "  br_if {iseq} {}() {}()", wpc(i), wpw(i)).unwrap();
@@ -214,7 +214,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         let z2 = fresh(&mut nv);
         let nz = fresh(&mut nv);
         writeln!(s, "  {wa} = i64.const {wa_off}").unwrap();
-        writeln!(s, "  {w} = i32.atomic.load.acquire {wa}").unwrap();
+        writeln!(s, "  {w} = i32.atomic.load {wa}").unwrap();
         writeln!(s, "  {z2} = i32.const 0").unwrap();
         writeln!(s, "  {nz} = i32.ne {w} {z2}").unwrap();
         writeln!(s, "  br_if {nz} {}() {}()", next_after(i), setwf(i)).unwrap();
@@ -226,7 +226,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         let one2 = fresh(&mut nv);
         writeln!(s, "  {wf} = i64.const {WORKFAIL}").unwrap();
         writeln!(s, "  {one2} = i32.const 1").unwrap();
-        writeln!(s, "  i32.atomic.store.release {wf} {one2}").unwrap();
+        writeln!(s, "  i32.atomic.store {wf} {one2}").unwrap();
         writeln!(s, "  br {}()", next_after(i)).unwrap();
         writeln!(s, "  }}").unwrap();
     }
@@ -237,18 +237,18 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
     let one = fresh(&mut nv);
     writeln!(s, "  {sa} = i64.const {STOPPED}").unwrap();
     writeln!(s, "  {one} = i32.const 1").unwrap();
-    writeln!(s, "  i32.atomic.store.release {sa} {one}").unwrap();
+    writeln!(s, "  i32.atomic.store {sa} {one}").unwrap();
     // (a real collector calls gc.roots(…) here — see gc_roots.rs; orthogonal to the barrier.)
     let sa2 = fresh(&mut nv);
     let z = fresh(&mut nv);
     writeln!(s, "  {sa2} = i64.const {STOPPED}").unwrap();
     writeln!(s, "  {z} = i32.const 0").unwrap();
-    writeln!(s, "  i32.atomic.store.release {sa2} {z}").unwrap();
+    writeln!(s, "  i32.atomic.store {sa2} {z}").unwrap();
     let ra = fresh(&mut nv);
     let one2 = fresh(&mut nv);
     writeln!(s, "  {ra} = i64.const {RELEASE}").unwrap();
     writeln!(s, "  {one2} = i32.const 1").unwrap();
-    writeln!(s, "  i32.atomic.store.release {ra} {one2}").unwrap();
+    writeln!(s, "  i32.atomic.store {ra} {one2}").unwrap();
     let ra2 = fresh(&mut nv);
     let wake = fresh(&mut nv);
     let nfy = fresh(&mut nv);
@@ -265,7 +265,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         let h = fresh(&mut nv);
         let jr = fresh(&mut nv);
         writeln!(s, "  {ha} = i64.const {}", HANDLE_BASE + i * 4).unwrap();
-        writeln!(s, "  {h} = i32.atomic.load.acquire {ha}").unwrap();
+        writeln!(s, "  {h} = i32.atomic.load {ha}").unwrap();
         writeln!(s, "  {jr} = thread.join {h}").unwrap();
         let nxt = if i < m - 1 { join(i + 1) } else { final_blk };
         writeln!(s, "  br {nxt}()").unwrap();
@@ -281,10 +281,10 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
     let wfi = fresh(&mut nv);
     let wfl = fresh(&mut nv);
     writeln!(s, "  {va} = i64.const {VIOLATION}").unwrap();
-    writeln!(s, "  {vi} = i32.atomic.load.acquire {va}").unwrap();
+    writeln!(s, "  {vi} = i32.atomic.load {va}").unwrap();
     writeln!(s, "  {viol} = i64.extend_i32_u {vi}").unwrap();
     writeln!(s, "  {wfa} = i64.const {WORKFAIL}").unwrap();
-    writeln!(s, "  {wfi} = i32.atomic.load.acquire {wfa}").unwrap();
+    writeln!(s, "  {wfi} = i32.atomic.load {wfa}").unwrap();
     writeln!(s, "  {wfl} = i64.extend_i32_u {wfi}").unwrap();
     writeln!(s, "  return {viol} {wfl}").unwrap();
     s.push_str("  }\n");

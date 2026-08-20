@@ -563,7 +563,11 @@ fn gen_fiber_root(g: &mut Gen, suspends: u32) -> Func {
         insts.push(Inst::ConstI64(g.u64v() as i64));
         let a = next;
         next += 1;
-        insts.push(Inst::ContResume { k, arg: a });
+        insts.push(Inst::ContResume {
+            k,
+            arg: a,
+            block: false,
+        });
         next += 1; // status (i32)
         let val = next; // delivered value (i64)
         next += 1;
@@ -735,7 +739,11 @@ fn gen_recycle_root(g: &mut Gen, throwaways: u32, suspends: u32) -> Func {
         insts.push(Inst::ConstI64(g.u64v() as i64));
         let a = next;
         next += 1;
-        insts.push(Inst::ContResume { k, arg: a });
+        insts.push(Inst::ContResume {
+            k,
+            arg: a,
+            block: false,
+        });
         next += 1; // status (i32)
         let val = next; // delivered value (A's return)
         next += 1;
@@ -752,7 +760,11 @@ fn gen_recycle_root(g: &mut Gen, throwaways: u32, suspends: u32) -> Func {
         insts.push(Inst::ConstI64(g.u64v() as i64));
         let a = next;
         next += 1;
-        insts.push(Inst::ContResume { k: kb, arg: a });
+        insts.push(Inst::ContResume {
+            k: kb,
+            arg: a,
+            block: false,
+        });
         next += 1; // status (i32)
         let val = next; // delivered value (i64)
         next += 1;

@@ -137,7 +137,7 @@ block 0 (v0: i32) {\n\
   v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)\n\
   v6 = i64.const 69632\n\
   v7 = i32.const 1\n\
-  i32.atomic.store.release v6 v7\n\
+  i32.atomic.store v6 v7\n\
   v8 = atomic.notify v6 v7\n\
   v9 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
   v10 = i64.const 10\n\

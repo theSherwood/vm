@@ -407,7 +407,6 @@ fn wrap_with_heap(residual: &Module, entry: u32, w: &[u8], x_addr: u64) -> (Modu
                     op: LoadOp::I64,
                     addr: 3,
                     offset: 0,
-                    align: 8,
                 }, // v4
             ],
             term: Terminator::Return(vec![4]),

@@ -5365,8 +5365,6 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::FToITrap { .. }
                 | Inst::IToFConv { .. }
                 | Inst::Cast { .. }
-                | Inst::PtrAdd { .. }
-                | Inst::PtrCast { .. }
                 | Inst::Load { .. }
                 | Inst::Store { .. }
                 | Inst::MemCopy { .. }
@@ -5404,15 +5402,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::VNot { .. }
                 | Inst::Bitselect { .. }
                 | Inst::Shuffle { .. }
-                | Inst::Swizzle { .. }
-                | Inst::SimdWidthBytes => {}
-                // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
-                // serviced host-side like any cap op — so it matches the interpreter.
-                Inst::CapSelfCount
-                | Inst::CapSelfAttest
-                | Inst::CapSelfGet { .. }
-                | Inst::CapSelfResolve { .. }
-                | Inst::CapSelfLabel { .. } => {}
+                | Inst::Swizzle { .. } => {}
                 // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
                 // (works for a plain non-fiber root), so supported on every target.
                 Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
@@ -5462,12 +5452,11 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
+                // I48: the `block: true` form lowers to a resume thunk that parks the OS thread on
+                // the domain condvar (see below); `block: false` returns FIBER_PARKED and the guest
+                // loops. Both accepted wherever `cont.resume` is.
                 Inst::ContNew { .. }
                 | Inst::ContResume { .. }
-                // I48: the blocking variant lowers to the same resume thunk (advisory — the JIT
-                // vCPU is a real thread, so it returns FIBER_PARKED and the guest loops; the
-                // oracle is the tier that idles). Accepted wherever `cont.resume` is.
-                | Inst::ContResumeBlock { .. }
                 | Inst::Suspend { .. }
                 | Inst::ThreadSpawn { .. }
                 | Inst::ThreadJoin { .. }
@@ -6345,106 +6334,9 @@ fn lower_block(
             )?;
             continue;
         }
-        // §7/§6 capability reflection: lower to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`
-        // (op 0 = count, op 1 = get, op 4 = attest) — the host services it directly, matching the
-        // interpreter. The handle is unused there, so pass a constant 0.
-        if matches!(
-            inst,
-            Inst::CapSelfCount | Inst::CapSelfGet { .. } | Inst::CapSelfAttest
-        ) {
-            let h0 = b.ins().iconst(I32, 0);
-            let (op, sig, call_args): (u32, FuncType, &[u32]) = match inst {
-                Inst::CapSelfCount => (
-                    0,
-                    FuncType {
-                        params: vec![],
-                        results: vec![ValType::I32],
-                    },
-                    &[],
-                ),
-                // §6 `cap.self.attest` — op 4, no args, one packed `i32` (the non-interposable trust
-                // anchor; the child host's provenance the thunk reports).
-                Inst::CapSelfAttest => (
-                    4,
-                    FuncType {
-                        params: vec![],
-                        results: vec![ValType::I32],
-                    },
-                    &[],
-                ),
-                Inst::CapSelfGet { idx } => (
-                    1,
-                    FuncType {
-                        params: vec![ValType::I32],
-                        results: vec![ValType::I32, ValType::I32],
-                    },
-                    std::slice::from_ref(idx),
-                ),
-                _ => unreachable!(),
-            };
-            lower_cap_call(
-                module,
-                b,
-                lower,
-                svm_ir::CAP_SELF_TYPE_ID,
-                op,
-                &sig,
-                h0,
-                call_args,
-                &mut vals,
-            )?;
-            continue;
-        }
-        // §7 `cap.self.resolve` — op 2 over the reserved `CAP_SELF_TYPE_ID`, with a `(name_ptr,
-        // name_len)` buffer (the thunk reads the window to resolve the name, like any cap op). One
-        // i32 result; the handle operand is unused (constant 0), as for count/get.
-        if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
-            let h0 = b.ins().iconst(I32, 0);
-            let sig = FuncType {
-                params: vec![ValType::I64, ValType::I64],
-                results: vec![ValType::I32],
-            };
-            let call_args = [*name_ptr, *name_len];
-            lower_cap_call(
-                module,
-                b,
-                lower,
-                svm_ir::CAP_SELF_TYPE_ID,
-                2,
-                &sig,
-                h0,
-                &call_args,
-                &mut vals,
-            )?;
-            continue;
-        }
-        // §7 `cap.self.label` — op 3 over `CAP_SELF_TYPE_ID`: `(handle, buf_ptr, buf_cap)` → label len
-        // (the thunk writes the label into the window). One i32 result; cap.call handle unused (0).
-        if let Inst::CapSelfLabel {
-            handle,
-            buf_ptr,
-            buf_cap,
-        } = inst
-        {
-            let h0 = b.ins().iconst(I32, 0);
-            let sig = FuncType {
-                params: vec![ValType::I32, ValType::I64, ValType::I64],
-                results: vec![ValType::I32],
-            };
-            let call_args = [*handle, *buf_ptr, *buf_cap];
-            lower_cap_call(
-                module,
-                b,
-                lower,
-                svm_ir::CAP_SELF_TYPE_ID,
-                3,
-                &sig,
-                h0,
-                &call_args,
-                &mut vals,
-            )?;
-            continue;
-        }
+        // §7/§6 capability reflection (`cap.self.count`/`get`/`resolve`/`label`/`attest`) is no longer
+        // a distinct IR op — the frontend emits its `cap.call CAP_SELF op N` form, lowered by the
+        // generic `Inst::CapCall` arm above (a `lower_cap_call` thunk the host services directly).
         // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
         // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `cap.call`. A thunk that
         // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
@@ -6475,8 +6367,8 @@ fn lower_block(
         // domain condvar and re-resumes until the fiber completes/suspends — a sleep, not a spin,
         // so the JIT idles like the oracle and the cooperative bytecode driver (INVARIANTS.md #9).
         // Both append the two results (status:i32, value:i64) to match the IR's shape.
-        if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
-            let blocking = matches!(inst, Inst::ContResumeBlock { .. });
+        if let Inst::ContResume { k, arg, block } = inst {
+            let blocking = *block;
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
@@ -6893,14 +6785,6 @@ fn lower_block(
                     CastOp::ReinterpF64I64 => b.ins().bitcast(I64, MemFlags::new(), x),
                 }
             }
-            // Pointer ops (§3b/§10): plain 64-bit arithmetic off-CHERI — `ptr.add` is a
-            // wrapping `iadd`, the int↔ptr casts pass the value through. Confinement is
-            // untouched: these produce values; only `load`/`store` accesses are masked.
-            Inst::PtrAdd { a, b: rb } => {
-                let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
-                b.ins().iadd(x, y)
-            }
-            Inst::PtrCast { a, .. } => get(&vals, *a)?,
             Inst::IToFConv { op, a } => {
                 let x = get(&vals, *a)?;
                 let (_, to, signed) = op.parts();
@@ -7446,9 +7330,6 @@ fn lower_block(
                 let y = get(&vals, *rb)?;
                 b.ins().swizzle(x, y)
             }
-            // §17/D58 feature-detect hook: the fixed-128 constant (matches the interpreter).
-            Inst::SimdWidthBytes => b.ins().iconst(I32, 16),
-
             Inst::Load {
                 op, addr, offset, ..
             } => {

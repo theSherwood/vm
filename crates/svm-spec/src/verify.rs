@@ -301,15 +301,6 @@ fn check_inst(
             w(*a, src)?;
             vec![dst]
         }
-        Inst::PtrAdd { a, b } => {
-            w(*a, V::I64)?;
-            w(*b, V::I64)?;
-            vec![V::I64]
-        }
-        Inst::PtrCast { a, .. } => {
-            w(*a, V::I64)?;
-            vec![V::I64]
-        }
 
         // ----- memory (§3b/§4): addresses are i64; every access needs a window -----
         Inst::Load { op, addr, .. } => {
@@ -340,29 +331,17 @@ fn check_inst(
             vec![]
         }
 
-        // ----- atomics (§12): a load may not be release-flavored, a store may not be
-        // acquire-flavored; a fence takes any ordering -----
-        Inst::AtomicLoad {
-            ty, addr, order, ..
-        } => {
+        // ----- atomics (§12): load/store/rmw/cmpxchg execute seq-cst and carry no ordering; only
+        // the fence keeps one (and it accepts any) -----
+        Inst::AtomicLoad { ty, addr, .. } => {
             need_memory(has_memory)?;
-            if !order.valid_for_load() {
-                return Err("atomic load with release ordering".into());
-            }
             w(*addr, V::I64)?;
             vec![ty.val()]
         }
         Inst::AtomicStore {
-            ty,
-            addr,
-            value,
-            order,
-            ..
+            ty, addr, value, ..
         } => {
             need_memory(has_memory)?;
-            if !order.valid_for_store() {
-                return Err("atomic store with acquire ordering".into());
-            }
             w(*addr, V::I64)?;
             w(*value, ty.val())?;
             vec![]
@@ -560,27 +539,8 @@ fn check_inst(
             w(*handle, V::I32)?;
             vec![V::I32]
         }
-        Inst::CapSelfCount => vec![V::I32],
-        Inst::CapSelfAttest => vec![V::I32],
-        Inst::CapSelfGet { idx } => {
-            w(*idx, V::I32)?;
-            vec![V::I32, V::I32]
-        }
-        Inst::CapSelfResolve { name_ptr, name_len } => {
-            w(*name_ptr, V::I64)?;
-            w(*name_len, V::I64)?;
-            vec![V::I32]
-        }
-        Inst::CapSelfLabel {
-            handle,
-            buf_ptr,
-            buf_cap,
-        } => {
-            w(*handle, V::I32)?;
-            w(*buf_ptr, V::I64)?;
-            w(*buf_cap, V::I64)?;
-            vec![V::I32]
-        }
+        // `cap.self.count`/`get`/`resolve`/`label`/`attest` are now `cap.call CAP_SELF op N` — verified
+        // by the generic `CapCall` arm above.
 
         // ----- fibers / threads / TLS (§12) -----
         Inst::ContNew { func, sp } => {
@@ -588,10 +548,10 @@ fn check_inst(
             w(*sp, V::I64)?;
             vec![V::I64]
         }
-        Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } => {
+        Inst::ContResume { k, arg, block: _ } => {
             w(*k, V::I64)?;
             w(*arg, V::I64)?;
-            vec![V::I32, V::I64] // (status, value) — I48 blocking variant types identically
+            vec![V::I32, V::I64] // (status, value) — the I48 blocking form types identically
         }
         Inst::Suspend { value } => {
             w(*value, V::I64)?;
@@ -816,7 +776,6 @@ fn check_inst(
             w(*b, V::V128)?;
             vec![V::V128]
         }
-        Inst::SimdWidthBytes => vec![V::I32],
     };
     types.extend_from_slice(&push);
     Ok(())

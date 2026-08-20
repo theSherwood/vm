@@ -66,7 +66,6 @@ fn offer_funcs() -> Arc<[Func]> {
                 op: LoadOp::I64,
                 addr: 0,
                 offset: 0,
-                align: 8,
             }],
             term: Terminator::Return(vec![1]),
         }],

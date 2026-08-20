@@ -313,7 +313,6 @@ fn wrap_with_heap(
                     op: LoadOp::I64,
                     addr: addr_v,
                     offset: 0,
-                    align: 8,
                 },
             ],
             term: Terminator::Return(vec![addr_v + 1]),

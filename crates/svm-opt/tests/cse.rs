@@ -135,20 +135,17 @@ fn loads_across_a_may_alias_store_are_not_merged() {
                     op: LoadOp::I32,
                     addr: 2,
                     offset: 0,
-                    align: 2,
                 }, // v3 = mem[0]  (x)
                 Inst::Store {
                     op: StoreOp::I32,
                     addr: 1,
                     value: 0,
                     offset: 0,
-                    align: 2,
                 }, // mem[b] = value — may alias mem[0]
                 Inst::Load {
                     op: LoadOp::I32,
                     addr: 2,
                     offset: 0,
-                    align: 2,
                 }, // v4 = mem[0]  (y) — must NOT merge with x
                 add(3, 4),         // v5 = x + y
             ],

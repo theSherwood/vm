@@ -1,5 +1,5 @@
-//! **`cap.self.resolve` outlining** ([`svm_wasm_jit::outline_cap_calls`] also hoists
-//! [`svm_ir::Inst::CapSelfResolve`]) — the transform that lets the on-ramp `_start` synth emit. The
+//! **`cap.self.resolve` outlining** ([`svm_wasm_jit::outline_cap_calls`] hoists it as the
+//! `cap.call CAP_SELF op 2` it now is) — the transform that lets the on-ramp `_start` synth emit. The
 //! powerbox entry is otherwise pure compute + stores, but resolves each granted capability **by name**
 //! (`cap.self.resolve`, a host-boundary reflection op outside the compute subset), so one such call
 //! kept func 0 — and, under the whole-module `call_indirect` rule, the *entire* guest — off the wasm

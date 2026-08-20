@@ -336,16 +336,27 @@ fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx
         let _ = writeln!(s, "  block {} ({}) {{", bi, params.join(", "));
 
         let mut next = b.params.len() as u32; // next value index in this block
+                                              // The value index of the immediately-preceding instruction when it is an `i32.const 0` — the
+                                              // ignored dispatch handle a `cap.self.*` sugar CapCall points at. Lets the printer spell the
+                                              // sugar only when its handle is that adjacent const (so parse re-pairs them exactly); any
+                                              // other CapCall CAP_SELF prints as the raw `cap.call`, which round-trips on its own.
+        let mut prev_const0: Option<u32> = None;
         for inst in &b.insts {
             let n = inst.result_count(fn_results);
             if n == 0 {
                 // No-result instruction (`store`, void `call`): no `vN =` binding.
-                let _ = writeln!(s, "    {}", print_inst(inst, m));
+                let _ = writeln!(s, "    {}", print_inst(inst, m, prev_const0));
             } else {
                 let lhs: Vec<String> = (0..n).map(|k| format!("v{}", next + k as u32)).collect();
-                let _ = writeln!(s, "    {} = {}", lhs.join(", "), print_inst(inst, m));
-                next += n as u32;
+                let _ = writeln!(
+                    s,
+                    "    {} = {}",
+                    lhs.join(", "),
+                    print_inst(inst, m, prev_const0)
+                );
             }
+            prev_const0 = matches!(inst, Inst::ConstI32(0)).then_some(next);
+            next += n as u32;
         }
         let _ = writeln!(s, "    {}", print_term(&b.term));
         s.push_str("  }\n");
@@ -353,7 +364,7 @@ fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx
     s.push_str("}\n");
 }
 
-fn print_inst(inst: &Inst, m: &Module) -> String {
+fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
     match inst {
         Inst::ConstI32(c) => format!("i32.const {c}"),
         Inst::ConstI64(c) => format!("i64.const {c}"),
@@ -381,56 +392,34 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
         Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
         Inst::IToFConv { op, a } => format!("{} v{a}", op.name()),
-        Inst::PtrAdd { a, b } => format!("ptr.add v{a} v{b}"),
-        Inst::PtrCast { to_int, a } => {
-            format!("ptr.{} v{a}", if *to_int { "to_int" } else { "from_int" })
-        }
         Inst::Cast { op, a } => format!("{} v{a}", op.sig().0),
-        Inst::Load {
-            op,
-            addr,
-            offset,
-            align,
-        } => format!("{} v{addr}{}", op.info().0, memarg(*offset, *align)),
+        Inst::Load { op, addr, offset } => {
+            format!("{} v{addr}{}", op.info().0, memarg(*offset))
+        }
         Inst::Store {
             op,
             addr,
             value,
             offset,
-            align,
-        } => format!(
-            "{} v{addr} v{value}{}",
-            op.info().0,
-            memarg(*offset, *align)
-        ),
+        } => format!("{} v{addr} v{value}{}", op.info().0, memarg(*offset)),
         // Bulk-memory ops (D62).
         Inst::MemCopy { dst, src, len } => format!("mem.copy v{dst} v{src} v{len}"),
         Inst::MemMove { dst, src, len } => format!("mem.move v{dst} v{src} v{len}"),
         Inst::MemFill { dst, val, len } => format!("mem.fill v{dst} v{val} v{len}"),
-        // §12 atomics: `<ty>.atomic.<op>[.<order>]`, naturally aligned (no `align=`, only `offset=`).
-        // The default `seqcst` ordering is omitted, so seq-cst atomics round-trip unchanged.
-        Inst::AtomicLoad {
-            ty,
-            addr,
-            offset,
-            order,
-        } => format!(
-            "{}.atomic.load{} v{addr}{}",
-            ty.prefix(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
-        ),
+        // §12 atomics: `<ty>.atomic.<op>`, naturally aligned (no `align=`, only `offset=`).
+        // Execution is uniformly seq-cst; the ordering suffix left the wire at the wire rev.
+        Inst::AtomicLoad { ty, addr, offset } => {
+            format!("{}.atomic.load v{addr}{}", ty.prefix(), memarg(*offset))
+        }
         Inst::AtomicStore {
             ty,
             addr,
             value,
             offset,
-            order,
         } => format!(
-            "{}.atomic.store{} v{addr} v{value}{}",
+            "{}.atomic.store v{addr} v{value}{}",
             ty.prefix(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
+            memarg(*offset)
         ),
         Inst::AtomicRmw {
             ty,
@@ -438,13 +427,11 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
             addr,
             value,
             offset,
-            order,
         } => format!(
-            "{}.atomic.rmw.{}{} v{addr} v{value}{}",
+            "{}.atomic.rmw.{} v{addr} v{value}{}",
             ty.prefix(),
             op.name(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
+            memarg(*offset)
         ),
         Inst::AtomicCmpxchg {
             ty,
@@ -452,12 +439,10 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
             expected,
             replacement,
             offset,
-            order,
         } => format!(
-            "{}.atomic.cmpxchg{} v{addr} v{expected} v{replacement}{}",
+            "{}.atomic.cmpxchg v{addr} v{expected} v{replacement}{}",
             ty.prefix(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
+            memarg(*offset)
         ),
         Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
         Inst::RefFunc { func } => format!("ref.func {func}"),
@@ -480,6 +465,25 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
             let name = if *op == 9 { "svc.poll" } else { "svc.wait" };
             format!("{name} v{handle}")
         }
+        // Wire-rev sugar: the `cap.self.*` reflection ops (their typed `Inst::CapSelf*` fronts were
+        // retired to the generic `cap.call CAP_SELF op N`) print as their mnemonics. The ignored
+        // const-0 dispatch handle is not spelled — but only when it is the immediately-preceding
+        // `i32.const 0`, so the parser re-pairs the two exactly; any other handle (a shared or
+        // non-adjacent value) prints as the raw `cap.call` below, which round-trips unaided.
+        Inst::CapCall {
+            type_id: svm_ir::CAP_SELF_TYPE_ID,
+            op: op @ 0..=4,
+            sig,
+            handle,
+            args,
+        } if cap_self_sig_matches(*op, sig, args.len()) && Some(*handle) == prev_const0 => match op
+        {
+            0 => "cap.self.count".to_string(),
+            4 => "cap.self.attest".to_string(),
+            1 => format!("cap.self.get v{}", args[0]),
+            2 => format!("cap.self.resolve v{} v{}", args[0], args[1]),
+            _ => format!("cap.self.label v{} v{} v{}", args[0], args[1], args[2]),
+        },
         Inst::CapCall {
             type_id,
             op,
@@ -554,18 +558,8 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         Inst::ExportHandle { export } => format!("export.handle {export}"),
         // Phase-2 `import.attach <idx> v<handle>`: rebind a rebindable slot to a held capability.
         Inst::ImportAttach { import, handle } => format!("import.attach {import} v{handle}"),
-        // §7 capability reflection intrinsics.
-        Inst::CapSelfCount => "cap.self.count".to_string(),
-        Inst::CapSelfAttest => "cap.self.attest".to_string(),
-        Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
-        Inst::CapSelfResolve { name_ptr, name_len } => {
-            format!("cap.self.resolve v{name_ptr} v{name_len}")
-        }
-        Inst::CapSelfLabel {
-            handle,
-            buf_ptr,
-            buf_cap,
-        } => format!("cap.self.label v{handle} v{buf_ptr} v{buf_cap}"),
+        // §7 capability reflection intrinsics that carry a type-section index (not expressible as a
+        // plain `cap.call` immediate) — kept as typed ops.
         Inst::CapSelfTypeId { ty } => format!("cap.self.type_id {ty}"),
         Inst::CapSelfCovers { handle, ty } => format!("cap.self.covers v{handle} {ty}"),
         Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
@@ -573,8 +567,13 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
-        Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
-        Inst::ContResumeBlock { k, arg } => format!("cont.resume.block v{k} v{arg}"),
+        Inst::ContResume { k, arg, block } => {
+            if *block {
+                format!("cont.resume.block v{k} v{arg}")
+            } else {
+                format!("cont.resume v{k} v{arg}")
+            }
+        }
         Inst::Suspend { value } => format!("suspend v{value}"),
         Inst::SetJmp { buf } => format!("setjmp v{buf}"),
         Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
@@ -601,19 +600,14 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
 
         // ----- §17 SIMD (D58) — lane shape carried by the op, bytes printed little-endian. -----
         Inst::ConstV128(bytes) => format!("v128.const{}", byte_list(bytes)),
-        Inst::V128Load {
-            addr,
-            offset,
-            align,
-        } => {
-            format!("v128.load v{addr}{}", memarg(*offset, *align))
+        Inst::V128Load { addr, offset } => {
+            format!("v128.load v{addr}{}", memarg(*offset))
         }
         Inst::V128Store {
             addr,
             value,
             offset,
-            align,
-        } => format!("v128.store v{addr} v{value}{}", memarg(*offset, *align)),
+        } => format!("v128.store v{addr} v{value}{}", memarg(*offset)),
         Inst::Splat { shape, a } => format!("{}.splat v{a}", shape.name()),
         Inst::ExtractLane {
             shape,
@@ -684,7 +678,6 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
-        Inst::SimdWidthBytes => "simd.width_bytes".to_string(),
     }
 }
 
@@ -740,14 +733,12 @@ fn split_order(rest: &str) -> (&str, Ordering) {
     (rest, Ordering::SeqCst)
 }
 
-/// Render the optional `offset=`/`align=` suffix, omitting zero defaults.
-fn memarg(offset: u64, align: u8) -> String {
+/// Render the optional `offset=` suffix, omitting the zero default. (The `align=` memarg suffix
+/// left the surface at the wire rev — the alignment hint was write-only.)
+fn memarg(offset: u64) -> String {
     let mut s = String::new();
     if offset != 0 {
         let _ = write!(s, " offset={offset}");
-    }
-    if align != 0 {
-        let _ = write!(s, " align={align}");
     }
     s
 }
@@ -809,6 +800,20 @@ fn arglist(args: &[u32]) -> String {
 fn types(ts: &[ValType]) -> String {
     let v: Vec<&str> = ts.iter().map(|t| t.as_str()).collect();
     v.join(", ")
+}
+
+/// Does a `cap.call CAP_SELF_TYPE_ID op` carry the exact signature/arity of a `cap.self.*` reflection
+/// mnemonic (op 0 count, 1 get, 2 resolve, 3 label, 4 attest)? Guards the sugar print so only a
+/// canonical reflection call spells as `cap.self.*`; any other CapCall prints as raw `cap.call`.
+fn cap_self_sig_matches(op: u32, sig: &FuncType, argc: usize) -> bool {
+    use svm_ir::ValType::{I32, I64};
+    match op {
+        0 | 4 => sig.params.is_empty() && *sig.results == [I32] && argc == 0,
+        1 => *sig.params == [I32] && *sig.results == [I32, I32] && argc == 1,
+        2 => *sig.params == [I64, I64] && *sig.results == [I32] && argc == 2,
+        3 => *sig.params == [I32, I64, I64] && *sig.results == [I32] && argc == 3,
+        _ => false,
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1104,6 +1109,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         auto_debug,
         auto_locs: Vec::new(),
         auto_vars: Vec::new(),
+        pending_self_handle: false,
     };
     let mut funcs = Vec::new();
     let mut memory = None;
@@ -1557,6 +1563,7 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
         auto_debug: false,
         auto_locs: Vec::new(),
         auto_vars: Vec::new(),
+        pending_self_handle: false,
     };
     let mut out = Vec::new();
     while !p.at_end() {
@@ -1788,6 +1795,10 @@ struct Parser<'a> {
     auto_debug: bool,
     auto_locs: Vec<Loc>,
     auto_vars: Vec<VarInfo>,
+    /// Set by [`Self::parse_inst`] when it parses a `cap.self.*` sugar mnemonic — the wire-rev form
+    /// carries no dispatch-handle operand in text, so [`Self::parse_block`] materializes an ignored
+    /// `i32.const 0` just ahead of the emitted `cap.call CAP_SELF` and points its handle at it.
+    pending_self_handle: bool,
 }
 
 /// A branch edge whose target is still a label name.
@@ -2254,7 +2265,28 @@ impl<'a> Parser<'a> {
             // no-result instruction (`store`, void `call`) is just `opcode operands`.
             // The binding LHS (idents/commas ending in `=`) is what tells them apart.
             let lhs = self.try_binding_lhs();
-            let inst = self.parse_inst(&names)?;
+            let mut inst = self.parse_inst(&names)?;
+            // A `cap.self.*` sugar mnemonic carries no dispatch handle in text. Point the emitted
+            // `cap.call CAP_SELF`'s handle at an ignored `i32.const 0`: reuse the immediately-preceding
+            // one when present — this is the printed sugar's own const-0 handle, so print∘parse is
+            // exact — otherwise materialize a fresh one (one text line then emits two instructions).
+            if self.pending_self_handle {
+                self.pending_self_handle = false;
+                let handle_idx = if matches!(insts.last(), Some(Inst::ConstI32(0))) {
+                    next_idx - 1
+                } else {
+                    let idx = next_idx;
+                    insts.push(Inst::ConstI32(0));
+                    next_idx += 1;
+                    if self.auto_debug {
+                        dbg.inst_lines.push(cur);
+                    }
+                    idx
+                };
+                if let Inst::CapCall { handle, .. } = &mut inst {
+                    *handle = handle_idx;
+                }
+            }
             let n = inst.result_count(&self.fn_results);
             if self.auto_debug {
                 dbg.inst_lines.push(cur);
@@ -2337,42 +2369,45 @@ impl<'a> Parser<'a> {
                 timeout,
             });
         }
+        // Load/store/rmw/cmpxchg execute uniformly seq-cst and no longer carry an ordering on the
+        // wire. A `.<order>` suffix here is a **parse error** (fail-closed): the old surface silently
+        // strengthened weak orderings to seq-cst, which would now be a lie about what the wire means.
         let (base, order) = split_order(rest);
+        if order != Ordering::SeqCst {
+            return Err(ParseError(format!(
+                "atomic ordering suffix on `{}.atomic.{rest}` is no longer accepted \
+                 (atomic load/store/rmw/cmpxchg execute seq-cst; the wire carries no ordering)",
+                ty.prefix()
+            )));
+        }
         match base {
             "load" => {
                 let addr = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
-                Ok(Inst::AtomicLoad {
-                    ty,
-                    addr,
-                    offset,
-                    order,
-                })
+                let offset = self.parse_memarg()?;
+                Ok(Inst::AtomicLoad { ty, addr, offset })
             }
             "store" => {
                 let addr = self.value(names)?;
                 let value = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
+                let offset = self.parse_memarg()?;
                 Ok(Inst::AtomicStore {
                     ty,
                     addr,
                     value,
                     offset,
-                    order,
                 })
             }
             "cmpxchg" => {
                 let addr = self.value(names)?;
                 let expected = self.value(names)?;
                 let replacement = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
+                let offset = self.parse_memarg()?;
                 Ok(Inst::AtomicCmpxchg {
                     ty,
                     addr,
                     expected,
                     replacement,
                     offset,
-                    order,
                 })
             }
             _ => {
@@ -2383,16 +2418,29 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| ParseError(format!("unknown atomic rmw op: {opname}")))?;
                 let addr = self.value(names)?;
                 let value = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
+                let offset = self.parse_memarg()?;
                 Ok(Inst::AtomicRmw {
                     ty,
                     op,
-                    order,
                     addr,
                     value,
                     offset,
                 })
             }
+        }
+    }
+
+    /// Build a `cap.self.*` reflection op as its `cap.call CAP_SELF op N` form. Flags
+    /// [`Self::pending_self_handle`] so [`Self::parse_block`] materializes the ignored const-0
+    /// dispatch handle (the sugar text carries none); the placeholder handle here is overwritten there.
+    fn cap_self_capcall(&mut self, op: u32, sig: FuncType, args: Vec<u32>) -> Inst {
+        self.pending_self_handle = true;
+        Inst::CapCall {
+            type_id: svm_ir::CAP_SELF_TYPE_ID,
+            op,
+            sig,
+            handle: u32::MAX, // placeholder; parse_block points it at the injected i32.const 0
+            args,
         }
     }
 
@@ -2559,31 +2607,65 @@ impl<'a> Parser<'a> {
             let handle = self.value(names)?;
             return Ok(Inst::ImportAttach { import, handle });
         }
-        // §7 capability reflection intrinsics.
+        // §7 capability reflection intrinsics — sugar over `cap.call CAP_SELF op N`. The sugar text
+        // carries no dispatch handle; `cap_self_capcall` flags `parse_block` to materialize the
+        // ignored const-0 handle. (`cap.self.type_id`/`covers` carry a type-section index and stay
+        // typed ops — handled above.)
         if op == "cap.self.count" {
-            return Ok(Inst::CapSelfCount);
+            return Ok(self.cap_self_capcall(
+                0,
+                FuncType {
+                    params: vec![],
+                    results: vec![ValType::I32],
+                },
+                vec![],
+            ));
         }
         if op == "cap.self.attest" {
-            return Ok(Inst::CapSelfAttest);
+            return Ok(self.cap_self_capcall(
+                4,
+                FuncType {
+                    params: vec![],
+                    results: vec![ValType::I32],
+                },
+                vec![],
+            ));
         }
         if op == "cap.self.get" {
             let idx = self.value(names)?;
-            return Ok(Inst::CapSelfGet { idx });
+            return Ok(self.cap_self_capcall(
+                1,
+                FuncType {
+                    params: vec![ValType::I32],
+                    results: vec![ValType::I32, ValType::I32],
+                },
+                vec![idx],
+            ));
         }
         if op == "cap.self.resolve" {
             let name_ptr = self.value(names)?;
             let name_len = self.value(names)?;
-            return Ok(Inst::CapSelfResolve { name_ptr, name_len });
+            return Ok(self.cap_self_capcall(
+                2,
+                FuncType {
+                    params: vec![ValType::I64, ValType::I64],
+                    results: vec![ValType::I32],
+                },
+                vec![name_ptr, name_len],
+            ));
         }
         if op == "cap.self.label" {
             let handle = self.value(names)?;
             let buf_ptr = self.value(names)?;
             let buf_cap = self.value(names)?;
-            return Ok(Inst::CapSelfLabel {
-                handle,
-                buf_ptr,
-                buf_cap,
-            });
+            return Ok(self.cap_self_capcall(
+                3,
+                FuncType {
+                    params: vec![ValType::I32, ValType::I64, ValType::I64],
+                    results: vec![ValType::I32],
+                },
+                vec![handle, buf_ptr, buf_cap],
+            ));
         }
         // §12 per-vCPU TLS register.
         if op == "vcpu.tls.get" {
@@ -2659,11 +2741,6 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
-        if op == "ptr.add" {
-            let a = self.value(names)?;
-            let b = self.value(names)?;
-            return Ok(Inst::PtrAdd { a, b });
-        }
         // Bulk-memory ops (D62): `mem.copy`/`mem.move`/`mem.fill` v{dst} v{src|val} v{len}.
         if op == "mem.copy" || op == "mem.move" {
             let dst = self.value(names)?;
@@ -2690,12 +2767,20 @@ impl<'a> Parser<'a> {
         if op == "cont.resume" {
             let k = self.value(names)?;
             let arg = self.value(names)?;
-            return Ok(Inst::ContResume { k, arg });
+            return Ok(Inst::ContResume {
+                k,
+                arg,
+                block: false,
+            });
         }
         if op == "cont.resume.block" {
             let k = self.value(names)?;
             let arg = self.value(names)?;
-            return Ok(Inst::ContResumeBlock { k, arg });
+            return Ok(Inst::ContResume {
+                k,
+                arg,
+                block: true,
+            });
         }
         if op == "suspend" {
             return Ok(Inst::Suspend {
@@ -2754,12 +2839,6 @@ impl<'a> Parser<'a> {
             };
             return Ok(Inst::AtomicFence { order });
         }
-        if op == "ptr.from_int" || op == "ptr.to_int" {
-            return Ok(Inst::PtrCast {
-                to_int: op == "ptr.to_int",
-                a: self.value(names)?,
-            });
-        }
         if let Some(o) = IToF::from_name(&op) {
             return Ok(Inst::IToFConv {
                 op: o,
@@ -2774,24 +2853,22 @@ impl<'a> Parser<'a> {
         }
         if let Some(o) = LoadOp::from_name(&op) {
             let addr = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
+            let offset = self.parse_memarg()?;
             return Ok(Inst::Load {
                 op: o,
                 addr,
                 offset,
-                align,
             });
         }
         if let Some(o) = StoreOp::from_name(&op) {
             let addr = self.value(names)?;
             let value = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
+            let offset = self.parse_memarg()?;
             return Ok(Inst::Store {
                 op: o,
                 addr,
                 value,
                 offset,
-                align,
             });
         }
         // §12 atomics: `<ty>.atomic.<load|store|cmpxchg|rmw.<op>>`.
@@ -2809,22 +2886,17 @@ impl<'a> Parser<'a> {
         }
         if op == "v128.load" {
             let addr = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
-            return Ok(Inst::V128Load {
-                addr,
-                offset,
-                align,
-            });
+            let offset = self.parse_memarg()?;
+            return Ok(Inst::V128Load { addr, offset });
         }
         if op == "v128.store" {
             let addr = self.value(names)?;
             let value = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
+            let offset = self.parse_memarg()?;
             return Ok(Inst::V128Store {
                 addr,
                 value,
                 offset,
-                align,
             });
         }
         if op == "v128.not" {
@@ -2887,9 +2959,6 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::Swizzle { a, b });
-        }
-        if op == "simd.width_bytes" {
-            return Ok(Inst::SimdWidthBytes);
         }
         if let Some((sh, suffix)) = op
             .split_once('.')
@@ -3323,9 +3392,11 @@ impl<'a> Parser<'a> {
 
     /// Parse the optional `offset=<int>` / `align=<int>` suffix of a memory op
     /// (either order, both optional; defaults 0).
-    fn parse_memarg(&mut self) -> Result<(u64, u8), ParseError> {
+    /// Parse the optional `offset=` memarg suffix. The `align=` suffix was removed at the wire rev
+    /// (the alignment hint was write-only); an explicit `align=` is now a **parse error**
+    /// (fail-closed) rather than a silently-ignored token.
+    fn parse_memarg(&mut self) -> Result<u64, ParseError> {
         let mut offset = 0u64;
-        let mut align = 0u8;
         while let Some(Tok::Ident(s)) = self.peek() {
             let key = s.clone();
             match key.as_str() {
@@ -3337,16 +3408,16 @@ impl<'a> Parser<'a> {
                         .map_err(|_| ParseError(format!("offset out of range: {v}")))?;
                 }
                 "align" => {
-                    self.next()?;
-                    self.expect(&Tok::Equals)?;
-                    let v = self.parse_int()?;
-                    align = u8::try_from(v)
-                        .map_err(|_| ParseError(format!("align out of range: {v}")))?;
+                    return Err(ParseError(
+                        "`align=` memarg is no longer accepted (the alignment hint left the wire \
+                         at the wire rev)"
+                            .into(),
+                    ));
                 }
                 _ => break,
             }
         }
-        Ok((offset, align))
+        Ok(offset)
     }
 
     /// A float literal — accepts an integer token too (e.g. `f64.const 2`).

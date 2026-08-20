@@ -171,7 +171,11 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
                     any_i64!()
                 };
                 let arg = any_i64!();
-                insts.push(Inst::ContResume { k, arg });
+                insts.push(Inst::ContResume {
+                    k,
+                    arg,
+                    block: false,
+                });
                 i32s.push(next); // status
                 i64s.push(next + 1); // value
                 next += 2;

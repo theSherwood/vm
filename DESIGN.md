@@ -1951,6 +1951,20 @@ primitive still wants a second consumer.
 - *Rejected as default:* SC-only (full barriers everywhere → slow, worse target);
   TSO/stronger (penalizes ARM/RISC-V). DRF-or-trap race detection is an optional
   §5 hardened tier, not the default (TSan-class cost).
+- **Wire encoding of ordering (2026-08-20, wire rev):** the model stays
+  C11-compatible, but the *wire* carries an ordering immediate **only where a
+  producer actually produces one** — i.e. on `atomic.fence` (svm-llvm maps LLVM
+  fence orderings faithfully). The four atomic *ops* (`atomic.load` / `.store` /
+  `.rmw` / `.cmpxchg`) dropped their `order` field: every producer hardcoded
+  `seqcst` there (svm-wasm is seq-cst by wasm spec; svm-llvm discards weak
+  orderings at each atomic-op site), so the field carried zero information. This is
+  a **representation** change, not a semantics change: execution was uniformly
+  seq-cst before and after, and SC executions ⊆ the C11-allowed weak executions (a
+  sound strengthening). Whether an op *eventually* executes weaker than seq-cst is
+  gated on **backend capability** (Cranelift atomics are seq-cst-only upstream;
+  wasm atomics are seq-cst by spec) plus the §18 concurrent-oracle story —
+  independent of what the wire carries; re-introducing a per-op ordering immediate
+  is a future wire rev to be spent only when a backend can honor it.
 
 ### Keeping cores busy under blocking
 Three mechanisms; OS-thread cost is **bounded by host-capped constants, never by

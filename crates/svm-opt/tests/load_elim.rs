@@ -37,7 +37,6 @@ fn loadi(addr: u32) -> Inst {
         op: LoadOp::I64,
         addr,
         offset: 0,
-        align: 0,
     }
 }
 fn storei(addr: u32, value: u32) -> Inst {
@@ -46,7 +45,6 @@ fn storei(addr: u32, value: u32) -> Inst {
         addr,
         value,
         offset: 0,
-        align: 0,
     }
 }
 fn store_off(op: StoreOp, addr: u32, value: u32, offset: u64) -> Inst {
@@ -55,7 +53,6 @@ fn store_off(op: StoreOp, addr: u32, value: u32, offset: u64) -> Inst {
         addr,
         value,
         offset,
-        align: 0,
     }
 }
 fn addi(a: u32, b: u32) -> Inst {

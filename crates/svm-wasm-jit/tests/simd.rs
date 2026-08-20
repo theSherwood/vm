@@ -434,7 +434,7 @@ fn shuffle_swizzle() {
     diff("shuffle_swizzle", SHUFFLE, ARGS);
 }
 
-/// v128.const materialization + a lane op + width probe (`simd.width_bytes` == 16).
+/// v128.const materialization + a lane op.
 const CONST_VEC: &str = r#"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -442,10 +442,7 @@ block 0 (v0: i64) {
   v2 = i64x2.splat v0
   v3 = i64x2.add v1 v2
   v4 = i64x2.extract_lane 0 v3
-  v5 = simd.width_bytes
-  v6 = i64.extend_i32_u v5
-  v7 = i64.add v4 v6
-  return v7
+  return v4
   }
 }
 "#;

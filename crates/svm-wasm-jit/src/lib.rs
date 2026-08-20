@@ -886,9 +886,6 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             Inst::FToISat { op, .. } | Inst::FToITrap { op, .. } => tys.push(op.parts().1.val()),
             Inst::IToFConv { op, .. } => tys.push(op.parts().1.val()),
             Inst::Cast { op, .. } => tys.push(op.sig().2),
-            // Pointer provenance ops are plain `i64` off-CHERI: `ptr.add` a wrapping add, `ptr.cast`
-            // a no-op. Both yield `i64`.
-            Inst::PtrAdd { .. } | Inst::PtrCast { .. } => tys.push(ValType::I64),
             // A standalone fence orders accesses without touching memory; no SSA result.
             Inst::AtomicFence { .. } => {}
             // `Fma` has no core-wasm scalar opcode (relaxed-SIMD only), so it stays interpreter-tier.
@@ -920,8 +917,8 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             // Indirect call: results come from the call site's own signature immediate.
             Inst::CallIndirect { ty, .. } => tys.extend(ty.results.iter().copied()),
             // ---- §17 SIMD (v128): the in-subset core lane ops (see the opcode helpers above). Each
-            // yields a `v128`, except lane-extract (the shape's scalar), the reductions
-            // any/all_true/bitmask (`i32`), and `simd.width_bytes` (`i32`). The verifier already
+            // yields a `v128`, except lane-extract (the shape's scalar) and the reductions
+            // any/all_true/bitmask (`i32`). The verifier already
             // typed these, so the emit-side opcode helpers (which return `None`/`Err` for the
             // shape holes wasm omits) are what actually gate a bogus lowering — here we only need
             // the result type. The deferred widening/reduction/relaxed ops fall through to the
@@ -961,7 +958,6 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {
                 tys.push(ValType::I32)
             }
-            Inst::SimdWidthBytes => tys.push(ValType::I32),
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }
     }
@@ -1647,14 +1643,14 @@ pub fn compile_module_b2(
 /// **both** tiers use: the emitter reads it, and the host's `call_interp` runs the wrapper on the
 /// interpreter — the wrapper only exists in the outlined module.
 ///
-/// It outlines three host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
+/// It outlines the host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
 /// executable manifest import, IMPORTS.md phase 3 — the wrapper carries the `call.import` to the
 /// import-capable interpreter tier, so an import-bearing guest emits without resolution or rewrite),
-/// and [`Inst::CapSelfResolve`] (the §7 runtime by-name capability lookup — `cap.self.resolve`). The
-/// latter matters for a `_start` that resolves names at startup: it is otherwise pure compute +
-/// stores, so hoisting its handful of `cap.self.resolve`s into cross-tier wrappers makes func 0
-/// itself emittable — the last thing keeping a QuickJS-scale guest (whose hot interpreter loop is
-/// all in-subset) off the wasm tier.
+/// and [`Inst::CallSym`]. The §7 runtime by-name capability lookup (`cap.self.resolve`) rides through
+/// the `CapCall` arm now (it is a `cap.call CAP_SELF op 2`): that matters for a `_start` that resolves
+/// names at startup — otherwise pure compute + stores, so hoisting its handful of `cap.self.resolve`s
+/// into cross-tier wrappers makes func 0 itself emittable — the last thing keeping a QuickJS-scale
+/// guest (whose hot interpreter loop is all in-subset) off the wasm tier.
 pub fn outline_cap_calls(m: &mut Module) {
     let base = m.funcs.len() as u32;
     let mut wrappers: Vec<Func> = Vec::new();
@@ -1775,27 +1771,6 @@ pub fn outline_cap_calls(m: &mut Module) {
                     *inst = Inst::Call {
                         func: g,
                         args: call_args,
-                    };
-                } else if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
-                    let g = base + wrappers.len() as u32;
-                    // Fixed signature `(name_ptr: i64, name_len: i64) -> i32` (result appended at val 2).
-                    let (np, nl) = (*name_ptr, *name_len);
-                    let block = Block {
-                        params: vec![ValType::I64, ValType::I64],
-                        insts: vec![Inst::CapSelfResolve {
-                            name_ptr: 0,
-                            name_len: 1,
-                        }],
-                        term: Terminator::Return(vec![2]),
-                    };
-                    wrappers.push(Func {
-                        params: vec![ValType::I64, ValType::I64],
-                        results: vec![ValType::I32],
-                        blocks: vec![block],
-                    });
-                    *inst = Inst::Call {
-                        func: g,
-                        args: vec![np, nl],
                     };
                 }
             }
@@ -3894,18 +3869,6 @@ fn emit_block_body(
                 code.push(OP_SELECT);
                 set_result(cx, code, k, &mut next_val);
             }
-            // Pointer provenance ops (off-CHERI, plain `i64`): `ptr.add` is a wrapping `i64.add`;
-            // `ptr.cast` is a free identity that forwards its operand into the result local.
-            Inst::PtrAdd { a, b: rb } => {
-                get(code, cx, *a);
-                get(code, cx, *rb);
-                code.push(0x7c); // i64.add (wrapping)
-                set_result(cx, code, k, &mut next_val);
-            }
-            Inst::PtrCast { a, .. } => {
-                get(code, cx, *a);
-                set_result(cx, code, k, &mut next_val);
-            }
             // Standalone fence: a pure ordering barrier with no data effect. The wasm-JIT only
             // compiles single-threaded guests (concurrency folds to the interp), where a fence is
             // observably a no-op — so emit nothing (matching the oracle, which honors it identically
@@ -4625,12 +4588,6 @@ fn emit_block_body(
                 get(code, cx, *a);
                 get(code, cx, *b);
                 emit_simd(code, 130); // i16x8.q15mulr_sat_s
-                set_result(cx, code, k, &mut next_val);
-            }
-            Inst::SimdWidthBytes => {
-                // Fixed-128 MVP: the constant 16 on every backend (deterministic across the oracle).
-                code.push(OP_I32_CONST);
-                sleb32(code, 16);
                 set_result(cx, code, k, &mut next_val);
             }
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),

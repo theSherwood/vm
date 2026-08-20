@@ -3754,7 +3754,6 @@ fn synth_start(
                 addr,
                 value: val,
                 offset: 0,
-                align: 0,
             });
         }
     }
@@ -3853,7 +3852,6 @@ fn synth_start_argv(
         addr,
         value,
         offset: 0,
-        align: 0,
     };
 
     // ---- block 0: entry — resolve handles by name, seed the heap, load argc, jump into the argv loop.
@@ -3888,7 +3886,6 @@ fn synth_start_argv(
         op: LoadOp::I32,
         addr: v_aa,
         offset: 0,
-        align: 0,
     }); // argc (u32)
     let v_argc32 = next;
     next += 1;
@@ -3956,7 +3953,6 @@ fn synth_start_argv(
                 op: LoadOp::I32_8U,
                 addr: 3,
                 offset: 0,
-                align: 0,
             }, // v4 = *q
             Inst::ConstI64(1), // v5
             add(3, 5),         // v6 = q+1
@@ -4051,7 +4047,6 @@ fn synth_start_argv(
         op: LoadOp::I32,
         addr,
         offset: 0,
-        align: 0,
     };
 
     // ---- block 5: argv_done(argc=0, p=1) — terminate argv[], compute envp_base, load envc, loop. ----
@@ -4129,7 +4124,6 @@ fn synth_start_argv(
                 op: LoadOp::I32_8U,
                 addr: 4,
                 offset: 0,
-                align: 0,
             }, // v5 = *r
             Inst::ConstI64(1), // v6
             add(4, 6),         // v7 = r+1
@@ -4251,14 +4245,12 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64) -> Func {
         op: LoadOp::I64,
         addr,
         offset: 0,
-        align: 0,
     };
     let store_i64 = |addr: ValIdx, value: ValIdx| Inst::Store {
         op: StoreOp::I64,
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     // block0(size=0): brk = *HEAP_BRK; new = align16(brk+16+size); branch on new > *HEAP_TOP. No
     // heap write here — `brk` may be an uncommitted page until `grow` maps it.
@@ -4734,7 +4726,6 @@ fn synth_realloc(malloc_idx: u32, memcpy_idx: u32) -> Func {
                 op: LoadOp::I64,
                 addr: 3,
                 offset: 0,
-                align: 0,
             }, // v4 = old size
             Inst::Call {
                 func: malloc_idx,
@@ -4848,7 +4839,6 @@ fn synth_eh_unwind() -> Func {
                 op: LoadOp::I64,
                 addr: 2,
                 offset: 0,
-                align: 8,
             }, // v3 = k (HSP)
             Inst::ConstI64(0),               // v4
             Inst::IntCmp {
@@ -4888,7 +4878,6 @@ fn synth_eh_unwind() -> Func {
                 addr: 0,
                 value: 4,
                 offset: 0,
-                align: 8,
             }, // *(hsp_addr) = target
             Inst::ConstI64(EH_BUFS_O as i64), // v5
             Inst::IntBin {
@@ -4968,7 +4957,6 @@ fn synth_memcpy() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 4,
                 offset: 0,
-                align: 0,
             }, // v5 = src[i]
             Inst::IntBin {
                 ty: IntTy::I64,
@@ -4981,7 +4969,6 @@ fn synth_memcpy() -> Func {
                 addr: 6,
                 value: 5,
                 offset: 0,
-                align: 0,
             },
             Inst::ConstI64(1), // v7
             Inst::IntBin {
@@ -5058,7 +5045,6 @@ fn synth_memcmp() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 4,
                 offset: 0,
-                align: 0,
             }, // v5 = av
             Inst::IntBin {
                 ty: IntTy::I64,
@@ -5070,7 +5056,6 @@ fn synth_memcmp() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 6,
                 offset: 0,
-                align: 0,
             }, // v7 = bv
             Inst::IntCmp {
                 ty: IntTy::I32,
@@ -5168,7 +5153,6 @@ fn synth_memchr() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 0,
                 offset: 0,
-                align: 0,
             }, // v3 = *cur
             Inst::ConstI32(0xff), // v4
             Inst::IntBin {
@@ -5288,7 +5272,6 @@ fn synth_utoa() -> Func {
                 addr: 14,
                 value: 12,
                 offset: 0,
-                align: 0,
             }, // *--p = ch
             i64bin(BinOp::DivU, 0, 1), // v15 = value / base
             Inst::ConstI64(0),         // v16
@@ -5468,7 +5451,6 @@ fn synth_strlen() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 0,
                 offset: 0,
-                align: 0,
             }, // v2 = *cur
             Inst::ConstI32(0), // v3
             Inst::IntCmp {
@@ -5533,13 +5515,11 @@ fn synth_strcmp() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 0,
                 offset: 0,
-                align: 0,
             }, // v2 = ca = *pa
             Inst::Load {
                 op: LoadOp::I32_8U,
                 addr: 1,
                 offset: 0,
-                align: 0,
             }, // v3 = cb = *pb
             Inst::IntBin {
                 ty: IntTy::I32,
@@ -5646,7 +5626,6 @@ fn synth_strncmp() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 4,
                 offset: 0,
-                align: 0,
             }, // v5 = ca
             Inst::IntBin {
                 ty: IntTy::I64,
@@ -5658,7 +5637,6 @@ fn synth_strncmp() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 6,
                 offset: 0,
-                align: 0,
             }, // v7 = cb
             Inst::IntBin {
                 ty: IntTy::I32,
@@ -5747,7 +5725,6 @@ fn synth_strchr() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 0,
                 offset: 0,
-                align: 0,
             }, // v2 = ch = *p
             Inst::IntCmp {
                 ty: IntTy::I32,
@@ -5829,14 +5806,12 @@ fn synth_strcpy() -> Func {
                 op: LoadOp::I32_8U,
                 addr: 1,
                 offset: 0,
-                align: 0,
             }, // v3 = c = *s
             Inst::Store {
                 op: StoreOp::I32_8,
                 addr: 0,
                 value: 3,
                 offset: 0,
-                align: 0,
             }, // *d = c   (void — no value index)
             Inst::ConstI32(0), // v4
             Inst::IntCmp {
@@ -5888,7 +5863,6 @@ fn synth_strspn() -> Func {
         op: LoadOp::I32_8U,
         addr,
         offset: 0,
-        align: 0,
     };
     let params = vec![ValType::I64, ValType::I64]; // s, set
                                                    // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
@@ -6026,7 +6000,6 @@ fn synth_strcspn() -> Func {
         op: LoadOp::I32_8U,
         addr,
         offset: 0,
-        align: 0,
     };
     let params = vec![ValType::I64, ValType::I64]; // s, set
                                                    // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
@@ -6165,7 +6138,6 @@ fn synth_strrchr() -> Func {
         op: LoadOp::I32_8U,
         addr,
         offset: 0,
-        align: 0,
     };
     let params = vec![ValType::I64, ValType::I32]; // s, c
                                                    // block0 entry(s=0, c=1): loop(p=s, c8=c&255, best=NULL)
@@ -6246,7 +6218,6 @@ fn synth_strpbrk() -> Func {
         op: LoadOp::I32_8U,
         addr,
         offset: 0,
-        align: 0,
     };
     let params = vec![ValType::I64, ValType::I64]; // s, set
                                                    // block0 entry(s=0, set=1): outer(p=s, set)
@@ -6724,7 +6695,6 @@ fn synth_frexp() -> Func {
                 addr: 1,
                 value: 2,
                 offset: 0,
-                align: 0,
             }, // *eptr = 0 (no value)
             Inst::FBin {
                 ty: FloatTy::F64,
@@ -6786,7 +6756,6 @@ fn synth_frexp() -> Func {
                 addr: 2,
                 value: 8,
                 offset: 0,
-                align: 0,
             }, // *eptr = e (no value)
         ],
         term: Terminator::Return(vec![7]),
@@ -7318,13 +7287,11 @@ fn synth_getenv(scratch: u64) -> Func {
         op: LoadOp::I32_8U,
         addr,
         offset: 0,
-        align: 0,
     };
     let load32 = |addr: ValIdx| Inst::Load {
         op: LoadOp::I32,
         addr,
         offset: 0,
-        align: 0,
     };
     let eq32 = |a: ValIdx, b: ValIdx| Inst::IntCmp {
         ty: IntTy::I32,
@@ -7618,7 +7585,6 @@ impl Bdr {
             op: svm_ir::LoadOp::I64,
             addr,
             offset: 0,
-            align: 0,
         })
     }
     /// Zero-extended u32 load (a 128-bit limb) into an i64.
@@ -7627,7 +7593,6 @@ impl Bdr {
             op: svm_ir::LoadOp::I32,
             addr,
             offset: 0,
-            align: 0,
         });
         self.push(Inst::Convert {
             op: ConvOp::ExtendI32U,
@@ -7640,7 +7605,6 @@ impl Bdr {
             op: svm_ir::LoadOp::I32_8U,
             addr,
             offset: 0,
-            align: 0,
         });
         self.push(Inst::Convert {
             op: ConvOp::ExtendI32U,
@@ -7653,7 +7617,6 @@ impl Bdr {
             addr,
             value,
             offset: 0,
-            align: 0,
         });
     }
     fn store32(&mut self, addr: ValIdx, value: ValIdx) {
@@ -7666,7 +7629,6 @@ impl Bdr {
             addr,
             value: w,
             offset: 0,
-            align: 0,
         });
     }
     fn store8(&mut self, addr: ValIdx, value: ValIdx) {
@@ -7679,7 +7641,6 @@ impl Bdr {
             addr,
             value: w,
             offset: 0,
-            align: 0,
         });
     }
     /// Zero-extend an `i32` (e.g. a compare result) to `i64`, so it can feed the I64-typed `bin`.
@@ -7702,7 +7663,6 @@ impl Bdr {
             ty: IntTy::I32,
             addr,
             offset: 0,
-            order: Ordering::SeqCst,
         })
     }
     /// Seq-cst `i32.atomic.cmpxchg` of the enclosing word; yields the old (i32) word value.
@@ -7713,7 +7673,6 @@ impl Bdr {
             expected,
             replacement,
             offset: 0,
-            order: Ordering::SeqCst,
         })
     }
     /// Call a synth helper that returns one i64 (`big_cmp`); yields its result value.
@@ -11616,9 +11575,9 @@ fn lower_vm_builtin(
     c: &crate::ll::ast::Call,
     name: &str,
 ) -> Result<bool, Error> {
-    use svm_ir::{AtomicRmwOp, Ordering, StoreOp};
-    // All §12 atomics are sequentially consistent (the op makes the JIT emit a hardware atomic).
-    let sc = Ordering::SeqCst;
+    use svm_ir::{AtomicRmwOp, StoreOp};
+    // All §12 atomic load/store/rmw/cmpxchg are sequentially consistent (the op makes the JIT emit
+    // a hardware atomic); they carry no ordering on the wire. Only fences keep an `Ordering`.
     match name {
         // ---- correctly-rounded float→string bridge for a **guest** printf/snprintf ----
         // `int __vm_fmt_{fix,sci,gen}(char *out, double x, int prec, int width, int flags)` formats `x`
@@ -11715,12 +11674,15 @@ fn lower_vm_builtin(
                     addr,
                     value: val,
                     offset: 0,
-                    align: 0,
                 });
             }
             let name_ptr = ctx.const_i64(ctx.scratch_base as i64);
             let name_len = ctx.const_i64(name.len() as i64);
-            let r = ctx.push(Inst::CapSelfResolve { name_ptr, name_len });
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let r = ctx.cap_self_call(2, sig, vec![name_ptr, name_len], 1)[0];
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -11817,13 +11779,19 @@ fn lower_vm_builtin(
             let k = ctx.operand_i64(vm_arg(c, 0)?)?; // i64 fiber handle
             let arg = ctx.operand_i64(vm_arg(c, 1)?)?;
             let done = ctx.operand_i64(vm_arg(c, 2)?)?; // `int *done`
-            let rs = ctx.push_multi(Inst::ContResume { k, arg }, 2); // (status, value)
+            let rs = ctx.push_multi(
+                Inst::ContResume {
+                    k,
+                    arg,
+                    block: false,
+                },
+                2,
+            ); // (status, value)
             ctx.push_effect(Inst::Store {
                 op: StoreOp::I32,
                 addr: done,
                 value: rs[0],
                 offset: 0,
-                align: 0,
             }); // *done = cont.resume status: 0 = suspended (guest `suspend`; `value` is the
                 //     yielded i64), 1 = returned (fiber ran to completion), 3 = FIBER_PARKED
                 //     (the fiber hit an event park — a timed/futex `memory.wait` inside it — and
@@ -11893,7 +11861,6 @@ fn lower_vm_builtin(
                 addr,
                 value,
                 offset: 0,
-                order: sc,
             });
             ctx.bind_dest(&c.dest, r); // the old value
             Ok(true)
@@ -11909,7 +11876,6 @@ fn lower_vm_builtin(
                 ty,
                 addr,
                 offset: 0,
-                order: sc,
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -11931,7 +11897,6 @@ fn lower_vm_builtin(
                 addr,
                 value,
                 offset: 0,
-                order: sc,
             });
             Ok(true) // void
         }
@@ -11945,7 +11910,6 @@ fn lower_vm_builtin(
                 expected,
                 replacement,
                 offset: 0,
-                order: sc,
             });
             ctx.bind_dest(&c.dest, r); // the old value (i32)
             Ok(true)
@@ -11978,25 +11942,36 @@ fn lower_vm_builtin(
             // so index i is the same capability the stash slot held (the discovery tier is the one
             // by-index surface deliberately kept).
             let i = ctx.operand_i32(vm_arg(c, 0)?)?;
-            let rs = ctx.push_multi(Inst::CapSelfGet { idx: i }, 2); // (handle, type_id)
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32, ValType::I32],
+            };
+            let rs = ctx.cap_self_call(1, sig, vec![i], 2); // (handle, type_id)
             ctx.bind_dest(&c.dest, rs[0]);
             Ok(true)
         }
         "__vm_cap_count" => {
-            let r = ctx.push(Inst::CapSelfCount);
+            let sig = svm_ir::FuncType {
+                params: vec![],
+                results: vec![ValType::I32],
+            };
+            let r = ctx.cap_self_call(0, sig, vec![], 1)[0];
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
         "__vm_cap_at" => {
             let idx = ctx.operand_i32(vm_arg(c, 0)?)?;
             let type_id_out = ctx.operand_i64(vm_arg(c, 1)?)?; // `int *type_id_out`
-            let rs = ctx.push_multi(Inst::CapSelfGet { idx }, 2); // (handle, type_id)
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32, ValType::I32],
+            };
+            let rs = ctx.cap_self_call(1, sig, vec![idx], 2); // (handle, type_id)
             ctx.push_effect(Inst::Store {
                 op: StoreOp::I32,
                 addr: type_id_out,
                 value: rs[1],
                 offset: 0,
-                align: 0,
             }); // *type_id_out = type_id
             ctx.bind_dest(&c.dest, rs[0]); // the capability handle
             Ok(true)
@@ -12008,7 +11983,11 @@ fn lower_vm_builtin(
         "__vm_cap_resolve" => {
             let name_ptr = ctx.operand_i64(vm_arg(c, 0)?)?;
             let name_len = ctx.operand_i64(vm_arg(c, 1)?)?;
-            let r = ctx.push(Inst::CapSelfResolve { name_ptr, name_len });
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let r = ctx.cap_self_call(2, sig, vec![name_ptr, name_len], 1)[0];
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -12660,7 +12639,6 @@ fn lower_format(
                             addr: a,
                             value: space,
                             offset: 0,
-                            align: 0,
                         });
                     }
                     let wv = ctx.const_i64(width as i64);
@@ -12889,7 +12867,6 @@ fn lower_snprintf(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<(), Er
         addr: nul_addr,
         value: zbyte,
         offset: 0,
-        align: 0,
     });
     // Return value: the would-be length, as `int` (low 32 bits).
     let ret = ctx.push(Inst::Convert {
@@ -12915,7 +12892,6 @@ fn pf_store8(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx) {
         addr,
         value,
         offset: 0,
-        align: 0,
     });
 }
 
@@ -13321,7 +13297,6 @@ fn lower_inline_asm(
                 addr,
                 value,
                 offset: 0,
-                order: Ordering::SeqCst,
             }),
             AtomWidth::Narrow(w) => {
                 let opcode = if is_add {
@@ -13353,7 +13328,6 @@ fn lower_inline_asm(
                     expected,
                     replacement,
                     offset: 0,
-                    order: Ordering::SeqCst,
                 });
                 (old, expected, ty)
             }
@@ -14495,7 +14469,6 @@ fn lower_load_relative(
         op: svm_ir::LoadOp::I32,
         addr: ea,
         offset: 0,
-        align: 0,
     });
     let delta = ctx.push(Inst::Convert {
         op: ConvOp::ExtendI32S,
@@ -14943,7 +14916,6 @@ fn lower_va_intrinsic(
             op: svm_ir::LoadOp::I64,
             addr: sp,
             offset: 0,
-            align: 0,
         });
         // gp_offset (48) | fp_offset (176) << 32 — both past their thresholds → memory branch only.
         let off_word = ctx.const_i64(48 | (176i64 << 32));
@@ -14952,14 +14924,12 @@ fn lower_va_intrinsic(
             addr: list,
             value: off_word,
             offset: 0,
-            align: 0,
         });
         ctx.push_effect(Inst::Store {
             op: svm_ir::StoreOp::I64,
             addr: list,
             value: area,
             offset: 8,
-            align: 0,
         });
         let zero = ctx.const_i64(0);
         ctx.push_effect(Inst::Store {
@@ -14967,7 +14937,6 @@ fn lower_va_intrinsic(
             addr: list,
             value: zero,
             offset: 16,
-            align: 0,
         });
         return Ok(true);
     }
@@ -14979,14 +14948,12 @@ fn lower_va_intrinsic(
                 op: svm_ir::LoadOp::I64,
                 addr: src,
                 offset: off,
-                align: 0,
             });
             ctx.push_effect(Inst::Store {
                 op: svm_ir::StoreOp::I64,
                 addr: dst,
                 value: w,
                 offset: off,
-                align: 0,
             });
         }
         return Ok(true);
@@ -15128,7 +15095,6 @@ fn lower_eh_unwinder<A>(
                 addr: exn_addr,
                 value: exn,
                 offset: 0,
-                align: 8,
             });
             let tid = ctx.eh_typeid(&arguments[1].0)?;
             let sel = ctx.push(Inst::ConstI32(tid as i32));
@@ -15138,7 +15104,6 @@ fn lower_eh_unwinder<A>(
                 addr: sel_addr,
                 value: sel,
                 offset: 0,
-                align: 4,
             });
             // The third argument is the object's destructor (a `void(T*)` funcref, or null for a
             // trivially-destructible type). Stash it so `__cxa_end_catch` can run it on the exception
@@ -15150,7 +15115,6 @@ fn lower_eh_unwinder<A>(
                 addr: dtor_addr,
                 value: dtor,
                 offset: 0,
-                align: 8,
             });
             ctx.eh_unwind(base)?;
             Ok(true)
@@ -15211,14 +15175,12 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
                 op: LoadOp::I64,
                 addr: exn_addr,
                 offset: 0,
-                align: 8,
             });
             let dtor_addr = ctx.const_i64((base + EH_DTOR_O) as i64);
             let dtor = ctx.push(Inst::Load {
                 op: LoadOp::I64,
                 addr: dtor_addr,
                 offset: 0,
-                align: 8,
             });
             let callee_sp = ctx.callee_base()?;
             ctx.push_effect(Inst::Call {
@@ -15233,7 +15195,6 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
                 addr: dtor_addr,
                 value: zero,
                 offset: 0,
-                align: 8,
             });
             Ok(true)
         }
@@ -15255,7 +15216,6 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
                 op: LoadOp::I32,
                 addr: sel_addr,
                 offset: 0,
-                align: 4,
             });
             let mut result = ctx.push(Inst::ConstI32(-1)); // sentinel: never equals a (1-based) id
             if let Some(matchset) = ctx.helpers.eh_subtype_ids.get(&name).cloned() {
@@ -15827,7 +15787,6 @@ impl<'a> BlockCtx<'a> {
             addr,
             value,
             offset: 0,
-            align: 0,
         });
         addr
     }
@@ -15919,7 +15878,6 @@ impl<'a> BlockCtx<'a> {
             parts.push(self.push(Inst::V128Load {
                 addr,
                 offset: (ci * 16) as u64,
-                align: 0,
             }));
         }
         let lb = layout.shape.lane_bytes() as u64;
@@ -15929,7 +15887,6 @@ impl<'a> BlockCtx<'a> {
                 op: lane_load_op(layout.shape),
                 addr,
                 offset: base + t as u64 * lb,
-                align: 0,
             }));
         }
         parts
@@ -15943,7 +15900,6 @@ impl<'a> BlockCtx<'a> {
                 addr,
                 value,
                 offset: (ci * 16) as u64,
-                align: 0,
             });
         }
         let lb = layout.shape.lane_bytes() as u64;
@@ -15954,13 +15910,36 @@ impl<'a> BlockCtx<'a> {
                 addr,
                 value: parts[layout.full_chunks + t],
                 offset: base + t as u64 * lb,
-                align: 0,
             });
         }
     }
 
     fn const_i64(&mut self, v: i64) -> ValIdx {
         self.push(Inst::ConstI64(v))
+    }
+
+    /// Build a `cap.self.*` reflection op as its canonical `cap.call CAP_SELF op N` form. The typed
+    /// `Inst::CapSelf*` fronts were retired at the wire rev — the wire/IR carry only the generic
+    /// `CapCall`, and the runtime CAP_SELF handler dispatches on `op`. `handle` is a freshly
+    /// materialized const-0 i32 the handler ignores. Returns the op's `n` result values.
+    fn cap_self_call(
+        &mut self,
+        op: u32,
+        sig: svm_ir::FuncType,
+        args: Vec<ValIdx>,
+        n: usize,
+    ) -> Vec<ValIdx> {
+        let handle = self.push(Inst::ConstI32(0));
+        self.push_multi(
+            Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op,
+                sig,
+                handle,
+                args,
+            },
+            n,
+        )
     }
 
     fn add_i64(&mut self, a: ValIdx, b: ValIdx) -> ValIdx {
@@ -16004,7 +15983,6 @@ impl<'a> BlockCtx<'a> {
                 op: LoadOp::I64,
                 addr: slot,
                 offset: 0,
-                align: 0,
             }))
         } else {
             let sp = self.sp()?;
@@ -16473,7 +16451,6 @@ fn translate_block(
                 addr: slot,
                 value: base,
                 offset: 0,
-                align: 0,
             });
         }
     }
@@ -16616,7 +16593,6 @@ fn lower_narrow_atomic_load(ctx: &mut BlockCtx, addr: ValIdx, w: u8) -> Result<V
         ty: IntTy::I32,
         addr: word,
         offset: 0,
-        order: Ordering::SeqCst,
     });
     let w64 = ctx.push(Inst::Convert {
         op: ConvOp::ExtendI32U,
@@ -17448,14 +17424,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             op: LoadOp::I64,
             addr: exn_addr,
             offset: 0,
-            align: 8,
         });
         let sel_addr = ctx.const_i64((base + EH_SEL_O) as i64);
         let sel = ctx.push(Inst::Load {
             op: LoadOp::I32,
             addr: sel_addr,
             offset: 0,
-            align: 4,
         });
         if let Some(&vid) = ctx.s.name2id.get(&lp.dest) {
             ctx.agg.insert(vid, vec![exn, sel]);
@@ -17545,7 +17519,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     addr,
                     value,
                     offset: 0,
-                    order: Ordering::SeqCst,
                 }),
                 AtomWidth::Narrow(w) => {
                     lower_narrow_atomic_rmw(ctx, addr, value, w, NARROW_RMW_XCHG)?;
@@ -17569,7 +17542,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 addr,
                 value: lo,
                 offset: 0,
-                align: 0,
             });
             let c8 = ctx.const_i64(8);
             let hi_addr = ctx.add_i64(addr, c8);
@@ -17578,7 +17550,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 addr: hi_addr,
                 value: hi,
                 offset: 0,
-                align: 0,
             });
             return Ok(());
         }
@@ -17590,7 +17561,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 addr,
                 value,
                 offset: 0,
-                align: 0,
             });
         } else if let Some(bits) = nonstd_int_bits(st.value.get_type(types).as_ref()) {
             // Non-power-of-two integer store (e.g. an `i56` niche field): write exactly its bytes.
@@ -17602,7 +17572,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 addr,
                 value,
                 offset: 0,
-                align: 0,
             });
         }
         return Ok(());
@@ -17621,7 +17590,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     expected,
                     replacement,
                     offset: 0,
-                    order: Ordering::SeqCst,
                 });
                 (old, expected, ty)
             }
@@ -17839,7 +17807,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     addr: area,
                     value,
                     offset: (i - fixed) as u64 * 8,
-                    align: 0,
                 });
             }
             ctx.push_effect(Inst::Store {
@@ -17847,7 +17814,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 addr: callee_sp,
                 value: area,
                 offset: 0,
-                align: 0,
             });
             for (a, _attrs) in c.arguments.iter().take(fixed) {
                 args.push(ctx.operand(a)?);
@@ -17984,7 +17950,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     op: svm_ir::LoadOp::I64,
                     addr,
                     offset: 0,
-                    align: 0,
                 });
                 let c8 = ctx.const_i64(8);
                 let hi_addr = ctx.add_i64(addr, c8);
@@ -17992,7 +17957,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     op: hi_op,
                     addr: hi_addr,
                     offset: 0,
-                    align: 0,
                 });
                 if let Some(&vid) = ctx.s.name2id.get(&l.dest) {
                     ctx.agg.insert(vid, vec![lo, hi]);
@@ -18066,7 +18030,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     op: LoadOp::I64,
                     addr: slot,
                     offset: 0,
-                    align: 0,
                 });
                 let new_top = ctx.add_i64(top, bytes16);
                 ctx.push_effect(Inst::Store {
@@ -18074,7 +18037,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     addr: slot,
                     value: new_top,
                     offset: 0,
-                    align: 0,
                 });
                 (&a.dest, top)
             }
@@ -18090,20 +18052,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         ty,
                         addr,
                         offset: 0,
-                        order: Ordering::SeqCst,
                     }),
                     AtomWidth::Narrow(w) => lower_narrow_atomic_load(ctx, addr, w)?,
                 };
                 (&l.dest, v)
             } else if vec128_shape(l.loaded_ty.as_ref()).is_some() {
-                (
-                    &l.dest,
-                    ctx.push(Inst::V128Load {
-                        addr,
-                        offset: 0,
-                        align: 0,
-                    }),
-                )
+                (&l.dest, ctx.push(Inst::V128Load { addr, offset: 0 }))
             } else if let Some(bits) = nonstd_int_bits(l.loaded_ty.as_ref()) {
                 // Non-power-of-two integer load (e.g. an `i56` niche-discriminant field): svm-IR has no
                 // `iN` load, so read the enclosing `i64` and mask to N bits. The window-bounded read may
@@ -18113,7 +18067,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     op: svm_ir::LoadOp::I64,
                     addr,
                     offset: 0,
-                    align: 0,
                 });
                 let m = ctx.const_i64(((1u64 << bits) - 1) as i64);
                 let v = ctx.push(Inst::IntBin {
@@ -18133,7 +18086,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         op: signed_load_op(lb, to),
                         addr,
                         offset: 0,
-                        align: 0,
                     }),
                 )
             } else {
@@ -18144,7 +18096,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         op,
                         addr,
                         offset: 0,
-                        align: 0,
                     }),
                 )
             }
@@ -18166,7 +18117,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         addr,
                         value,
                         offset: 0,
-                        order: Ordering::SeqCst,
                     })
                 }
                 AtomWidth::Narrow(w) => {
@@ -19981,7 +19931,6 @@ fn store_nonstd_int(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx, bits: u32) 
             addr,
             value,
             offset: 0,
-            align: 0,
         });
         return;
     }
@@ -19995,7 +19944,6 @@ fn store_nonstd_int(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx, bits: u32) 
         addr,
         value: lo,
         offset: 0,
-        align: 0,
     });
     // High bytes (bits 32+) shifted down, written exactly.
     let c32 = ctx.const_i64(32);
@@ -20022,7 +19970,6 @@ fn store_nonstd_int(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx, bits: u32) 
         addr: addr4,
         value: hi32,
         offset: 0,
-        align: 0,
     });
     if rem == 3 {
         // The 7th byte (bits 48..56) at +6.
@@ -20044,7 +19991,6 @@ fn store_nonstd_int(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx, bits: u32) 
             addr: addr6,
             value: hi2_32,
             offset: 0,
-            align: 0,
         });
     }
 }
@@ -21101,7 +21047,6 @@ fn lower_invoke(
         op: LoadOp::I64,
         addr: hsp_addr,
         offset: 0,
-        align: 8,
     }); // p+3 (d)
     let d = p + 3;
     insts.push(Inst::ConstI64(1)); // p+4 (one)
@@ -21118,7 +21063,6 @@ fn lower_invoke(
         addr: hsp_addr,
         value: dp,
         offset: 0,
-        align: 8,
     }); // no result
         // the call: args = [callee_sp, arg params…].
     let mut cargs: Vec<ValIdx> = vec![callee_sp];
@@ -21133,7 +21077,6 @@ fn lower_invoke(
         addr: hsp_addr,
         value: d,
         offset: 0,
-        align: 8,
     }); // no result
         // Br -> %ok, remapping each arg: a result slot to the local call `result`, every other to its
         // `Bcall` parameter index.
@@ -21163,7 +21106,6 @@ fn lower_invoke(
         op: LoadOp::I64,
         addr: d_addr,
         offset: 0,
-        align: 8,
     });
     let bufs = ctx.const_i64((base + EH_BUFS_O) as i64);
     let slot = ctx.const_i64(EH_SLOT as i64);

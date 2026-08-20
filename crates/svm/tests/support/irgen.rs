@@ -348,30 +348,14 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 let a = bb.want(from);
                 bb.push(Inst::Cast { op, a }, to);
             }
-            12 => {
-                let a = bb.want(ValType::I64);
-                let b = bb.want(ValType::I64);
-                bb.push(Inst::PtrAdd { a, b }, ValType::I64);
-            }
-            13 => {
-                let to_int = bb.g.boolean();
-                let a = bb.want(ValType::I64);
-                bb.push(Inst::PtrCast { to_int, a }, ValType::I64);
-            }
+            // 12/13 were PtrAdd/PtrCast (retired in the wire rev #900); those draws now re-roll
+            // via the `_ => continue` arm below.
             14 if has_mem => {
                 let op = LoadOp::from_index(bb.g.below(14) as u8).unwrap();
                 let (_, rty, _, _) = op.info();
                 let addr = bb.want(ValType::I64);
                 let offset = bb.g.below(256) as u64;
-                bb.push(
-                    Inst::Load {
-                        op,
-                        addr,
-                        offset,
-                        align: 0,
-                    },
-                    rty,
-                );
+                bb.push(Inst::Load { op, addr, offset }, rty);
             }
             15 if has_mem => {
                 let op = StoreOp::from_index(bb.g.below(9) as u8).unwrap();
@@ -384,7 +368,6 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     addr,
                     value,
                     offset,
-                    align: 0,
                 });
             }
             16 if can_call => {
@@ -535,24 +518,12 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
             // Both backends execute seq-cst, so the `order` is carried but doesn't change results.
             20 if has_mem => {
                 let ty = bb.g.inttype();
-                let order =
-                    bb.g.order_from(&[Ordering::Relaxed, Ordering::Acquire, Ordering::SeqCst]);
                 let addr = atomic_addr(bb, ty);
                 let offset = aligned_offset(bb, ty);
-                bb.push(
-                    Inst::AtomicLoad {
-                        ty,
-                        addr,
-                        offset,
-                        order,
-                    },
-                    ty.val(),
-                );
+                bb.push(Inst::AtomicLoad { ty, addr, offset }, ty.val());
             }
             21 if has_mem => {
                 let ty = bb.g.inttype();
-                let order =
-                    bb.g.order_from(&[Ordering::Relaxed, Ordering::Release, Ordering::SeqCst]);
                 let addr = atomic_addr(bb, ty);
                 let value = bb.want(ty.val());
                 let offset = aligned_offset(bb, ty);
@@ -561,12 +532,10 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     addr,
                     value,
                     offset,
-                    order,
                 });
             }
             22 if has_mem => {
                 let ty = bb.g.inttype();
-                let order = bb.g.order_from(&Ordering::ALL);
                 let addr = atomic_addr(bb, ty);
                 let offset = aligned_offset(bb, ty);
                 if bb.g.boolean() {
@@ -579,7 +548,6 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                             addr,
                             value,
                             offset,
-                            order,
                         },
                         ty.val(),
                     );
@@ -593,7 +561,6 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                             expected,
                             replacement,
                             offset,
-                            order,
                         },
                         ty.val(),
                     );
@@ -740,14 +707,7 @@ fn gen_simd(bb: &mut BB, has_mem: bool) {
             // The 16-byte masked load — exercises `svm-mask`'s wider width under the oracle.
             let addr = bb.want(ValType::I64);
             let offset = bb.g.below(256) as u64;
-            bb.push(
-                Inst::V128Load {
-                    addr,
-                    offset,
-                    align: 0,
-                },
-                ValType::V128,
-            );
+            bb.push(Inst::V128Load { addr, offset }, ValType::V128);
         }
         11 if has_mem => {
             let addr = bb.want(ValType::I64);
@@ -757,13 +717,13 @@ fn gen_simd(bb: &mut BB, has_mem: bool) {
                 addr,
                 value,
                 offset,
-                align: 0,
             });
         }
         12 => gen_simd_int(bb),
-        // The feature-detect hook, and the fallback when memory isn't available for 10/11.
+        // A memory-free constant is the fallback when memory isn't available for 10/11.
         _ => {
-            bb.push(Inst::SimdWidthBytes, ValType::I32);
+            let bytes = bb.g.v128bytes();
+            bb.push(Inst::ConstV128(bytes), ValType::V128);
         }
     }
 }

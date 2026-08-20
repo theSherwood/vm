@@ -205,15 +205,6 @@ enum Op {
         a: u32,
         op: CastOp,
     },
-    PtrAdd {
-        dst: u32,
-        a: u32,
-        b: u32,
-    },
-    PtrCast {
-        dst: u32,
-        a: u32,
-    },
     RefFunc {
         dst: u32,
         func: u32,
@@ -390,14 +381,9 @@ enum Op {
         export: u32,
         dst: u32,
     },
-    /// §7 reflection `cap.self.count` — number of caps this domain holds (one `i32` result).
-    CapSelfCount {
-        dst: u32,
-    },
-    /// §6 attestation `cap.self.attest` — the domain's packed provenance (one `i32` result).
-    CapSelfAttest {
-        dst: u32,
-    },
+    // §7/§6 capability reflection `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer
+    // dedicated bytecode ops — they arrive as `cap.call CAP_SELF op 0/1/2/3/4` and compile to the
+    // generic `Op::CapCall` (host `cap_dispatch_slots`), the same path the JIT thunk takes.
     /// §3.5 self-namespace extensions through the shared dispatch entry: `op` packs
     /// `(selfop | idx << 8)` (6 = `cap.self.type_id`, 7 = `cap.self.covers`, 8 =
     /// `export.handle`); `handle` is the optional live handle-register (covers only). One
@@ -405,27 +391,6 @@ enum Op {
     CapSelfExt {
         op: u32,
         handle: Option<u32>,
-        dst: u32,
-    },
-    /// §7 reflection `cap.self.get` — the `idx`-th held cap as `(handle, type_id)` (two `i32`
-    /// results in `dst`, `dst+1`).
-    CapSelfGet {
-        idx: u32,
-        dst: u32,
-    },
-    /// §7 reflection `cap.self.resolve` — resolve a name buffer `(name_ptr, name_len)` to its handle
-    /// (one `i32` result, `-errno` on miss). Routed through `cap_dispatch_slots` (op 2) like a cap.call.
-    CapSelfResolve {
-        name_ptr: u32,
-        name_len: u32,
-        dst: u32,
-    },
-    /// §7 reflection `cap.self.label` — write the handle's label into the window `(handle, buf_ptr,
-    /// buf_cap)`, returning its length (one `i32`). Routed through `cap_dispatch_slots` (op 3).
-    CapSelfLabel {
-        handle: u32,
-        buf_ptr: u32,
-        buf_cap: u32,
         dst: u32,
     },
     /// §12 fiber create (`cont.new`): register a pending fiber `(funcref, sp)` in the driver's
@@ -1009,8 +974,7 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                     | Inst::SetJmp { .. }
                     | Inst::LongJmp { .. } => s.has_park_seam = true,
                     Inst::ContNew { .. }
-                    | Inst::ContResume { .. }
-                    | Inst::ContResumeBlock { .. } // I48: advisory alias to cont.resume here
+                    | Inst::ContResume { .. } // I48: `block` flag is advisory here
                     | Inst::Suspend { .. } => s.has_fiber = true,
                     Inst::ThreadSpawn { .. }
                     | Inst::ThreadJoin { .. }
@@ -1489,12 +1453,6 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             a: g(*a),
             op: *op,
         },
-        Inst::PtrAdd { a, b } => Op::PtrAdd {
-            dst,
-            a: g(*a),
-            b: g(*b),
-        },
-        Inst::PtrCast { a, .. } => Op::PtrCast { dst, a: g(*a) },
         Inst::RefFunc { func } => Op::RefFunc { dst, func: *func },
         Inst::Load {
             op, addr, offset, ..
@@ -1752,26 +1710,9 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 },
             }
         }
-        // §7 reflection — synchronous self-powerbox queries (no scheduler/fiber); reuse the host's
-        // `self_dispatch`, the same path the tree-walker and the JIT thunk take.
-        Inst::CapSelfCount => Op::CapSelfCount { dst },
-        Inst::CapSelfAttest => Op::CapSelfAttest { dst },
-        Inst::CapSelfGet { idx } => Op::CapSelfGet { idx: g(*idx), dst },
-        Inst::CapSelfResolve { name_ptr, name_len } => Op::CapSelfResolve {
-            name_ptr: g(*name_ptr),
-            name_len: g(*name_len),
-            dst,
-        },
-        Inst::CapSelfLabel {
-            handle,
-            buf_ptr,
-            buf_cap,
-        } => Op::CapSelfLabel {
-            handle: g(*handle),
-            buf_ptr: g(*buf_ptr),
-            buf_cap: g(*buf_cap),
-            dst,
-        },
+        // §7/§6 reflection `cap.self.count`/`get`/`resolve`/`label`/`attest` reach here as their
+        // `cap.call CAP_SELF op 0/1/2/3/4` form and compile via the generic `Op::CapCall` fallthrough
+        // in the `Inst::CapCall` arm above.
         // §12 fibers — cooperative continuation switching, driven by the bytecode driver (no M:N
         // pool, no DPOR; single-vCPU). `cont.new` registers a pending fiber, `cont.resume` switches
         // in (two results), `suspend` switches back (one result).
@@ -1780,22 +1721,16 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             sp: g(*sp),
             dst,
         },
-        Inst::ContResume { k, arg } => Op::ContResume {
-            k: g(*k),
-            arg: g(*arg),
-            dst,
-            blocking: false,
-        },
-        // I48 — the blocking variant idles the resumer's task on the fiber's event (see the
+        // I48 — the `block: true` form idles the resumer's task on the fiber's event (see the
         // cooperative driver's `Outcome::ContResume` / fiber-park arms + `TaskState::BlockedOnFiber`)
         // instead of spinning the poll. Advisory still holds: `FIBER_PARKED` remains a legal
         // transient (the guest keeps its loop), so the deterministic explorer and any non-idling
         // path stay conforming (invariant 9).
-        Inst::ContResumeBlock { k, arg } => Op::ContResume {
+        Inst::ContResume { k, arg, block } => Op::ContResume {
             k: g(*k),
             arg: g(*arg),
             dst,
-            blocking: true,
+            blocking: *block,
         },
         Inst::Suspend { value } => Op::Suspend {
             value: g(*value),
@@ -12436,14 +12371,6 @@ impl Vm {
                     r!(*dst) = cast(*op, r!(*a));
                     pc += 1;
                 }
-                Op::PtrAdd { dst, a, b } => {
-                    r!(*dst) = Reg::from_i64(r!(*a).i64().wrapping_add(r!(*b).i64()));
-                    pc += 1;
-                }
-                Op::PtrCast { dst, a } => {
-                    r!(*dst) = Reg::from_i64(r!(*a).i64());
-                    pc += 1;
-                }
                 Op::RefFunc { dst, func } => {
                     r!(*dst) = Reg::from_i32(*func as i32);
                     pc += 1;
@@ -13067,18 +12994,6 @@ impl Vm {
                         pc += 1;
                     }
                 }
-                Op::CapSelfCount { dst } => {
-                    // §7 reflection op 0 — same `self_dispatch` the tree-walker uses; one i32 result.
-                    let res = host.with(|p| p.self_dispatch(0, &[]))?;
-                    r!(*dst) = Reg::from_i32(res[0] as i32);
-                    pc += 1;
-                }
-                Op::CapSelfAttest { dst } => {
-                    // §6 attestation op 4 — same `self_dispatch` the tree-walker / JIT thunk use.
-                    let res = host.with(|p| p.self_dispatch(4, &[]))?;
-                    r!(*dst) = Reg::from_i32(res[0] as i32);
-                    pc += 1;
-                }
                 Op::CapSelfExt { op, handle, dst } => {
                     // §3.5 self-namespace extensions — through the shared &mut dispatch entry
                     // (interning / reification mutate host state), same as the tree-walker.
@@ -13090,48 +13005,6 @@ impl Vm {
                         p.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, *op, 0, &argv, None)
                     })?;
                     r!(*dst) = Reg::from_i32(*res.first().ok_or(Trap::CapFault)? as i32);
-                    pc += 1;
-                }
-                Op::CapSelfGet { idx, dst } => {
-                    // §7 reflection op 1 — the idx-th held cap as (handle, type_id), two i32 results.
-                    let i = r!(*idx).i32() as i64;
-                    let res = host.with(|p| p.self_dispatch(1, &[i]))?;
-                    self.regs[base + *dst as usize] = Reg::from_i32(res[0] as i32);
-                    self.regs[base + *dst as usize + 1] = Reg::from_i32(res[1] as i32);
-                    pc += 1;
-                }
-                Op::CapSelfResolve {
-                    name_ptr,
-                    name_len,
-                    dst,
-                } => {
-                    // §7 reflection op 2 — resolve a name to its handle. Through the generic dispatch
-                    // (which has the window to read the name), identical to the tree-walker / JIT.
-                    let ptr = r!(*name_ptr).i64();
-                    let len = r!(*name_len).i64();
-                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let res = host.with(|p| {
-                        p.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)
-                    })?;
-                    r!(*dst) = Reg::from_i32(res[0] as i32);
-                    pc += 1;
-                }
-                Op::CapSelfLabel {
-                    handle,
-                    buf_ptr,
-                    buf_cap,
-                    dst,
-                } => {
-                    // §7 reflection op 3 — write the handle's label into the window. Through the
-                    // generic dispatch (which has the window), identical to the tree-walker / JIT.
-                    let h = r!(*handle).i32() as i64;
-                    let ptr = r!(*buf_ptr).i64();
-                    let cap = r!(*buf_cap).i64();
-                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let res = host.with(|p| {
-                        p.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 3, 0, &[h, ptr, cap], gm)
-                    })?;
-                    r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }
                 // §12 fiber ops escape to `drive` (which owns the registry / resume chain). Each

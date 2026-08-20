@@ -86,12 +86,7 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         a,
         b,
     };
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
 
     // 0 — entry(input): acc = 0, i = 0, pc = 0.
     let entry = Block {
@@ -255,12 +250,7 @@ fn build_calc_interpreter() -> Module {
         a,
         b,
     };
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
 
     // 0 — entry(a, b): acc = a, pc = 0.
     let entry = Block {
@@ -506,18 +496,12 @@ const STACK_HI: u64 = 32768 + 512;
 
 fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
     let t = || ValType::I64;
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
     let store = |addr, value| Inst::Store {
         op: StoreOp::I64,
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let bin = |op, a, b| Inst::IntBin {
         ty: IntTy::I64,
@@ -871,18 +855,12 @@ fn combine_ref(a: i64, b: i64) -> i64 {
 /// a readonly segment; `run(input)` returns the final top of stack.
 fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
     let t = || ValType::I64;
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
     let store = |addr, value| Inst::Store {
         op: StoreOp::I64,
         addr,
         value,
         offset: 0,
-        align: 0,
     };
     let bin = |op, a, b| Inst::IntBin {
         ty: IntTy::I64,
@@ -1050,12 +1028,7 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         a,
         b,
     };
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
     // Address of heap[acc & 63] from the op-block's `acc` (param 0): (acc & 63) << 3 + HEAP_LO.
     let heap_addr = || {
         vec![
@@ -1142,7 +1115,6 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
             addr: 9,
             value: 0,
             offset: 0,
-            align: 0,
         });
         insts.push(Inst::ConstI64(9));
         insts.push(bin(BinOp::Add, 1, 10)); // 11: npc
@@ -1227,7 +1199,6 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
                 op: LoadOp::I32_8U,
                 addr: 4,
                 offset: 0,
-                align: 0,
             }, // 5: op byte
         ],
         term: Terminator::BrTable {

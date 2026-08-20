@@ -230,11 +230,7 @@ fn spec_v128_load_store_boundary_lattice() {
         // v128.load: const addr → load → two i64 extracts.
         let mut insts = vec![
             Inst::ConstI64(addr as i64),
-            Inst::V128Load {
-                addr: 0,
-                offset,
-                align: 0,
-            },
+            Inst::V128Load { addr: 0, offset },
         ];
         for lane in [0u8, 1] {
             insts.push(Inst::ExtractLane {
@@ -295,7 +291,6 @@ fn spec_v128_load_store_boundary_lattice() {
                             addr: 0,
                             value: 1,
                             offset,
-                            align: 0,
                         },
                     ],
                     term: Terminator::Return(vec![]),

@@ -521,7 +521,6 @@ fn keeps_dead_load_but_drops_dead_arithmetic() {
                         op: LoadOp::I32,
                         addr: 0,
                         offset: 0,
-                        align: 0,
                     }, // 1 : dead result, but kept (can fault)
                     Inst::ConstI32(3), // 2
                     Inst::ConstI32(4), // 3
@@ -584,7 +583,6 @@ fn keeps_store_effect_across_renumbering() {
                         addr: 0,
                         value: 1,
                         offset: 0,
-                        align: 0,
                     }, // (no result)
                     Inst::ConstI32(0),  // 5
                 ],

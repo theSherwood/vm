@@ -294,7 +294,6 @@ fn directed_rule_rejects() {
             op: LoadOp::I32,
             addr: 0,
             offset: 0,
-            align: 0,
         }],
         T::Return(vec![1]),
     );
@@ -348,23 +347,9 @@ fn directed_rule_rejects() {
         |e| matches!(e, VerifyError::ThreadEntrySignature { .. }),
     );
 
-    // §12 atomic orderings: a store may not carry acquire semantics.
-    let mut m = module(vec![func(
-        vec![V::I64, V::I32],
-        vec![],
-        vec![Inst::AtomicStore {
-            ty: IntTy::I32,
-            addr: 0,
-            value: 1,
-            offset: 0,
-            order: Ordering::Acquire,
-        }],
-        T::Return(vec![]),
-    )]);
-    m.memory = Some(Memory { size_log2: 12 });
-    reject(&m, "atomic store acquire", |e| {
-        matches!(e, VerifyError::BadAtomicOrdering { .. })
-    });
+    // §12 atomic ordering: load/store/rmw/cmpxchg carry no ordering on the wire (execution is
+    // uniformly seq-cst), so there is no longer an ordering-validity rule to reject — the field and
+    // its `BadAtomicOrdering` error were cut at the wire rev.
 
     // §17 SIMD: lane indices bounded by the shape; op families constrain shapes.
     let f = func(

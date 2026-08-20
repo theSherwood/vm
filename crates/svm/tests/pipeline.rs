@@ -1617,30 +1617,6 @@ block 0 (v0: f32) {
     );
 }
 
-#[test]
-fn ptr_ops_roundtrip_and_compute() {
-    // base + offset via ptr.add, bracketed by from_int/to_int provenance casts.
-    let src = r#"
-func (i64, i64) -> (i64) {
-block 0 (v0: i64, v1: i64) {
-  v2 = ptr.from_int v0
-  v3 = ptr.add v2 v1
-  v4 = ptr.to_int v3
-  return v4
-  }
-}
-"#;
-    let m = parse_module(src).expect("parse");
-    verify_module(&m).expect("verify");
-    assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
-    assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
-    // off-CHERI these are i64 identity / wrapping add: 1000 + 24 = 1024.
-    assert_eq!(
-        run1at(src, 0, &[Value::I64(1000), Value::I64(24)]),
-        Ok(vec![Value::I64(1024)])
-    );
-}
-
 // ---- verifier fail-closed coverage for the newer ops (escape-TCB rejection paths) ----
 
 /// Every program here is ill-typed/ill-formed in one specific way; the verifier
@@ -1655,18 +1631,6 @@ fn verifier_rejects_newer_op_violations() {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = call_indirect (i64) -> (i64) v0 (v0)
-  return v1
-  }
-}
-"#,
-        ),
-        // ptr.add operands must be i64.
-        (
-            "ptr.add on i32",
-            r#"
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = ptr.add v0 v0
   return v1
   }
 }

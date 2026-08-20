@@ -52,7 +52,6 @@ fn with_readback(residual: &Module, entry: u32, read_addr: u64, nparams: usize) 
                     op: LoadOp::I64,
                     addr: nparams as u32,
                     offset: 0,
-                    align: 8,
                 },
             ],
             term: Terminator::Return(vec![nparams as u32 + 1]),

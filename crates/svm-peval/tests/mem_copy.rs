@@ -32,14 +32,12 @@ fn tvalue_copy_module() -> Module {
                     addr: 1,
                     value: 0,
                     offset: 0,
-                    align: 3,
                 }, // S.val = x
                 Inst::Store {
                     op: StoreOp::I64_8,
                     addr: 1,
                     value: 3,
                     offset: 8,
-                    align: 0,
                 }, // S.tag = 7
                 Inst::ConstI64(16),  // v4: len
                 Inst::MemCopy {
@@ -51,13 +49,11 @@ fn tvalue_copy_module() -> Module {
                     op: LoadOp::I64,
                     addr: 2,
                     offset: 0,
-                    align: 3,
                 }, // v5: D.val
                 Inst::Load {
                     op: LoadOp::I64_8U,
                     addr: 2,
                     offset: 8,
-                    align: 0,
                 }, // v6: D.tag
                 Inst::IntBin {
                     ty: IntTy::I64,

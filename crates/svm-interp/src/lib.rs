@@ -12982,60 +12982,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     frames[top].vals.push(Reg::from_i32(status as i32));
                 }
-                // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
-                // through `self_dispatch` (op 0) — the same path the JIT's thunk takes, so they agree.
-                Inst::CapSelfCount => {
-                    let hg = host.lock_unpoisoned();
-                    let r = hg.self_dispatch(0, &[])?;
-                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
-                }
-                // §6 attestation (`cap.self.attest`): the domain's platform-vouched provenance, packed
-                // into an `i32` (op 4). Same `self_dispatch` path the JIT thunk takes, so they agree.
-                Inst::CapSelfAttest => {
-                    let hg = host.lock_unpoisoned();
-                    let r = hg.self_dispatch(4, &[])?;
-                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
-                }
-                // §7 reflection (`cap.self.get`): the `idx`-th held capability as `(handle, type_id)`
-                // (op 1). An out-of-range index is fail-closed (the guest bounds it by the count).
-                Inst::CapSelfGet { idx } => {
-                    let i = get_i32(&frames[top].vals, *idx)? as i64;
-                    let hg = host.lock_unpoisoned();
-                    let r = hg.self_dispatch(1, &[i])?;
-                    drop(hg);
-                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
-                    frames[top].vals.push(Reg::from_i32(r[1] as i32));
-                }
-                // §7 reflection (`cap.self.resolve`): resolve a name buffer to its handle (op 2).
-                // Routed through the generic capability dispatch (which has the window to read the
-                // name) — the same code the JIT thunk / bytecode engine reach, so all three agree.
-                Inst::CapSelfResolve { name_ptr, name_len } => {
-                    let ptr = get_i64(&frames[top].vals, *name_ptr)?;
-                    let len = get_i64(&frames[top].vals, *name_len)?;
-                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
-                    let r =
-                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
-                    drop(hg);
-                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
-                }
-                // §7 reflection (`cap.self.label`): write the handle's label into the window (op 3),
-                // the reverse of resolve. Routed through the generic dispatch (which has the window).
-                Inst::CapSelfLabel {
-                    handle,
-                    buf_ptr,
-                    buf_cap,
-                } => {
-                    let h = get_i32(&frames[top].vals, *handle)? as i64;
-                    let ptr = get_i64(&frames[top].vals, *buf_ptr)?;
-                    let cap = get_i64(&frames[top].vals, *buf_cap)?;
-                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
-                    let r =
-                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 3, 0, &[h, ptr, cap], gm)?;
-                    drop(hg);
-                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
-                }
+                // §7/§6 capability reflection (`cap.self.count`/`get`/`resolve`/`label`/`attest`) is no
+                // longer a distinct IR op — it arrives as `cap.call CAP_SELF op 0/1/2/3/4` and is
+                // serviced by the generic `Inst::CapCall` arm above (host cap dispatch), so all tiers
+                // agree over one path.
                 // §12 per-vCPU TLS register: read/write **this** vCPU's word (`tls`, destructured from
                 // `v` above), so a fiber that migrated here sees the current vCPU's value.
                 Inst::VcpuTlsGet => {
@@ -13071,13 +13021,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // and a loser faults (D57) — and switch into it, delivering `arg`. The two results
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
-                Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } => {
-                    // I48 — the **blocking** variant (`cont.resume.block`) idles this vCPU on the
-                    // resumed fiber's own registered waiter instead of returning the FIBER_PARKED
-                    // poll status (see the `StillParked` arm). Advisory: every other path is
-                    // byte-identical to `cont.resume`, so the flag only matters when the target is
-                    // still parked.
-                    let blocking = matches!(inst, Inst::ContResumeBlock { .. });
+                Inst::ContResume { k, arg, block } => {
+                    // I48 — the **blocking** form (`block: true`, `cont.resume.block`) idles this
+                    // vCPU on the resumed fiber's own registered waiter instead of returning the
+                    // FIBER_PARKED poll status (see the `StillParked` arm). Advisory: every other
+                    // path is byte-identical to `cont.resume`, so the flag only matters when the
+                    // target is still parked.
+                    let blocking = *block;
                     // Fuel unification: resuming a fiber is a control transfer that per-op fuel used to
                     // meter (every op the fiber ran decremented the counter). Under safepoint metering
                     // it must charge here too — one fuel per `cont.resume` op, exactly as the bytecode
@@ -13662,15 +13612,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let r = i_to_f(*op, get(&frames[top].vals, *a)?);
                     frames[top].vals.push(r);
                 }
-                Inst::PtrAdd { a, b } => {
-                    let vals = &frames[top].vals;
-                    let r = Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?));
-                    frames[top].vals.push(r);
-                }
-                Inst::PtrCast { a, .. } => {
-                    let r = Reg::from_i64(get_i64(&frames[top].vals, *a)?);
-                    frames[top].vals.push(r);
-                }
                 Inst::Cast { op, a } => {
                     let r = cast(*op, get(&frames[top].vals, *a)?);
                     frames[top].vals.push(r);
@@ -14119,15 +14060,10 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
-        // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
-        // (like `cap.call`), never here.
-        Inst::CapSelfCount
-        | Inst::CapSelfAttest
-        | Inst::CapSelfGet { .. }
-        | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. }
-        | Inst::CapSelfTypeId { .. }
-        | Inst::CapSelfCovers { .. } => return Err(Trap::Malformed),
+        // §3.5 reflection intrinsics need the host table, so they're serviced in the eval loop
+        // (like `cap.call`), never here. (`cap.self.count`/`get`/`resolve`/`label`/`attest` are now
+        // `cap.call CAP_SELF` and take the `CapCall` path.)
+        Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => return Err(Trap::Malformed),
         // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
         // loop (`run_inner`), never here.
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
@@ -14197,9 +14133,6 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?),
         Inst::FToITrap { op, a } => trunc_trap(*op, get(vals, *a)?)?,
         Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?),
-        Inst::PtrAdd { a, b } => Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?)),
-        // `ptr.from_int`/`ptr.to_int` are a no-op off-CHERI: pass the i64 through.
-        Inst::PtrCast { a, .. } => Reg::from_i64(get_i64(vals, *a)?),
         Inst::Cast { op, a } => cast(*op, get(vals, *a)?),
         // A funcref is just the function index as plain i32 data (§3c).
         Inst::RefFunc { func } => Reg::from_i32(*func as i32),
@@ -14413,10 +14346,6 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::Swizzle { a, b } => {
             Reg::from_v128(simd_swizzle(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
         }
-        // The §17/D58 feature-detect hook: a deterministic constant in the fixed-128 MVP, so it
-        // stays identical across the interp↔JIT oracle.
-        Inst::SimdWidthBytes => Reg::from_i32(16),
-
         // Handled in `run_func` for the §12 fiber ops (which switch stacks) and in the eval
         // loop for calls/cap-calls; listed for exhaustiveness (no panic).
         Inst::Call { .. }
@@ -14424,7 +14353,6 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::CapCall { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
-        | Inst::ContResumeBlock { .. }
         | Inst::Suspend { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }

@@ -1209,16 +1209,6 @@ pub fn simd_rows() -> Vec<SimdRow> {
             SpecVal::V128(out)
         }),
     });
-    rows.push(SimdRow {
-        id: "simd.width_bytes".into(),
-        inputs: vec![],
-        result: V::I32,
-        nan_lanes: None,
-        encoding: enc(0x0E),
-        build: Box::new(|_| Inst::SimdWidthBytes),
-        eval: Box::new(|_| SpecVal::I32(16)), // fixed-128 floor (D58)
-    });
-
     rows
 }
 

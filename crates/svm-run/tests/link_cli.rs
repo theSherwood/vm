@@ -57,13 +57,11 @@ fn unit_b() -> Module {
                         op: LoadOp::I64,
                         addr: 0,
                         offset: 0,
-                        align: 3,
                     }, // v1 = *v0 = &g_val (written by the data.ptr relocation)
                     Inst::Load {
                         op: LoadOp::I64,
                         addr: 1,
                         offset: 0,
-                        align: 3,
                     }, // v2 = *v1 = 7
                 ],
                 term: Terminator::Return(vec![2]),

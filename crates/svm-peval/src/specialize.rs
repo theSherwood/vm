@@ -1964,7 +1964,6 @@ impl Spec<'_> {
             op,
             addr,
             offset: 0,
-            align: 0,
         });
         mem.insert(eff, (width, Abs::Dyn(bump(rnext))));
     }
@@ -1990,7 +1989,6 @@ impl Spec<'_> {
                 op,
                 addr,
                 offset: 0,
-                align: 0,
             });
             mem.insert(eff, (width, Abs::Dyn(bump(rnext))));
         }
@@ -2303,19 +2301,15 @@ impl Spec<'_> {
                 Abs::Dyn(bump(rnext))
             }
 
-            Inst::Load {
-                op,
-                addr,
-                offset,
-                align,
-            } => return self.eval_load(op, addr, offset, align, env, mem, out, rnext),
+            Inst::Load { op, addr, offset } => {
+                return self.eval_load(op, addr, offset, env, mem, out, rnext)
+            }
             Inst::Store {
                 op,
                 addr,
                 value,
                 offset,
-                align,
-            } => return self.eval_store(op, addr, value, offset, align, env, mem, out, rnext),
+            } => return self.eval_store(op, addr, value, offset, env, mem, out, rnext),
             Inst::MemCopy { dst, src, len } => {
                 return self.eval_mem_copy(dst, src, len, env, mem, out, rnext)
             }
@@ -2352,7 +2346,6 @@ impl Spec<'_> {
         op: LoadOp,
         addr: u32,
         offset: u64,
-        align: u8,
         env: &[Abs],
         mem: &BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
@@ -2451,12 +2444,7 @@ impl Spec<'_> {
                 return Ok(Some(Abs::Const(k)));
             }
             let addr = materialize(env[addr as usize], out, rnext);
-            out.push(Inst::Load {
-                op,
-                addr,
-                offset,
-                align,
-            });
+            out.push(Inst::Load { op, addr, offset });
             return Ok(Some(Abs::Dyn(bump(rnext))));
         }
         // Dynamic address: with a region active it might alias the renamed stack, so refuse —
@@ -2465,12 +2453,7 @@ impl Spec<'_> {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
-        out.push(Inst::Load {
-            op,
-            addr,
-            offset,
-            align,
-        });
+        out.push(Inst::Load { op, addr, offset });
         Ok(Some(Abs::Dyn(bump(rnext))))
     }
 
@@ -2482,7 +2465,6 @@ impl Spec<'_> {
         addr: u32,
         value: u32,
         offset: u64,
-        align: u8,
         env: &[Abs],
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
@@ -2572,7 +2554,6 @@ impl Spec<'_> {
                     addr,
                     value,
                     offset,
-                    align,
                 });
                 return Ok(None);
             }
@@ -2590,7 +2571,6 @@ impl Spec<'_> {
             addr,
             value,
             offset,
-            align,
         });
         Ok(None)
     }
@@ -3064,7 +3044,6 @@ impl Spec<'_> {
                 addr,
                 value,
                 offset: 0,
-                align: 0,
             });
         }
         Ok(())

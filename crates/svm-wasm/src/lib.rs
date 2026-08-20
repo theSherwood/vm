@@ -1988,7 +1988,6 @@ fn v128_load(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
     let v = lo.emit(Inst::V128Load {
         addr,
         offset: m.offset,
-        align: m.align,
     });
     lo.push(v, ValType::V128);
     Ok(())
@@ -2000,15 +1999,14 @@ fn v128_store(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
         addr,
         value,
         offset: m.offset,
-        align: m.align,
     });
     Ok(())
 }
 
 // ---- SIMD memory variants (splat-load / load-extend / load-zero / load+store-lane) ----
 // None need new IR: each composes a scalar `Load`/`Store` with `Splat`/`ReplaceLane`/`ExtractLane`/
-// `VWiden` (the lane immediates are wasm-validated `< lanes`). Synthesized scalar accesses carry
-// `align: 0` (advisory only; SVM does not trap on misalignment for non-atomic accesses).
+// `VWiden` (the lane immediates are wasm-validated `< lanes`). The wasm memarg's alignment hint is
+// dropped: SVM does not trap on misalignment for non-atomic accesses, and the hint left the wire.
 
 /// `v128.loadN_splat`: load a scalar of width N and broadcast it across every lane of `shape`.
 fn v_load_splat(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<(), Error> {
@@ -2017,7 +2015,6 @@ fn v_load_splat(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<
         op,
         addr,
         offset: m.offset,
-        align: 0,
     });
     let v = lo.emit(Inst::Splat { shape, a: s });
     lo.push(v, ValType::V128);
@@ -2031,7 +2028,6 @@ fn v_load_zero(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<(
         op,
         addr,
         offset: m.offset,
-        align: 0,
     });
     let zero = lo.emit(Inst::ConstV128([0u8; 16]));
     let v = lo.emit(Inst::ReplaceLane {
@@ -2052,7 +2048,6 @@ fn v_load_extend(lo: &mut Lower, shape: VShape, op: VWidenOp, m: MemArg) -> Resu
         op: LoadOp::I64,
         addr,
         offset: m.offset,
-        align: 0,
     });
     let zero = lo.emit(Inst::ConstV128([0u8; 16]));
     let packed = lo.emit(Inst::ReplaceLane {
@@ -2084,7 +2079,6 @@ fn v_load_lane(
         op,
         addr,
         offset: m.offset,
-        align: 0,
     });
     let v = lo.emit(Inst::ReplaceLane {
         shape,
@@ -2117,7 +2111,6 @@ fn v_store_lane(
         addr,
         value: s,
         offset: m.offset,
-        align: 0,
     });
     Ok(())
 }
@@ -2141,7 +2134,6 @@ fn mem_load(lo: &mut Lower, op: LoadOp, m: MemArg) -> Result<(), Error> {
         op,
         addr,
         offset: m.offset,
-        align: m.align,
     });
     lo.push(v, op.info().1); // `info().1` is the result value type (i32/i64)
     Ok(())
@@ -2238,7 +2230,6 @@ fn spawn_op(lo: &mut Lower) -> Result<(), Error> {
         addr: slot,
         value: one,
         offset: 0,
-        order: Ordering::SeqCst,
     });
     let one2 = lo.emit(Inst::ConstI32(1));
     let tid = lo.emit(Inst::IntBin {
@@ -2311,7 +2302,6 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
         op: LoadOp::I32,
         addr: byte_off,
         offset: lo.table_base,
-        align: 2,
     });
     let mut args = Vec::with_capacity(params.len());
     for _ in 0..params.len() {
@@ -2395,7 +2385,6 @@ fn return_call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) ->
         op: LoadOp::I32,
         addr: byte_off,
         offset: lo.table_base,
-        align: 2,
     });
     let mut args = Vec::with_capacity(params.len());
     for _ in 0..params.len() {
@@ -2419,7 +2408,6 @@ fn mem_store(lo: &mut Lower, op: StoreOp, m: MemArg) -> Result<(), Error> {
         addr,
         value,
         offset: m.offset,
-        align: m.align,
     });
     Ok(())
 }
@@ -2463,7 +2451,6 @@ fn atomic_load(lo: &mut Lower, ty: IntTy, m: MemArg) -> Result<(), Error> {
         ty,
         addr,
         offset: m.offset,
-        order: Ordering::SeqCst,
     });
     lo.push(v, int_vt(ty));
     Ok(())
@@ -2477,7 +2464,6 @@ fn atomic_store(lo: &mut Lower, ty: IntTy, m: MemArg) -> Result<(), Error> {
         addr,
         value,
         offset: m.offset,
-        order: Ordering::SeqCst,
     });
     Ok(())
 }
@@ -2491,7 +2477,6 @@ fn atomic_rmw(lo: &mut Lower, ty: IntTy, op: AtomicRmwOp, m: MemArg) -> Result<(
         addr,
         value,
         offset: m.offset,
-        order: Ordering::SeqCst,
     });
     lo.push(v, int_vt(ty)); // yields the old value
     Ok(())
@@ -2507,7 +2492,6 @@ fn atomic_cmpxchg(lo: &mut Lower, ty: IntTy, m: MemArg) -> Result<(), Error> {
         expected,
         replacement,
         offset: m.offset,
-        order: Ordering::SeqCst,
     });
     lo.push(v, int_vt(ty)); // yields the old value
     Ok(())
@@ -2623,7 +2607,6 @@ fn narrow_atomic_load(lo: &mut Lower, dst: IntTy, w: u32, m: MemArg) -> Result<(
             ty: IntTy::I32,
             addr,
             offset: m.offset,
-            order: Ordering::SeqCst,
         });
         let v = zext_result(lo, dst, word);
         lo.push(v, int_vt(dst));
@@ -2634,7 +2617,6 @@ fn narrow_atomic_load(lo: &mut Lower, dst: IntTy, w: u32, m: MemArg) -> Result<(
         ty: IntTy::I32,
         addr: word_addr,
         offset: 0,
-        order: Ordering::SeqCst,
     });
     let shifted = lo.emit(Inst::IntBin {
         ty: IntTy::I32,
@@ -2689,7 +2671,6 @@ fn narrow_sub_word(
         ty: IntTy::I32,
         addr: word_addr,
         offset: 0,
-        order: Ordering::SeqCst,
     });
 
     // The loop carries: prefix ++ operand-stack ++ [word_addr i64, shift i32, a i32, b i32, old i32].
@@ -2810,7 +2791,6 @@ fn narrow_sub_word(
         expected: old_word,
         replacement: new_word,
         offset: 0,
-        order: Ordering::SeqCst,
     });
     let success = lo.emit(Inst::IntCmp {
         ty: IntTy::I32,
@@ -2856,7 +2836,6 @@ fn narrow_atomic_store(lo: &mut Lower, dst: IntTy, w: u32, m: MemArg) -> Result<
             addr,
             value,
             offset: m.offset,
-            order: Ordering::SeqCst,
         });
         return Ok(());
     }
@@ -2882,7 +2861,6 @@ fn narrow_atomic_rmw(
             addr,
             value,
             offset: m.offset,
-            order: Ordering::SeqCst,
         });
         let v = zext_result(lo, dst, old);
         lo.push(v, int_vt(dst));
@@ -2906,7 +2884,6 @@ fn narrow_atomic_cmpxchg(lo: &mut Lower, dst: IntTy, w: u32, m: MemArg) -> Resul
             expected,
             replacement,
             offset: m.offset,
-            order: Ordering::SeqCst,
         });
         let v = zext_result(lo, dst, old);
         lo.push(v, int_vt(dst));
@@ -2935,7 +2912,6 @@ fn mem_size_op(lo: &mut Lower) -> Result<(), Error> {
             op,
             addr: a,
             offset: 0,
-            align: 3,
         })
     } else if lo.mem64 {
         lo.emit(Inst::ConstI64(lo.mg.initial_pages as i64))
@@ -2963,7 +2939,6 @@ fn mem_grow_op(lo: &mut Lower) -> Result<(), Error> {
         op: load_op,
         addr: cell,
         offset: 0,
-        align: 3,
     });
     // Overflow-safe in i64 (a near-`u32::MAX` delta must not wrap past the cap into a "fits").
     let widen = |lo: &mut Lower, v| {
@@ -3010,7 +2985,6 @@ fn mem_grow_op(lo: &mut Lower) -> Result<(), Error> {
         addr: cell,
         value: stored,
         offset: 0,
-        align: 3,
     });
     let negone = if lo.mem64 {
         lo.emit(Inst::ConstI64(-1))
@@ -3156,7 +3130,6 @@ fn init_unroll(lo: &mut Lower, dest: ValIdx, bytes: &[u8]) {
             addr: dest,
             value,
             offset: off,
-            align: 0,
         });
     }
 }
@@ -3207,7 +3180,6 @@ fn table_get_op(lo: &mut Lower) -> Result<(), Error> {
         op: LoadOp::I32,
         addr: off,
         offset: base,
-        align: 2,
     });
     lo.push(v, ValType::I32);
     Ok(())
@@ -3224,7 +3196,6 @@ fn table_set_op(lo: &mut Lower) -> Result<(), Error> {
         addr: off,
         value,
         offset: base,
-        align: 2,
     });
     Ok(())
 }
@@ -3238,7 +3209,6 @@ fn table_size_op(lo: &mut Lower) -> Result<(), Error> {
             op: LoadOp::I32,
             addr: a,
             offset: 0,
-            align: 2,
         })
     } else {
         lo.emit(Inst::ConstI32(lo.table_size as i32))
@@ -3328,7 +3298,6 @@ fn table_fill_loop(lo: &mut Lower, dest64: ValIdx, val: ValIdx, n: ValIdx) {
         addr: off,
         value: v,
         offset: base,
-        align: 2,
     });
     let one = lo.emit(Inst::ConstI64(1));
     let i1 = lo.emit(Inst::IntBin {
@@ -3443,7 +3412,6 @@ fn table_init_op(lo: &mut Lower, elem_index: u32) -> Result<(), Error> {
             addr: dest,
             value,
             offset: (k * 4) as u64,
-            align: 2,
         });
     }
     Ok(())
@@ -3462,7 +3430,6 @@ fn table_grow_op(lo: &mut Lower) -> Result<(), Error> {
         op: LoadOp::I32,
         addr: cell,
         offset: 0,
-        align: 2,
     });
     // Overflow-safe in i64 (a near-`u32::MAX` delta must not wrap past the cap into a "fits").
     let zext = |lo: &mut Lower, v| {
@@ -3501,7 +3468,6 @@ fn table_grow_op(lo: &mut Lower) -> Result<(), Error> {
         addr: cell,
         value: stored,
         offset: 0,
-        align: 2,
     });
     let negone = lo.emit(Inst::ConstI32(-1));
     let result = lo.emit(Inst::Select {
@@ -3972,7 +3938,6 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
                 op: load_op(ty),
                 addr: a,
                 offset: 0,
-                align: 3,
             });
             lo.push(v, ty);
         }
@@ -3985,7 +3950,6 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
                 addr: a,
                 value,
                 offset: 0,
-                align: 3,
             });
         }
         // ---- calls ----

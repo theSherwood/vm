@@ -185,13 +185,11 @@ fn build_interpreter(win_log2: u8) -> Module {
                 op: LoadOp::I64,
                 addr: 6,
                 offset: 0,
-                align: 0,
             }, // v7 = op (i64)
             Inst::Load {
                 op: LoadOp::I64,
                 addr: 6,
                 offset: 8,
-                align: 0,
             }, // v8 = k (i64)
             Inst::Convert {
                 op: ConvOp::WrapI64,

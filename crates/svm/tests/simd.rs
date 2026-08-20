@@ -119,7 +119,7 @@ fn simd_text_and_binary_roundtrip() {
           v26 = i8x16.extract_lane_s 3 v2\n\
           v27 = i8x16.extract_lane_u 3 v2\n\
           v28 = i32x4.extract_lane 0 v5\n\
-          v29 = simd.width_bytes\n\
+          v29 = i32.const 16\n\
           v30 = i64.const 0\n\
           v128.store v30 v2 offset=0\n\
           v31 = v128.load v30\n\
@@ -196,12 +196,6 @@ fn i8x16_swizzle_indexes_and_zeroes() {
         v4 = i8x16.extract_lane_u 1 v2\n\
         v5 = i32.add v3 v4\n  return v5\n  }\n}\n";
     assert_eq!(interp1(s, &[]), Value::I32(3)); // a[3]=3, plus 0
-}
-
-#[test]
-fn simd_width_is_fixed_128() {
-    let s = "func () -> (i32) {\nblock 0 () {\n  v0 = simd.width_bytes\n  return v0\n  }\n}\n";
-    assert_eq!(interp1(s, &[]), Value::I32(16));
 }
 
 // ---------------------------------------------------------------------------

@@ -7317,11 +7317,24 @@ int f(void) {
     let Some((m, entry_sp)) = translate_verified("vm_cap", src) else {
         return;
     };
-    // Structural: the reflection ops are present.
+    // Structural: the reflection ops are present, now as `cap.call CAP_SELF op 0/1`.
     assert!(
-        module_has_inst(&m, |i| matches!(i, svm_ir::Inst::CapSelfCount))
-            && module_has_inst(&m, |i| matches!(i, svm_ir::Inst::CapSelfGet { .. })),
-        "expected cap.self.count + cap.self.get"
+        module_has_inst(&m, |i| matches!(
+            i,
+            svm_ir::Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op: 0,
+                ..
+            }
+        )) && module_has_inst(&m, |i| matches!(
+            i,
+            svm_ir::Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op: 1,
+                ..
+            }
+        )),
+        "expected cap.self.count + cap.self.get (as cap.call CAP_SELF 0/1)"
     );
     // Run on the interpreter with a granted powerbox: 8 capabilities held → count 8.
     let mut h = Host::new();
@@ -7450,7 +7463,14 @@ int main(void) { return (__vm_cap(5) == __vm_blocking_handle()) ? 7 : 0; }
         m.funcs[0].blocks[0]
             .insts
             .iter()
-            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .filter(|i| matches!(
+                i,
+                svm_ir::Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
             .count(),
         0,
         "phase 3: no resolve prologue in _start"
@@ -7519,7 +7539,14 @@ int main(void) {
         m.funcs[0].blocks[0]
             .insts
             .iter()
-            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .filter(|i| matches!(
+                i,
+                svm_ir::Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
             .count(),
         0,
         "phase 3: no resolve prologue — the manifest declares the Jit imports"
@@ -7627,7 +7654,14 @@ fn vm_jit_threads_demo() {
         t.module.funcs[0].blocks[0]
             .insts
             .iter()
-            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .filter(|i| matches!(
+                i,
+                svm_ir::Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
             .count(),
         0,
         "phase 3: no resolve prologue — the manifest declares the Jit imports"
@@ -7707,7 +7741,14 @@ int main(void) {
         m.funcs[0].blocks[0]
             .insts
             .iter()
-            .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
+            .filter(|i| matches!(
+                i,
+                svm_ir::Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
             .count(),
         0,
         "phase 3: no resolve prologue in _start"

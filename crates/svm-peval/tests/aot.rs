@@ -41,12 +41,7 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         a,
         b,
     };
-    let load = |op, addr, offset| Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    };
+    let load = |op, addr, offset| Inst::Load { op, addr, offset };
 
     let entry = Block {
         params: vec![i64t()],                              // 0: input

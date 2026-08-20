@@ -250,10 +250,6 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // Scalar fused multiply-add: Cranelift has `fma`; core wasm has no scalar FMA opcode.
         Inst::Fma { .. } => row(F, cell(Status::Declines, NO_WASM_OP)),
 
-        // Pointer provenance ops (off-CHERI plain i64): both JITs lower them — Cranelift natively,
-        // the wasm-JIT as a wrapping `i64.add` / identity forward.
-        Inst::PtrAdd { .. } | Inst::PtrCast { .. } => row(F, F),
-
         // ---- Guest linear memory: both JITs emit confined accesses / bulk memory. ---------------
         Inst::Load { .. }
         | Inst::Store { .. }
@@ -296,15 +292,12 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => row(F, cell(Status::Declines, LEAF)),
 
-        // ---- §7 capability reflection (`cap.self.*`): Cranelift services them via a host thunk;
-        // the wasm-JIT leaf folds them to the interpreter. ---------------------------------------
-        Inst::CapSelfCount
-        | Inst::CapSelfGet { .. }
-        | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. }
-        | Inst::CapSelfTypeId { .. }
-        | Inst::CapSelfCovers { .. }
-        | Inst::CapSelfAttest => row(F, cell(Status::Declines, HOST_OP)),
+        // ---- §3.5 capability reflection (`cap.self.type_id`/`covers`): Cranelift services them via a
+        // host thunk; the wasm-JIT leaf folds them to the interpreter. (`cap.self.count`/`get`/
+        // `resolve`/`label`/`attest` are now `cap.call CAP_SELF` — covered by the `CapCall` row.) ----
+        Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => {
+            row(F, cell(Status::Declines, HOST_OP))
+        }
 
         // Per-vCPU TLS register + durable shadow base: baked thunks over a thread-local, supported on
         // every Cranelift target; the wasm-JIT leaf folds them.
@@ -315,8 +308,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // ---- §12 fibers / threads / futex: Cranelift lowers them to host-runtime calls only where
         // the stack-switch substrate exists; the wasm-JIT (leaf) never runs concurrency itself. ---
         Inst::ContNew { .. }
-        | Inst::ContResume { .. }
-        | Inst::ContResumeBlock { .. } // I48: advisory alias to cont.resume on every backend
+        | Inst::ContResume { .. } // I48: the `block` flag is advisory scheduling only
         | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
@@ -362,8 +354,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::VNot { .. }
         | Inst::Bitselect { .. }
         | Inst::Shuffle { .. }
-        | Inst::Swizzle { .. }
-        | Inst::SimdWidthBytes => row(F, F),
+        | Inst::Swizzle { .. } => row(F, F),
 
         // `i64x2` min/max: Cranelift synthesizes it (per-lane compare + `bitselect`, since x86/aarch64
         // have no native `i64` vector min/max); wasm has no `i64x2` min/max opcode, so the wasm-JIT

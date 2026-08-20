@@ -7,10 +7,10 @@
 //! same source the text printer uses — so a renamed op renames its catalog row automatically.
 //!
 //! **Granularity note.** Rows fan out over the *semantic* immediates (type prefix, sub-op, lane
-//! shape). They deliberately do **not** fan out over immediates that change neither support nor
-//! observable result — the memory-access `align` hint, and the atomic `Ordering` (all backends
-//! execute every ordering sequentially-consistent; DESIGN §12 / `Ordering`'s doc). Those collapse to
-//! one representative row.
+//! shape). The memory-access `align` hint and the load/store/rmw/cmpxchg atomic `Ordering` (both
+//! write-only — every backend executed seq-cst regardless; DESIGN §12) left the wire at the wire
+//! rev, so there is nothing left to collapse for them. `AtomicFence` keeps its `Ordering`, but it
+//! is not fanned out (all orderings share support/result).
 
 use svm_ir::*;
 
@@ -364,7 +364,6 @@ fn memory(ops: &mut Vec<Op>) {
             op,
             addr: 0,
             offset: 0,
-            align: 0,
         };
         push(
             ops,
@@ -381,7 +380,6 @@ fn memory(ops: &mut Vec<Op>) {
             addr: 0,
             value: 1,
             offset: 0,
-            align: 0,
         };
         push(
             ops,
@@ -441,7 +439,6 @@ fn atomics(ops: &mut Vec<Op>) {
             ty,
             addr: 0,
             offset: 0,
-            order: Ordering::SeqCst,
         };
         push(
             ops,
@@ -455,7 +452,6 @@ fn atomics(ops: &mut Vec<Op>) {
             addr: 0,
             value: 1,
             offset: 0,
-            order: Ordering::SeqCst,
         };
         push(
             ops,
@@ -471,7 +467,6 @@ fn atomics(ops: &mut Vec<Op>) {
                 addr: 0,
                 value: 1,
                 offset: 0,
-                order: Ordering::SeqCst,
             };
             push(
                 ops,
@@ -487,7 +482,6 @@ fn atomics(ops: &mut Vec<Op>) {
             expected: 1,
             replacement: 2,
             offset: 0,
-            order: Ordering::SeqCst,
         };
         push(
             ops,
@@ -551,11 +545,7 @@ fn simd(ops: &mut Vec<Op>) {
         Inst::ConstV128([0; 16]),
         unit(&[], Inst::ConstV128([0; 16]), &[v], false),
     );
-    let ld = Inst::V128Load {
-        addr: 0,
-        offset: 0,
-        align: 0,
-    };
+    let ld = Inst::V128Load { addr: 0, offset: 0 };
     push(
         ops,
         "v128.load".into(),
@@ -567,7 +557,6 @@ fn simd(ops: &mut Vec<Op>) {
         addr: 0,
         value: 1,
         offset: 0,
-        align: 0,
     };
     push(
         ops,
@@ -951,13 +940,6 @@ fn simd(ops: &mut Vec<Op>) {
         swz.clone(),
         unit(&[v, v], swz, &[v], false),
     );
-    push(
-        ops,
-        "simd.width_bytes".into(),
-        FAM,
-        Inst::SimdWidthBytes,
-        unit(&[], Inst::SimdWidthBytes, &[ValType::I32], false),
-    );
 }
 
 fn control_and_calls(ops: &mut Vec<Op>) {
@@ -1048,31 +1030,8 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
         ),
         skip,
     );
-    // Reflection intrinsics (self-contained, but declined on wasm as host ops — pin them where cheap).
-    let count = Inst::CapSelfCount;
-    push(
-        ops,
-        "cap.self.count".into(),
-        FAM,
-        count.clone(),
-        unit(&[], count, &[ValType::I32], false),
-    );
-    let attest = Inst::CapSelfAttest;
-    push(
-        ops,
-        "cap.self.attest".into(),
-        FAM,
-        attest.clone(),
-        unit(&[], attest, &[ValType::I32], false),
-    );
-    let get = Inst::CapSelfGet { idx: 0 };
-    push(
-        ops,
-        "cap.self.get".into(),
-        FAM,
-        get.clone(),
-        unit(&[ValType::I32], get, &[ValType::I32, ValType::I32], false),
-    );
+    // Reflection intrinsics. `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct
+    // ops — they are `cap.call CAP_SELF op N`, covered by the generic `cap.call` parity row.
     let tls_get = Inst::VcpuTlsGet;
     push(
         ops,
@@ -1089,47 +1048,6 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
         tls_set.clone(),
         unit(&[ValType::I64], tls_set, &[], false),
     );
-    // The remaining §7 ops need import/impl/type sections; list them with the manifest, skip the pin.
-    for (name, inst) in [
-        (
-            "cap.self.resolve",
-            Inst::CapSelfResolve {
-                name_ptr: 0,
-                name_len: 1,
-            },
-        ),
-        (
-            "cap.self.label",
-            Inst::CapSelfLabel {
-                handle: 0,
-                buf_ptr: 1,
-                buf_cap: 2,
-            },
-        ),
-    ] {
-        // These do touch memory; give them a window so verify passes even though we skip the pin.
-        let operands = if name == "cap.self.resolve" {
-            vec![ValType::I64, ValType::I64]
-        } else {
-            vec![ValType::I32, ValType::I64, ValType::I64]
-        };
-        let res = if name == "cap.self.label" {
-            vec![ValType::I64]
-        } else {
-            vec![ValType::I32]
-        };
-        let n = operands.len() as ValIdx;
-        let m = module1(
-            func(
-                operands.clone(),
-                res.clone(),
-                vec![inst.clone()],
-                Terminator::Return(vec![n]),
-            ),
-            true,
-        );
-        push_skip(ops, name.into(), FAM, inst, m, skip);
-    }
     for (name, inst) in [
         ("export.handle", Inst::ExportHandle { export: 0 }),
         (
@@ -1225,10 +1143,25 @@ fn fibers_threads(ops: &mut Vec<Op>) {
     let skip = "target-conditional (needs x86-64-unix stack-switch / setjmp substrate)";
     for (name, inst) in [
         ("cont.new", Inst::ContNew { func: 0, sp: 1 }),
-        ("cont.resume", Inst::ContResume { k: 0, arg: 1 }),
-        // I48 advisory blocking resume: same parity as `cont.resume` (bytecode/Cranelift alias
-        // it; only the tree-walk oracle idles — DESIGN §12).
-        ("cont.resume.block", Inst::ContResumeBlock { k: 0, arg: 1 }),
+        (
+            "cont.resume",
+            Inst::ContResume {
+                k: 0,
+                arg: 1,
+                block: false,
+            },
+        ),
+        // I48 advisory blocking resume (`block: true`): same parity shape as `cont.resume`; the
+        // idling backends park while the OS-thread-parallel drivers take the FIBER_PARKED
+        // downgrade (DESIGN §12).
+        (
+            "cont.resume.block",
+            Inst::ContResume {
+                k: 0,
+                arg: 1,
+                block: true,
+            },
+        ),
         ("suspend", Inst::Suspend { value: 0 }),
         (
             "thread.spawn",

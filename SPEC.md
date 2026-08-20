@@ -271,8 +271,8 @@ commit). Ordered so every slice delivers a standing suite:
    the bulk guard-hole trap vectors excepted — ISSUES.md I21.)
 6. **SIMD** — **done** (see Status). The `v128` families (lane typing already
    total, §17/D58); `eval` per lane op is mechanical. *Exit: parity with slices
-   1–2 for vector ops.* ✅ (`i64x2` min/max JIT leg excepted — a documented
-   backend bail, not a spec gap.)
+   1–2 for vector ops.* ✅ (`i64x2` min/max is JIT-synthesized per-lane and
+   differentially pinned like every other SIMD row — see the SIMD status note above.)
 7. **Coverage closure** — **done** (see Status). Typing + encoding rows for the remaining control /
    host / concurrency ops (no `eval`), plus the exhaustive `row_home()` walk.
    *Exit: the completeness walk covers all of `Inst`.* ✅

@@ -368,7 +368,6 @@ fn impure_loads_at_a_join_are_not_deduped_by_gvn() {
         op: LoadOp::I32,
         addr,
         offset: 0,
-        align: 2,
     };
     let f = Func {
         params: vec![ValType::I32, ValType::I64], // cond, addr

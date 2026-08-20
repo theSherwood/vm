@@ -270,7 +270,6 @@ fn with_readback(residual: &Module, read_addr: u64) -> (Module, u32) {
                     op: LoadOp::I64,
                     addr: 3,
                     offset: 0,
-                    align: 8,
                 },
             ],
             term: Terminator::Return(vec![4]),

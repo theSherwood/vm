@@ -31,7 +31,6 @@ fn load(addr: u32) -> Inst {
         op: LoadOp::I64,
         addr,
         offset: 0,
-        align: 0,
     }
 }
 fn store(addr: u32, value: u32) -> Inst {
@@ -40,7 +39,6 @@ fn store(addr: u32, value: u32) -> Inst {
         addr,
         value,
         offset: 0,
-        align: 0,
     }
 }
 fn add(a: u32, b: u32) -> Inst {
@@ -56,7 +54,6 @@ fn load_off(addr: u32, offset: u64) -> Inst {
         op: LoadOp::I64,
         addr,
         offset,
-        align: 0,
     }
 }
 fn store_off(op: StoreOp, addr: u32, value: u32, offset: u64) -> Inst {
@@ -65,7 +62,6 @@ fn store_off(op: StoreOp, addr: u32, value: u32, offset: u64) -> Inst {
         addr,
         value,
         offset,
-        align: 0,
     }
 }
 
@@ -280,18 +276,9 @@ fn v128_store_forwards_to_loads() {
                     addr: 0,
                     value: 1,
                     offset: 0,
-                    align: 0,
                 },
-                Inst::V128Load {
-                    addr: 0,
-                    offset: 0,
-                    align: 0,
-                }, // v2 → forwards to v1
-                Inst::V128Load {
-                    addr: 0,
-                    offset: 0,
-                    align: 0,
-                }, // v3 → forwards to v1
+                Inst::V128Load { addr: 0, offset: 0 }, // v2 → forwards to v1
+                Inst::V128Load { addr: 0, offset: 0 }, // v3 → forwards to v1
                 Inst::VBitBin {
                     op: VBitBinOp::Or,
                     a: 2,

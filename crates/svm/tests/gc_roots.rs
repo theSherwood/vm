@@ -471,7 +471,7 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         }\n\
         block 1 (v3: i32) {\n\
         \x20 v4 = i64.const 128\n\
-        \x20 v5 = i32.atomic.load.acquire v4\n\
+        \x20 v5 = i32.atomic.load v4\n\
         \x20 v6 = i32.const 0\n\
         \x20 v7 = i32.ne v5 v6\n\
         \x20 br_if v7 3(v3) 2(v3)\n\
@@ -492,7 +492,7 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v18 = gc.roots v14 v15 vmask v16 v17\n\
         \x20 v19 = i64.const 136\n\
         \x20 v20 = i32.const 1\n\
-        \x20 i32.atomic.store.release v19 v20\n\
+        \x20 i32.atomic.store v19 v20\n\
         \x20 v21 = i64.const 136\n\
         \x20 v22 = i32.const 1\n\
         \x20 v23 = atomic.notify v21 v22\n\
@@ -513,7 +513,7 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v6, v7 = cont.resume v4 v5\n\
         \x20 v8 = i64.const 128\n\
         \x20 v9 = i32.const 1\n\
-        \x20 i32.atomic.store.release v8 v9\n\
+        \x20 i32.atomic.store v8 v9\n\
         \x20 v10 = i64.const 128\n\
         \x20 v11 = i32.const 1\n\
         \x20 v12 = atomic.notify v10 v11\n\
@@ -521,7 +521,7 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         }\n\
         block 1 () {\n\
         \x20 v13 = i64.const 136\n\
-        \x20 v14 = i32.atomic.load.acquire v13\n\
+        \x20 v14 = i32.atomic.load v13\n\
         \x20 v15 = i32.const 0\n\
         \x20 v16 = i32.ne v14 v15\n\
         \x20 br_if v16 3() 2()\n\

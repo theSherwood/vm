@@ -435,7 +435,6 @@ fn guarded_stitch_takes_the_right_arm() {
                         op: LoadOp::I64,
                         addr: 0,
                         offset: 0,
-                        align: 0,
                     },
                     Inst::ConstI64(expected as i64),
                     Inst::IntCmp {

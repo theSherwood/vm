@@ -190,12 +190,12 @@ const FUTEX: &str = "memory 16\n\
     block 0 () {\n\
     \x20 v0 = i64.const 8\n\
     \x20 v1 = i64.const 987654\n\
-    \x20 i64.atomic.store.release v0 v1\n\
+    \x20 i64.atomic.store v0 v1\n\
     \x20 v2 = i64.const 0\n\
     \x20 v3 = thread.spawn 1 v2 v2\n\
     \x20 v4 = i64.const 0\n\
     \x20 v5 = i32.const 1\n\
-    \x20 i32.atomic.store.release v4 v5\n\
+    \x20 i32.atomic.store v4 v5\n\
     \x20 v6 = i64.const 0\n\
     \x20 v7 = i32.const 1\n\
     \x20 v8 = atomic.notify v6 v7\n\
@@ -210,7 +210,7 @@ const FUTEX: &str = "memory 16\n\
     \x20 v3 = i64.const 1000000000\n\
     \x20 v4 = i32.atomic.wait v1 v2 v3\n\
     \x20 v5 = i64.const 8\n\
-    \x20 v6 = i64.atomic.load.acquire v5\n\
+    \x20 v6 = i64.atomic.load v5\n\
     \x20 return v6\n\
       }\n\
     }\n";
