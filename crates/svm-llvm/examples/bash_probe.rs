@@ -66,13 +66,15 @@ fn main() {
             v
         })
         .unwrap_or_default();
-    if bins.is_empty() {
-        let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
-        run_and_print(&inst, &config, cap, posix);
-        return;
-    }
-    // `posix_cap` plus the /bin registration, which must happen inside the grant (module
-    // handles live in the run's Host).
+    // Interactive mode (#797): BASH_PROBE_TERM holds `;`-separated lines to type at the terminal
+    // (each fed with a newline after a short delay — the `run_interp_terminal` witness shape).
+    // The terminal is enabled at grant time; the feeder thread types while bash runs.
+    let term_feed: Option<Vec<String>> = std::env::var("BASH_PROBE_TERM")
+        .ok()
+        .map(|s| s.split(';').map(|x| x.to_string()).collect());
+    let with_term = term_feed.is_some();
+    // `posix_cap` plus the /bin registration and terminal enable, which must happen inside the
+    // grant (module handles and the terminal input pipe live in the run's Host).
     let (posix, make) = svm_posix::cap(0, 0, Vec::new());
     let fork = svm_posix::cap_fork_factory(&posix);
     let p = posix.clone();
@@ -87,9 +89,32 @@ fn main() {
             let mh = h.grant_module(m);
             p.register_executable(path, mh, *wl);
         }
+        if with_term {
+            p.enable_terminal(h);
+        }
         handle
     });
+    let feeder = term_feed.map(|lines| {
+        let px = posix.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400)); // let bash reach the prompt
+            for l in lines {
+                // Control tokens: a line that is exactly `^C`/`^D`/`^Z` feeds the raw control
+                // byte (no newline) — the VINTR/VEOF/VSUSP keystrokes.
+                match l.as_str() {
+                    "^C" => px.feed_terminal(&[0x03]),
+                    "^D" => px.feed_terminal(&[0x04]),
+                    "^Z" => px.feed_terminal(&[0x1a]),
+                    _ => px.feed_terminal(format!("{l}\n").as_bytes()),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        })
+    });
     run_and_print(&inst, &config, cap, posix);
+    if let Some(f) = feeder {
+        f.join().expect("feeder thread");
+    }
 }
 
 fn run_and_print(
@@ -104,6 +129,10 @@ fn run_and_print(
             println!(
                 "--- posix stdout ---\n{}",
                 String::from_utf8_lossy(&posix.stdout())
+            );
+            println!(
+                "--- posix stderr ---\n{}",
+                String::from_utf8_lossy(&posix.stderr())
             );
             println!("--- run stdout ---\n{}", String::from_utf8_lossy(&r.stdout));
             println!("--- run stderr ---\n{}", String::from_utf8_lossy(&r.stderr));

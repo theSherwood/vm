@@ -12594,4 +12594,61 @@ fn demo_bash_translates_and_verifies() {
             "bash -c {script:?} (external): stdout differs from the oracle"
         );
     }
+
+    // ▶ Interactive rung 1 (#802 interactive slice): `bash -i` on the **#797 controlling
+    // terminal** (`posix_cap_terminal`), a feeder thread typing while the shell runs (the
+    // `run_interp_terminal` witness shape — feed timing is best-effort, so the assertions are on
+    // session RESULTS, not on parking/interleaving). The session proves: the prompt loop (PS1 on
+    // fd 2 between commands), a command typed at the prompt runs, `^C` at the prompt aborts the
+    // line and sets `$? = 130` (SIGINT through the feed-time line discipline), and `^D` on an
+    // empty line exits the shell cleanly with bash's `exit` farewell.
+    {
+        let (cap, posix) = svm_run::posix::posix_cap_terminal(0, 0);
+        let feeder = {
+            let px = posix.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in ["echo hi\n", "\x03", "echo rc=$?\n", "\x04"] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+        };
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .expect("bash -i session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            svm_run::Outcome::Exited(0),
+            "bash -i: the ^D exit carries the last command's status"
+        );
+        let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix.stderr()).into_owned();
+        assert!(
+            out.contains("echo hi\nhi\n"),
+            "bash -i: the typed command echoed and ran (stdout: {out:?})"
+        );
+        assert!(
+            out.contains("rc=130"),
+            "bash -i: ^C at the prompt set $? = 130 (stdout: {out:?})"
+        );
+        assert!(
+            err.matches("$ ").count() >= 3,
+            "bash -i: the PS1 prompt re-printed between commands (stderr: {err:?})"
+        );
+        assert!(
+            err.contains("exit"),
+            "bash -i: ^D printed bash's `exit` farewell (stderr: {err:?})"
+        );
+    }
 }

@@ -24,6 +24,24 @@ use svm_posix::Posix;
 /// The cap grants once per backend over one shared personality state, so an interp/JIT differential run
 /// observes the same `Posix` — read it back after the run.
 pub fn posix_cap(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (HostCap, Posix) {
+    posix_cap_inner(heap_base, heap_end, stdin, false)
+}
+
+/// [`posix_cap`] with the **#797 controlling terminal** enabled at grant time
+/// ([`Posix::enable_terminal`]): fds 0-2 answer `isatty`, `read(0)` rides the terminal input pipe
+/// (parks empty — a real prompt), and the embedder types with [`Posix::feed_terminal`] from
+/// another thread while the run is live (the `run_interp_terminal` witness shape). This is the
+/// lane an **interactive** on-ramp guest (bash `-i`) runs on.
+pub fn posix_cap_terminal(heap_base: u64, heap_end: u64) -> (HostCap, Posix) {
+    posix_cap_inner(heap_base, heap_end, Vec::new(), true)
+}
+
+fn posix_cap_inner(
+    heap_base: u64,
+    heap_end: u64,
+    stdin: Vec<u8>,
+    terminal: bool,
+) -> (HostCap, Posix) {
     let (posix, make) = svm_posix::cap(heap_base, heap_end, stdin);
     // #863 — the personality's own fork factory rides along, so a `fork()` through the powerbox
     // path gets real POSIX semantics (own fd table/cwd/env/signals, shared memfs), not a shared blob.
@@ -41,6 +59,9 @@ pub fn posix_cap(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (HostCap, Pos
         h.push_exec_remap_hook(svm_posix::cap_exec_remap_hook(&p));
         let (names, sigs) = svm_posix::cap_vtable();
         h.set_host_proc_vtable(handle, names, sigs);
+        if terminal {
+            p.enable_terminal(h);
+        }
         handle
     });
     (cap, posix)

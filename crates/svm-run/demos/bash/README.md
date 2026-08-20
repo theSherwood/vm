@@ -119,11 +119,36 @@ Known nuance (deferred until a real script trips it): `(kill -INT $$); echo rc=$
 the shell ITSELF is signaled from a subshell while waiting differs (svm 128, native 0: bash's
 `wait_sigint` discard logic vs the personality's `128+sig` zombie status encoding).
 
+## Interactive rung 1 (DONE) — `bash -i` on the #797 controlling terminal, foreground
+
+The harness lane: `svm_run::posix::posix_cap_terminal` enables the #797 terminal at grant time;
+the embedder types with `Posix::feed_terminal` from a feeder thread while the shell runs (the
+`run_interp_terminal` witness shape). What works, session-proven and gated (the interactive block
+in `demo_bash_translates_and_verifies`; `bash_probe` drives ad-hoc sessions via
+`BASH_PROBE_TERM='line;^C;line;^D'`):
+
+- **The prompt loop** — bash comes up `flags=himBHs` (interactive AND monitor/job-control mode —
+  richer than native bash under a pipe, which loses `m`), prints PS1 to fd 2 between commands,
+  reads canonical lines through the feed-time discipline (echo on the captured stdout).
+- **`^C` at the prompt** — VINTR through the discipline → SIGINT to the foreground group → bash
+  aborts the line, `$? = 130`, fresh prompt (native-exact).
+- **`^D` on an empty line** — true EOF → bash prints its `exit` farewell and exits with the last
+  command's status.
+- **Commands at the prompt** — builtins, external commands, and pipelines (`seq 3 | cat`) run
+  exactly as in `-c` mode.
+- Shim fix en route: `getcwd(NULL, 0)` (the glibc allocate-extension — bash's shell-init cwd
+  probe) now allocates instead of failing into the `shell-init: error retrieving current
+  directory` warning.
+
 ## What remains (the slice ladder from the #802 sketch)
 
-- **Slice 4 remainder**: here-docs, `$?` edge above; then interactive on the #797 terminal
-  (readline re-enabled or the dumb-terminal path, the controlling-terminal ops, job control
-  foreground/background).
+- **Interactive rung 2 — background jobs**: `^Z`/`jobs`/`fg`/`bg`. The walk found the gap: an
+  exec'd child's fd 0 is a **drained stdin snapshot**, not the terminal — `cat` at the prompt
+  EOFs instantly instead of reading the terminal, so there is never a live foreground job to
+  stop. Needs the #801 exec plumbing to hand the child the terminal-backed fd 0 (and then the
+  VSUSP feed path + the stop report through interactive `waitpid(WUNTRACED)` — the #798
+  machinery, already personality-side).
+- **Slice 4 remainder**: here-docs, the `$?` edge above.
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
   (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without

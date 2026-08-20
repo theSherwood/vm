@@ -129,6 +129,16 @@ int mkdir(const char *p, unsigned int mode) {
 }
 int rmdir(const char *p) { return (int)px_ret_(px_call_(PX_RMDIR, (long)p, (long)strlen(p), 0, 0)); }
 char *getcwd(char *buf, unsigned long size) {
+  if (!buf) { /* the glibc allocate-extension — bash's shell-init cwd probe uses it */
+    if (size == 0) size = 4096;
+    buf = (char *)malloc(size);
+    if (!buf) return 0;
+    if (px_call_(PX_GETCWD, (long)buf, (long)size, 0, 0) < 0) {
+      free(buf);
+      return 0;
+    }
+    return buf;
+  }
   return px_call_(PX_GETCWD, (long)buf, (long)size, 0, 0) < 0 ? 0 : buf;
 }
 int chdir(const char *p) { return (int)px_ret_(px_call_(PX_CHDIR, (long)p, (long)strlen(p), 0, 0)); }
